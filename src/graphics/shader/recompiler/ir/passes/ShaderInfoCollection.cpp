@@ -265,6 +265,8 @@ struct InputUsage {
 	std::array<StageInputKind, static_cast<size_t>(StageInputKind::Parameter)> builtins {};
 	uint32_t builtin_mask = 0;
 	uint32_t builtin_count = 0;
+	// Without host barycentrics no pixel input is per-vertex (see CollectShaderInfo).
+	bool fragment_shader_barycentric = true;
 
 	void AddBuiltin(StageInputKind kind) {
 		const auto bit = 1u << static_cast<uint32_t>(kind);
@@ -403,7 +405,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				// FP16_INTERP_MODE packs two halves per dword, so smooth inputs blend unpacked
 				// vertices; flat inputs unpack the provoking vertex.
 				const auto input = inst.Arg(0).U32();
-				inputs.per_vertex[input] |= !ShaderPixelParameterIsFlat(*input_info.pixel, input);
+				inputs.per_vertex[input] |= inputs.fragment_shader_barycentric &&
+				                            !ShaderPixelParameterIsFlat(*input_info.pixel, input);
 			}
 			break;
 		}
@@ -419,8 +422,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				return Fail("interpolation parameter reference is out of range");
 			}
 			const auto input = inst.Arg(0).U32();
-			inputs.per_vertex[input] |= inst.Arg(2).U32() < 2u ||
-			                            !ShaderPixelParameterIsFlat(*input_info.pixel, input);
+			// Raw vertex reads need per-vertex inputs, which only exist with host barycentrics;
+			// otherwise the emitter approximates them from the interpolated value.
+			inputs.per_vertex[input] |= inputs.fragment_shader_barycentric &&
+			                            (inst.Arg(2).U32() < 2u ||
+			                             !ShaderPixelParameterIsFlat(*input_info.pixel, input));
 			break;
 		}
 		case ValueOpcode::GetBuiltin: {
@@ -562,7 +568,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 
 } // namespace
 
-void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
+void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info,
+                       bool fragment_shader_barycentric) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
 		                                                : "shader info already collected");
@@ -581,6 +588,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
 	InputUsage inputs;
+	inputs.fragment_shader_barycentric = fragment_shader_barycentric;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
@@ -617,7 +625,15 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		default: return Fail("unsupported shader stage for info collection");
 	}
 	for (uint32_t i = 0; i < inputs.builtin_count; i++) {
-		AddBuiltinInput(info, inputs.builtins[i]);
+		const auto kind = inputs.builtins[i];
+		// Without host barycentrics the barycentric builtins stay undeclared and read as zero.
+		if (!fragment_shader_barycentric &&
+		    (kind == StageInputKind::BaryCoordSmooth || kind == StageInputKind::BaryCoordSmoothCentroid ||
+		     kind == StageInputKind::BaryCoordSmoothSample ||
+		     kind == StageInputKind::BaryCoordNoPerspective)) {
+			continue;
+		}
+		AddBuiltinInput(info, kind);
 	}
 	program.shader_info_complete = true;
 }
