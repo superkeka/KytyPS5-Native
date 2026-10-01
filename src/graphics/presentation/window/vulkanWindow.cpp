@@ -530,6 +530,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	physical_device.getFeatures2(&supported_features2);
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
+	// The recompiler falls back to interpolated inputs for raw vertex reads without it.
+	graphics.fragment_shader_barycentric_enabled = barycentric_supported;
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "

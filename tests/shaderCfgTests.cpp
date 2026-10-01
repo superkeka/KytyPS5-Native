@@ -6882,6 +6882,64 @@ void TestVop3F16InterpolationTranslation() {
   CheckSpirvBinaryValidates(flat_result.spirv);
 }
 
+void TestVintrpMovWithoutHostBarycentrics() {
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(2, 14, 0, 3, 1),      EncodeVop2(0x03, 15, 12 + 256, 0),
+      EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+      EncodeExp1(15, 16, 14, 12),        0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 1;
+  ps_info.ps_system_input_base = 2;
+  ps_info.ps_perspective_center_vgpr = 0;
+  SetIdentityInterpolatorSettings(&ps_info);
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  options.fragment_shader_barycentric = false;
+
+  for (const uint32_t custom_mask : {0u, 1u}) {
+    ps_info.custom_interpolation_mask = custom_mask;
+    auto result = RecompileForTest(shader, options);
+    Check(!SpirvContainsCapability(result.spirv, 5284u),
+          "VINTRP without host barycentrics required FragmentBarycentricKHR");
+    Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 0u, 5285u),
+          "VINTRP without host barycentrics emitted PerVertexKHR");
+    Check(!SpirvHasDecorationValue(result.spirv, 11u, 5286u),
+          "VINTRP without host barycentrics declared BaryCoordKHR");
+    Check(SpirvInstructionOpcodeCount(result.spirv, 131u) == 0u,
+          "VINTRP without host barycentrics subtracted per-vertex values");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestF16InterpolationWithoutHostBarycentrics() {
+  // Same f16 interpolation as TestVop3F16InterpolationTranslation, compiled for a device
+  // without VK_KHR_fragment_shader_barycentric: no per-vertex inputs, valid SPIR-V.
+  const uint32_t shader[] = {
+      EncodeVop3Word0(0x342, 21),    EncodeVop3Word1(0x1c0, 256 + 0, 0),
+      EncodeVop3Word0(0x35a, 14),    EncodeVop3Word1(0x1c0, 256 + 1, 256 + 21),
+      EncodeVop3Word0(0x342, 15),    EncodeVop3Word1(0x080, 256 + 0, 0),
+      EncodeVop3Word0(0x35a, 14, 8), EncodeVop3Word1(0x080, 256 + 1, 256 + 15),
+      EncodeExp0(0x00, 0x1),         EncodeExp1(14, 0, 0, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 1;
+  SetIdentityInterpolatorSettings(&ps_info);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  options.fragment_shader_barycentric = false;
+
+  auto result = RecompileForTest(shader, options);
+  Check(!SpirvContainsCapability(result.spirv, 5284u),
+        "f16 interpolation without host barycentrics required FragmentBarycentricKHR");
+  Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 0u, 5285u),
+        "f16 interpolation without host barycentrics emitted PerVertexKHR");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestPerspectiveCentroidInputs() {
   constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
                              std::array{5u, UINT32_MAX, 2u},
@@ -16933,6 +16991,8 @@ int main() {
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
   TestVop3F16InterpolationTranslation();
+  TestVintrpMovWithoutHostBarycentrics();
+  TestF16InterpolationWithoutHostBarycentrics();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();
   TestGraphicsCreateInterpolantMapping();

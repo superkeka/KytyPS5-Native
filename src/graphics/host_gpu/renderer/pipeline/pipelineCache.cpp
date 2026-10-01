@@ -408,6 +408,7 @@ struct PipelineCache::ProgramCache {
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.fragment_shader_barycentric = graphics.fragment_shader_barycentric_enabled;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
