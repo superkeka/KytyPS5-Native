@@ -228,6 +228,12 @@ uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
 	if (!input->per_vertex) {
+		// Without per-vertex inputs (no host barycentrics), P0 reads the interpolated value
+		// and the P10/P20 deltas read as zero, so p0 + i * p10 + j * p20 still yields the
+		// interpolated attribute.
+		if (!PixelParameterIsCustom(state, attr) && mode < 2u) {
+			return ConstantU32(state, 0);
+		}
 		return EmitAttribute(ctx.state, attr, chan);
 	}
 	uint32_t selected_vertex = (mode + 1u) % 3u;
