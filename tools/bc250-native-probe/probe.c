@@ -332,7 +332,8 @@ static void IbPad(Ib* ib) {
 }
 
 // Copies ib into ib_bo and submits it with the given buffers resident. Returns the fence seq.
-static int Submit(Device* d, Bo* ib_bo, const Ib* ib, Bo* const* bos, uint32_t num_bos, uint64_t* seq) {
+static int SubmitOn(Device* d, uint32_t ip, uint32_t ring, Bo* ib_bo, const Ib* ib, Bo* const* bos,
+                    uint32_t num_bos, uint64_t* seq) {
 	memcpy(ib_bo->cpu, ib->dw, ib->n * 4u);
 	__sync_synchronize();
 
@@ -356,7 +357,8 @@ static int Submit(Device* d, Bo* ib_bo, const Ib* ib, Bo* const* bos, uint32_t n
 	memset(&ib_info, 0, sizeof(ib_info));
 	ib_info.va_start = ib_bo->va;
 	ib_info.ib_bytes = ib->n * 4u;
-	ib_info.ip_type  = AMDGPU_HW_IP_COMPUTE;
+	ib_info.ip_type  = ip;
+	ib_info.ring     = ring;
 
 	struct drm_amdgpu_cs_chunk chunks[2];
 	chunks[0].chunk_id   = AMDGPU_CHUNK_ID_IB;
@@ -379,8 +381,12 @@ static int Submit(Device* d, Bo* ib_bo, const Ib* ib, Bo* const* bos, uint32_t n
 	return r;
 }
 
+static int Submit(Device* d, Bo* ib_bo, const Ib* ib, Bo* const* bos, uint32_t num_bos, uint64_t* seq) {
+	return SubmitOn(d, AMDGPU_HW_IP_COMPUTE, 0, ib_bo, ib, bos, num_bos, seq);
+}
+
 // Returns 0 when the fence signaled, 1 on timeout, negative errno on error.
-static int Wait(Device* d, uint64_t seq, double timeout_sec) {
+static int WaitOn(Device* d, uint32_t ip, uint32_t ring, uint64_t seq, double timeout_sec) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	union drm_amdgpu_wait_cs w;
@@ -388,13 +394,18 @@ static int Wait(Device* d, uint64_t seq, double timeout_sec) {
 	w.in.handle  = seq;
 	w.in.timeout = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec +
 	               (uint64_t)(timeout_sec * 1e9);
-	w.in.ip_type = AMDGPU_HW_IP_COMPUTE;
+	w.in.ip_type = ip;
+	w.in.ring    = ring;
 	w.in.ctx_id  = d->ctx;
 	int r        = Ioctl(d->fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w);
 	if (r != 0) {
 		return r;
 	}
 	return w.out.status != 0 ? 1 : 0;
+}
+
+static int Wait(Device* d, uint64_t seq, double timeout_sec) {
+	return WaitOn(d, AMDGPU_HW_IP_COMPUTE, 0, seq, timeout_sec);
 }
 
 // Submits and waits; prints a failure line and returns false on error, timeout or context reset.
@@ -975,10 +986,337 @@ static bool DangerVmFault(Device* d, Common* c) {
 	return ok;
 }
 
+// One valid wave runs for 12 s (no fault, nothing wrong but its length) while the CPU watches
+// the elapsed time it publishes. Shows whether amdgpu kills long compute jobs, and when.
+static bool DangerLong(Device* d, Common* c) {
+	const double   run_sec   = 12.0;
+	const uint32_t tick_khz  = d->info.gpu_counter_freq;
+	const uint32_t run_ticks = (uint32_t)(run_sec * tick_khz * 1000.0);
+	printf("== danger long: one wave64 spins for %.0f s (%u ticks at %u kHz)\n", run_sec, run_ticks, tick_khz);
+
+	Bo  prog;
+	int r = MemCreate(d, &prog, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &prog, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &prog);
+		return false;
+	}
+	volatile uint32_t* pv = (volatile uint32_t*)prog.cpu;
+	pv[0] = pv[1] = pv[2] = 0;
+	LoadCode(c, k_long_w64, sizeof(k_long_w64));
+	uint32_t ud[3] = {(uint32_t)prog.va, (uint32_t)(prog.va >> 32), run_ticks};
+	Dispatch p     = {c->code.va, 64, 8, 3, false, 64, 1, ud};
+	Ib       ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo*      bos[] = {&prog, &c->code};
+	uint64_t seq   = 0;
+	double   t0    = NowSec();
+	r              = Submit(d, &c->ib, &ib, bos, 2, &seq);
+	if (r != 0) {
+		printf("  submit failed: %s\n", ErrStr(r));
+		BoDestroy(d, &prog);
+		return false;
+	}
+	int wr = 1;
+	for (int s = 1; s <= 20 && wr == 1; s++) {
+		wr                = Wait(d, seq, 1.0);
+		uint64_t elapsed  = (uint64_t)pv[0] | ((uint64_t)pv[1] << 32);
+		printf("  t=%5.1f s  gpu elapsed %6.2f s  finished %u\n", NowSec() - t0,
+		       (double)elapsed / (tick_khz * 1000.0), pv[2]);
+		fflush(stdout);
+	}
+	double   t       = NowSec() - t0;
+	int64_t  state   = ContextState(d);
+	uint64_t elapsed = (uint64_t)pv[0] | ((uint64_t)pv[1] << 32);
+	printf("  job: %s after %.1f s, gpu ran %.2f s, finished on its own: %s, context state 0x%" PRIx64 "\n",
+	       wr == 0 ? "signaled" : (wr == 1 ? "TIMEOUT" : ErrStr(wr)), t, (double)elapsed / (tick_khz * 1000.0),
+	       pv[2] == 1 ? "yes" : "no", (uint64_t)state);
+	BoDestroy(d, &prog);
+
+	Bo dst;
+	r = MemCreate(d, &dst, MEM_GTT, 2 * MiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &dst, 0x0200000000ull, 0);
+	}
+	bool ok = r == 0 && StoreAndCheck(d, c, &dst, &c->code, 64, 64);
+	printf("  follow-up store on the same context: %s\n", ok ? "ok" : "FAILED");
+	BoDestroy(d, &dst);
+	return ok;
+}
+
+// Runs a 64-lane shader that takes only a destination address and returns the lane values.
+static bool RunLanes(Device* d, Common* c, const uint8_t* code, size_t size, Bo* extra, uint32_t out[64],
+                     double timeout_sec) {
+	Bo  dst;
+	int r = MemCreate(d, &dst, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &dst, 0x0200000000ull, 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &dst);
+		return false;
+	}
+	memset(dst.cpu, 0xee, 64 * 4);
+	LoadCode(c, code, size);
+	uint32_t ud[2] = {(uint32_t)dst.va, (uint32_t)(dst.va >> 32)};
+	Dispatch p     = {c->code.va, 64, 16, 2, false, 64, 1, ud};
+	Ib       ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo*      bos[] = {&dst, &c->code, extra};
+	uint64_t seq   = 0;
+	double   t0    = NowSec();
+	r              = Submit(d, &c->ib, &ib, bos, extra != NULL ? 3 : 2, &seq);
+	if (r == 0) {
+		r = Wait(d, seq, timeout_sec);
+	}
+	int64_t state = ContextState(d);
+	printf("  job: %s after %.1f ms, context state 0x%" PRIx64 "\n",
+	       r == 0 ? "signaled" : (r == 1 ? "TIMEOUT" : ErrStr(r)), (NowSec() - t0) * 1e3, (uint64_t)state);
+	memcpy(out, dst.cpu, 64 * 4);
+	BoDestroy(d, &dst);
+	return r == 0 && state == 0;
+}
+
+static bool DangerDot2c(Device* d, Common* c) {
+	printf("== danger dot2c: v_dot2c_f32_f16 (gfx10.3 encoding, VOP2 0x02), expect 22.5 in all lanes\n");
+	uint32_t out[64];
+	if (!RunLanes(d, c, k_dot2c_w64, sizeof(k_dot2c_w64), NULL, out, 15.0)) {
+		return false;
+	}
+	uint32_t good = 0;
+	for (int i = 0; i < 64; i++) {
+		good += out[i] == 0x41b40000u;
+	}
+	float f;
+	memcpy(&f, &out[0], 4);
+	printf("  lane 0 = 0x%08x (%g), %u/64 lanes correct\n", out[0], f, good);
+	return good == 64;
+}
+
+static bool DangerDot2x(Device* d, Common* c) {
+	printf("== danger dot2x: what VOP2 opcode 0x02 does on this GPU (see dot2x.s)\n");
+	uint32_t out[64];
+	if (!RunLanes(d, c, k_dot2x_w64, sizeof(k_dot2x_w64), NULL, out, 15.0)) {
+		return false;
+	}
+	static const char* const what[4] = {"acc 10.0, (1.5,2).(3,4)  expect 0x41b40000",
+	                                    "acc 0x12345678, same     expect (dot) ",
+	                                    "acc 10.0, zero inputs    expect 0x41200000",
+	                                    "control                  expect 0xabcd0123"};
+	for (int lane = 0; lane < 2; lane++) {
+		for (int k = 0; k < 4; k++) {
+			printf("  lane %d +%2d %s: 0x%08x\n", lane, k * 4, what[k], out[lane * 4 + k]);
+		}
+	}
+	return true;
+}
+
+static bool DangerGds(Device* d, Common* c) {
+	printf("== danger gds: allocate GDS/GWS/OA, then 64 lanes ds_add_rtn_u32 on GDS dword 0\n");
+	static const struct {
+		uint32_t    domain;
+		uint64_t    size;
+		const char* name;
+	} doms[] = {{AMDGPU_GEM_DOMAIN_GDS, 4 * KiB, "gds 4 KiB"}, {AMDGPU_GEM_DOMAIN_GWS, 1, "gws 1"},
+	            {AMDGPU_GEM_DOMAIN_OA, 1, "oa 1"}};
+	for (size_t k = 0; k < ARRAY_SIZE(doms); k++) {
+		Bo  bo;
+		int r = BoCreate(d, &bo, doms[k].size, doms[k].domain, 0);
+		printf("  alloc %-9s: %s\n", doms[k].name, ErrStr(r));
+		BoDestroy(d, &bo);
+	}
+	Bo  gds;
+	int r = BoCreate(d, &gds, 4 * KiB, AMDGPU_GEM_DOMAIN_GDS, 0);
+	if (r != 0) {
+		printf("  no GDS buffer, skipping the atomic test\n");
+		return true;
+	}
+	uint32_t out[64];
+	bool     ok = RunLanes(d, c, k_gds_w64, sizeof(k_gds_w64), &gds, out, 15.0);
+	BoDestroy(d, &gds);
+	if (!ok) {
+		return false;
+	}
+	uint64_t seen = 0;
+	for (int i = 0; i < 64; i++) {
+		if (out[i] < 64) {
+			seen |= 1ull << out[i];
+		}
+	}
+	printf("  lane values 0x%x 0x%x 0x%x ... unique 0..63: %s\n", out[0], out[1], out[2],
+	       seen == ~0ull ? "yes" : "no");
+	return true;
+}
+
+// Job A on compute ring 1 waits (WAIT_REG_MEM) for a memory flag; 100 ms later job B on
+// compute ring 0 writes it (WRITE_DATA). Checks that queues can wait on each other via memory.
+static bool DangerCrossQueue(Device* d, Common* c) {
+	printf("== danger crossqueue: ring 1 waits on a flag, ring 0 writes it 100 ms later\n");
+	Bo  flag;
+	Bo  ib2;
+	int r = MemCreate(d, &flag, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &flag, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &ib2, MEM_GTT_USWC, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &ib2, 0x0082000000ull, 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &flag);
+		BoDestroy(d, &ib2);
+		return false;
+	}
+	*(volatile uint32_t*)flag.cpu = 0;
+
+	Ib wait = {.n = 0};
+	IbPush(&wait, Pkt3(0x3cu, 6));        // WAIT_REG_MEM
+	IbPush(&wait, 3u | (1u << 4));        // function == , memory space
+	IbPush(&wait, (uint32_t)flag.va);
+	IbPush(&wait, (uint32_t)(flag.va >> 32));
+	IbPush(&wait, 1u);                    // reference
+	IbPush(&wait, 0xffffffffu);           // mask
+	IbPush(&wait, 4u);                    // poll interval
+	IbPad(&wait);
+
+	Ib write = {.n = 0};
+	IbPush(&write, Pkt3(0x37u, 4));       // WRITE_DATA
+	IbPush(&write, (5u << 8) | (1u << 20)); // dst_sel memory, write confirm
+	IbPush(&write, (uint32_t)flag.va);
+	IbPush(&write, (uint32_t)(flag.va >> 32));
+	IbPush(&write, 1u);
+	IbPad(&write);
+
+	Bo*      bos[]  = {&flag};
+	uint64_t seq_a  = 0;
+	uint64_t seq_b  = 0;
+	double   t0     = NowSec();
+	r               = SubmitOn(d, AMDGPU_HW_IP_COMPUTE, 1, &ib2, &wait, bos, 1, &seq_a);
+	int      a_mid  = r == 0 ? WaitOn(d, AMDGPU_HW_IP_COMPUTE, 1, seq_a, 0.1) : r;
+	int      rb     = SubmitOn(d, AMDGPU_HW_IP_COMPUTE, 0, &c->ib, &write, bos, 1, &seq_b);
+	int      wb     = rb == 0 ? WaitOn(d, AMDGPU_HW_IP_COMPUTE, 0, seq_b, 15.0) : rb;
+	int      wa     = r == 0 ? WaitOn(d, AMDGPU_HW_IP_COMPUTE, 1, seq_a, 15.0) : r;
+	double   t      = NowSec() - t0;
+	int64_t  state  = ContextState(d);
+	printf("  A pending before B: %s; B: %s; A: %s after %.1f ms; flag %u; context state 0x%" PRIx64 "\n",
+	       a_mid == 1 ? "yes" : (a_mid == 0 ? "NO (finished early)" : ErrStr(a_mid)),
+	       wb == 0 ? "signaled" : (wb == 1 ? "TIMEOUT" : ErrStr(wb)),
+	       wa == 0 ? "signaled" : (wa == 1 ? "TIMEOUT" : ErrStr(wa)), t * 1e3, *(volatile uint32_t*)flag.cpu,
+	       (uint64_t)state);
+	BoDestroy(d, &flag);
+	BoDestroy(d, &ib2);
+	return wa == 0 && wb == 0 && state == 0;
+}
+
+#define UCONFIG_BASE 0x30000u
+
+static void IbCopyRegToMem(Ib* ib, uint32_t reg, uint64_t va) {
+	IbPush(ib, Pkt3(0x40u, 5));                  // COPY_DATA
+	IbPush(ib, 0u | (5u << 8) | (1u << 20));     // src register, dst memory, write confirm
+	IbPush(ib, reg >> 2);
+	IbPush(ib, 0);
+	IbPush(ib, (uint32_t)va);
+	IbPush(ib, (uint32_t)(va >> 32));
+}
+
+static void IbSetUconfig(Ib* ib, uint32_t reg, uint32_t value) {
+	IbPush(ib, Pkt3(0x79u, 2));                  // SET_UCONFIG_REG
+	IbPush(ib, (reg - UCONFIG_BASE) / 4);
+	IbPush(ib, value);
+}
+
+// UCONFIG registers that PS5 command buffers write (per KytyPS5's PM4 handlers) but RADV never
+// does, plus one RADV-written control per ring. Each register is read, written with its low bit
+// flipped, read back and restored within one IB, so other processes never see the change.
+static bool DangerUconfig(Device* d, Common* c) {
+	printf("== danger uconfig: user-mode reads/writes of PS5 UCONFIG registers RADV never writes\n");
+	static const struct {
+		uint32_t    ip;
+		uint32_t    reg;
+		const char* name;
+	} regs[] = {
+	    {AMDGPU_HW_IP_COMPUTE, 0x30e00u, "TA_CS_BC_BASE_ADDR (control)"},
+	    {AMDGPU_HW_IP_COMPUTE, 0x31074u, "GDS_OA_CNTL"},
+	    {AMDGPU_HW_IP_COMPUTE, 0x31078u, "GDS_OA_COUNTER"},
+	    {AMDGPU_HW_IP_COMPUTE, 0x3107cu, "GDS_OA_ADDRESS"},
+	    {AMDGPU_HW_IP_GFX, 0x30908u, "VGT_PRIMITIVE_TYPE (control)"},
+	    {AMDGPU_HW_IP_GFX, 0x30920u, "VGT_OBJECT_ID"},
+	    {AMDGPU_HW_IP_GFX, 0x30e0cu, "TEXTURE_GRADIENT_FACTORS"},
+	    {AMDGPU_HW_IP_GFX, 0x30e10u, "TEXTURE_GRADIENT_CONTROL"},
+	};
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m  = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	bool               all_ok = true;
+	for (size_t k = 0; k < ARRAY_SIZE(regs) && all_ok; k++) {
+		const char* ring = regs[k].ip == AMDGPU_HW_IP_GFX ? "gfx" : "comp";
+		m[0] = m[1] = m[2] = 0xeeeeeeeeu;
+
+		// Pass 1: read only.
+		Ib ib = {.n = 0};
+		IbCopyRegToMem(&ib, regs[k].reg, mem.va);
+		IbPad(&ib);
+		uint64_t seq = 0;
+		r            = SubmitOn(d, regs[k].ip, 0, &c->ib, &ib, bos, 1, &seq);
+		int w        = r == 0 ? WaitOn(d, regs[k].ip, 0, seq, 15.0) : r;
+		int64_t st   = ContextState(d);
+		if (w != 0 || st != 0) {
+			printf("  %-4s 0x%05x %-30s read: %s ctx 0x%" PRIx64 "\n", ring, regs[k].reg, regs[k].name,
+			       w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st);
+			all_ok = false;
+			break;
+		}
+		uint32_t orig = m[0];
+
+		// Pass 2: write flipped value, read back, restore, read again.
+		ib.n = 0;
+		IbSetUconfig(&ib, regs[k].reg, orig ^ 1u);
+		IbCopyRegToMem(&ib, regs[k].reg, mem.va + 4);
+		IbSetUconfig(&ib, regs[k].reg, orig);
+		IbCopyRegToMem(&ib, regs[k].reg, mem.va + 8);
+		IbPad(&ib);
+		r  = SubmitOn(d, regs[k].ip, 0, &c->ib, &ib, bos, 1, &seq);
+		w  = r == 0 ? WaitOn(d, regs[k].ip, 0, seq, 15.0) : r;
+		st = ContextState(d);
+		if (w != 0 || st != 0) {
+			printf("  %-4s 0x%05x %-30s read 0x%08x, write: %s ctx 0x%" PRIx64 "\n", ring, regs[k].reg,
+			       regs[k].name, orig, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st);
+			all_ok = false;
+			break;
+		}
+		const char* verdict = m[1] == (orig ^ 1u) ? "write took effect"
+		                      : m[1] == orig      ? "write IGNORED"
+		                                          : "readback differs";
+		printf("  %-4s 0x%05x %-30s orig 0x%08x, after write 0x%08x (%s), restored 0x%08x\n", ring, regs[k].reg,
+		       regs[k].name, orig, m[1], verdict, m[2]);
+		fflush(stdout);
+	}
+	BoDestroy(d, &mem);
+	return all_ok;
+}
+
 static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [probe...]\n", argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault\n");
+	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds crossqueue uconfig\n");
 }
 
 int main(int argc, char** argv) {
@@ -1013,11 +1351,25 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	if (danger != NULL) {
-		if (strcmp(danger, "vmfault") != 0) {
+		bool ok;
+		if (strcmp(danger, "vmfault") == 0) {
+			ok = DangerVmFault(&d, &c);
+		} else if (strcmp(danger, "long") == 0) {
+			ok = DangerLong(&d, &c);
+		} else if (strcmp(danger, "dot2c") == 0) {
+			ok = DangerDot2c(&d, &c);
+		} else if (strcmp(danger, "dot2x") == 0) {
+			ok = DangerDot2x(&d, &c);
+		} else if (strcmp(danger, "gds") == 0) {
+			ok = DangerGds(&d, &c);
+		} else if (strcmp(danger, "crossqueue") == 0) {
+			ok = DangerCrossQueue(&d, &c);
+		} else if (strcmp(danger, "uconfig") == 0) {
+			ok = DangerUconfig(&d, &c);
+		} else {
 			fprintf(stderr, "unknown danger case '%s'\n", danger);
 			return 1;
 		}
-		bool ok = DangerVmFault(&d, &c);
 		BoDestroy(&d, &c.code);
 		BoDestroy(&d, &c.ib);
 		close(d.fd);

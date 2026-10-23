@@ -63,6 +63,12 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | Case | What it does |
 |---|---|
 | `vmfault` | one wave64 stores 256 bytes to the unmapped VA `0x900000000`, then a normal store checks the GPU |
+| `long` | one valid wave64 spins 12 s, publishing elapsed GPU time |
+| `dot2c` | `v_dot2c_f32_f16` (gfx10.3 encoding) with known inputs |
+| `dot2x` | same opcode as raw words with several accumulators/inputs, plus a control store |
+| `gds` | GDS/GWS/OA allocation, then 64 lanes of GDS `ds_add_rtn_u32` |
+| `crossqueue` | `WAIT_REG_MEM` on compute ring 1 released by `WRITE_DATA` on ring 0 |
+| `uconfig` | **took the board down**, see below; do not rerun as is |
 
 ### `vmfault` result (2026-10-23, run once with approval)
 
@@ -80,3 +86,42 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 For the backend this means a single bad guest address costs a ~10 s freeze of that queue, not
 the machine: every guest range must be mapped before submission, and the fault query plus the
 devcoredump are the debugging path.
+
+### `long` result
+
+- A valid wave that runs 12 s is killed at 10.16 s of GPU time (`ring comp_1.1.0 timeout`,
+  queue reset succeeded). The effective compute job limit is ~10 s although `lockup_timeout`
+  reads 5000.
+- After the queue reset the context reports `AMDGPU_CTX_QUERY2_FLAGS_RESET` and further
+  submissions on it fail; a new context (new process) works normally. The backend must split
+  long guest work or raise the timeout, and must recreate its context after a reset.
+
+### `dot2c` / `dot2x` result
+
+- BC-250 executes VOP2 opcode `0x02` (`v_dot2c_f32_f16` on gfx10.3, decoded by KytyPS5 for PS5
+  shaders) without any fault, but always writes `0` to the destination, whatever the inputs or
+  accumulator. LLVM's gfx1013 model, which lists no dot instructions, matches the hardware.
+- So the PS5 dialect is not 1:1 with this GPU for this opcode: a native backend has to patch
+  guest shaders, e.g. branch to a stub that does the same math with two `v_fma_mix_f32`
+  (available on gfx1013). Every other VOP1/VOP2/VOPC/VOP3/VOP3P opcode that KytyPS5 decodes is
+  valid for gfx1013 in LLVM.
+
+### `gds` result
+
+- GDS (4 KiB), GWS and OA allocate from user mode. 64 lanes of `ds_add_rtn_u32 ... gds` return
+  64 consecutive values, so GDS atomics work; GDS is not zeroed on allocation.
+
+### `crossqueue` result
+
+- A `WAIT_REG_MEM` on compute ring 1 is released by a `WRITE_DATA` on compute ring 0 100 ms
+  later (103 ms total), no reset: compute queues can wait on each other through memory.
+
+### `uconfig`: took the board down (2026-10-23 13:28)
+
+- Reads (`COPY_DATA` from register) and flipped-bit writes (`SET_UCONFIG_REG`, restored in the
+  same IB) of UCONFIG registers that PS5 command buffers write and RADV does not. Output was
+  block-buffered, so it is not known which register or which step was reached; the first one
+  is `TA_CS_BC_BASE_ADDR` read via `COPY_DATA` on the compute ring.
+- The board stopped answering ping within seconds and did not come back on its own.
+- Do not rerun as is. Next attempt: line-buffered output and one register/step per process,
+  starting with register reads on the gfx ring (as Mesa does) instead of the compute ring.
