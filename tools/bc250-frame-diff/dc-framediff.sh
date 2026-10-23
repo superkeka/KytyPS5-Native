@@ -2,7 +2,7 @@
 # Dead Cells in native shadow mode, dumping native and Vulkan versions of a series of flips for
 # tools/bc250-frame-diff. Usage: [EXTRA_ENV="VAR=1 ..."] dc-framediff.sh TAG [FLIPS]
 #   -> /home/deck/dev/kyty-runs/TAG. FLIPS as in KYTY_NATIVE_GPU_DUMP_FLIPS (default 200-6000/100).
-# Inputs: menu, three confirms into gameplay, walk/jump, pause. Each dumped flip is ~66 MB.
+# Inputs: menu, Cross x4 into gameplay, walk/jump, pause. Each dumped flip is ~66 MB.
 set -u
 TAG=${1:-dc-framediff}
 FLIPS=${2:-200-6000/100}
@@ -19,7 +19,7 @@ for i in $(seq 1 40); do sleep 1; WID=$(DISPLAY=:1 xdotool search --name "Dead C
 DISPLAY=:1 xprop -id "$WID" -f STEAM_GAME 32c -set STEAM_GAME 424242
 DISPLAY=:0 xprop -root -f GAMESCOPECTRL_BASELAYER_APPID 32co -set GAMESCOPECTRL_BASELAYER_APPID 424242
 sleep 15
-key j; sleep 5; key j; sleep 5; key j; sleep 40
+key j; sleep 5; key j; sleep 5; key j; sleep 5; key j; sleep 35  # a 4th Cross is a jump if the 3rd already started the run
 for i in 1 2 3 4; do key Right 2; key Left 2; key space; sleep 1; done
 sleep 10
 key Return; sleep 20
