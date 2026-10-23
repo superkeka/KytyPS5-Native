@@ -342,10 +342,9 @@ void TestWriteData() {
 	std::vector<uint32_t> dcb;
 	Append(dcb, IT_WRITE_DATA, {(5u << 8u) | (1u << 20u), 0x1000u, 0x2u, 0xabcdu}, false);
 	auto r = t.Translate(dcb);
-	Check(r.ok && r.stats.write_data == 1, "WRITE_DATA to memory passed through");
-	const auto    pkts = Decode(r.ib);
-	const Packet* p    = FindFirst(pkts, IT_WRITE_DATA);
-	Check(p != nullptr && p->body.size() == 4 && p->body[3] == 0xabcdu, "WRITE_DATA body preserved");
+	Check(r.ok && r.stats.write_data_dropped == 1, "WRITE_DATA to memory accepted");
+	const auto pkts = Decode(r.ib);
+	Check(FindFirst(pkts, IT_WRITE_DATA) == nullptr, "WRITE_DATA left to Kyty, not in the native IB");
 
 	std::vector<uint32_t> to_reg;
 	Append(to_reg, IT_WRITE_DATA, {0u, 0x2c00u, 0x0u, 0x1u}, false);

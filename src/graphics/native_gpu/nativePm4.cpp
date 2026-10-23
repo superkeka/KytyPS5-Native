@@ -435,11 +435,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.dma_data++;
 				break;
 			case IT_WRITE_DATA:
+				// Games write their completion labels with WRITE_DATA. The native IB completes before
+				// Kyty has even parsed this DCB, so a native label tells the game the GPU is done while
+				// Kyty is still reading the command buffer, and the game starts rewriting it (Dead
+				// Cells: a truncated packet in Kyty's parser on entering gameplay). Kyty performs the
+				// write itself, in order, so the native IB leaves it out.
 				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
 					return fail(op, dw);
 				}
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-				stats.write_data++;
+				stats.write_data_dropped++;
 				break;
 			case IT_DRAW_INDEX_2:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
