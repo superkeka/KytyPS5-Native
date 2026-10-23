@@ -511,6 +511,35 @@ void TestFmaskFix() {
 	Check(fmask4 == 0x5125700u && fix_at < draw_at, "CB_COLOR4_FMASK = CB_COLOR4_BASE before the draw");
 }
 
+void TestComputeQueueDispatchIndirect() {
+	Pm4Translator t;
+	t.SetComputeQueue(true);
+	std::vector<uint32_t> acb;
+	Append(acb, 0x16u /* IT_DISPATCH_INDIRECT */, {0x074063c0u, 0x5u, 0x41u}, false); // ADDR_LO, ADDR_HI, initiator
+	auto r = t.Translate(acb);
+	Check(r.ok && r.stats.dispatches == 1, "compute-queue DISPATCH_INDIRECT translated");
+	const auto     pkts = Decode(r.ib);
+	const Packet*  base = FindFirst(pkts, 0x11u);
+	const Packet*  disp = FindFirst(pkts, 0x16u);
+	Check(base != nullptr && base->body.size() == 3 && base->body[0] == 1u && base->body[1] == 0x074063c0u &&
+	          base->body[2] == 0x5u,
+	      "SET_BASE(1) points at the argument address");
+	Check(disp != nullptr && disp->body.size() == 2 && disp->body[0] == 0u && disp->body[1] == 0x41u,
+	      "DISPATCH_INDIRECT at offset 0 keeps the initiator");
+}
+
+void TestIndirectDraws() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x10000000u, 0x2u}, false);
+	Append(dcb, 0x25u /* IT_DRAW_INDEX_INDIRECT */, {0x40u, 0u, 0u, 0u}, false);
+	Append(dcb, 0x8Eu /* IT_GET_LOD_STATS */, {0u, 0x10000000u, 0x2u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.draws == 1 && r.stats.lod_stats_dropped == 1, "DRAW_INDEX_INDIRECT and GET_LOD_STATS translated");
+	const auto pkts = Decode(r.ib);
+	Check(Count(pkts, 0x25u) == 1 && Count(pkts, 0x8Eu) == 0, "indirect draw kept, LOD statistics dropped");
+}
+
 void TestContextDefaults() {
 	Pm4Translator t;
 	t.SeedPs5Defaults();
@@ -594,6 +623,8 @@ int main() {
 	TestContextDefaults();
 	TestDrawIndexOffset();
 	TestFmaskFix();
+	TestComputeQueueDispatchIndirect();
+	TestIndirectDraws();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

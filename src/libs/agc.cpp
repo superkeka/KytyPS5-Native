@@ -4194,6 +4194,8 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 
 	EXIT_IF(g_renderer == nullptr);
+	// BC-250 native GPU path: run the ACB natively too (KYTY_NATIVE_GPU_ACB); no-op otherwise.
+	Libs::Graphics::NativeGpu::ShadowSubmitAcb(acb, size_in_dwords);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
 }
 

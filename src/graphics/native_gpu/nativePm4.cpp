@@ -14,6 +14,9 @@ constexpr uint32_t IT_SET_BASE                 = 0x11;
 constexpr uint32_t IT_INDEX_BUFFER_SIZE        = 0x13;
 constexpr uint32_t IT_DISPATCH_DIRECT          = 0x15;
 constexpr uint32_t IT_DISPATCH_INDIRECT        = 0x16;
+constexpr uint32_t IT_DRAW_INDIRECT            = 0x24;
+constexpr uint32_t IT_DRAW_INDEX_INDIRECT      = 0x25;
+constexpr uint32_t IT_GET_LOD_STATS            = 0x8E;
 constexpr uint32_t IT_INDEX_BASE               = 0x26;
 constexpr uint32_t IT_DRAW_INDEX_2             = 0x27;
 constexpr uint32_t IT_DRAW_INDEX_AUTO          = 0x2D;
@@ -783,6 +786,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
 				break;
 			}
+			case IT_DRAW_INDIRECT:       // arguments at the SET_BASE address + DATA_OFFSET; same on the gfx ring
+			case IT_DRAW_INDEX_INDIRECT: // the same, indexed through INDEX_BASE / INDEX_BUFFER_SIZE
+				if (skip_draw()) {
+					stats.draws_skipped++;
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				}
+				stats.draws++;
+				collect_refs();
+				if (op == IT_DRAW_INDEX_INDIRECT) {
+					add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
+				}
+				break;
+			case IT_GET_LOD_STATS: // texture LOD statistics for the game's streaming: not issued
+				stats.lod_stats_dropped++;
+				break;
 			case IT_DRAW_INDEX_AUTO: // a non-indexed draw: no index buffer to reference
 				if (skip_draw()) {
 					stats.draws_skipped++;
@@ -802,7 +821,25 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_queue) {
+					// A compute-queue buffer carries the argument address itself (ADDR_LO, ADDR_HI,
+					// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,
+					// so set the base to that address and dispatch at offset 0, as RADV does.
+					if (body_count < 3) {
+						return fail(op, dw);
+					}
+					const uint64_t args = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
+					body.push_back(Pkt3(IT_SET_BASE, 3, true));
+					body.push_back(1u); // BASE_INDEX: DISPATCH_INDIRECT / DRAW_INDIRECT base
+					body.push_back(static_cast<uint32_t>(args));
+					body.push_back(static_cast<uint32_t>(args >> 32u));
+					body.push_back(Pkt3(IT_DISPATCH_INDIRECT, 2, true));
+					body.push_back(0u);
+					body.push_back(bptr[2]);
+					add_ref(args, kMetadataSpan, false);
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				}
 				stats.dispatches++;
 				collect_refs();
 				break;

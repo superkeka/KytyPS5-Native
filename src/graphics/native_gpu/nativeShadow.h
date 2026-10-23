@@ -25,6 +25,13 @@ namespace Libs::Graphics::NativeGpu {
 // GPU timeout or context reset it disables itself for the rest of the run.
 void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
 
+// The same for an asynchronous compute buffer (KYTY_NATIVE_GPU_ACB=1, or "dry" to only translate
+// and report). ACBs run on the gfx ring in guest submission order with the DCBs.
+void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords);
+
+// True in primary mode with native async compute: Kyty then skips its own dispatches of ACBs too.
+bool NativeAsyncCompute();
+
 // While shadow submission is active, each guest DCB has already run natively before Kyty records
 // it, so at a flip the guest's display surface in guest memory holds the native result. When this
 // returns true the presenter re-reads that surface from guest memory instead of showing Kyty's own

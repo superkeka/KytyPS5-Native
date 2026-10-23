@@ -80,21 +80,28 @@ public:
 #endif
 	}
 
-	void Submit(std::span<const uint32_t> dcb) {
+	// `acb`: an asynchronous compute buffer. ACBs go through their own translator (their own shadow
+	// of the compute registers) and run on the same gfx ring as the DCBs, in guest submission order.
+	void Submit(std::span<const uint32_t> dcb, bool acb = false) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (!m_initialized) {
 			Init();
 			m_initialized = true;
 		}
-		if (!m_enabled || m_disabled) {
+		if (!m_enabled || m_disabled || (acb && m_acb_mode == AcbMode::Off)) {
 			return;
 		}
 
-		const uint64_t frame = m_frames++;
+		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
+		const char* const  kind  = acb ? "acb" : "frame";
+		Pm4Translator&     tr    = acb ? m_acb_translator : m_translator;
 		SetStage(Stage::Translate, frame);
 		const double       t_translate = NowSecShadow();
-		Pm4TranslateResult result      = m_translator.Translate(dcb);
+		Pm4TranslateResult result      = tr.Translate(dcb);
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
+		if (acb && SkipAcb(frame, result)) {
+			return;
+		}
 
 		DetectShaders(result.shader_addrs);
 		for (const auto& snap: result.inspected) {
@@ -105,7 +112,7 @@ public:
 		// Skip mode learns GDS shaders as they appear: the DCB that introduces one was translated
 		// before the scan, so it goes to Kyty whole and the translator drops that shader's draws from
 		// the next DCB on.
-		if (result.ok && m_skip_gds_shaders && m_gds_shaders.size() != m_skipped_shader_count) {
+		if (result.ok && !acb && m_skip_gds_shaders && m_gds_shaders.size() != m_skipped_shader_count) {
 			m_skipped_shader_count = m_gds_shaders.size();
 			std::set<uint64_t> skip = m_gds_shaders;
 			skip.insert(m_skip_ps.begin(), m_skip_ps.end());
@@ -143,15 +150,15 @@ public:
 		if (!result.ok) {
 			for (uint32_t op: result.unknown_ops) {
 				if (m_unknown_ops.insert(op).second) {
-					std::fprintf(stderr, "native shadow: untranslatable packet op 0x%02x (first in frame %llu)\n", op,
+					std::fprintf(stderr, "native shadow: untranslatable packet op 0x%02x (first in %s %llu)\n", op, kind,
 					             static_cast<unsigned long long>(frame));
 				}
 			}
 			if (m_refused < 8) {
 				std::fprintf(stderr,
-				             "native shadow: frame %llu refused, unknown packet op 0x%02x at dw %u "
+				             "native shadow: %s %llu refused, unknown packet op 0x%02x at dw %u "
 				             "(%u packets translated)%s",
-				             static_cast<unsigned long long>(frame), result.unknown_op,
+				             kind, static_cast<unsigned long long>(frame), result.unknown_op,
 				             result.unknown_dw, result.stats.packets, result.unknown_detail.empty() ? "\n" : ", body");
 				for (uint32_t v: result.unknown_detail) {
 					std::fprintf(stderr, " 0x%08x", v);
@@ -209,7 +216,7 @@ public:
 		}
 		std::span<const uint32_t> ib = wrapped;
 		if (!m_breadcrumbs.empty()) {
-			WriteBreadcrumb(frame, dcb, result, ib);
+			WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, ib);
 		}
 		SetStage(Stage::Gpu, frame);
 		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
@@ -224,7 +231,7 @@ public:
 		const bool detail = frame < 3 || (frame % 120 == 0);
 		if (!r.submitted) {
 			std::fprintf(stderr,
-			             "native shadow: frame %llu submit failed: %s (after %d retries, %zu BOs)\n",
+			             "native shadow: %s %llu submit failed: %s (after %d retries, %zu BOs)\n", kind,
 			             static_cast<unsigned long long>(frame), std::strerror(-r.err), r.retries,
 			             handles.size());
 			Disable("submit error");
@@ -232,15 +239,30 @@ public:
 		}
 		if (r.timed_out || r.reset || !r.completed) {
 			std::fprintf(stderr,
-			             "native shadow: frame %llu %s after %.1f ms (ib %zu dw, %u draws); "
+			             "native shadow: %s %llu %s after %.1f ms (ib %zu dw, %u draws); "
 			             "disabling native path\n",
-			             static_cast<unsigned long long>(frame),
+			             kind, static_cast<unsigned long long>(frame),
 			             r.timed_out ? "TIMED OUT" : (r.reset ? "context RESET" : "did not complete"),
 			             r.seconds * 1e3, result.ib.size(), result.stats.draws);
 			Disable("timeout or reset");
 			return;
 		}
 
+		if (acb) {
+			m_acbs_completed++;
+			if (m_acbs_completed % 30 == 0 && m_gem->DummyWritten() && m_acb_dummy_writes++ < 8) {
+				std::fprintf(stderr,
+				             "native shadow: acb %llu: the GPU wrote to guest memory that was not resident "
+				             "(a reference the translator missed)\n",
+				             static_cast<unsigned long long>(frame));
+			}
+			if (m_acbs_completed <= 3 || m_acbs_completed % 600 == 0) {
+				std::fprintf(stderr, "native shadow: acb %llu ok (%llu done), %.2f ms, ib %zu dw, %u dispatches\n",
+				             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(m_acbs_completed),
+				             r.seconds * 1e3, result.ib.size(), result.stats.dispatches);
+			}
+			return;
+		}
 		m_completed++;
 		if (m_completed % 30 == 0 && m_gem->DummyWritten()) {
 			m_dummy_writes++;
@@ -296,7 +318,57 @@ public:
 #endif
 	}
 
+	// Display buffers are written by the GPU (often by compute through a descriptor the translator
+	// cannot see), so whatever is flipped is made resident; until then such writes land in the dummy.
+	void KeepResident(uint64_t addr, uint64_t size) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_gem == nullptr || !m_flipped.insert(addr).second) {
+			return;
+		}
+		const uint32_t promoted = m_gem->PromoteGuestRange(addr, size);
+		std::fprintf(stderr, "native shadow: display buffer 0x%llx (%llu MiB) kept resident, %u block(s) promoted\n",
+		             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size >> 20u), promoted);
+#else
+		(void)addr;
+		(void)size;
+#endif
+	}
+
+	bool NativeAcb() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		return m_initialized && m_enabled && !m_disabled && m_acb_mode == AcbMode::On;
+	}
+
 private:
+	// KYTY_NATIVE_GPU_ACB: "1" runs async compute buffers natively (and Kyty skips their dispatches),
+	// "dry" only translates them and reports what the translator lacks.
+	enum class AcbMode { Off, Dry, On };
+
+	// Dry mode: count and report, never submit. Returns true when the ACB is done with.
+	bool SkipAcb(uint64_t n, const Pm4TranslateResult& result) {
+		if (m_acb_mode != AcbMode::Dry) {
+			return false;
+		}
+		if (result.ok) {
+			m_acbs_completed++;
+		} else {
+			m_acbs_refused++;
+			for (uint32_t op: result.unknown_ops) {
+				if (m_unknown_acb_ops.insert(op).second) {
+					std::fprintf(stderr, "native shadow: acb dry run: untranslatable packet op 0x%02x (first in acb %llu)\n",
+					             op, static_cast<unsigned long long>(n));
+				}
+			}
+		}
+		if (n < 3 || n % 600 == 0) {
+			std::fprintf(stderr, "native shadow: acb dry run: acb %llu %s, %u dispatches; %llu ok, %llu refused so far\n",
+			             static_cast<unsigned long long>(n), result.ok ? "ok" : "refused", result.stats.dispatches,
+			             static_cast<unsigned long long>(m_acbs_completed), static_cast<unsigned long long>(m_acbs_refused));
+		}
+		return true;
+	}
+
 	// Watchdog (KYTY_NATIVE_GPU_WATCHDOG=1): every 2 s it checks whether the shadow path is stuck inside a
 	// submission (which stage, for how long) or whether the game has stopped submitting DCBs at all, so an
 	// intermittent freeze shows where it sits without a debugger.
@@ -341,8 +413,8 @@ private:
 	// any log reaches the disk, so before each submission the guest DCB, the IB about to run and a
 	// summary are written and synced: after a power cycle, last.txt names the submission that hung
 	// and dcb_<n>.bin / ib_<n>.bin (the last four, n = frame % 4) hold it.
-	void WriteBreadcrumb(uint64_t frame, std::span<const uint32_t> dcb, const Pm4TranslateResult& result,
-	                     std::span<const uint32_t> ib) const {
+	void WriteBreadcrumb(const std::string& prefix, uint64_t frame, std::span<const uint32_t> dcb,
+	                     const Pm4TranslateResult& result, std::span<const uint32_t> ib) const {
 		auto write_file = [&](const std::string& name, const void* data, size_t bytes) {
 			const std::string path = m_breadcrumbs + "/" + name;
 			const int         fd   = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -362,16 +434,16 @@ private:
 			::close(fd);
 		};
 		const unsigned slot = static_cast<unsigned>(frame % 4u);
-		write_file("dcb_" + std::to_string(slot) + ".bin", dcb.data(), dcb.size_bytes());
-		write_file("ib_" + std::to_string(slot) + ".bin", ib.data(), ib.size_bytes());
+		write_file(prefix + "dcb_" + std::to_string(slot) + ".bin", dcb.data(), dcb.size_bytes());
+		write_file(prefix + "ib_" + std::to_string(slot) + ".bin", ib.data(), ib.size_bytes());
 		char summary[512];
 		const int n = std::snprintf(summary, sizeof(summary),
-		                            "frame %llu slot %u: dcb %zu dw, ib %zu dw, %u draws, %u dispatches, %u dma, "
+		                            "%s %llu slot %u: dcb %zu dw, ib %zu dw, %u draws, %u dispatches, %u dma, "
 		                            "%u set_base, %llu MiB resident\n",
-		                            static_cast<unsigned long long>(frame), slot, dcb.size(), ib.size(),
+		                            prefix.empty() ? "frame" : prefix.c_str(), static_cast<unsigned long long>(frame), slot, dcb.size(), ib.size(),
 		                            result.stats.draws, result.stats.dispatches, result.stats.dma_data,
 		                            result.stats.set_base, static_cast<unsigned long long>(m_gem->ResidentBytes() >> 20u));
-		write_file("last.txt", summary, static_cast<size_t>(n));
+		write_file(prefix + "last.txt", summary, static_cast<size_t>(n));
 	}
 
 	// Makes resident, before `result`'s IB runs: every block the CPU has written, every shader, and
@@ -657,6 +729,7 @@ private:
 				}
 			}
 			m_translator.SetSkippedOpcodes(skip);
+			m_acb_translator.SetSkippedOpcodes(skip);
 			std::fprintf(stderr, "native shadow: leaving %zu packet type(s) out of the IB: %s\n", skip.size(), ops);
 		}
 		// KYTY_NATIVE_GPU_GDS_SHADERS=1 runs draws with GDS shaders natively, =skip leaves just those
@@ -701,6 +774,13 @@ private:
 			return;
 		}
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
+		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
+		m_acb_translator.SetComputeQueue(true);
+		if (const char* acb = std::getenv("KYTY_NATIVE_GPU_ACB"); acb != nullptr && acb[0] != '\0' && acb[0] != '0') {
+			m_acb_mode = std::strcmp(acb, "dry") == 0 ? AcbMode::Dry : AcbMode::On;
+			std::fprintf(stderr, "native shadow: async compute buffers %s\n",
+			             m_acb_mode == AcbMode::Dry ? "translated only (dry run)" : "run natively on the gfx ring");
+		}
 		if (const char* depth = std::getenv("KYTY_NATIVE_GPU_DEPTH"); depth != nullptr) {
 			const bool hiz_off  = std::strcmp(depth, "hiz_off") == 0;
 			const bool no_htile = std::strcmp(depth, "no_htile") == 0;
@@ -779,6 +859,14 @@ private:
 	bool          m_enabled     = false;
 	bool          m_disabled    = false;
 	Pm4Translator m_translator;
+	Pm4Translator m_acb_translator; // async compute buffers (KYTY_NATIVE_GPU_ACB)
+	AcbMode       m_acb_mode = AcbMode::Off;
+	uint64_t      m_acbs           = 0;
+	uint64_t      m_acbs_completed = 0;
+	uint64_t      m_acbs_refused   = 0;
+	std::set<uint32_t> m_unknown_acb_ops;
+	uint32_t      m_acb_dummy_writes = 0;
+	std::set<uint64_t> m_flipped; // display buffers already made resident
 	bool          m_stats          = false;
 	uint32_t      m_stats_logged   = 0;
 	int64_t       m_dump_regs_frame = -1;
@@ -829,6 +917,17 @@ void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords) {
 		return;
 	}
 	Shadow::Instance().Submit(std::span<const uint32_t>(dcb, size_in_dwords));
+}
+
+void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords) {
+	if (acb == nullptr || size_in_dwords == 0) {
+		return;
+	}
+	Shadow::Instance().Submit(std::span<const uint32_t>(acb, size_in_dwords), true);
+}
+
+bool NativeAsyncCompute() {
+	return PrimaryRendering() && Shadow::Instance().NativeAcb();
 }
 
 namespace {
@@ -968,6 +1067,9 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
                   const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
+	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
+		Shadow::Instance().KeepResident(address, size);
+	}
 	const char*                  list = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS");
 	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active()) {
 		return;
@@ -994,6 +1096,23 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			WriteFile(path, reinterpret_cast<const void*>(address), size);
 		}
 		DumpRenderTargets(dir, flip, download_region);
+	}
+	// KYTY_NATIVE_GPU_DUMP_RANGES=0xADDR:0xSIZE[,...]: guest ranges saved next to the flip, e.g. a
+	// game's intermediate targets when the presented surface stays empty.
+	if (const char* ranges = std::getenv("KYTY_NATIVE_GPU_DUMP_RANGES"); ranges != nullptr) {
+		for (const char* p = ranges; *p != '\0';) {
+			char*          end   = nullptr;
+			const uint64_t raddr = std::strtoull(p, &end, 0);
+			if (end == p || *end != ':') {
+				break;
+			}
+			const uint64_t rsize = std::strtoull(end + 1, &end, 0);
+			std::vector<uint8_t> bytes(rsize);
+			const uint64_t       got = Shadow::Instance().ReadGuest(raddr, bytes.data(), rsize);
+			std::snprintf(path, sizeof(path), "%s/flip_%llu.range_%llx.raw", dir, flip, static_cast<unsigned long long>(raddr));
+			WriteFile(path, bytes.data(), got);
+			p = (*end == ',') ? end + 1 : end;
+		}
 	}
 	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, flip);
 	if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {

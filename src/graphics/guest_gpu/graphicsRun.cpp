@@ -964,8 +964,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	if (!IsAsyncComputeQueue() && NativeGpu::PrimaryRendering()) { // dispatched natively with its DCB
-		return;
+	if (IsAsyncComputeQueue() ? NativeGpu::NativeAsyncCompute() : NativeGpu::PrimaryRendering()) {
+		return; // dispatched natively with its DCB or ACB
 	}
 
 	uint32_t frame_num = 0;
@@ -1003,7 +1003,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
-	if (!IsAsyncComputeQueue() && NativeGpu::PrimaryRendering()) {
+	if (IsAsyncComputeQueue() ? NativeGpu::NativeAsyncCompute() : NativeGpu::PrimaryRendering()) {
 		return;
 	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,

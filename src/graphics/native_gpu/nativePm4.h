@@ -45,6 +45,7 @@ struct Pm4TranslateStats {
 	uint32_t index_state       = 0; // IT_INDEX_BASE / IT_INDEX_BUFFER_SIZE passed through
 	uint32_t draws_skipped     = 0; // draws left out (SetSkippedPixelShaders)
 	uint32_t fmask_fixed       = 0; // CB_COLORn_FMASK set to the target base (was 0) before a draw
+	uint32_t lod_stats_dropped = 0; // GET_LOD_STATS packets left out
 	uint32_t packets_skipped   = 0; // packets left out (SetSkippedOpcodes)
 	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
@@ -166,6 +167,10 @@ public:
 	// Experiment: CB_TARGET_MASK is ANDed with `mask`, e.g. 0xf keeps only MRT0 writable.
 	void SetTargetMask(uint32_t mask) { m_target_mask = mask; }
 
+	// The buffers come from a compute queue (ACBs), whose packets differ from the gfx ring's
+	// (DISPATCH_INDIRECT carries its argument address); they are rewritten for the gfx ring.
+	void SetComputeQueue(bool compute_queue) { m_compute_queue = compute_queue; }
+
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
 	void SetGdsAvailable(bool available) { m_gds = available; }
@@ -196,6 +201,7 @@ private:
 	bool                         m_no_dcc     = false;
 	uint32_t                     m_target_mask = 0xffffffffu;
 	bool                         m_no_cmask_clear = false;
+	bool                         m_compute_queue  = false;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;
 	uint64_t                     m_inspect_ps = 0;
