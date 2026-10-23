@@ -1,0 +1,30 @@
+#version 450
+
+// "Detile" a linear (Prospero kLinear, tile mode 0x00) 32-bit surface: the guest surface is
+// row-major with a row pitch that may exceed width*4; the output is tightly packed. One
+// invocation per destination texel. This is the trivial case Kyty's TileManager::Detile()
+// short-circuits (it returns the source unchanged); here it is a real copy so the readback
+// path and the external-memory-host import are exercised for linear surfaces too.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Tiled { uint data[]; } tiled;   // guest surface
+layout(set = 0, binding = 1, std430) writeonly buffer Linear { uint data[]; } lin;   // packed output
+
+layout(push_constant) uniform PC {
+	uint width;        // texels
+	uint height;       // texels
+	uint pitch_words;  // row pitch in 32-bit words
+	uint reserved;
+} pc;
+
+void main() {
+	uint idx   = gl_GlobalInvocationID.x;
+	uint total = pc.width * pc.height;
+	if (idx >= total) {
+		return;
+	}
+	uint x = idx % pc.width;
+	uint y = idx / pc.width;
+	lin.data[idx] = tiled.data[y * pc.pitch_words + x];
+}

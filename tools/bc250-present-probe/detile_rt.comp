@@ -1,0 +1,47 @@
+#version 450
+
+// Detile one SW_64KB_R_X (Prospero kRenderTarget, 0x1b) 32-bit colour surface into a
+// tightly-packed linear image, one invocation per destination texel.
+//
+// The address math is copied verbatim from Kyty's production GPU detiler
+// (src/graphics/host_gpu/shaders/gpu_tiler_render_target.comp, the ELEMENT_BYTES==4 case,
+// and the block-grid loop in gpu_tiler_common.inc). Keeping it byte-identical is what makes
+// this tool's output match Kyty's CPU reference tiler bit-exactly.
+//
+// Block geometry for 32bpp RenderTarget64KB: 128x128-element blocks, 64 KiB each.
+// Only the low 7 bits of x and y feed rt_offset(), so passing the full coordinate is the
+// same as passing the within-block coordinate (exactly as the Kyty shader does).
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Tiled { uint data[]; } tiled;   // guest surface
+layout(set = 0, binding = 1, std430) writeonly buffer Linear { uint data[]; } lin;   // detiled output
+
+layout(push_constant) uniform PC {
+	uint width;           // texels
+	uint height;          // texels
+	uint blocks_per_row;  // AlignUp(width,128)/128
+	uint reserved;
+} pc;
+
+uint rt_offset(uint x, uint y) {
+	return ((y << 4) & 0x070u) ^ ((y << 5) & 0xf00u) ^
+	       ((y << 9) & 0x1000u) ^ ((y << 8) & 0x4000u) ^
+	       ((x << 2) & 0x00cu) ^ ((x << 5) & 0x380u) ^
+	       ((x << 4) & 0x400u) ^ ((x << 6) & 0x800u) ^ ((x << 9) & 0xa000u);
+}
+
+void main() {
+	uint idx   = gl_GlobalInvocationID.x;
+	uint total = pc.width * pc.height;
+	if (idx >= total) {
+		return;
+	}
+	uint x = idx % pc.width;
+	uint y = idx / pc.width;
+
+	uint block_index = (y >> 7) * pc.blocks_per_row + (x >> 7);
+	uint tiled_byte  = block_index * 65536u + rt_offset(x, y);
+
+	lin.data[idx] = tiled.data[tiled_byte >> 2];
+}
