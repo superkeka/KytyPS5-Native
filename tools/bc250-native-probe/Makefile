@@ -1,7 +1,7 @@
 CFLAGS ?= -O2 -g -Wall -Wextra -std=gnu11
 
 bc250-native-probe: probe.c shaders.h
-	$(CC) $(CFLAGS) -o $@ probe.c
+	$(CC) $(CFLAGS) -o $@ probe.c -lm
 
 clean:
 	rm -f bc250-native-probe

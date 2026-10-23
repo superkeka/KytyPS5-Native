@@ -34,6 +34,7 @@ distrobox enter bc250-mesa-dev -- make
 | `coherency` | a running wave polls a flag the CPU writes mid-job |
 | `dmabuf` | dma-buf export per memory kind |
 | `submit` | CS ioctl cost and round trip |
+| `dot2emu` | `v_dot2c_f32_f16` replacement (two `v_fma_mix_f32`) against a CPU reference |
 
 ## Results (2026-10-23, SteamOS kernel 6.18.50-valve2, firmware ME 99 / PFP 148 / MEC 144)
 
@@ -125,3 +126,13 @@ devcoredump are the debugging path.
 - The board stopped answering ping within seconds and did not come back on its own.
 - Do not rerun as is. Next attempt: line-buffered output and one register/step per process,
   starting with register reads on the gfx ring (as Mesa does) instead of the compute ring.
+- After the power cycle, the crashed boot's journal ends at 13:28:31 (the build just before the
+  run) with no amdgpu line at all: no timeout, reset or page fault. The whole system froze
+  instantly instead of going through a GPU reset, so the kernel never logged anything.
+
+### `dot2emu` result (safe probe)
+
+- Two `v_fma_mix_f32` (low halves, then high halves, accumulating in place) reproduce
+  `fma(a.hi, b.hi, fma(a.lo, b.lo, acc))` bit-exactly on 64 random lanes. They differ from a
+  single-rounded dot by up to 52 ulp in cancellation-heavy lanes; how PS5 hardware rounds
+  `v_dot2c_f32_f16` is unknown.

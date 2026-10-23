@@ -1313,9 +1313,102 @@ static bool DangerUconfig(Device* d, Common* c) {
 	return all_ok;
 }
 
+static float HalfToFloat(uint16_t h) {
+	uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+	uint32_t exp  = (h >> 10) & 0x1fu;
+	uint32_t man  = h & 0x3ffu;
+	uint32_t bits;
+	if (exp == 0) {
+		float f = (float)man * (1.0f / 16777216.0f); // subnormal: man * 2^-24
+		memcpy(&bits, &f, 4);
+		bits |= sign;
+	} else if (exp == 31) {
+		bits = sign | 0x7f800000u | (man << 13);
+	} else {
+		bits = sign | ((exp + 112u) << 23) | (man << 13);
+	}
+	float f;
+	memcpy(&f, &bits, 4);
+	return f;
+}
+
+// Normal halves only: sign, exponent in [11, 18] (|x| in [2^-4, 2^4)), random mantissa.
+static uint16_t RandomHalf(uint32_t* state) {
+	*state       = *state * 1664525u + 1013904223u;
+	uint32_t r   = *state >> 8;
+	uint32_t exp = 11u + (r & 7u);
+	return (uint16_t)(((r >> 3) & 1u) << 15 | exp << 10 | ((r >> 4) & 0x3ffu));
+}
+
+// Checks the v_dot2c_f32_f16 replacement (two v_fma_mix_f32) bit-exactly against
+// fma(a.hi, b.hi, fma(a.lo, b.lo, acc)) and reports its distance from a single-rounded dot.
+static void ProbeDot2Emu(Device* d, Common* c) {
+	printf("== dot2emu: v_dot2c_f32_f16 replacement with two v_fma_mix_f32, 64 random lanes\n");
+	Bo  in;
+	Bo  out;
+	int r = MemCreate(d, &in, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &in, 0x0300000000ull, 0);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &out, MEM_GTT, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &out, 0x0400000000ull, 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &in);
+		BoDestroy(d, &out);
+		return;
+	}
+	uint32_t* iv    = (uint32_t*)in.cpu;
+	uint32_t  state = 12345u;
+	float     ref_fma[64];
+	double    ref_exact[64];
+	for (int i = 0; i < 64; i++) {
+		uint16_t a0 = RandomHalf(&state), a1 = RandomHalf(&state);
+		uint16_t b0 = RandomHalf(&state), b1 = RandomHalf(&state);
+		state       = state * 1664525u + 1013904223u;
+		float acc   = (float)((int32_t)(state >> 8) % 20000) / 100.0f;
+		iv[i * 3 + 0] = (uint32_t)a1 << 16 | a0;
+		iv[i * 3 + 1] = (uint32_t)b1 << 16 | b0;
+		memcpy(&iv[i * 3 + 2], &acc, 4);
+		float fa0 = HalfToFloat(a0), fa1 = HalfToFloat(a1), fb0 = HalfToFloat(b0), fb1 = HalfToFloat(b1);
+		ref_fma[i]   = __builtin_fmaf(fa1, fb1, __builtin_fmaf(fa0, fb0, acc));
+		ref_exact[i] = (double)acc + (double)fa0 * fb0 + (double)fa1 * fb1;
+	}
+	LoadCode(c, k_dot2emu_w64, sizeof(k_dot2emu_w64));
+	uint32_t ud[4] = {(uint32_t)in.va, (uint32_t)(in.va >> 32), (uint32_t)out.va, (uint32_t)(out.va >> 32)};
+	Dispatch p     = {c->code.va, 64, 8, 4, false, 64, 1, ud};
+	Ib       ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo* bos[] = {&in, &out, &c->code};
+	if (RunIb(d, &c->ib, &ib, bos, 3, NULL)) {
+		const float* ov        = (const float*)out.cpu;
+		int          exact_fma = 0;
+		int          max_ulp   = 0;
+		for (int i = 0; i < 64; i++) {
+			exact_fma += memcmp(&ov[i], &ref_fma[i], 4) == 0;
+			float    single = (float)ref_exact[i];
+			int32_t  a, b;
+			memcpy(&a, &ov[i], 4);
+			memcpy(&b, &single, 4);
+			int ulp = a > b ? a - b : b - a;
+			max_ulp = ulp > max_ulp ? ulp : max_ulp;
+		}
+		printf("  bit-exact vs fma(fma()) reference: %d/64; max distance from single-rounded dot: %d ulp\n",
+		       exact_fma, max_ulp);
+		printf("  lane 0: got %.9g, reference %.9g\n", ov[0], ref_fma[0]);
+	}
+	BoDestroy(d, &in);
+	BoDestroy(d, &out);
+}
+
 static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [probe...]\n", argv0);
-	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit (default: all)\n");
+	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit dot2emu (default: all)\n");
 	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds crossqueue uconfig\n");
 }
 
@@ -1376,7 +1469,7 @@ int main(int argc, char** argv) {
 		return ok ? 0 : 2;
 	}
 	static const char* const order[] = {"info",      "va",        "alloc",  "dispatch", "identity",
-	                                    "bandwidth", "coherency", "dmabuf", "submit"};
+	                                    "bandwidth", "coherency", "dmabuf", "submit",   "dot2emu"};
 	for (size_t k = 0; k < ARRAY_SIZE(order); k++) {
 		const char* n    = order[k];
 		bool        want = num_selected == 0;
@@ -1404,6 +1497,8 @@ int main(int argc, char** argv) {
 			ProbeDmabuf(&d);
 		} else if (strcmp(n, "submit") == 0) {
 			ProbeSubmitLatency(&d, &c);
+		} else if (strcmp(n, "dot2emu") == 0) {
+			ProbeDot2Emu(&d, &c);
 		}
 		fflush(stdout);
 		int64_t state = ContextState(&d);
