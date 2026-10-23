@@ -13,6 +13,12 @@
 // A supported site is replaced in place by an s_branch to a stub appended after the code; the
 // stub does the same math with two v_fma_mix_f32 and branches back. Instruction offsets inside
 // the original code never move, so branches, s_getpc-relative data and jump tables stay valid.
+//
+// v_fma_mix_f32 is VOP3P: it cannot carry a 32-bit literal and gfx10 VOP3P has no DPP, so the
+// literal (8-byte), DPP16/DPP8 and vdst-aliasing forms are reproduced by first materialising the
+// effective src0 (or a preserved copy of vdst) into one scratch VGPR at the top of the stub. The
+// scratch register is v[num_vgprs] (the first VGPR past the shader's own allocation); when any
+// patched site needs it the caller must raise COMPUTE_PGM_RSRC1 VGPRS to cover num_vgprs + 1.
 
 namespace Libs::Graphics::NativeGpu {
 
@@ -23,15 +29,18 @@ uint32_t InstructionDwords(std::span<const uint32_t> code);
 struct ShaderPatchResult {
 	std::vector<uint32_t> code;                 // original words with sites rewritten, then stubs
 	uint32_t              patched_sites     = 0;
-	uint32_t              unsupported_sites = 0; // left untouched: literal/DPP/SDWA/aliasing forms
+	uint32_t              unsupported_sites = 0; // left untouched: SDWA and some aliasing combos
+	uint32_t              scratch_vgprs     = 0; // extra VGPRs the stubs use past num_vgprs (0 or 1)
 	bool                  decode_error      = false;
 	uint32_t              decode_error_dw   = 0; // dword offset of the undecodable instruction
 };
 
 // `code` must cover exactly the instruction stream (a linear sweep decodes every word), not data
-// appended after the last instruction. On a decode error or an out-of-range branch nothing is
-// patched and `code` is returned unchanged.
-ShaderPatchResult PatchDot2c(std::span<const uint32_t> code);
+// appended after the last instruction. `num_vgprs` is the VGPR count the shader allocates
+// (COMPUTE_PGM_RSRC1 VGPRS decoded to a register count); the stubs use v[num_vgprs] as scratch
+// when needed. On a decode error or an out-of-range branch nothing is patched and `code` is
+// returned unchanged with scratch_vgprs == 0.
+ShaderPatchResult PatchDot2c(std::span<const uint32_t> code, uint32_t num_vgprs);
 
 } // namespace Libs::Graphics::NativeGpu
 
