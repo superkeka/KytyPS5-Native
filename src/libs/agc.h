@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "kernel/eventQueue.h"
 
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 
 struct Shader;
@@ -35,6 +38,10 @@ namespace Gen5 {
 
 struct CommandBuffer;
 struct Label;
+
+// The context-register values (offset, value) of the PS5 graphics library's register defaults, the
+// state its templates start from. The BC-250 native backend seeds its register shadow with them.
+std::vector<std::pair<uint32_t, uint32_t>> AgcContextRegisterDefaults();
 
 int KYTY_SYSV_ABI   AgcInit(uint32_t* state, uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver);

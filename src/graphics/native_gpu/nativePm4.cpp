@@ -61,6 +61,9 @@ constexpr uint32_t Normalize(uint32_t raw) { return raw & ~kRegisterSelectorMask
 constexpr uint32_t kCbColor0Base     = 0x318;
 constexpr uint32_t kCbColorStride    = 0xF;
 constexpr uint32_t kCbColor0View     = 0x31B;
+constexpr uint32_t kCbColor0Info     = 0x31C;
+constexpr uint32_t kCbColor0Attrib   = 0x31D;
+constexpr uint32_t kCbColor0Attrib3  = 0x3B8;
 constexpr uint32_t kCbColor0Cmask    = 0x31F;
 constexpr uint32_t kCbColor0Fmask    = 0x321;
 constexpr uint32_t kCbColor0DccBase  = 0x325;
@@ -70,6 +73,9 @@ constexpr uint32_t kCbColor0FmaskExt = 0x3A0;
 constexpr uint32_t kCbColor0DccExt   = 0x3A8;
 constexpr uint32_t kCbColor0Attrib2  = 0x3B0;
 constexpr uint32_t kDbDepthView      = 0x002;
+constexpr uint32_t kDbRenderOverride = 0x003;
+constexpr uint32_t kDbZInfo          = 0x010;
+constexpr uint32_t kDbStencilInfo    = 0x011;
 constexpr uint32_t kDbHtileDataBase  = 0x005;
 constexpr uint32_t kDbDepthSizeXy    = 0x007;
 constexpr uint32_t kDbZReadBase      = 0x012; // Z read, stencil read, Z write, stencil write
@@ -181,6 +187,19 @@ bool WriteDataToMemory(uint32_t control) {
 
 } // namespace
 
+uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
+	switch (m_depth_mode) {
+		case DepthDebugMode::None: return value;
+		case DepthDebugMode::HizOff:
+			// DB_RENDER_OVERRIDE FORCE_HIZ_ENABLE, FORCE_HIS_ENABLE0/1 = FORCE_DISABLE (2).
+			return offset == kDbRenderOverride ? ((value & ~0x3fu) | 0x2au) : value;
+		case DepthDebugMode::NoHtile:
+			// DB_Z_INFO / DB_STENCIL_INFO TILE_SURFACE_ENABLE (bit 29) off: depth without HTILE.
+			return (offset == kDbZInfo || offset == kDbStencilInfo) ? (value & ~(1u << 29u)) : value;
+	}
+	return value;
+}
+
 bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
 	switch (normalized_offset) {
 		case 0x242: // VGT_PRIMITIVE_TYPE
@@ -205,6 +224,12 @@ void Pm4Translator::DumpShadow(std::FILE* f) const {
 	}
 	for (const auto& [offset, value]: m_uc) {
 		std::fprintf(f, "uc 0x%03x 0x%08x\n", offset, value);
+	}
+}
+
+void Pm4Translator::SeedContextDefaults(std::span<const std::pair<uint32_t, uint32_t>> defaults) {
+	for (const auto& [offset, value]: defaults) {
+		m_cx.emplace(offset, value);
 	}
 }
 
@@ -247,8 +272,11 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	ib.push_back(0u);
 
 	for (const auto& [offset, value]: m_cx) {
-		EmitSet(ib, IT_SET_CONTEXT_REG, offset, value, false);
+		EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
 		stats.preamble_cx++;
+	}
+	if (m_depth_mode == DepthDebugMode::HizOff && m_cx.count(kDbRenderOverride) == 0) {
+		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
 	}
 	for (const auto& [offset, value]: m_sh) {
 		EmitSet(ib, IT_SET_SH_REG, offset, value, offset >= kShComputeBase);
@@ -304,6 +332,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// dispatch from the registers that changed since the previous one: the whole shadow is live at
 	// the first one, since state carries over from earlier DCBs.
 	std::vector<GpuRef>   refs;
+	std::map<uint64_t, RenderTargetInfo> targets; // by address, for Pm4TranslateResult::render_targets
+	std::vector<uint64_t> bound_targets;          // addresses bound at the last state collection
 	std::vector<uint32_t> dirty_sh;
 	uint64_t              index_base  = 0; // from INDEX_BASE, for draws that use the bound buffer
 	uint64_t              index_bytes = 0; // from INDEX_BUFFER_SIZE (indices, at most 4 bytes each)
@@ -354,9 +384,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		dirty_sh.clear();
 		if (!rt_dirty) {
+			for (uint64_t addr: bound_targets) {
+				targets[addr].draws++;
+			}
 			return;
 		}
 		rt_dirty = false;
+		bound_targets.clear();
 		auto base40 = [&](uint32_t lo_reg, uint32_t ext_reg) {
 			return (static_cast<uint64_t>(reg(cx, lo_reg)) << 8u) |
 			       (static_cast<uint64_t>(reg(cx, ext_reg) & 0xffu) << 40u);
@@ -370,7 +404,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			const uint64_t slices  = ((view >> 13u) & 0x1fffu) + 1u;
 			// 16 bytes per pixel is the widest color format; mips add at most a third.
 			const uint64_t size = std::min(width * height * 16u * slices * 4u / 3u, kSurfaceCap);
-			add_ref(base40(kCbColor0Base + step, kCbColor0BaseExt + i), size, false);
+			const uint64_t base = base40(kCbColor0Base + step, kCbColor0BaseExt + i);
+			add_ref(base, size, false);
+			// INFO.FORMAT (bits 6:2) == 0 means the slot is unbound.
+			if (base != 0 && ((reg(cx, kCbColor0Info + step) >> 2u) & 0x1fu) != 0) {
+				auto& t   = targets[base];
+				t.addr    = base;
+				t.size    = size;
+				t.width   = static_cast<uint32_t>(width);
+				t.height  = static_cast<uint32_t>(height);
+				t.info    = reg(cx, kCbColor0Info + step);
+				t.attrib  = reg(cx, kCbColor0Attrib + step);
+				t.attrib3 = reg(cx, kCbColor0Attrib3 + i);
+				bound_targets.push_back(base);
+			}
 			add_ref(base40(kCbColor0Cmask + step, kCbColor0CmaskExt + i), kMetadataSpan, false);
 			add_ref(base40(kCbColor0Fmask + step, kCbColor0FmaskExt + i), kMetadataSpan, false);
 			add_ref(base40(kCbColor0DccBase + step, kCbColor0DccExt + i), kMetadataSpan, false);
@@ -384,6 +431,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			add_ref(base40(kDbZReadBase + i, kDbZReadBaseHi + i), dsize, false);
 		}
 		add_ref(base40(kDbHtileDataBase, kDbHtileBaseHi), kMetadataSpan, false);
+		for (uint64_t addr: bound_targets) {
+			targets[addr].draws++;
+		}
 	};
 
 	auto fail = [&](uint32_t op, uint32_t dw) {
@@ -425,14 +475,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 
 			case IT_SET_CONTEXT_REG: {
+				const size_t at = body.size();
+				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				if (body_count >= 1) {
 					const uint32_t base = Normalize(bptr[0]);
 					for (uint32_t i = 1; i < body_count; i++) {
 						cx[base + (i - 1)] = bptr[i];
 						mark_cx(base + (i - 1));
+						body[at + 1 + i] = PatchContext(base + (i - 1), bptr[i]);
 					}
 				}
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				stats.set_context++;
 				break;
 			}
@@ -520,7 +572,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (op == IT_SET_CONTEXT_REG_INDIRECT) {
 						cx[off] = value;
 						mark_cx(off);
-						EmitSet(body, IT_SET_CONTEXT_REG, off, value, false);
+						EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
 						stats.loaded_cx_regs++;
 					} else if (op == IT_SET_SH_REG_INDIRECT) {
 						if (off == kShNop) {
@@ -577,6 +629,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.waits_dropped++;
 				if (!met) {
 					stats.waits_unmet++;
+				}
+				// A wait the prefetch parser does (ENGINE_SEL = PFP) on a label the micro engine has just
+				// written is how the guest keeps the PFP from fetching ahead of the ME past a cache flush.
+				// The label pair cannot run natively, but PFP_SYNC_ME is that same synchronization
+				// without memory.
+				if ((bptr[0] & (1u << 8u)) != 0) {
+					body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u)); // PKT3 PFP_SYNC_ME, one body dword
+					body.push_back(0);
+					stats.pfp_syncs_emitted++;
 				}
 				break;
 			}
@@ -726,6 +787,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	std::sort(refs.begin(), refs.end());
 	refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
 	r.refs = std::move(refs);
+	for (auto& [addr, t]: targets) {
+		r.render_targets.push_back(t);
+	}
 	return r;
 }
 

@@ -243,6 +243,22 @@ static RegisterDefaults* get_public_register_defaults(uint32_t ver) {
 	return get_register_defaults(g_agc_public_reg_defaults_by_version[index], &storage[index]);
 }
 
+std::vector<std::pair<uint32_t, uint32_t>> AgcContextRegisterDefaults() {
+	// Table 0 of the public defaults holds the context registers (offsets 0x000..0x3ff); the same
+	// register can appear in several state templates, and the first value is taken.
+	const CompactRegisterDefaults&             defaults = g_agc_public_reg_defaults_v11;
+	std::vector<std::pair<uint32_t, uint32_t>> out;
+	std::vector<bool>                          seen(0x400, false);
+	for (uint32_t i = 0; i < defaults.tbl0_register_count; i++) {
+		const ShaderRegister& reg = defaults.tbl0_regs[i];
+		if (reg.offset < seen.size() && !seen[reg.offset]) {
+			seen[reg.offset] = true;
+			out.emplace_back(reg.offset, reg.value);
+		}
+	}
+	return out;
+}
+
 static RegisterDefaults* get_internal_register_defaults(uint32_t ver) {
 	static RegisterDefaultsStorage storage[GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION + 1] = {};
 	const auto                     index = normalize_register_defaults_version(ver);

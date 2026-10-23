@@ -5,6 +5,7 @@
 #include "graphics/native_gpu/shaderPatcher.h"
 
 #include "kernel/memory.h"
+#include "libs/agc.h"
 
 #include <algorithm>
 #include <atomic>
@@ -13,10 +14,12 @@
 #include <cstring>
 #include <functional>
 #include <ctime>
+#include <map>
 #include <mutex>
 #include <set>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -53,6 +56,29 @@ public:
 		return m_initialized && m_enabled && !m_disabled;
 	}
 
+	// The color targets the DCBs bound since the last call, for the flip dump.
+	std::vector<RenderTargetInfo> TakeFrameTargets() {
+		std::lock_guard<std::mutex>   lock(m_mutex);
+		std::vector<RenderTargetInfo> out;
+		for (const auto& [addr, t]: m_frame_targets) {
+			out.push_back(t);
+		}
+		m_frame_targets.clear();
+		return out;
+	}
+
+	// Reads guest memory through the backing (clipped to the view holding `addr`); 0 when unavailable.
+	uint64_t ReadGuest(uint64_t addr, void* dst, uint64_t size) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return m_gem != nullptr ? m_gem->ReadGuest(addr, dst, size) : 0;
+#else
+		(void)addr;
+		(void)dst;
+		(void)size;
+		return 0;
+#endif
+	}
+
 	void Submit(std::span<const uint32_t> dcb) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (!m_initialized) {
@@ -64,11 +90,20 @@ public:
 		}
 
 		const uint64_t frame = m_frames++;
+		SetStage(Stage::Translate, frame);
 		const double       t_translate = NowSecShadow();
 		Pm4TranslateResult result      = m_translator.Translate(dcb);
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
 
 		DetectShaders(result.shader_addrs);
+		if (m_collect_targets) {
+			for (const auto& t: result.render_targets) {
+				auto& acc = m_frame_targets[t.addr];
+				const uint32_t draws = acc.draws + t.draws;
+				acc       = t;
+				acc.draws = draws;
+			}
+		}
 		for (uint32_t off: result.skipped_uconfig) {
 			if (m_skipped_uconfig.insert(off).second) {
 				std::fprintf(stderr, "native shadow: dropping non-whitelisted UCONFIG 0x%05x (offset 0x%03x)\n",
@@ -107,6 +142,7 @@ public:
 		// Guest direct memory is resident on the GPU only where needed (gemBacking.h): before the IB
 		// runs, promote what the CPU has written and what this DCB references.
 		const double t_residency = NowSecShadow();
+		SetStage(Stage::Residency, frame);
 		MakeResident(result);
 		m_residency_ms_total += (NowSecShadow() - t_residency) * 1e3;
 
@@ -146,7 +182,9 @@ public:
 		if (!m_breadcrumbs.empty()) {
 			WriteBreadcrumb(frame, dcb, result, ib);
 		}
+		SetStage(Stage::Gpu, frame);
 		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
+		SetStage(Stage::Idle, frame);
 
 		const bool detail = frame < 3 || (frame % 120 == 0);
 		if (!r.submitted) {
@@ -224,6 +262,45 @@ public:
 	}
 
 private:
+	// Watchdog (KYTY_NATIVE_GPU_WATCHDOG=1): every 2 s it checks whether the shadow path is stuck inside a
+	// submission (which stage, for how long) or whether the game has stopped submitting DCBs at all, so an
+	// intermittent freeze shows where it sits without a debugger.
+	enum class Stage : int { Idle = 0, Translate = 1, Residency = 2, Gpu = 3 };
+	void SetStage(Stage stage, uint64_t frame) {
+		m_stage.store(static_cast<int>(stage), std::memory_order_relaxed);
+		m_stage_frame.store(frame, std::memory_order_relaxed);
+		m_stage_since.store(NowSecShadow(), std::memory_order_relaxed);
+	}
+	void StartWatchdog() {
+		std::thread([this] {
+			static const char* const kNames[] = {"idle (waiting for the next DCB)", "translate", "residency", "GPU submit/wait"};
+			double reported = -1.0;
+			for (;;) {
+				struct timespec nap = {2, 0};
+				nanosleep(&nap, nullptr);
+				const double since = m_stage_since.load(std::memory_order_relaxed);
+				const double stuck = NowSecShadow() - since;
+				if (since > 0.0 && stuck >= 10.0 && since != reported) {
+					reported = since;
+					const int stage = m_stage.load(std::memory_order_relaxed);
+					std::fprintf(stderr, "native shadow: WATCHDOG: %.0f s in stage %s at frame %llu (promotion in progress: %s)\n",
+					             stuck, kNames[stage], static_cast<unsigned long long>(m_stage_frame.load()),
+					             PromotionInProgress() ? "yes" : "no");
+				}
+			}
+		}).detach();
+	}
+	static bool PromotionInProgress() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return GemBacking::WaitIfPromotingWouldWait();
+#else
+		return false;
+#endif
+	}
+	std::atomic<int>      m_stage {0};
+	std::atomic<uint64_t> m_stage_frame {0};
+	std::atomic<double>   m_stage_since {0.0};
+
 #if KYTY_GEM_BACKING_SUPPORTED
 	// KYTY_NATIVE_GPU_BREADCRUMBS: a GPU hang on this board can take the whole machine down before
 	// any log reaches the disk, so before each submission the guest DCB, the IB about to run and a
@@ -433,7 +510,19 @@ private:
 			return;
 		}
 		m_translator.SeedPs5Defaults();
+		// The rest of the PS5 context state the system sets up before a title runs: the graphics
+		// library's register defaults. amdgpu's CLEAR_STATE leaves many of these at other values
+		// (rasterizer and depth controls, scissors, guard band, blend and DCC defaults).
+		if (!EnvOn("KYTY_NATIVE_GPU_NO_PS5_DEFAULTS")) {
+			const auto defaults = Gen5::AgcContextRegisterDefaults();
+			m_translator.SeedContextDefaults(defaults);
+			std::fprintf(stderr, "native shadow: seeded %zu PS5 context register defaults\n", defaults.size());
+		}
 		m_stats = EnvOn("KYTY_NATIVE_GPU_STATS");
+		m_collect_targets = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr;
+		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
+			StartWatchdog();
+		}
 		if (const char* dir = std::getenv("KYTY_NATIVE_GPU_BREADCRUMBS"); dir != nullptr && dir[0] != '\0') {
 			m_breadcrumbs = dir;
 			std::fprintf(stderr, "native shadow: breadcrumbs (every submission synced to disk) in %s\n", dir);
@@ -466,6 +555,14 @@ private:
 			return;
 		}
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
+		if (const char* depth = std::getenv("KYTY_NATIVE_GPU_DEPTH"); depth != nullptr) {
+			const bool hiz_off  = std::strcmp(depth, "hiz_off") == 0;
+			const bool no_htile = std::strcmp(depth, "no_htile") == 0;
+			m_translator.SetDepthDebugMode(hiz_off ? Pm4Translator::DepthDebugMode::HizOff
+			                                       : (no_htile ? Pm4Translator::DepthDebugMode::NoHtile
+			                                                   : Pm4Translator::DepthDebugMode::None));
+			std::fprintf(stderr, "native shadow: depth experiment %s\n", depth);
+		}
 		m_enabled = true;
 		std::fprintf(stderr, "native shadow: enabled (gfx-ring shadow submission, %.1f s timeout)\n",
 		             m_timeout_sec);
@@ -523,6 +620,8 @@ private:
 	uint32_t      m_stats_logged   = 0;
 	int64_t       m_dump_regs_frame = -1;
 	std::string   m_breadcrumbs; // KYTY_NATIVE_GPU_BREADCRUMBS directory, empty when off
+	bool          m_collect_targets = false;           // flip dumps compare render targets too
+	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
 	uint64_t      m_frames         = 0;
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
@@ -630,14 +729,77 @@ void WriteFile(const char* path, const void* data, uint64_t size) {
 
 } // namespace
 
+namespace {
+
+// Bytes per pixel of a CB_COLORn_INFO.FORMAT, 0 when unknown.
+uint32_t ColorFormatBytes(uint32_t info) {
+	switch ((info >> 2u) & 0x1fu) {
+		case 1: return 1;                                            // 8
+		case 2: case 3: case 16: case 17: case 18: case 19: return 2; // 16, 8_8, 5_6_5, 1_5_5_5, 5_5_5_1, 4_4_4_4
+		case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 20: case 21: return 4;
+		case 11: case 12: case 22: return 8;                         // 32_32, 16_16_16_16, X24_8_32
+		case 14: return 16;                                          // 32_32_32_32
+		default: return 0;
+	}
+}
+
+// For each color target bound since the last dump: guest memory as the native path left it, then
+// after Kyty's Vulkan copy is written back over it. Differing targets are written out; a summary of
+// all of them goes to flip_<n>.rts.txt, so the first target whose contents diverge can be found.
+void DumpRenderTargets(const char* dir, unsigned long long flip,
+                       const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
+	auto       targets = Shadow::Instance().TakeFrameTargets();
+	char       path[512];
+	std::snprintf(path, sizeof(path), "%s/flip_%llu.rts.txt", dir, flip);
+	std::FILE* summary = std::fopen(path, "w");
+	if (summary == nullptr) {
+		return;
+	}
+	std::fprintf(summary, "# addr width height format swizzle draws bytes vulkan_images differing_bytes\n");
+	for (const auto& t: targets) {
+		const uint32_t bpp = ColorFormatBytes(t.info);
+		// The surface itself, padded to whole 64 KiB swizzle blocks.
+		const uint64_t want = bpp != 0 ? (static_cast<uint64_t>(t.width) * t.height * bpp + 0xffffu) & ~0xffffull
+		                               : std::min<uint64_t>(t.size, 64ull << 20u);
+		std::vector<uint8_t> native(want), vulkan(want);
+		const uint64_t       got = Shadow::Instance().ReadGuest(t.addr, native.data(), want);
+		if (got == 0) {
+			continue;
+		}
+		const uint32_t images = download_region ? download_region(t.addr, got) : 0;
+		Shadow::Instance().ReadGuest(t.addr, vulkan.data(), got);
+		uint64_t differing = 0;
+		for (uint64_t i = 0; i < got; i++) {
+			differing += native[i] != vulkan[i] ? 1u : 0u;
+		}
+		std::fprintf(summary, "0x%llx %u %u %u 0x%x %u %llu %u %llu\n", static_cast<unsigned long long>(t.addr),
+		             t.width, t.height, (t.info >> 2u) & 0x1fu, t.attrib3 & 0x1fu, t.draws,
+		             static_cast<unsigned long long>(got), images, static_cast<unsigned long long>(differing));
+		if (differing != 0) {
+			std::snprintf(path, sizeof(path), "%s/flip_%llu.rt_%llx.native.raw", dir, flip,
+			              static_cast<unsigned long long>(t.addr));
+			WriteFile(path, native.data(), got);
+			std::snprintf(path, sizeof(path), "%s/flip_%llu.rt_%llx.vulkan.raw", dir, flip,
+			              static_cast<unsigned long long>(t.addr));
+			WriteFile(path, vulkan.data(), got);
+		}
+	}
+	std::fclose(summary);
+}
+
+} // namespace
+
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
                   uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
-                  const std::function<uint32_t()>& download_vulkan) {
+                  const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
 	const char*                  list = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS");
-	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active() ||
-	    !FlipWanted(list, n)) {
+	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active()) {
+		return;
+	}
+	if (!FlipWanted(list, n)) {
+		(void)Shadow::Instance().TakeFrameTargets(); // keep only the dumped frame's targets
 		return;
 	}
 	const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
@@ -651,12 +813,13 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	WriteFile(path, reinterpret_cast<const void*>(address), size);
 	// Then Kyty's Vulkan rendering of the same DCBs, written back over the same guest bytes.
 	uint32_t vulkan_images = 0;
-	if (!PrimaryRendering() && download_vulkan) {
-		vulkan_images = download_vulkan();
+	if (!PrimaryRendering() && download_region) {
+		vulkan_images = download_region(address, size);
 		if (vulkan_images > 0) {
 			std::snprintf(path, sizeof(path), "%s/flip_%llu.vulkan.raw", dir, flip);
 			WriteFile(path, reinterpret_cast<const void*>(address), size);
 		}
+		DumpRenderTargets(dir, flip, download_region);
 	}
 	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, flip);
 	if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {

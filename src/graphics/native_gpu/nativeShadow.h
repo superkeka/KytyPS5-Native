@@ -44,13 +44,17 @@ bool PrimaryRendering();
 // listed in KYTY_NATIVE_GPU_DUMP_FLIPS ("300,600" or a range "300-2000/10"), writes to
 // KYTY_NATIVE_GPU_DUMP_DIR (default "."):
 //   flip_<n>.native.raw  the guest bytes as the native path rendered them,
-//   flip_<n>.vulkan.raw  the same surface after `download_vulkan` wrote Kyty's Vulkan copy back
+//   flip_<n>.vulkan.raw  the same surface after `download_region` wrote Kyty's Vulkan copy back
 //                        (shadow mode only; skipped in primary mode, where Kyty draws nothing),
-//   flip_<n>.txt         the layout.
-// tools/bc250-frame-diff compares the pairs.
+//   flip_<n>.txt         the layout,
+//   flip_<n>.rts.txt     every color target bound since the previous flip, native vs Vulkan
+//                        (differing bytes), with flip_<n>.rt_<addr>.{native,vulkan}.raw for those
+//                        that differ (shadow mode only).
+// tools/bc250-frame-diff compares the pairs. `download_region(addr, size)` writes Kyty's Vulkan copy
+// of guest range [addr, addr + size) back into guest memory and returns how many images it wrote.
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
                   uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
-                  const std::function<uint32_t()>& download_vulkan);
+                  const std::function<uint32_t(uint64_t, uint64_t)>& download_region);
 
 } // namespace Libs::Graphics::NativeGpu
 

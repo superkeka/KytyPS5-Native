@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <span>
+#include <utility>
 #include <vector>
 
 // PM4 translator for the BC-250 native GPU backend. Turns one guest DCB (a PS5 draw command
@@ -50,6 +51,7 @@ struct Pm4TranslateStats {
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
+	uint32_t pfp_syncs_emitted = 0; // PFP_SYNC_ME emitted in place of dropped PFP waits
 	uint32_t clear_state       = 0; // IT_CLEAR_STATE
 	uint32_t uconfig_skipped   = 0; // non-whitelisted UCONFIG writes dropped for board safety
 	uint32_t preamble_cx       = 0; // context registers emitted in the IB preamble
@@ -74,6 +76,18 @@ struct GpuRef {
 	bool operator==(const GpuRef& o) const { return addr == o.addr && size == o.size && pointer == o.pointer; }
 };
 
+// A color render target bound for a draw: where it is and the raw CB registers that describe it.
+struct RenderTargetInfo {
+	uint64_t addr    = 0;
+	uint64_t size    = 0; // upper bound (16 bytes per pixel, all slices, mips)
+	uint32_t width   = 0;
+	uint32_t height  = 0;
+	uint32_t info    = 0; // CB_COLORn_INFO (format, number type, ...)
+	uint32_t attrib  = 0; // CB_COLORn_ATTRIB
+	uint32_t attrib3 = 0; // CB_COLORn_ATTRIB3 (swizzle mode, resource type, ...)
+	uint32_t draws   = 0; // draws in the DCB with this target bound
+};
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -85,6 +99,7 @@ struct Pm4TranslateResult {
 	std::vector<uint64_t> shader_addrs;       // shader base VAs from PGM_LO writes this DCB
 	std::set<uint32_t>    skipped_uconfig;    // non-whitelisted UCONFIG offsets dropped this DCB
 	std::vector<GpuRef>   refs;               // guest memory the DCB's draws/dispatches may touch
+	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -113,9 +128,18 @@ public:
 	// override these like any other shadowed value.
 	void SeedPs5Defaults();
 
+	// Seeds every context register in `defaults` that the shadow does not hold yet (so it never
+	// overrides SeedPs5Defaults or a guest write), e.g. the PS5 library's register defaults.
+	void SeedContextDefaults(std::span<const std::pair<uint32_t, uint32_t>> defaults);
+
 	// Writes the shadowed registers as "cx|sh|uc <offset> <value>" lines (dword offsets within each
 	// register space), for comparing against the state Kyty sees.
 	void DumpShadow(std::FILE* f) const;
+
+	// Depth-unit experiments (KYTY_NATIVE_GPU_DEPTH): HizOff forces hierarchical Z/stencil off in
+	// DB_RENDER_OVERRIDE; NoHtile drops TILE_SURFACE_ENABLE so depth runs without HTILE at all.
+	enum class DepthDebugMode { None, HizOff, NoHtile };
+	void SetDepthDebugMode(DepthDebugMode mode) { m_depth_mode = mode; }
 
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
@@ -126,12 +150,14 @@ public:
 	static bool UconfigAllowed(uint32_t normalized_offset);
 
 private:
-	void EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats) const;
+	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats) const;
+	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
 
 	std::map<uint32_t, uint32_t> m_cx; // context registers (SET_CONTEXT_REG space)
 	std::map<uint32_t, uint32_t> m_sh; // SH registers (SET_SH_REG space)
 	std::map<uint32_t, uint32_t> m_uc; // whitelisted UCONFIG registers
 	bool                         m_gds = false;
+	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 };
 
 } // namespace Libs::Graphics::NativeGpu

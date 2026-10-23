@@ -324,6 +324,16 @@ void TestWaitRegMemDropped() {
 	for (const auto& p: Decode(r.ib)) {
 		Check(p.op != 0x93u, "WAIT_REG_MEM_64 must not reach the shadow IB");
 	}
+	Check(r.stats.pfp_syncs_emitted == 0 && Count(Decode(r.ib), 0x42u) == 0, "ME waits leave no PFP_SYNC_ME");
+
+	// A PFP wait (ENGINE_SEL bit 8, as Dead Cells does after each cache flush) becomes PFP_SYNC_ME.
+	std::vector<uint32_t> pfp;
+	Append(pfp, 0x93u, {0x113u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0u,
+	                    0xffffffffu, 0xffffffffu, 10u}, false);
+	auto rp = t.Translate(pfp);
+	Check(rp.ok && rp.stats.pfp_syncs_emitted == 1 && Count(Decode(rp.ib), 0x42u) == 1,
+	      "a dropped PFP wait becomes PFP_SYNC_ME");
+
 	std::vector<uint32_t> reg_wait;
 	Append(reg_wait, 0x93u, {0x05u, 0x1234u, 0u, 0u, 0u, 0u, 0u, 10u}, false);
 	Check(!t.Translate(reg_wait).ok, "register wait refused");
@@ -457,6 +467,28 @@ bool HasRef(const std::vector<GpuRef>& refs, uint64_t addr, uint64_t min_size, b
 	return false;
 }
 
+void TestContextDefaults() {
+	Pm4Translator t;
+	t.SeedPs5Defaults();
+	const std::pair<uint32_t, uint32_t> defaults[] = {{0x206u, 0x0u}, {0x2DEu, 0x1E9u}, {0x2F9u, 0x2Du}};
+	t.SeedContextDefaults(defaults);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x2F9u, 0x1u}, false); // the guest's own value replaces a default
+	auto r = t.Translate(dcb);
+	bool vte = false, seeded = false, guest = false;
+	for (const auto& p: Decode(r.ib)) {
+		if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2) {
+			vte    = vte || (p.body[0] == 0x206u && p.body[1] == 0x43Fu);
+			seeded = seeded || (p.body[0] == 0x2DEu && p.body[1] == 0x1E9u);
+			guest  = guest || (p.body[0] == 0x2F9u && p.body[1] == 0x1u);
+		}
+	}
+	Check(vte, "library defaults do not override SeedPs5Defaults");
+	Check(seeded, "a seeded default reaches the preamble");
+	Check(guest, "a guest write replaces the seeded default");
+	Check(r.stats.preamble_cx == 7, "five SeedPs5Defaults plus two library defaults in the preamble");
+}
+
 void TestGpuRefs() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
@@ -473,6 +505,18 @@ void TestGpuRefs() {
 	Check(HasRef(r.refs, 0x212345600ull, 0, true), "user-data pair reported as a pointer candidate");
 	Check(HasRef(r.refs, 0x240000000ull, 1200, false), "index buffer ref from DRAW_INDEX_2");
 	Check(std::is_sorted(r.refs.begin(), r.refs.end()), "refs sorted");
+	Check(r.render_targets.empty(), "a target with INFO.FORMAT 0 is not reported as bound");
+
+	// With a format, the target is reported with its size and the draws that used it.
+	std::vector<uint32_t> bound;
+	Append(bound, IT_SET_CONTEXT_REG, {0x31Cu, 0xAu << 2u}, false); // CB_COLOR0_INFO.FORMAT = 10
+	Append(bound, IT_DRAW_INDEX_2, {3u, 0x40000000u, 0x2u, 3u, 0u}, false);
+	Append(bound, IT_DRAW_INDEX_2, {3u, 0x40000000u, 0x2u, 3u, 0u}, false);
+	auto rb = t.Translate(bound);
+	Check(rb.render_targets.size() == 1 && rb.render_targets[0].addr == 0x200000000ull &&
+	          rb.render_targets[0].width == 1920 && rb.render_targets[0].height == 1080 &&
+	          rb.render_targets[0].draws == 2,
+	      "bound render target reported with dimensions and draw count");
 
 	// A second DCB with no register change still reports the live render target (state carries over),
 	// and only once per DCB.
@@ -503,6 +547,7 @@ int main() {
 	TestPassthroughPackets();
 	TestUnknownRefused();
 	TestGpuRefs();
+	TestContextDefaults();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
