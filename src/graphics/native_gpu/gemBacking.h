@@ -16,6 +16,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -30,8 +31,8 @@
 
 namespace Libs::Graphics::NativeGpu {
 
-// Backs guest direct memory so every guest direct-memory mapping is also GPU-mappable later at
-// the same virtual address, on /dev/dri/renderD128.
+// Backs guest direct memory so every guest direct-memory mapping is also mapped into the GPU VM
+// at the same virtual address, on /dev/dri/renderD128.
 //
 // The CPU side stays a memfd with a single contiguous writable alias, exactly like the upstream
 // backing: the stock amdgpu driver can only CPU-map a GEM buffer whole and from its start (a
@@ -39,11 +40,12 @@ namespace Libs::Graphics::NativeGpu {
 // the arbitrary-offset guest views this backing needs. Instead each 256 MiB slice of the alias is
 // registered as a userptr GEM buffer (REGISTER, no ANONONLY — the pages are shared memfd pages),
 // created lazily on first touch; a job never pins more than it uses and no buffer approaches the
-// board's ~8 GiB GTT limit. A later step binds these buffers into the GPU VM at the matching guest
-// address; Lookup resolves a backing offset to (chunk handle, offset-in-chunk) for it.
+// board's ~8 GiB GTT limit. BindView maps a guest view's chunks into the GPU VM of DrmFd() at the
+// view's own address; Lookup resolves a backing offset to (chunk handle, offset-in-chunk) for the
+// buffer list of a submission.
 //
-// This class performs no GPU VM mapping and no command submission. userptr buffers cannot be
-// dma-buf exported, so presentable surfaces still need dedicated real-GEM allocations elsewhere.
+// This class performs no command submission. userptr buffers cannot be dma-buf exported, so
+// presentable surfaces still need dedicated real-GEM allocations elsewhere.
 class GemBacking {
 public:
 	// GEM chunk granularity. 256 MiB divides the 13.5 GiB backing (13824 MiB) evenly and stays
@@ -148,6 +150,37 @@ public:
 		return got != MAP_FAILED && got == dst;
 	}
 
+	// Maps backing bytes [offset, offset + size) into this device's GPU VM at `vaddr`, the same
+	// address the CPU view uses, so guest pointers are valid on the GPU unchanged. A range that
+	// crosses chunks becomes one GPU mapping per chunk. REPLACE drops whatever was mapped there
+	// before, so remapping a guest range needs no separate unbind. All guest memory is mapped
+	// readable, writable and executable (shaders live in guest memory).
+	bool BindView(uint64_t vaddr, uint64_t size, uint64_t offset) {
+		if (size == 0 || !EnsureRange(offset, size)) {
+			return false;
+		}
+		uint64_t done = 0;
+		while (done < size) {
+			const uint64_t at    = offset + done;
+			const uint64_t index = at / kChunkSize;
+			const uint64_t inner = at - index * kChunkSize;
+			const uint64_t part  = std::min(size - done, m_chunks[index].size - inner);
+			if (VaOp(AMDGPU_VA_OP_REPLACE, m_chunks[index].handle, vaddr + done, inner, part) != 0) {
+				return false;
+			}
+			done += part;
+		}
+		return true;
+	}
+
+	// Removes every GPU mapping in [vaddr, vaddr + size), whichever chunk it came from.
+	bool UnbindView(uint64_t vaddr, uint64_t size) {
+		return size == 0 || VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, size) == 0;
+	}
+
+	// The DRM file whose GPU VM holds the bindings; command submission must use the same file.
+	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
+
 	// Looks up the GEM buffer backing `offset`, for a later GPU-VM mapping step. Returns false if
 	// `offset` is out of range or its chunk has not been created yet.
 	bool Lookup(uint64_t offset, uint32_t* handle, uint64_t* offset_in_chunk) const {
@@ -182,6 +215,24 @@ private:
 			r = ::ioctl(m_drm_fd, request, arg);
 		} while (r == -1 && (errno == EINTR || errno == EAGAIN));
 		return r == -1 ? -errno : 0;
+	}
+
+	int VaOp(uint32_t op, uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t size) const {
+		struct drm_amdgpu_gem_va v;
+		std::memset(&v, 0, sizeof(v));
+		v.handle       = handle;
+		v.operation    = op;
+		v.flags        = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE;
+		v.va_address   = vaddr;
+		v.offset_in_bo = offset_in_bo;
+		v.map_size     = size;
+		const int r    = Ioctl(DRM_IOCTL_AMDGPU_GEM_VA, &v);
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: GEM_VA op %u at 0x%llx (+0x%llx) failed: %s\n", op,
+			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+			             std::strerror(-r));
+		}
+		return r;
 	}
 
 	void GemClose(uint32_t handle) const {

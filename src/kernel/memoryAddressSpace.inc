@@ -520,6 +520,11 @@ public:
 
 		std::lock_guard lock(m_mutex);
 		RemoveMappingsUnlocked(vaddr, size);
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_gem != nullptr) {
+			m_gem->UnbindView(vaddr, size);
+		}
+#endif
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
@@ -703,6 +708,13 @@ private:
 			if (!m_gem->MapView(vaddr, size, backing_offset, GetProtect(mode))) {
 				SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
 				return nullptr;
+			}
+			// The CPU view stays usable even if the GPU VM refuses the range.
+			if (!m_gem->BindView(vaddr, size, backing_offset)) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t direct-memory backing: GPU bind of 0x%016" PRIx64 " size 0x%" PRIx64
+				           " failed\n",
+				           vaddr, size);
 			}
 			return reinterpret_cast<void*>(vaddr);
 		}
