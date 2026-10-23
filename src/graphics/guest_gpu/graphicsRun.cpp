@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -844,6 +845,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	if (NativeGpu::PrimaryRendering()) { // BC-250 native GPU path already drew this DCB
+		return;
+	}
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
@@ -903,7 +907,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
 	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
-	if (draw_count == 0) {
+	if (draw_count == 0 || NativeGpu::PrimaryRendering()) {
 		return;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
@@ -960,6 +964,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	if (!IsAsyncComputeQueue() && NativeGpu::PrimaryRendering()) { // dispatched natively with its DCB
+		return;
+	}
 
 	uint32_t frame_num = 0;
 
@@ -996,11 +1003,17 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 		return;
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	if (!IsAsyncComputeQueue() && NativeGpu::PrimaryRendering()) {
+		return;
+	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode,
 	                                                IsAsyncComputeQueue());
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	if (NativeGpu::PrimaryRendering()) {
+		return;
+	}
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}

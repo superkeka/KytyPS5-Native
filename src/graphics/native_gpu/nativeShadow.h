@@ -32,6 +32,12 @@ void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
 bool ShadowShowsNativeFrames();
 void ShadowToggleNativeFrames();
 
+// Primary mode (KYTY_NATIVE_GPU_PRIMARY=1, implies shadow submission and showing native frames):
+// the native path renders and Kyty's command processor still runs every DCB for synchronization,
+// labels and flips, but skips its own Vulkan draws and DCB dispatches. Returns false whenever the
+// native path is not active, e.g. after it disabled itself, so Kyty falls back to rendering.
+bool PrimaryRendering();
+
 // Called at every video-out flip with the guest surface about to be presented. Writes the raw
 // guest bytes of the flips listed in KYTY_NATIVE_GPU_DUMP_FLIPS (e.g. "300,600") to
 // KYTY_NATIVE_GPU_DUMP_DIR (default ".") as flip_<n>.raw plus flip_<n>.txt with the layout.

@@ -222,7 +222,7 @@ private:
 	static constexpr double kDefaultTimeoutSec = 12.0;
 
 	void Init() {
-		if (!EnvOn("KYTY_NATIVE_GPU_SHADOW")) {
+		if (!EnvOn("KYTY_NATIVE_GPU_SHADOW") && !EnvOn("KYTY_NATIVE_GPU_PRIMARY")) {
 			return;
 		}
 		m_translator.SeedPs5Defaults();
@@ -336,8 +336,14 @@ std::atomic<bool>& ShowNative() {
 
 } // namespace
 
+bool PrimaryRendering() {
+	static const bool primary = EnvOn("KYTY_NATIVE_GPU_PRIMARY");
+	return primary && Shadow::Instance().Active();
+}
+
 bool ShadowShowsNativeFrames() {
-	return ShowNative().load(std::memory_order_relaxed) && Shadow::Instance().Active();
+	return (ShowNative().load(std::memory_order_relaxed) || PrimaryRendering()) &&
+	       Shadow::Instance().Active();
 }
 
 void ShadowToggleNativeFrames() {
