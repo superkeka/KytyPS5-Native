@@ -102,6 +102,21 @@ public:
 			m_handle = nullptr;
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_GEM_BACKING_SUPPORTED
+		// Opt-in (Linux only, default off): back guest memory with amdgpu GEM buffers so every
+		// mapping is GPU-mappable later at the same virtual address. Falls back to the memfd below.
+		if (const char* opt = getenv("KYTY_NATIVE_GPU_GEM");
+		    opt != nullptr && opt[0] != '\0' && opt[0] != '0') {
+			m_gem = Libs::Graphics::NativeGpu::GemBacking::Create(m_size);
+			if (m_gem != nullptr) {
+				m_backing_base = m_gem->AliasBase();
+				return;
+			}
+			LOGF_COLOR(Log::Color::Red,
+			           "\t direct-memory backing: GEM backing requested but unavailable, "
+			           "falling back to memfd\n");
+		}
+#endif
 #if defined(__APPLE__)
 		{
 			char shm_name[64];
@@ -156,11 +171,19 @@ public:
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
 		m_maps.clear();
-		if (m_backing_base != nullptr) {
-			munmap(m_backing_base, m_size);
-		}
-		if (m_fd >= 0) {
-			close(m_fd);
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_gem != nullptr) {
+			delete m_gem; // owns the alias and the GEM buffers
+			m_gem = nullptr;
+		} else
+#endif
+		{
+			if (m_backing_base != nullptr) {
+				munmap(m_backing_base, m_size);
+			}
+			if (m_fd >= 0) {
+				close(m_fd);
+			}
 		}
 #endif
 	}
@@ -185,6 +208,11 @@ public:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		return m_handle != nullptr && m_backing_base != nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_gem != nullptr) {
+			return m_backing_base != nullptr;
+		}
+#endif
 		return m_fd >= 0 && m_backing_base != nullptr;
 #else
 		return false;
@@ -197,11 +225,23 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+#if KYTY_GEM_BACKING_SUPPORTED
+	// Exposes the GEM backing (null unless the opt-in switch is on) for the later step that binds
+	// chunks into the GPU VM; use GemBacking::Lookup to resolve a backing offset to (handle, offset).
+	[[nodiscard]] Libs::Graphics::NativeGpu::GemBacking* Gem() const { return m_gem; }
+#endif
+
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+#if KYTY_GEM_BACKING_SUPPORTED
+		// Zeroing precedes the view's MapBacking, so this is where lazy chunks first appear.
+		if (m_gem != nullptr && !m_gem->EnsureRange(backing_offset, size)) {
+			return false;
+		}
+#endif
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -658,6 +698,15 @@ private:
 			callback(vaddr, size);
 		}
 #endif
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_gem != nullptr) {
+			if (!m_gem->MapView(vaddr, size, backing_offset, GetProtect(mode))) {
+				SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
+				return nullptr;
+			}
+			return reinterpret_cast<void*>(vaddr);
+		}
+#endif
 		void* ptr = mmap(reinterpret_cast<void*>(vaddr), size, GetProtect(mode),
 		                 MAP_SHARED | MAP_FIXED, m_fd, static_cast<off_t>(backing_offset));
 		if (ptr == MAP_FAILED) {
@@ -675,6 +724,9 @@ private:
 	}
 
 	int m_fd = -1;
+#if KYTY_GEM_BACKING_SUPPORTED
+	Libs::Graphics::NativeGpu::GemBacking* m_gem = nullptr;
+#endif
 #endif
 
 	uint8_t*                     m_backing_base = nullptr;
@@ -741,6 +793,10 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+
+#if KYTY_GEM_BACKING_SUPPORTED
+	[[nodiscard]] Libs::Graphics::NativeGpu::GemBacking* Gem() const { return m_backing->Gem(); }
+#endif
 
 	bool ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		return m_backing->ZeroRange(backing_offset, size);

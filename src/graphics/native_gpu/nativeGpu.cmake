@@ -11,3 +11,15 @@ if(BUILD_TESTING)
 	add_test(NAME native_gpu_shader_patcher COMMAND $<TARGET_FILE:native_gpu_shader_patcher_tests>)
 	add_dependencies(kyty_tests native_gpu_shader_patcher_tests)
 endif()
+
+# GEM backing is header-only (src/graphics/native_gpu/gemBacking.h), so the emulator needs no extra
+# source; this standalone test exercises it directly and skips cleanly off the board.
+add_executable(native_gpu_gem_backing_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuGemBackingTests.cpp"
+)
+target_include_directories(native_gpu_gem_backing_tests PRIVATE ${inc_headers})
+
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_gem_backing COMMAND $<TARGET_FILE:native_gpu_gem_backing_tests>)
+	add_dependencies(kyty_tests native_gpu_gem_backing_tests)
+endif()
