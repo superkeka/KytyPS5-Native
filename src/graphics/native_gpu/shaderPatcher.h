@@ -48,6 +48,7 @@ struct Dot2cScan {
 	uint32_t gds_ops      = 0;     // DS instructions with the GDS bit (GDS memory, append/consume)
 	uint32_t ordered_ops  = 0;     // ds_ordered_count (ordered append; needs the GDS OA engine)
 	uint32_t gws_ops      = 0;     // ds_gws_* (global wave sync)
+	uint32_t dwords       = 0;     // dwords swept, s_endpgm included
 	bool     ended        = false; // true if an s_endpgm terminated the sweep
 	bool     decode_error = false; // true if an instruction could not be decoded
 };

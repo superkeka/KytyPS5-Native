@@ -43,6 +43,9 @@ struct Pm4TranslateStats {
 	uint32_t dispatches        = 0; // IT_DISPATCH_DIRECT / IT_DISPATCH_INDIRECT
 	uint32_t num_instances     = 0; // IT_NUM_INSTANCES passed through
 	uint32_t index_state       = 0; // IT_INDEX_BASE / IT_INDEX_BUFFER_SIZE passed through
+	uint32_t draws_skipped     = 0; // draws left out (SetSkippedPixelShaders)
+	uint32_t fmask_fixed       = 0; // CB_COLORn_FMASK set to the target base (was 0) before a draw
+	uint32_t packets_skipped   = 0; // packets left out (SetSkippedOpcodes)
 	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
@@ -69,11 +72,15 @@ struct GpuRef {
 	uint64_t addr    = 0;
 	uint64_t size    = 0;
 	bool     pointer = false;
+	bool     index   = false; // an index buffer the next draws fetch from (must be GPU-mapped)
 
 	bool operator<(const GpuRef& o) const {
-		return addr != o.addr ? addr < o.addr : (size != o.size ? size < o.size : pointer < o.pointer);
+		return addr != o.addr ? addr < o.addr
+		                      : (size != o.size ? size < o.size : (pointer != o.pointer ? pointer < o.pointer : index < o.index));
 	}
-	bool operator==(const GpuRef& o) const { return addr == o.addr && size == o.size && pointer == o.pointer; }
+	bool operator==(const GpuRef& o) const {
+		return addr == o.addr && size == o.size && pointer == o.pointer && index == o.index;
+	}
 };
 
 // A color render target bound for a draw: where it is and the raw CB registers that describe it.
@@ -88,6 +95,14 @@ struct RenderTargetInfo {
 	uint32_t draws   = 0; // draws in the DCB with this target bound
 };
 
+// User data of a draw whose pixel shader is under inspection (SetInspectedPixelShader).
+struct DrawSnapshot {
+	uint64_t ps = 0;
+	uint64_t es = 0;
+	uint32_t ps_user_data[32] = {};
+	uint32_t gs_user_data[32] = {}; // SPI_SHADER_USER_DATA_GS_*: the NGG (merged ES/GS) stage on gfx10
+};
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -100,6 +115,7 @@ struct Pm4TranslateResult {
 	std::set<uint32_t>    skipped_uconfig;    // non-whitelisted UCONFIG offsets dropped this DCB
 	std::vector<GpuRef>   refs;               // guest memory the DCB's draws/dispatches may touch
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
+	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -141,9 +157,28 @@ public:
 	enum class DepthDebugMode { None, HizOff, NoHtile };
 	void SetDepthDebugMode(DepthDebugMode mode) { m_depth_mode = mode; }
 
+	// Experiment: render targets without DCC compression (CB_COLORn_INFO.DCC_ENABLE cleared).
+	void SetNoDcc(bool no_dcc) { m_no_dcc = no_dcc; }
+
+	// Experiment: targets without DCC lose CB_COLORn_INFO.FAST_CLEAR (no CMASK fast clear).
+	void SetNoCmaskClear(bool on) { m_no_cmask_clear = on; }
+
+	// Experiment: CB_TARGET_MASK is ANDed with `mask`, e.g. 0xf keeps only MRT0 writable.
+	void SetTargetMask(uint32_t mask) { m_target_mask = mask; }
+
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
 	void SetGdsAvailable(bool available) { m_gds = available; }
+
+	// Draws whose pixel shader (SPI_SHADER_PGM_LO/HI_PS) is in `shaders` are left out of the IB, for
+	// bisecting a hang down to one shader; everything else in the DCB still runs natively.
+	void SetSkippedPixelShaders(std::set<uint64_t> shaders) { m_skip_ps = std::move(shaders); }
+
+	// Packets of these opcodes are left out of the IB (bisecting a hang down to a packet type).
+	void SetSkippedOpcodes(std::set<uint32_t> ops) { m_skip_ops = std::move(ops); }
+
+	// Draws with this pixel shader are reported in Pm4TranslateResult::inspected (0: none).
+	void SetInspectedPixelShader(uint64_t ps) { m_inspect_ps = ps; }
 
 	// UCONFIG registers the backend is allowed to write. Everything else is dropped, because one
 	// experiment writing other UCONFIG registers froze the whole board (see the probe README).
@@ -158,6 +193,12 @@ private:
 	std::map<uint32_t, uint32_t> m_uc; // whitelisted UCONFIG registers
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
+	bool                         m_no_dcc     = false;
+	uint32_t                     m_target_mask = 0xffffffffu;
+	bool                         m_no_cmask_clear = false;
+	std::set<uint64_t>           m_skip_ps;
+	std::set<uint32_t>           m_skip_ops;
+	uint64_t                     m_inspect_ps = 0;
 };
 
 } // namespace Libs::Graphics::NativeGpu

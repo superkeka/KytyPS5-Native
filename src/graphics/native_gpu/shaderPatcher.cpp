@@ -261,7 +261,8 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 		// SOPP s_endpgm (enc9 0x17d via bits 31:23 == 0x17f, op 0x01) ends the program.
 		if ((w >> 23u) == 0x17fu && ((w >> 16u) & 0x7fu) == 0x01u) {
 			scan.instructions++;
-			scan.ended = true;
+			scan.ended  = true;
+			scan.dwords = dw + 1;
 			break;
 		}
 		const uint32_t len = InstructionDwords(code.subspan(dw));
@@ -285,6 +286,7 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 		}
 		scan.instructions++;
 		dw += len;
+		scan.dwords = dw;
 	}
 	return scan;
 }

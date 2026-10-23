@@ -304,6 +304,16 @@ public:
 		return FindViewUnlocked(vaddr) != m_views.end();
 	}
 
+	// True when `vaddr` is mapped into the GPU VM at all: a view of the backing or an external range.
+	[[nodiscard]] bool IsGpuMapped(uint64_t vaddr) const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		if (FindViewUnlocked(vaddr) != m_views.end()) {
+			return true;
+		}
+		auto it = m_external.upper_bound(vaddr);
+		return it != m_external.begin() && vaddr < std::prev(it)->second.end;
+	}
+
 	// Copies up to `size` bytes of guest memory at `vaddr` (clipped to the view holding it) through
 	// the alias, which is always readable whatever the guest's own protection. Returns the bytes
 	// copied, 0 when `vaddr` is not backed.

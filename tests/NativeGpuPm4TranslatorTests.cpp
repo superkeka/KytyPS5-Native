@@ -467,6 +467,50 @@ bool HasRef(const std::vector<GpuRef>& refs, uint64_t addr, uint64_t min_size, b
 	return false;
 }
 
+void TestDrawIndexOffset() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_UCONFIG_REG, {0x243u, 1u}, false);                // VGT_INDEX_TYPE = 32-bit
+	Append(dcb, 0x26u /* IT_INDEX_BASE */, {0x10000000u, 0x2u}, false); // 0x2_1000_0000
+	Append(dcb, 0x35u /* IT_DRAW_INDEX_OFFSET_2 */, {0x33cu, 0x75cu, 0x33cu, 0u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.draws == 1, "DRAW_INDEX_OFFSET_2 translated");
+	const auto pkts = Decode(r.ib);
+	Check(Count(pkts, 0x35u) == 0, "DRAW_INDEX_OFFSET_2 does not reach the IB");
+	const Packet* d = FindFirst(pkts, IT_DRAW_INDEX_2);
+	const uint64_t addr = 0x210000000ull + 0x75cull * 4u;
+	Check(d != nullptr && d->body.size() == 5 && d->body[0] == 0x33cu && d->body[1] == static_cast<uint32_t>(addr) &&
+	          d->body[2] == static_cast<uint32_t>(addr >> 32u) && d->body[3] == 0x33cu,
+	      "DRAW_INDEX_OFFSET_2 becomes DRAW_INDEX_2 at INDEX_BASE + offset * index size");
+}
+
+void TestFmaskFix() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	// MRT0 and MRT4 bound and writable; MRT4 has no FMASK (0), MRT0 already points it at its base.
+	Append(dcb, IT_SET_CONTEXT_REG, {0x08Eu, 0xf000fu}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x50fc300u}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x321u, 0x50fc300u}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u + 4u * 0xFu, 0x5125700u}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x321u + 4u * 0xFu, 0x0u}, false);
+	Append(dcb, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.fmask_fixed == 1, "one target without FMASK fixed");
+	uint32_t fmask4 = 0;
+	size_t   fix_at = 0, draw_at = 0, i = 0;
+	for (const auto& p: Decode(r.ib)) {
+		if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x321u + 4u * 0xFu) {
+			fmask4 = p.body[1];
+			fix_at = i;
+		}
+		if (p.op == 0x2Du) {
+			draw_at = i;
+		}
+		i++;
+	}
+	Check(fmask4 == 0x5125700u && fix_at < draw_at, "CB_COLOR4_FMASK = CB_COLOR4_BASE before the draw");
+}
+
 void TestContextDefaults() {
 	Pm4Translator t;
 	t.SeedPs5Defaults();
@@ -548,6 +592,8 @@ int main() {
 	TestUnknownRefused();
 	TestGpuRefs();
 	TestContextDefaults();
+	TestDrawIndexOffset();
+	TestFmaskFix();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

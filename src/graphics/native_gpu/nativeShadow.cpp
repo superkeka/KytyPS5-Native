@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -96,6 +97,34 @@ public:
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
 
 		DetectShaders(result.shader_addrs);
+		for (const auto& snap: result.inspected) {
+			InspectDraw(frame, snap);
+		}
+		// A shader that uses GDS hung the board in ASTRO BOT even with a GDS partition; until that is
+		// understood such DCBs stay on Kyty unless KYTY_NATIVE_GPU_GDS_SHADERS=1.
+		// Skip mode learns GDS shaders as they appear: the DCB that introduces one was translated
+		// before the scan, so it goes to Kyty whole and the translator drops that shader's draws from
+		// the next DCB on.
+		if (result.ok && m_skip_gds_shaders && m_gds_shaders.size() != m_skipped_shader_count) {
+			m_skipped_shader_count = m_gds_shaders.size();
+			std::set<uint64_t> skip = m_gds_shaders;
+			skip.insert(m_skip_ps.begin(), m_skip_ps.end());
+			m_translator.SetSkippedPixelShaders(skip);
+			m_refused++;
+			return;
+		}
+		if (result.ok && !m_allow_gds_shaders && !m_skip_gds_shaders) {
+			for (uint64_t va: result.shader_addrs) {
+				if (m_gds_shaders.count(va) != 0) {
+					if (m_gds_refused++ < 4) {
+						std::fprintf(stderr, "native shadow: frame %llu left to Kyty: shader 0x%llx uses GDS\n",
+						             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(va));
+					}
+					m_refused++;
+					return;
+				}
+			}
+		}
 		if (m_collect_targets) {
 			for (const auto& t: result.render_targets) {
 				auto& acc = m_frame_targets[t.addr];
@@ -184,6 +213,12 @@ public:
 		}
 		SetStage(Stage::Gpu, frame);
 		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
+		// ENOENT: a buffer in the list was closed meanwhile (another guest thread unmapped an external
+		// range between CreatedHandles and the ioctl). Take a fresh list and try again.
+		for (int retry = 0; !r.submitted && r.err == -ENOENT && retry < 3; retry++) {
+			handles = m_gem->CreatedHandles();
+			r       = m_submitter->Submit(ib, handles, m_timeout_sec);
+		}
 		SetStage(Stage::Idle, frame);
 
 		const bool detail = frame < 3 || (frame % 120 == 0);
@@ -344,6 +379,58 @@ private:
 	// from shader user data are followed two levels deep (resource tables, and tables of tables),
 	// scanning each table for 48-bit buffer pointers (V#, whose dwords 1-2 give stride and record
 	// count, so the whole buffer is promoted) and 40-bit image bases (T#).
+	// KYTY_NATIVE_GPU_LOG_UNMAPPED=1: report addresses found in shader user data and resource tables
+	// that fall in the guest address range but are mapped for the GPU nowhere (a GPU access there is a
+	// page fault, which hangs this board). Candidates are heuristic, so some reports are just data.
+	void NoteUnmapped(uint64_t addr, const char* kind, uint64_t table) {
+		if (!m_log_unmapped || addr < 0x100000000ull || addr >= 0x10000000000ull || m_unmapped_seen.size() >= 4096 ||
+		    !m_unmapped_seen.insert(addr >> 16u).second || m_gem->IsGpuMapped(addr)) {
+			return;
+		}
+		if (m_unmapped_logged++ < 40) {
+			std::fprintf(stderr, "native shadow: %s 0x%llx (from table 0x%llx) is not mapped for the GPU\n", kind,
+			             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(table));
+		}
+	}
+
+	// KYTY_NATIVE_GPU_INSPECT_PS: for a few draws with that pixel shader, log both stages' user data and
+	// decode the descriptors around them: inline V#s in the user data, and V#/T# in the 0x200 bytes
+	// behind every user-data pointer, each with whether its base is mapped for the GPU.
+	void InspectDraw(uint64_t frame, const DrawSnapshot& snap) {
+		if (m_inspected++ >= 3) {
+			return;
+		}
+		auto mapped = [&](uint64_t a) { return a == 0 ? "null" : (m_gem->IsGpuMapped(a) ? "mapped" : "NOT MAPPED"); };
+		std::fprintf(stderr, "native shadow: INSPECT frame %llu ps 0x%llx es 0x%llx\n", static_cast<unsigned long long>(frame),
+		             static_cast<unsigned long long>(snap.ps), static_cast<unsigned long long>(snap.es));
+		auto dump_stage = [&](const char* stage, const uint32_t* ud) {
+			for (uint32_t i = 0; i < 32; i++) {
+				std::fprintf(stderr, "%s%s ud[%2u]=0x%08x", i % 8 == 0 ? "\n  " : " ", stage, i, ud[i]);
+			}
+			std::fprintf(stderr, "\n");
+			for (uint32_t i = 0; i + 1 < 32; i++) {
+				const uint64_t ptr = ud[i] | (static_cast<uint64_t>(ud[i + 1] & 0xffffu) << 32u);
+				if (ptr < 0x100000000ull || ptr >= 0x10000000000ull) {
+					continue;
+				}
+				std::fprintf(stderr, "  %s ud[%u:%u] -> 0x%llx (%s)\n", stage, i, i + 1, static_cast<unsigned long long>(ptr), mapped(ptr));
+				uint32_t     t[128];
+				const size_t n = m_gem->ReadGuest(ptr, t, sizeof(t)) / 4;
+				for (size_t k = 0; k + 3 < n; k += 4) {
+					const uint64_t vbase = t[k] | (static_cast<uint64_t>(t[k + 1] & 0xffffu) << 32u);
+					const uint64_t tbase = (t[k] | (static_cast<uint64_t>(t[k + 1] & 0xffu) << 32u)) << 8u;
+					if ((vbase >= 0x100000000ull && vbase < 0x10000000000ull) || (tbase >= 0x100000000ull && tbase < 0x10000000000ull)) {
+						std::fprintf(stderr, "    +0x%03zx: %08x %08x %08x %08x  as V# 0x%llx (%s) stride %u records %u | as T# 0x%llx (%s)\n",
+						             k * 4, t[k], t[k + 1], t[k + 2], t[k + 3], static_cast<unsigned long long>(vbase), mapped(vbase),
+						             (t[k + 1] >> 16u) & 0x3fffu, t[k + 2], static_cast<unsigned long long>(tbase), mapped(tbase));
+					}
+				}
+			}
+		};
+		dump_stage("ps", snap.ps_user_data);
+		dump_stage("gs", snap.gs_user_data);
+	}
+
 	void MakeResident(const Pm4TranslateResult& result) {
 		constexpr uint64_t kTableSpan = 4096;
 		constexpr uint64_t kImageSpan = 32ull << 20u;
@@ -380,6 +467,14 @@ private:
 		}
 		std::vector<uint64_t> tables;
 		for (const auto& ref: result.refs) {
+			if (ref.pointer) {
+				NoteUnmapped(ref.addr, "user-data pointer", 0);
+			}
+			// An index buffer the GPU cannot reach at all is a page fault, and a fault hangs this board.
+			if (ref.index && !backed(ref.addr) && !m_gem->IsGpuMapped(ref.addr) && m_unmapped_logged++ < 16) {
+				std::fprintf(stderr, "native shadow: index buffer 0x%llx (0x%llx bytes) is not mapped for the GPU\n",
+				             static_cast<unsigned long long>(ref.addr), static_cast<unsigned long long>(ref.size));
+			}
 			if (backed(ref.addr)) {
 				promote(ref.addr, ref.size != 0 ? ref.size : kTableSpan);
 				if (ref.pointer) {
@@ -398,6 +493,7 @@ private:
 				const size_t n = m_gem->ReadGuest(table, d, sizeof(d)) / 4;
 				for (size_t i = 0; i + 1 < n; i++) {
 					const uint64_t ptr = d[i] | (static_cast<uint64_t>(d[i + 1] & 0xffffu) << 32u);
+					NoteUnmapped(ptr, "buffer", table);
 					if (ptr != 0 && backed(ptr)) {
 						const uint64_t stride  = (d[i + 1] >> 16u) & 0x3fffu;
 						const uint64_t records = i + 2 < n ? d[i + 2] : 0;
@@ -406,6 +502,7 @@ private:
 						next.push_back(ptr);
 					}
 					const uint64_t image = (d[i] | (static_cast<uint64_t>(d[i + 1] & 0xffu) << 32u)) << 8u;
+					NoteUnmapped(image, "image", table);
 					if (image != 0 && backed(image)) {
 						promote(image, kImageSpan);
 					}
@@ -519,6 +616,55 @@ private:
 			std::fprintf(stderr, "native shadow: seeded %zu PS5 context register defaults\n", defaults.size());
 		}
 		m_stats = EnvOn("KYTY_NATIVE_GPU_STATS");
+		m_dump_shaders = EnvOn("KYTY_NATIVE_GPU_DUMP_SHADERS");
+		m_log_unmapped = EnvOn("KYTY_NATIVE_GPU_LOG_UNMAPPED");
+		if (EnvOn("KYTY_NATIVE_GPU_NO_DCC")) {
+			m_translator.SetNoDcc(true);
+			std::fprintf(stderr, "native shadow: render targets without DCC (experiment)\n");
+		}
+		if (EnvOn("KYTY_NATIVE_GPU_NO_CMASK_CLEAR")) {
+			m_translator.SetNoCmaskClear(true);
+			std::fprintf(stderr, "native shadow: no CMASK fast clear on targets without DCC (experiment)\n");
+		}
+		if (const char* mask = std::getenv("KYTY_NATIVE_GPU_TARGET_MASK"); mask != nullptr) {
+			m_translator.SetTargetMask(static_cast<uint32_t>(std::strtoul(mask, nullptr, 0)));
+			std::fprintf(stderr, "native shadow: CB_TARGET_MASK limited to %s (experiment)\n", mask);
+		}
+		if (const char* ps = std::getenv("KYTY_NATIVE_GPU_INSPECT_PS"); ps != nullptr) {
+			m_translator.SetInspectedPixelShader(std::strtoull(ps, nullptr, 0));
+		}
+		// KYTY_NATIVE_GPU_SKIP_PS=0xADDR[,0xADDR...]: leave draws with these pixel shaders out of the IB.
+		if (const char* list = std::getenv("KYTY_NATIVE_GPU_SKIP_PS"); list != nullptr) {
+			for (const char* p = list; *p != '\0';) {
+				char* end = nullptr;
+				m_skip_ps.insert(std::strtoull(p, &end, 0));
+				if (end == p) {
+					break;
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+			m_translator.SetSkippedPixelShaders(m_skip_ps);
+			std::fprintf(stderr, "native shadow: leaving draws with %zu pixel shader(s) out: %s\n", m_skip_ps.size(), list);
+		}
+		if (const char* ops = std::getenv("KYTY_NATIVE_GPU_SKIP_OPS"); ops != nullptr) {
+			std::set<uint32_t> skip;
+			for (const char* p = ops; *p != '\0';) {
+				char* end = nullptr;
+				skip.insert(static_cast<uint32_t>(std::strtoul(p, &end, 0)));
+				p = (*end == ',') ? end + 1 : end;
+				if (end == p && *p != '\0') {
+					break;
+				}
+			}
+			m_translator.SetSkippedOpcodes(skip);
+			std::fprintf(stderr, "native shadow: leaving %zu packet type(s) out of the IB: %s\n", skip.size(), ops);
+		}
+		// KYTY_NATIVE_GPU_GDS_SHADERS=1 runs draws with GDS shaders natively, =skip leaves just those
+		// draws out of the IB (the rest of their DCB runs natively); unset leaves whole DCBs to Kyty.
+		if (const char* g = std::getenv("KYTY_NATIVE_GPU_GDS_SHADERS"); g != nullptr) {
+			m_skip_gds_shaders  = std::strcmp(g, "skip") == 0;
+			m_allow_gds_shaders = !m_skip_gds_shaders && g[0] == '1';
+		}
 		m_collect_targets = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr;
 		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
 			StartWatchdog();
@@ -603,10 +749,27 @@ private:
 				             scan.ended ? "s_endpgm" : (scan.decode_error ? "decode stop" : "capped"));
 			}
 			if (scan.gds_ops + scan.ordered_ops + scan.gws_ops > 0) {
+				m_gds_shaders.insert(va);
 				std::fprintf(stderr,
 				             "native shadow: shader 0x%llx uses GDS: %u gds, %u ds_ordered_count, %u ds_gws (%u instrs, %s)\n",
 				             static_cast<unsigned long long>(va), scan.gds_ops, scan.ordered_ops, scan.gws_ops,
 				             scan.instructions, scan.ended ? "s_endpgm" : (scan.decode_error ? "decode stop" : "capped"));
+			}
+			// Keep the code for disassembly (llvm-mc -arch=amdgcn -mcpu=gfx1013 --disassemble): GDS
+			// shaders always, every shader with KYTY_NATIVE_GPU_DUMP_SHADERS=1.
+			if (scan.gds_ops + scan.ordered_ops + scan.gws_ops > 0 || m_dump_shaders) {
+				if (const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR"); dir != nullptr && scan.dwords != 0) {
+					char path[512];
+					std::snprintf(path, sizeof(path), "%s/shader_%llx.bin", dir, static_cast<unsigned long long>(va));
+					// KYTY_NATIVE_GPU_DUMP_TAIL=<dwords> also keeps code past the first s_endpgm, where
+					// compilers put out-of-line blocks such as the all-lanes-killed epilogue.
+					const char*  tail  = std::getenv("KYTY_NATIVE_GPU_DUMP_TAIL");
+					const size_t extra = tail != nullptr ? std::strtoul(tail, nullptr, 0) : 0;
+					if (std::FILE* f = std::fopen(path, "wb"); f != nullptr) {
+						std::fwrite(code, 4, scan.dwords + extra, f);
+						std::fclose(f);
+					}
+				}
 			}
 		}
 	}
@@ -636,7 +799,18 @@ private:
 	std::set<uint64_t>                         m_resident_buckets; // 16 MiB guest buckets already promoted
 #endif
 	uint32_t      m_dummy_writes       = 0;
+	uint32_t      m_unmapped_logged    = 0;
+	bool          m_dump_shaders       = false;
+	bool          m_log_unmapped       = false;
+	uint32_t      m_inspected          = 0;
+	std::set<uint64_t> m_unmapped_seen;     // 64 KiB pages already checked by NoteUnmapped
+	std::set<uint64_t> m_skip_ps;           // KYTY_NATIVE_GPU_SKIP_PS
 	std::set<uint32_t> m_unknown_ops;
+	std::set<uint64_t> m_gds_shaders;         // shaders seen using GDS instructions
+	bool               m_allow_gds_shaders = false;
+	bool               m_skip_gds_shaders  = false;
+	size_t             m_skipped_shader_count = 0;
+	uint32_t           m_gds_refused       = 0;
 	double        m_timeout_sec    = kDefaultTimeoutSec;
 	uint32_t      m_shaders_scanned = 0;
 	uint32_t      m_dot2c_sites    = 0;

@@ -60,11 +60,12 @@ public:
 			delete self;
 			return nullptr;
 		}
-		// Opt-in: with GDS, GWS and OA buffers in every submission (so amdgpu reprograms the GDS
-		// partition for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even
-		// when no packet or shader used GDS.
-		if (const char* opt = std::getenv("KYTY_NATIVE_GPU_GDS"); opt != nullptr && opt[0] == '1') {
-			self->CreateGds();
+		// Opt-in: with the whole GDS, GWS and OA partitions in every submission (so amdgpu reprograms
+		// them for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even when
+		// no packet or shader used GDS. KYTY_NATIVE_GPU_GDS=1 asks for the whole partitions,
+		// "gds=<bytes>,gws=<n>,oa=<n>" for chosen sizes (0 or absent: none of that resource).
+		if (const char* opt = std::getenv("KYTY_NATIVE_GPU_GDS"); opt != nullptr && opt[0] != '\0' && opt[0] != '0') {
+			self->CreateGds(opt);
 		}
 		return self;
 	}
@@ -289,7 +290,7 @@ private:
 	// Allocates the whole GFX partition of GDS and its GWS and OA resources once. PS5 titles address
 	// GDS directly (counters, ordered append), so the native jobs need the same partition from offset
 	// 0. Optional: without it, packets that use GDS stay untranslated.
-	void CreateGds() {
+	void CreateGds(const char* spec) {
 		struct drm_amdgpu_info_gds gds;
 		std::memset(&gds, 0, sizeof(gds));
 		struct drm_amdgpu_info request;
@@ -300,9 +301,18 @@ private:
 		const bool queried = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) == 0;
 		// Newer kernels report GDS only through the compute-partition and total fields (the GFX
 		// partition fields read 0), so take the largest of each.
-		const uint32_t gds_size = std::max({gds.gds_gfx_partition_size, gds.compute_partition_size, gds.gds_total_size});
-		const uint32_t gws_size = std::max(gds.gws_per_gfx_partition, gds.gws_per_compute_partition);
-		const uint32_t oa_size  = std::max(gds.oa_per_gfx_partition, gds.oa_per_compute_partition);
+		uint32_t gds_size = std::max({gds.gds_gfx_partition_size, gds.compute_partition_size, gds.gds_total_size});
+		uint32_t gws_size = std::max(gds.gws_per_gfx_partition, gds.gws_per_compute_partition);
+		uint32_t oa_size  = std::max(gds.oa_per_gfx_partition, gds.oa_per_compute_partition);
+		if (std::strcmp(spec, "1") != 0) {
+			auto field = [&](const char* key, uint32_t limit) -> uint32_t {
+				const char* at = std::strstr(spec, key);
+				return at == nullptr ? 0u : std::min(limit, static_cast<uint32_t>(std::strtoul(at + std::strlen(key), nullptr, 0)));
+			};
+			gds_size = field("gds=", gds_size);
+			gws_size = field("gws=", gws_size);
+			oa_size  = field("oa=", oa_size);
+		}
 		if (!queried || gds_size == 0) {
 			std::fprintf(stderr, "NativeSubmitter: no GDS config, GDS packets stay untranslated\n");
 			return;

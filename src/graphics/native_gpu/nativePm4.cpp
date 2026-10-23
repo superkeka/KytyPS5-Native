@@ -72,6 +72,7 @@ constexpr uint32_t kCbColor0CmaskExt = 0x398;
 constexpr uint32_t kCbColor0FmaskExt = 0x3A0;
 constexpr uint32_t kCbColor0DccExt   = 0x3A8;
 constexpr uint32_t kCbColor0Attrib2  = 0x3B0;
+constexpr uint32_t kCbTargetMask     = 0x08E;
 constexpr uint32_t kDbDepthView      = 0x002;
 constexpr uint32_t kDbRenderOverride = 0x003;
 constexpr uint32_t kDbZInfo          = 0x010;
@@ -188,6 +189,20 @@ bool WriteDataToMemory(uint32_t control) {
 } // namespace
 
 uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
+	// CB_COLORn_INFO.DCC_ENABLE (bit 28) off, for the no-DCC experiment.
+	if (m_no_dcc && offset >= kCbColor0Info && offset < kCbColor0Info + 8 * kCbColorStride &&
+	    (offset - kCbColor0Info) % kCbColorStride == 0) {
+		value &= ~(1u << 28u);
+	}
+	// CB_COLORn_INFO.FAST_CLEAR (bit 13) off on targets without DCC: CMASK-only fast clear, for the
+	// no-CMASK-clear experiment.
+	if (m_no_cmask_clear && offset >= kCbColor0Info && offset < kCbColor0Info + 8 * kCbColorStride &&
+	    (offset - kCbColor0Info) % kCbColorStride == 0 && (value & (1u << 28u)) == 0) {
+		value &= ~(1u << 13u);
+	}
+	if (offset == kCbTargetMask) {
+		value &= m_target_mask;
+	}
 	switch (m_depth_mode) {
 		case DepthDebugMode::None: return value;
 		case DepthDebugMode::HizOff:
@@ -348,9 +363,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		auto it = regs.find(off);
 		return it == regs.end() ? 0u : it->second;
 	};
-	auto add_ref = [&](uint64_t addr, uint64_t size, bool pointer) {
+	auto add_ref = [&](uint64_t addr, uint64_t size, bool pointer, bool index = false) {
 		if (addr != 0) {
-			refs.push_back(GpuRef {addr, size, pointer});
+			refs.push_back(GpuRef {addr, size, pointer, index});
 		}
 	};
 	// A user-data dword pair can be a 48-bit pointer (V# and table pointers) or the 40-bit
@@ -436,6 +451,44 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 
+	// A bound color target without FMASK must still point CB_COLORn_FMASK at its own base, as
+	// radeonsi and PAL always program it: with a CMASK fast clear the CB reads that address. ASTRO BOT
+	// binds such a target as MRT4 with FMASK 0, and the CB stalls forever on the gfx10 hardware here
+	// (CB/SC busy, no waves; the same surface with FMASK == BASE renders fine as MRT0).
+	auto fix_fmask = [&]() {
+		const uint32_t mask = reg(cx, kCbTargetMask) & m_target_mask;
+		for (uint32_t i = 0; i < 8; i++) {
+			const uint32_t step = i * kCbColorStride;
+			const uint32_t base = reg(cx, kCbColor0Base + step);
+			if (((mask >> (4u * i)) & 0xfu) == 0 || base == 0 || reg(cx, kCbColor0Fmask + step) != 0) {
+				continue;
+			}
+			const uint32_t ext = reg(cx, kCbColor0BaseExt + i);
+			cx[kCbColor0Fmask + step]  = base;
+			cx[kCbColor0FmaskExt + i] = ext;
+			EmitSet(body, IT_SET_CONTEXT_REG, kCbColor0Fmask + step, base, false);
+			EmitSet(body, IT_SET_CONTEXT_REG, kCbColor0FmaskExt + i, ext, false);
+			stats.fmask_fixed++;
+		}
+	};
+
+	// True when the bound pixel shader is one SetSkippedPixelShaders named; the draw is then left out.
+	auto skip_draw = [&]() {
+		fix_fmask();
+		const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
+		if (m_inspect_ps != 0 && ps == m_inspect_ps && r.inspected.size() < 4) {
+			DrawSnapshot snap;
+			snap.ps = ps;
+			snap.es = (static_cast<uint64_t>(reg(sh, 0x0C8)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x0C9)) << 40u);
+			for (uint32_t i = 0; i < 32; i++) {
+				snap.ps_user_data[i] = reg(sh, 0x00C + i);
+				snap.gs_user_data[i] = reg(sh, 0x08C + i);
+			}
+			r.inspected.push_back(snap);
+		}
+		return !m_skip_ps.empty() && m_skip_ps.count(ps) != 0;
+	};
+
 	auto fail = [&](uint32_t op, uint32_t dw) {
 		r.ok         = false;
 		r.unknown_op = op;
@@ -460,6 +513,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		const uint32_t* const bptr = dcb.data() + dw + 1;
 		stats.packets++;
 
+		if (m_skip_ops.count(op) != 0) {
+			stats.packets_skipped++;
+			dw += size;
+			continue;
+		}
 		switch (op) {
 			case IT_NOP: {
 				stats.nops++;
@@ -672,12 +730,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.write_data_dropped++;
 				break;
 			case IT_DRAW_INDEX_2:
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (skip_draw()) {
+					stats.draws_skipped++;
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				}
 				stats.draws++;
 				collect_refs();
 				if (body_count >= 3) { // MAX_SIZE (indices), INDEX_BASE_LO, INDEX_BASE_HI, ...
 					add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u),
-					        static_cast<uint64_t>(bptr[0]) * 4u, false);
+					        static_cast<uint64_t>(bptr[0]) * 4u, false, true);
 				}
 				break;
 			case IT_INDEX_BASE: // the index buffer for draws that do not carry their own
@@ -686,7 +748,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
-				add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false);
+				add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
 				stats.index_state++;
 				break;
 			case IT_INDEX_BUFFER_SIZE:
@@ -695,14 +757,38 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				add_ref(index_base, index_bytes, false);
 				stats.index_state++;
 				break;
-			case IT_DRAW_INDEX_OFFSET_2: // indexed draw into the INDEX_BASE buffer
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+			case IT_DRAW_INDEX_OFFSET_2: { // MAX_SIZE, INDEX_OFFSET, INDEX_COUNT, DRAW_INITIATOR
+				// The PS5 command processor takes MAX_SIZE as the indices left from INDEX_OFFSET (games
+				// send offsets past it); the BC-250's amdgpu microcode takes it as the whole buffer, and
+				// such a draw hung the GPU (ASTRO BOT). Issue it as DRAW_INDEX_2 at the offset's address
+				// instead, as Kyty's own command processor does.
+				if (body_count < 4) {
+					return fail(op, dw);
+				}
+				if (skip_draw()) {
+					stats.draws_skipped++;
+				} else {
+					const uint32_t index_type  = reg(uc, 0x243u) & 0x3u; // VGT_INDEX_TYPE: 0 16-bit, 1 32-bit, 2 8-bit
+					const uint64_t index_bytes = index_type == 1u ? 4u : (index_type == 2u ? 1u : 2u);
+					const uint64_t addr        = index_base + static_cast<uint64_t>(bptr[1]) * index_bytes;
+					body.push_back(Pkt3(IT_DRAW_INDEX_2, 5, false));
+					body.push_back(bptr[0]);
+					body.push_back(static_cast<uint32_t>(addr));
+					body.push_back(static_cast<uint32_t>(addr >> 32u));
+					body.push_back(bptr[2]);
+					body.push_back(bptr[3]);
+				}
 				stats.draws++;
 				collect_refs();
-				add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false);
+				add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
 				break;
+			}
 			case IT_DRAW_INDEX_AUTO: // a non-indexed draw: no index buffer to reference
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (skip_draw()) {
+					stats.draws_skipped++;
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				}
 				stats.draws++;
 				collect_refs();
 				break;
