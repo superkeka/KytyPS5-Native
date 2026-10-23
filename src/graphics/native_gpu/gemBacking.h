@@ -175,6 +175,9 @@ public:
 	// For the access-violation handler: true when a block is being moved into a GPU buffer (its
 	// views are write-protected meanwhile), after waiting until the move is done; the faulting write
 	// should then simply be retried. False, at once, otherwise. Async-signal-safe.
+	// For diagnostics: true while a block is being moved.
+	static bool WaitIfPromotingWouldWait() { return s_promoting.load(std::memory_order_acquire) != 0; }
+
 	static bool WaitIfPromoting() {
 		if (s_promoting.load(std::memory_order_acquire) == 0) {
 			return false;
