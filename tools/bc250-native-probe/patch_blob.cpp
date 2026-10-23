@@ -5,14 +5,17 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 int main(int argc, char** argv) {
-	if (argc != 3) {
-		std::fprintf(stderr, "usage: %s IN.bin OUT.bin\n", argv[0]);
+	if (argc != 4) {
+		std::fprintf(stderr, "usage: %s IN.bin OUT.bin NUM_VGPRS\n", argv[0]);
+		std::fprintf(stderr, "  NUM_VGPRS: VGPRs the shader allocates; the stubs use v[NUM_VGPRS] as scratch.\n");
 		return 1;
 	}
-	std::FILE* in = std::fopen(argv[1], "rb");
+	const uint32_t num_vgprs = static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10));
+	std::FILE*     in        = std::fopen(argv[1], "rb");
 	if (in == nullptr) {
 		std::perror(argv[1]);
 		return 1;
@@ -24,9 +27,10 @@ int main(int argc, char** argv) {
 	}
 	std::fclose(in);
 
-	const auto r = Libs::Graphics::NativeGpu::PatchDot2c(code);
-	std::printf("%zu dwords in, %zu out, %u patched, %u unsupported%s\n", code.size(), r.code.size(),
-	            r.patched_sites, r.unsupported_sites, r.decode_error ? ", DECODE ERROR" : "");
+	const auto r = Libs::Graphics::NativeGpu::PatchDot2c(code, num_vgprs);
+	std::printf("%zu dwords in, %zu out, %u patched, %u unsupported, +%u scratch vgpr (dispatch with >= %u vgprs)%s\n",
+	            code.size(), r.code.size(), r.patched_sites, r.unsupported_sites, r.scratch_vgprs,
+	            num_vgprs + r.scratch_vgprs, r.decode_error ? ", DECODE ERROR" : "");
 	if (r.decode_error) {
 		std::printf("undecodable instruction at dword %u: 0x%08x\n", r.decode_error_dw, code[r.decode_error_dw]);
 		return 2;
