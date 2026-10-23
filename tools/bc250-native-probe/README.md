@@ -147,3 +147,26 @@ devcoredump are the debugging path.
 run with `--blob`: unpatched every lane reads `0 0 0 0xabcd0123`; after `patch_blob` (3 sites
 patched, 22 -> 48 dwords) every lane reads `0x41b40000 0x41b40000 0x41200000 0xabcd0123`, the
 correct results. Unit tests: `native_gpu_shader_patcher_tests` (ctest `native_gpu_shader_patcher`).
+
+## Dead Cells PM4 census (2026-10-23, Vulkan-path baseline)
+
+Dead Cells (PPSA15552 01.005.000, the owner's dump) on the `bc250-barycentric` branch boots to
+the main menu at a steady 60 FPS on the BC-250 (about 170 draws per frame, 4 shaders, 2.1 GB of
+GPU memory). 25 s with `--command-buffer-dump` gave 1266 DCBs (one per frame), all in guest
+direct memory (`0x2_01c00000`), with this packet mix:
+
+| Packet | Count | Native path |
+|---|---:|---|
+| `SET_SH_REG` 0x76 | 329075 | as is |
+| `0x9F` (Kyty: SET_CONTEXT_REG_INDIRECT) | 164621 | Mesa: `LOAD_CONTEXT_REG_INDEX` (GFX8+), offset/value pairs in guest memory |
+| `0x64` (Kyty: SET_UCONFIG_REG_INDIRECT) | 162225 | not in Mesa; same layout as 0x63/0x9F. Only loads `VGT_PRIMITIVE_TYPE`, `GE_CNTL`, `GE_USER_VGPR_EN` (all RADV-written); translate to plain `SET_UCONFIG_REG` on the CPU instead of trusting the opcode |
+| `SET_UCONFIG_REG_INDEX` 0x7A | 162002 | `VGT_INDEX_TYPE` with index 2, standard |
+| `DRAW_INDEX_2` 0x27 | 162002 | as is |
+| `0x63` (Kyty: SET_SH_REG_INDIRECT) | 4640 | Mesa: `LOAD_SH_REG_INDEX` (GFX8+) |
+| `ACQUIRE_MEM` 0x58 | 1269 | as is |
+| `DISPATCH_DIRECT`, `EVENT_WRITE`, `CLEAR_STATE` | 6 / 4 / 1 | as is |
+| Kyty markers in `IT_NOP`: `R_FLIP`, `R_RELEASE_MEM`, `R_WAIT_FLIP_DONE` | 1 each per frame | the CP skips NOPs; the backend must turn them into present, a real `RELEASE_MEM` and a CPU-side wait |
+
+No other UCONFIG writes appear, so this title never touches the registers suspected in the
+`uconfig` crash.
+
