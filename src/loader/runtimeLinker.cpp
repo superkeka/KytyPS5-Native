@@ -50,6 +50,11 @@
 #endif
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
+
 namespace Libs::LibKernel {
 void SetProgName(const std::string& name);
 } // namespace Libs::LibKernel
@@ -707,6 +712,27 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		// Host frames as module+offset, so a crash in emulator code can be symbolized afterwards
+		// (llvm-symbolizer --obj=kyty_emulator 0xOFFSET) without knowing the PIE load base.
+		auto print_frame = [](const char* what, uint64_t addr) {
+			Dl_info dl {};
+			if (dladdr(reinterpret_cast<void*>(addr), &dl) != 0 && dl.dli_fname != nullptr) {
+				std::printf("  %s %016" PRIx64 " %s+0x%" PRIx64 "%s%s\n", what, addr, dl.dli_fname,
+				            addr - reinterpret_cast<uint64_t>(dl.dli_fbase), dl.dli_sname != nullptr ? " " : "",
+				            dl.dli_sname != nullptr ? dl.dli_sname : "");
+			} else {
+				std::printf("  %s %016" PRIx64 " (no module)\n", what, addr);
+			}
+		};
+		std::printf("host frames:\n");
+		print_frame("pc   ", info->exception_address);
+		void*     frames[32];
+		const int count = backtrace(frames, 32);
+		for (int i = 0; i < count; i++) {
+			print_frame("frame", reinterpret_cast<uint64_t>(frames[i]));
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64

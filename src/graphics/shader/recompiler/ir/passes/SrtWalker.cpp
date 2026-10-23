@@ -39,6 +39,10 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
 	} else {
+		// A null resource pointer in the SRT (ASTRO BOT: a compute DispatchIndirect, read at 0x58)
+		// lands in the first 64 KiB, where no guest memory is ever mapped; treat it as unreadable
+		// like the callback path does instead of faulting the host.
+		if (address < 0x10000u) return false;
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
 	capture.m_ranges.emplace_back(address, values.size_bytes());
