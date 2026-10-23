@@ -1,11 +1,13 @@
 #include "graphics/native_gpu/nativePm4.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <span>
 #include <vector>
 
+using Libs::Graphics::NativeGpu::GpuRef;
 using Libs::Graphics::NativeGpu::Pm4TranslateResult;
 using Libs::Graphics::NativeGpu::Pm4Translator;
 
@@ -23,6 +25,7 @@ constexpr uint32_t IT_NOP                      = 0x10;
 constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_DISPATCH_DIRECT          = 0x15;
 constexpr uint32_t IT_DRAW_INDEX_2             = 0x27;
+constexpr uint32_t IT_NUM_INSTANCES            = 0x2F;
 constexpr uint32_t IT_CONTEXT_CONTROL          = 0x28;
 constexpr uint32_t IT_EVENT_WRITE              = 0x46;
 constexpr uint32_t IT_ACQUIRE_MEM              = 0x58;
@@ -241,6 +244,10 @@ void TestUconfigWhitelist() {
 		index_type = index_type || (p.op == IT_SET_UCONFIG_REG_INDEX && p.body[0] == 0x20000243u);
 	}
 	Check(index_type, "VGT_INDEX_TYPE emitted with SET_UCONFIG_REG_INDEX index 2");
+	Check(Pm4Translator::UconfigAllowed(0x24Au) && Pm4Translator::UconfigAllowed(0x24Bu) &&
+	          Pm4Translator::UconfigAllowed(0x25Fu),
+	      "per-draw GE registers (index offset, primitive restart, stereo) allowed");
+	Check(!Pm4Translator::UconfigAllowed(0x342u), "unknown UCONFIG 0x342 stays dropped");
 }
 
 // GFX9+ only updates the CP's copy of VGT_PRIMITIVE_TYPE / VGT_INDEX_TYPE through
@@ -334,7 +341,13 @@ void TestDmaData() {
 	Check(!t.Translate(to_reg).ok, "DMA_DATA into the register space refused");
 	std::vector<uint32_t> gds;
 	Append(gds, 0x50u, {1u << 20u, 0x1000u, 0x2u, 0x0u, 0x0u, 4u}, false);
-	Check(!t.Translate(gds).ok, "DMA_DATA into GDS refused");
+	Check(!t.Translate(gds).ok, "DMA_DATA into GDS refused without a GDS partition");
+	t.SetGdsAvailable(true);
+	auto rg = t.Translate(gds);
+	Check(rg.ok && rg.stats.dma_data == 1, "DMA_DATA into GDS passed through with a GDS partition");
+	for (const auto& ref: rg.refs) {
+		Check(ref.addr != 0x0u, "a GDS destination is not a memory reference");
+	}
 }
 
 void TestWriteData() {
@@ -371,13 +384,33 @@ void TestPassthroughPackets() {
 	Append(dcb, IT_DISPATCH_DIRECT, {1, 1, 1, 0}, true);
 	Append(dcb, IT_EVENT_WRITE, {0, 0}, false);
 	Append(dcb, IT_CLEAR_STATE, {0}, false);
+	Append(dcb, IT_NUM_INSTANCES, {4}, false);
+	Append(dcb, 0x26u /* IT_INDEX_BASE */, {0x10000000u, 0x2u}, false);
+	Append(dcb, 0x13u /* IT_INDEX_BUFFER_SIZE */, {600u}, false);
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x20000000u, 0x2u}, false);
+	Append(dcb, 0x16u /* IT_DISPATCH_INDIRECT */, {0x40u, 1u}, true);
+	Append(dcb, 0x42u /* IT_PFP_SYNC_ME */, {0u}, false);
+	Append(dcb, 0x35u /* IT_DRAW_INDEX_OFFSET_2 */, {600u, 0u, 300u, 0u}, false);
 	auto r = t.Translate(dcb);
 	Check(r.ok, "passthrough DCB translates");
-	Check(r.stats.acquire_mem == 1 && r.stats.dispatches == 1 && r.stats.event_write == 1 &&
-	          r.stats.clear_state == 1,
+	Check(r.stats.acquire_mem == 1 && r.stats.dispatches == 2 && r.stats.event_write == 1 &&
+	          r.stats.clear_state == 1 && r.stats.num_instances == 1 && r.stats.index_state == 2 &&
+	          r.stats.set_base == 1 && r.stats.pfp_sync_me == 1 && r.stats.draws == 1,
 	      "passthrough packets counted");
 	auto pkts = Decode(r.ib);
-	Check(Count(pkts, IT_ACQUIRE_MEM) == 1 && Count(pkts, IT_DISPATCH_DIRECT) == 1, "present in IB");
+	Check(Count(pkts, IT_ACQUIRE_MEM) == 1 && Count(pkts, IT_DISPATCH_DIRECT) == 1 &&
+	          Count(pkts, IT_NUM_INSTANCES) == 1 && FindFirst(pkts, IT_NUM_INSTANCES)->body[0] == 4,
+	      "present in IB");
+	bool index_ref = false;
+	for (const auto& ref: r.refs) {
+		index_ref = index_ref || (ref.addr == 0x210000000ull && ref.size == 2400u);
+	}
+	Check(index_ref, "INDEX_BASE + INDEX_BUFFER_SIZE reported as a 2400-byte reference");
+	bool base_ref = false;
+	for (const auto& ref: r.refs) {
+		base_ref = base_ref || ref.addr == 0x220000000ull;
+	}
+	Check(base_ref, "SET_BASE address reported as a reference");
 }
 
 void TestUnknownRefused() {
@@ -400,9 +433,59 @@ void TestUnknownRefused() {
 	Append(dcb2, IT_DRAW_INDEX_2, {0, 0, 0, 0}, false);
 	auto r2 = t.Translate(dcb2);
 	Check(r2.ok && r2.stats.preamble_cx == 1, "shadow intact after refusal");
+
+	// Every unknown opcode of a refused DCB is reported, not just the first.
+	std::vector<uint32_t> many;
+	Append(many, 0xA1u, {0}, false);
+	Append(many, IT_SET_CONTEXT_REG, {0x9u, 0x5u}, false);
+	Append(many, 0xB2u, {0, 0}, false);
+	Append(many, 0xA1u, {0}, false);
+	auto r3 = t.Translate(many);
+	Check(!r3.ok && r3.unknown_op == 0xA1u && r3.unknown_dw == 0, "first unknown opcode and offset reported");
+	Check(r3.unknown_ops.size() == 2 && r3.unknown_ops.count(0xB2u) == 1, "all unknown opcodes collected");
+	Check(t.Translate(dcb2).stats.preamble_cx == 1, "shadow intact after a multi-unknown refusal");
 }
 
 } // namespace
+
+bool HasRef(const std::vector<GpuRef>& refs, uint64_t addr, uint64_t min_size, bool pointer) {
+	for (const auto& r: refs) {
+		if (r.addr == addr && r.size >= min_size && r.pointer == pointer) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void TestGpuRefs() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	// CB_COLOR0 at 0x2_0000_0000 (BASE = addr >> 8, BASE_EXT = 0), 1920x1080 via ATTRIB2.
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x02000000u}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x3B0u, ((1920u - 1u) << 14u) | (1080u - 1u)}, false);
+	// A user-data pair holding the 48-bit pointer 0x2_1234_5600 (SPI_SHADER_USER_DATA_PS_0/1).
+	Append(dcb, IT_SET_SH_REG, {0x0Cu, 0x12345600u, 0x00000002u}, false);
+	// DRAW_INDEX_2: MAX_SIZE 300 indices at 0x2_4000_0000.
+	Append(dcb, IT_DRAW_INDEX_2, {300u, 0x40000000u, 0x2u, 300u, 0u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok, "refs DCB translated");
+	Check(HasRef(r.refs, 0x200000000ull, 1920ull * 1080ull * 16ull, false), "render target ref sized from ATTRIB2");
+	Check(HasRef(r.refs, 0x212345600ull, 0, true), "user-data pair reported as a pointer candidate");
+	Check(HasRef(r.refs, 0x240000000ull, 1200, false), "index buffer ref from DRAW_INDEX_2");
+	Check(std::is_sorted(r.refs.begin(), r.refs.end()), "refs sorted");
+
+	// A second DCB with no register change still reports the live render target (state carries over),
+	// and only once per DCB.
+	std::vector<uint32_t> again;
+	Append(again, IT_DRAW_INDEX_2, {3u, 0x40000000u, 0x2u, 3u, 0u}, false);
+	Append(again, IT_DRAW_INDEX_2, {3u, 0x40000000u, 0x2u, 3u, 0u}, false);
+	auto r2 = t.Translate(again);
+	size_t rt = 0;
+	for (const auto& ref: r2.refs) {
+		rt += ref.addr == 0x200000000ull && !ref.pointer ? 1u : 0u;
+	}
+	Check(rt == 1, "carried-over render target reported once");
+}
 
 int main() {
 	TestNopsOnly();
@@ -419,6 +502,7 @@ int main() {
 	TestDmaData();
 	TestPassthroughPackets();
 	TestUnknownRefused();
+	TestGpuRefs();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

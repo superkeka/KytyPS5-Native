@@ -39,7 +39,11 @@ struct Pm4TranslateStats {
 	uint32_t loaded_sh_regs    = 0; // offset/value pairs expanded from 0x63
 	uint32_t loaded_uc_regs    = 0; // offset/value pairs expanded from 0x64
 	uint32_t draws             = 0; // IT_DRAW_INDEX_2
-	uint32_t dispatches        = 0; // IT_DISPATCH_DIRECT
+	uint32_t dispatches        = 0; // IT_DISPATCH_DIRECT / IT_DISPATCH_INDIRECT
+	uint32_t num_instances     = 0; // IT_NUM_INSTANCES passed through
+	uint32_t index_state       = 0; // IT_INDEX_BASE / IT_INDEX_BUFFER_SIZE passed through
+	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
+	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
 	uint32_t write_data_dropped = 0; // IT_WRITE_DATA to memory, left to Kyty (see Translate)
@@ -53,14 +57,34 @@ struct Pm4TranslateStats {
 	uint32_t preamble_uc       = 0; // UCONFIG registers emitted in the IB preamble
 };
 
+// A guest memory range the GPU may touch while running a translated DCB, for the backend's lazy
+// residency (gemBacking.h): only guest memory the GPU can reach has to be a GPU buffer. The
+// translator reports candidates generously; the backend keeps the ones that fall into guest
+// direct memory. A `pointer` candidate is a 64-bit address taken from shader user data, i.e.
+// possibly a resource table that holds further descriptors; the backend reads it and follows the
+// addresses it finds.
+struct GpuRef {
+	uint64_t addr    = 0;
+	uint64_t size    = 0;
+	bool     pointer = false;
+
+	bool operator<(const GpuRef& o) const {
+		return addr != o.addr ? addr < o.addr : (size != o.size ? size < o.size : pointer < o.pointer);
+	}
+	bool operator==(const GpuRef& o) const { return addr == o.addr && size == o.size && pointer == o.pointer; }
+};
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
 	uint32_t              unknown_dw = 0;     // its dword offset in the DCB
+	std::set<uint32_t>    unknown_ops;        // every untranslatable opcode in the DCB
+	std::vector<uint32_t> unknown_detail;     // leading body dwords of a refused known packet
 	std::vector<uint32_t> ib;                 // the self-contained IB (empty when !ok)
 	Pm4TranslateStats     stats;
 	std::vector<uint64_t> shader_addrs;       // shader base VAs from PGM_LO writes this DCB
 	std::set<uint32_t>    skipped_uconfig;    // non-whitelisted UCONFIG offsets dropped this DCB
+	std::vector<GpuRef>   refs;               // guest memory the DCB's draws/dispatches may touch
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -93,6 +117,10 @@ public:
 	// register space), for comparing against the state Kyty sees.
 	void DumpShadow(std::FILE* f) const;
 
+	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
+	// (NativeSubmitter::HasGds), otherwise such packets are refused.
+	void SetGdsAvailable(bool available) { m_gds = available; }
+
 	// UCONFIG registers the backend is allowed to write. Everything else is dropped, because one
 	// experiment writing other UCONFIG registers froze the whole board (see the probe README).
 	static bool UconfigAllowed(uint32_t normalized_offset);
@@ -103,6 +131,7 @@ private:
 	std::map<uint32_t, uint32_t> m_cx; // context registers (SET_CONTEXT_REG space)
 	std::map<uint32_t, uint32_t> m_sh; // SH registers (SET_SH_REG space)
 	std::map<uint32_t, uint32_t> m_uc; // whitelisted UCONFIG registers
+	bool                         m_gds = false;
 };
 
 } // namespace Libs::Graphics::NativeGpu

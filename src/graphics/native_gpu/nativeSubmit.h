@@ -13,6 +13,7 @@
 #include <ctime>
 #include <span>
 #include <vector>
+#include <algorithm>
 
 namespace Libs::Graphics::NativeGpu {
 
@@ -58,10 +59,17 @@ public:
 			delete self;
 			return nullptr;
 		}
+		self->CreateGds();
 		return self;
 	}
 
 	~NativeSubmitter() {
+		for (uint32_t h: m_gds_handles) {
+			struct drm_gem_close c;
+			std::memset(&c, 0, sizeof(c));
+			c.handle = h;
+			Ioctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &c);
+		}
 		if (m_ib_va != 0) {
 			VaOp(AMDGPU_VA_OP_UNMAP, m_ib_handle, m_ib_va);
 		}
@@ -84,6 +92,11 @@ public:
 	}
 
 	[[nodiscard]] uint64_t ScratchVa() const { return m_ib_va + kIbSize - kScratchSize; }
+
+	// True when every submission owns the GFX partition of GDS (and its GWS and OA), so guest
+	// packets and shaders that use GDS can run natively.
+	[[nodiscard]] bool HasGds() const { return m_gds_size != 0; }
+	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
 	[[nodiscard]] volatile uint8_t* ScratchCpu() const {
 		return static_cast<volatile uint8_t*>(m_ib_cpu) + kIbSize - kScratchSize;
 	}
@@ -109,6 +122,11 @@ public:
 		std::memset(&e, 0, sizeof(e));
 		e.bo_handle = m_ib_handle;
 		entries.push_back(e);
+		// A GDS, GWS or OA buffer in the list is what gives the job its GDS partition.
+		for (uint32_t h: m_gds_handles) {
+			e.bo_handle = h;
+			entries.push_back(e);
+		}
 		for (uint32_t h: bo_handles) {
 			e.bo_handle = h;
 			entries.push_back(e);
@@ -262,6 +280,54 @@ private:
 		return true;
 	}
 
+	// Allocates the whole GFX partition of GDS and its GWS and OA resources once. PS5 titles address
+	// GDS directly (counters, ordered append), so the native jobs need the same partition from offset
+	// 0. Optional: without it, packets that use GDS stay untranslated.
+	void CreateGds() {
+		struct drm_amdgpu_info_gds gds;
+		std::memset(&gds, 0, sizeof(gds));
+		struct drm_amdgpu_info request;
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer = reinterpret_cast<uintptr_t>(&gds);
+		request.return_size    = sizeof(gds);
+		request.query          = AMDGPU_INFO_GDS_CONFIG;
+		const bool queried = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) == 0;
+		// Newer kernels report GDS only through the compute-partition and total fields (the GFX
+		// partition fields read 0), so take the largest of each.
+		const uint32_t gds_size = std::max({gds.gds_gfx_partition_size, gds.compute_partition_size, gds.gds_total_size});
+		const uint32_t gws_size = std::max(gds.gws_per_gfx_partition, gds.gws_per_compute_partition);
+		const uint32_t oa_size  = std::max(gds.oa_per_gfx_partition, gds.oa_per_compute_partition);
+		if (!queried || gds_size == 0) {
+			std::fprintf(stderr, "NativeSubmitter: no GDS config, GDS packets stay untranslated\n");
+			return;
+		}
+		const struct {
+			uint32_t domain;
+			uint64_t size;
+		} parts[] = {{AMDGPU_GEM_DOMAIN_GDS, gds_size}, {AMDGPU_GEM_DOMAIN_GWS, gws_size}, {AMDGPU_GEM_DOMAIN_OA, oa_size}};
+		for (const auto& part: parts) {
+			if (part.size == 0) {
+				continue;
+			}
+			union drm_amdgpu_gem_create c;
+			std::memset(&c, 0, sizeof(c));
+			c.in.bo_size   = part.size;
+			c.in.alignment = 1;
+			c.in.domains   = part.domain;
+			if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) != 0) {
+				std::fprintf(stderr, "NativeSubmitter: GEM_CREATE in domain 0x%x (%llu) failed: %s\n", part.domain,
+				             static_cast<unsigned long long>(part.size), std::strerror(errno));
+				continue;
+			}
+			m_gds_handles.push_back(c.out.handle);
+			if (part.domain == AMDGPU_GEM_DOMAIN_GDS) {
+				m_gds_size = static_cast<uint32_t>(part.size);
+			}
+		}
+		std::fprintf(stderr, "NativeSubmitter: GDS %u bytes, GWS %u, OA %u allocated for every job\n", m_gds_size,
+		             gws_size, oa_size);
+	}
+
 	bool ContextReset() const {
 		union drm_amdgpu_ctx ctx;
 		std::memset(&ctx, 0, sizeof(ctx));
@@ -278,6 +344,8 @@ private:
 	uint32_t m_ib_handle = 0;
 	void*    m_ib_cpu    = nullptr;
 	uint64_t m_ib_va     = 0;
+	std::vector<uint32_t> m_gds_handles; // GDS, GWS and OA buffers listed in every submission
+	uint32_t              m_gds_size = 0;
 };
 
 } // namespace Libs::Graphics::NativeGpu

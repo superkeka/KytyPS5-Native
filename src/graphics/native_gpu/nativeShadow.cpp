@@ -6,6 +6,7 @@
 
 #include "kernel/memory.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +16,11 @@
 #include <mutex>
 #include <set>
 #include <span>
+#include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace Libs::Graphics::NativeGpu {
 
@@ -72,12 +77,24 @@ public:
 		}
 
 		if (!result.ok) {
+			for (uint32_t op: result.unknown_ops) {
+				if (m_unknown_ops.insert(op).second) {
+					std::fprintf(stderr, "native shadow: untranslatable packet op 0x%02x (first in frame %llu)\n", op,
+					             static_cast<unsigned long long>(frame));
+				}
+			}
 			if (m_refused < 8) {
 				std::fprintf(stderr,
 				             "native shadow: frame %llu refused, unknown packet op 0x%02x at dw %u "
-				             "(%u packets translated)\n",
+				             "(%u packets translated)%s",
 				             static_cast<unsigned long long>(frame), result.unknown_op,
-				             result.unknown_dw, result.stats.packets);
+				             result.unknown_dw, result.stats.packets, result.unknown_detail.empty() ? "\n" : ", body");
+				for (uint32_t v: result.unknown_detail) {
+					std::fprintf(stderr, " 0x%08x", v);
+				}
+				if (!result.unknown_detail.empty()) {
+					std::fprintf(stderr, "\n");
+				}
 			}
 			m_refused++;
 			return;
@@ -87,9 +104,15 @@ public:
 		if (m_submitter == nullptr) {
 			return;
 		}
+		// Guest direct memory is resident on the GPU only where needed (gemBacking.h): before the IB
+		// runs, promote what the CPU has written and what this DCB references.
+		const double t_residency = NowSecShadow();
+		MakeResident(result);
+		m_residency_ms_total += (NowSecShadow() - t_residency) * 1e3;
+
 		// Every GEM buffer the GPU may touch must be resident in the submission: the kernel only
 		// validates and fences buffers that are listed, so a userptr one left out could have its pages
-		// migrated under a live GPU access. CreatedHandles() is the direct-memory chunks plus the
+		// migrated under a live GPU access. CreatedHandles() is the resident blocks, the dummy and the
 		// readable external slices (CPU stacks are never bound, so they are not here).
 		std::vector<uint32_t> handles = m_gem->CreatedHandles();
 
@@ -120,6 +143,9 @@ public:
 			wrapped.push_back(0xffff1000u);
 		}
 		std::span<const uint32_t> ib = wrapped;
+		if (!m_breadcrumbs.empty()) {
+			WriteBreadcrumb(frame, dcb, result, ib);
+		}
 		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
 
 		const bool detail = frame < 3 || (frame % 120 == 0);
@@ -143,6 +169,15 @@ public:
 		}
 
 		m_completed++;
+		if (m_completed % 30 == 0 && m_gem->DummyWritten()) {
+			m_dummy_writes++;
+			if (m_dummy_writes <= 8) {
+				std::fprintf(stderr,
+				             "native shadow: frame %llu: the GPU wrote to guest memory that was not "
+				             "resident (a reference the translator missed)\n",
+				             static_cast<unsigned long long>(frame));
+			}
+		}
 		m_gpu_ms_total += r.seconds * 1e3;
 		const double gpu_ms = GpuMs();
 		m_cs_ms_total += r.cs_seconds * 1e3;
@@ -170,10 +205,12 @@ public:
 		if (m_completed > 0 && m_completed % 120 == 0) {
 			const double n = static_cast<double>(m_completed);
 			std::fprintf(stderr,
-			             "native shadow: avg per frame: translate %.2f ms, CS ioctl %.2f ms, GPU %.2f ms, "
-			             "submit->fence %.2f ms\n",
-			             m_translate_ms_total / n, m_cs_ms_total / n, m_gpu_only_ms_total / n,
-			             m_gpu_ms_total / n);
+			             "native shadow: avg per frame: translate %.2f ms, residency %.2f ms, CS ioctl %.2f ms, "
+			             "GPU %.2f ms, submit->fence %.2f ms; %llu MiB of guest memory resident, %u dummy "
+			             "writes seen\n",
+			             m_translate_ms_total / n, m_residency_ms_total / n, m_cs_ms_total / n,
+			             m_gpu_only_ms_total / n, m_gpu_ms_total / n,
+			             static_cast<unsigned long long>(m_gem->ResidentBytes() >> 20u), m_dummy_writes);
 			std::fprintf(stderr,
 			             "native shadow: %llu frames completed, avg gpu(submit->fence) %.2f ms, "
 			             "%u shaders scanned, %u v_dot2c_f32_f16 sites\n",
@@ -187,6 +224,121 @@ public:
 	}
 
 private:
+#if KYTY_GEM_BACKING_SUPPORTED
+	// KYTY_NATIVE_GPU_BREADCRUMBS: a GPU hang on this board can take the whole machine down before
+	// any log reaches the disk, so before each submission the guest DCB, the IB about to run and a
+	// summary are written and synced: after a power cycle, last.txt names the submission that hung
+	// and dcb_<n>.bin / ib_<n>.bin (the last four, n = frame % 4) hold it.
+	void WriteBreadcrumb(uint64_t frame, std::span<const uint32_t> dcb, const Pm4TranslateResult& result,
+	                     std::span<const uint32_t> ib) const {
+		auto write_file = [&](const std::string& name, const void* data, size_t bytes) {
+			const std::string path = m_breadcrumbs + "/" + name;
+			const int         fd   = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+			if (fd < 0) {
+				return;
+			}
+			const auto* p = static_cast<const char*>(data);
+			while (bytes > 0) {
+				const ssize_t n = ::write(fd, p, bytes);
+				if (n <= 0) {
+					break;
+				}
+				p += n;
+				bytes -= static_cast<size_t>(n);
+			}
+			::fdatasync(fd);
+			::close(fd);
+		};
+		const unsigned slot = static_cast<unsigned>(frame % 4u);
+		write_file("dcb_" + std::to_string(slot) + ".bin", dcb.data(), dcb.size_bytes());
+		write_file("ib_" + std::to_string(slot) + ".bin", ib.data(), ib.size_bytes());
+		char summary[512];
+		const int n = std::snprintf(summary, sizeof(summary),
+		                            "frame %llu slot %u: dcb %zu dw, ib %zu dw, %u draws, %u dispatches, %u dma, "
+		                            "%u set_base, %llu MiB resident\n",
+		                            static_cast<unsigned long long>(frame), slot, dcb.size(), ib.size(),
+		                            result.stats.draws, result.stats.dispatches, result.stats.dma_data,
+		                            result.stats.set_base, static_cast<unsigned long long>(m_gem->ResidentBytes() >> 20u));
+		write_file("last.txt", summary, static_cast<size_t>(n));
+	}
+
+	// Makes resident, before `result`'s IB runs: every block the CPU has written, every shader, and
+	// every reference the translator reported that lies in guest direct memory. Pointer candidates
+	// from shader user data are followed two levels deep (resource tables, and tables of tables),
+	// scanning each table for 48-bit buffer pointers (V#, whose dwords 1-2 give stride and record
+	// count, so the whole buffer is promoted) and 40-bit image bases (T#).
+	void MakeResident(const Pm4TranslateResult& result) {
+		constexpr uint64_t kTableSpan = 4096;
+		constexpr uint64_t kImageSpan = 32ull << 20u;
+		constexpr uint64_t kBufferCap = 64ull << 20u;
+		constexpr size_t   kMaxTables = 2048;
+		constexpr uint32_t kBucketShift = 24; // 16 MiB guest-address buckets, the block size
+		m_gem->PromoteTouched();
+
+		// Membership tests run thousands of times per frame: binary search over a cached copy of the
+		// view ranges, refreshed when the views change (which also forgets which buckets are known
+		// to be resident).
+		if (const uint64_t gen = m_gem->ViewsGeneration(); gen != m_views_generation) {
+			m_view_ranges      = m_gem->ViewRanges();
+			m_views_generation = gen;
+			m_resident_buckets.clear();
+		}
+		auto backed = [&](uint64_t addr) {
+			auto it = std::upper_bound(m_view_ranges.begin(), m_view_ranges.end(),
+			                           std::make_pair(addr, ~0ull));
+			return it != m_view_ranges.begin() && addr < std::prev(it)->second;
+		};
+		auto promote = [&](uint64_t addr, uint64_t size) {
+			for (uint64_t b = addr >> kBucketShift; b <= (addr + size - 1) >> kBucketShift; b++) {
+				if (m_resident_buckets.insert(b).second) {
+					m_gem->PromoteGuestRange(b << kBucketShift, 1ull << kBucketShift);
+				}
+			}
+		};
+
+		for (uint64_t addr: result.shader_addrs) {
+			if (backed(addr)) {
+				promote(addr, 64u * 1024u);
+			}
+		}
+		std::vector<uint64_t> tables;
+		for (const auto& ref: result.refs) {
+			if (backed(ref.addr)) {
+				promote(ref.addr, ref.size != 0 ? ref.size : kTableSpan);
+				if (ref.pointer) {
+					tables.push_back(ref.addr);
+				}
+			}
+		}
+		std::set<uint64_t> seen;
+		for (int depth = 0; depth < 2 && !tables.empty(); depth++) {
+			std::vector<uint64_t> next;
+			for (uint64_t table: tables) {
+				if (seen.size() >= kMaxTables || !seen.insert(table).second) {
+					continue;
+				}
+				uint32_t     d[64];
+				const size_t n = m_gem->ReadGuest(table, d, sizeof(d)) / 4;
+				for (size_t i = 0; i + 1 < n; i++) {
+					const uint64_t ptr = d[i] | (static_cast<uint64_t>(d[i + 1] & 0xffffu) << 32u);
+					if (ptr != 0 && backed(ptr)) {
+						const uint64_t stride  = (d[i + 1] >> 16u) & 0x3fffu;
+						const uint64_t records = i + 2 < n ? d[i + 2] : 0;
+						const uint64_t bytes   = stride != 0 ? stride * records : records;
+						promote(ptr, std::clamp<uint64_t>(bytes, kTableSpan, kBufferCap));
+						next.push_back(ptr);
+					}
+					const uint64_t image = (d[i] | (static_cast<uint64_t>(d[i + 1] & 0xffu) << 32u)) << 8u;
+					if (image != 0 && backed(image)) {
+						promote(image, kImageSpan);
+					}
+				}
+			}
+			tables = std::move(next);
+		}
+	}
+#endif
+
 	// Pipeline statistics: 11 64-bit counters per sample on GFX10, in hardware slot order
 	// (RADV pipeline_statistics_indices): PS invocations, clipper primitives, clipper invocations,
 	// VS invocations, GS invocations, GS primitives, IA primitives, IA vertices, HS, DS, CS.
@@ -282,6 +434,10 @@ private:
 		}
 		m_translator.SeedPs5Defaults();
 		m_stats = EnvOn("KYTY_NATIVE_GPU_STATS");
+		if (const char* dir = std::getenv("KYTY_NATIVE_GPU_BREADCRUMBS"); dir != nullptr && dir[0] != '\0') {
+			m_breadcrumbs = dir;
+			std::fprintf(stderr, "native shadow: breadcrumbs (every submission synced to disk) in %s\n", dir);
+		}
 
 		if (const char* d = std::getenv("KYTY_NATIVE_GPU_DUMP_REGS"); d != nullptr && d[0] != '\0') {
 			m_dump_regs_frame = std::atoll(d);
@@ -309,6 +465,7 @@ private:
 			std::fprintf(stderr, "native shadow: submitter init failed; staying off.\n");
 			return;
 		}
+		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_enabled = true;
 		std::fprintf(stderr, "native shadow: enabled (gfx-ring shadow submission, %.1f s timeout)\n",
 		             m_timeout_sec);
@@ -359,6 +516,7 @@ private:
 	bool          m_stats          = false;
 	uint32_t      m_stats_logged   = 0;
 	int64_t       m_dump_regs_frame = -1;
+	std::string   m_breadcrumbs; // KYTY_NATIVE_GPU_BREADCRUMBS directory, empty when off
 	uint64_t      m_frames         = 0;
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
@@ -366,6 +524,14 @@ private:
 	double        m_cs_ms_total    = 0.0;
 	double        m_gpu_only_ms_total = 0.0;
 	double        m_translate_ms_total = 0.0;
+	double        m_residency_ms_total = 0.0;
+#if KYTY_GEM_BACKING_SUPPORTED
+	uint64_t                                   m_views_generation = ~0ull;
+	std::vector<std::pair<uint64_t, uint64_t>> m_view_ranges;
+	std::set<uint64_t>                         m_resident_buckets; // 16 MiB guest buckets already promoted
+#endif
+	uint32_t      m_dummy_writes       = 0;
+	std::set<uint32_t> m_unknown_ops;
 	double        m_timeout_sec    = kDefaultTimeoutSec;
 	uint32_t      m_shaders_scanned = 0;
 	uint32_t      m_dot2c_sites    = 0;
