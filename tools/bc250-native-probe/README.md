@@ -55,3 +55,28 @@ distrobox enter bc250-mesa-dev -- make
 - dma-buf export: VRAM and GTT ok, userptr `EPERM`. Presentable surfaces must be GEM buffers.
 - Submission: 8.3 us per CS ioctl, 31 us round trip for an empty IB.
 - No amdgpu messages in the kernel log and no context reset after any probe.
+
+## Dangerous cases
+
+Run one at a time with `--danger CASE`, only with the owner's approval.
+
+| Case | What it does |
+|---|---|
+| `vmfault` | one wave64 stores 256 bytes to the unmapped VA `0x900000000`, then a normal store checks the GPU |
+
+### `vmfault` result (2026-10-23, run once with approval)
+
+- The write faults (`GCVM_L2_PROTECTION_FAULT_STATUS 0x00541050`, client TCP, `RW=1`) and the
+  wave does **not** retire: on this setup a write to an unmapped page hangs the job instead of
+  being dropped.
+- After ~10 s amdgpu times the job out (`ring comp_1.1.0 timeout`), writes a devcoredump and
+  resets only that compute queue (`Ring comp_1.1.0 reset succeeded`, "device wedged, but
+  recovered through reset"). No full GPU reset, no board reset; the display and other
+  processes were unaffected.
+- `AMDGPU_INFO_GPUVM_FAULT` reports the fault to user space (`addr 0x900000000`), so a native
+  backend can name the bad guest address itself.
+- The follow-up store on the same context and a full `dispatch` + `submit` re-run passed.
+
+For the backend this means a single bad guest address costs a ~10 s freeze of that queue, not
+the machine: every guest range must be mapped before submission, and the fault query plus the
+devcoredump are the debugging path.

@@ -916,14 +916,75 @@ static void ProbeSubmitLatency(Device* d, Common* c) {
 	       t_batch / n * 1e6, t_rt / 200 * 1e6);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Dangerous cases: each one may fault, hang or reset the GPU. Never part of the default run;
+// each needs its own --danger NAME and the board owner's explicit approval.
+
+static void PrintGpuvmFault(Device* d, const char* when) {
+	struct drm_amdgpu_info_gpuvm_fault f;
+	memset(&f, 0, sizeof(f));
+	int r = QueryInfo(d, AMDGPU_INFO_GPUVM_FAULT, &f, sizeof(f), 0);
+	if (r != 0) {
+		printf("  last gpuvm fault (%s): query failed: %s\n", when, ErrStr(r));
+		return;
+	}
+	printf("  last gpuvm fault (%s): addr 0x%" PRIx64 " status 0x%x vmhub %u\n", when, (uint64_t)f.addr, f.status,
+	       f.vmhub);
+}
+
+// One wave64 stores 64 dwords (one 256-byte run, a single page) to a GPU VA that has no
+// mapping, then a normal store checks that the GPU still works.
+static bool DangerVmFault(Device* d, Common* c) {
+	const uint64_t unmapped = 0x0900000000ull;
+	printf("== danger vmfault: wave64 store of 256 bytes to unmapped VA 0x%" PRIx64 "\n", unmapped);
+	PrintGpuvmFault(d, "before");
+
+	LoadCode(c, k_store_w64, sizeof(k_store_w64));
+	uint32_t ud[3] = {(uint32_t)unmapped, (uint32_t)(unmapped >> 32), 0x5000000u};
+	Dispatch p     = {c->code.va, 64, 8, 3, true, 64, 1, ud};
+	Ib       ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo*      bos[] = {&c->code};
+	uint64_t seq   = 0;
+	double   t0    = NowSec();
+	int      r     = Submit(d, &c->ib, &ib, bos, 1, &seq);
+	if (r != 0) {
+		printf("  submit failed: %s\n", ErrStr(r));
+		return false;
+	}
+	// Longer than amdgpu's 5 s lockup timeout, so a hang shows up as a reset, not as our timeout.
+	r             = Wait(d, seq, 10.0);
+	double  t     = NowSec() - t0;
+	int64_t state = ContextState(d);
+	printf("  faulting job: %s after %.1f ms, context state 0x%" PRIx64 "\n",
+	       r == 0 ? "signaled" : (r == 1 ? "TIMEOUT" : ErrStr(r)), t * 1e3, (uint64_t)state);
+	PrintGpuvmFault(d, "after");
+	if (state != 0) {
+		return false;
+	}
+
+	Bo dst;
+	r = MemCreate(d, &dst, MEM_GTT, 2 * MiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &dst, 0x0200000000ull, 0);
+	}
+	bool ok = r == 0 && StoreAndCheck(d, c, &dst, &c->code, 64, 64);
+	printf("  follow-up store on the same context: %s\n", ok ? "ok" : "FAILED");
+	BoDestroy(d, &dst);
+	return ok;
+}
+
 static void Usage(const char* argv0) {
-	printf("usage: %s [--device PATH] [--max-alloc-gib N] [probe...]\n", argv0);
+	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [probe...]\n", argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit (default: all)\n");
+	printf("danger cases (owner approval required, run alone): vmfault\n");
 }
 
 int main(int argc, char** argv) {
 	const char* path        = "/dev/dri/renderD128";
 	uint64_t    max_alloc   = 4 * GiB;
+	const char* danger      = NULL;
 	const char* selected[16];
 	int         num_selected = 0;
 	for (int i = 1; i < argc; i++) {
@@ -931,6 +992,8 @@ int main(int argc, char** argv) {
 			path = argv[++i];
 		} else if (strcmp(argv[i], "--max-alloc-gib") == 0 && i + 1 < argc) {
 			max_alloc = strtoull(argv[++i], NULL, 10) * GiB;
+		} else if (strcmp(argv[i], "--danger") == 0 && i + 1 < argc) {
+			danger = argv[++i];
 		} else if (strcmp(argv[i], "--help") == 0) {
 			Usage(argv[0]);
 			return 0;
@@ -948,6 +1011,17 @@ int main(int argc, char** argv) {
 	if (r != 0) {
 		fprintf(stderr, "common buffers: %s\n", ErrStr(r));
 		return 1;
+	}
+	if (danger != NULL) {
+		if (strcmp(danger, "vmfault") != 0) {
+			fprintf(stderr, "unknown danger case '%s'\n", danger);
+			return 1;
+		}
+		bool ok = DangerVmFault(&d, &c);
+		BoDestroy(&d, &c.code);
+		BoDestroy(&d, &c.ib);
+		close(d.fd);
+		return ok ? 0 : 2;
 	}
 	static const char* const order[] = {"info",      "va",        "alloc",  "dispatch", "identity",
 	                                    "bandwidth", "coherency", "dmabuf", "submit"};
