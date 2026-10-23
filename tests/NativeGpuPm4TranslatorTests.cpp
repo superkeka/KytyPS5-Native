@@ -540,6 +540,30 @@ void TestIndirectDraws() {
 	Check(Count(pkts, 0x25u) == 1 && Count(pkts, 0x8Eu) == 0, "indirect draw kept, LOD statistics dropped");
 }
 
+void TestContextStatePushPop() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	auto marker = [&](uint32_t operation) {
+		// Kyty's R_CONTEXT_STATE NOP: type-3 NOP whose header bits 7:2 carry the marker.
+		dcb.push_back((3u << 30u) | (1u << 16u) | (0x10u << 8u) | (0x1Au << 2u));
+		dcb.push_back(operation);
+		dcb.push_back(0u);
+	};
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x1111u}, false); // CB_COLOR0_BASE before the push
+	marker(1);                                                // push
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x2222u}, false); // an inner pass changes it
+	marker(2);                                                // pop
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.context_ops == 2, "context push/pop markers applied");
+	uint32_t last = 0;
+	for (const auto& p: Decode(r.ib)) {
+		if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x318u) {
+			last = p.body[1];
+		}
+	}
+	Check(last == 0x1111u, "the pop restores the pushed CB_COLOR0_BASE");
+}
+
 void TestContextDefaults() {
 	Pm4Translator t;
 	t.SeedPs5Defaults();
@@ -625,6 +649,7 @@ int main() {
 	TestFmaskFix();
 	TestComputeQueueDispatchIndirect();
 	TestIndirectDraws();
+	TestContextStatePushPop();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

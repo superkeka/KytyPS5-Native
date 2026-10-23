@@ -1,6 +1,10 @@
 #include "graphics/native_gpu/nativePm4.h"
 
 #include <algorithm>
+#if defined(__linux__)
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
 
 namespace Libs::Graphics::NativeGpu {
 
@@ -42,6 +46,7 @@ constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT = 0x9F;
 constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
+constexpr uint32_t R_CONTEXT_STATE  = 0x1A; // Kyty's marker for Agc context-state push/pop/clear
 
 // High bits of a register offset select an indexed SET variant; the register itself is the rest.
 constexpr uint32_t kRegisterSelectorMask = 0x70000000u;
@@ -248,6 +253,7 @@ void Pm4Translator::DumpShadow(std::FILE* f) const {
 void Pm4Translator::SeedContextDefaults(std::span<const std::pair<uint32_t, uint32_t>> defaults) {
 	for (const auto& [offset, value]: defaults) {
 		m_cx.emplace(offset, value);
+		m_cx_defaults.emplace(offset, value);
 	}
 }
 
@@ -269,6 +275,7 @@ void Pm4Translator::SeedPs5Defaults() {
 	};
 	for (const auto& d: kDefaults) {
 		m_cx.emplace(d.offset, d.value);
+		m_cx_defaults.emplace(d.offset, d.value);
 	}
 }
 
@@ -318,7 +325,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 
 	// A scratch copy of the shadow so a refusal mid-DCB does not leave it half-updated.
 	// (Unknown packets are collected in r.unknown_ops and refuse the DCB once the walk is done.)
-	auto cx = m_cx;
+	auto cx        = m_cx;
+	auto saved_cx  = m_saved_cx;
+	bool cx_pushed = m_cx_pushed;
 	auto sh = m_sh;
 	auto uc = m_uc;
 
@@ -378,7 +387,90 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		add_ref(static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi & 0xffffu) << 32u), 0, true);
 		add_ref((static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi & 0xffu) << 32u)) << 8u, kTextureSpan, false);
 	};
+	// SetFindRange diagnostics. Guest VA == host VA, but a stale pointer must not crash the emulator,
+	// so tables are read with process_vm_readv on ourselves (EFAULT instead of SIGSEGV).
+	uint32_t cur_op = 0;
+	auto read_safe = [](uint64_t addr, uint32_t* dst, size_t dwords) -> size_t {
+#if defined(__linux__)
+		struct iovec local  = {dst, dwords * 4};
+		struct iovec remote = {reinterpret_cast<void*>(addr), dwords * 4};
+		const ssize_t n     = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+		return n > 0 ? static_cast<size_t>(n) / 4 : 0;
+#else
+		(void)addr;
+		(void)dst;
+		(void)dwords;
+		return 0;
+#endif
+	};
+	auto find_refs = [&]() {
+		const bool dispatch = cur_op == IT_DISPATCH_DIRECT || cur_op == IT_DISPATCH_INDIRECT;
+		auto in_range = [&](uint64_t a) { return a >= m_find_lo && a < m_find_hi; };
+		auto pgm = [&](uint32_t lo_off) {
+			return (static_cast<uint64_t>(reg(sh, lo_off)) << 8u) | (static_cast<uint64_t>(reg(sh, lo_off + 1)) << 40u);
+		};
+		FindHit base;
+		base.dispatch = dispatch;
+		base.index    = dispatch ? stats.dispatches : stats.draws;
+		base.shader   = dispatch ? pgm(0x20C) : pgm(0x008);
+		base.es       = dispatch ? 0 : pgm(0x0C8);
+		auto check = [&](uint32_t lo, uint32_t hi, FindHit at) {
+			const uint64_t image = (static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi & 0xffu) << 32u)) << 8u;
+			const uint64_t ptr   = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi & 0xffffu) << 32u);
+			if (in_range(image)) {
+				at.target = image;
+				at.image  = true;
+				r.find_hits.push_back(at);
+			} else if (in_range(ptr)) {
+				at.target = ptr;
+				r.find_hits.push_back(at);
+			}
+		};
+		auto plausible = [](uint64_t p) { return p >= 0x100000000ull && p < 0x10000000000ull && (p & 3u) == 0; };
+		std::vector<uint32_t> regs;
+		if (dispatch) {
+			for (uint32_t o = 0x240; o < 0x250; o++) regs.push_back(o);
+		} else {
+			for (uint32_t o = 0x00C; o < 0x02C; o++) regs.push_back(o);
+			for (uint32_t o = 0x08C; o < 0x0AC; o++) regs.push_back(o);
+		}
+		std::set<uint64_t> visited;
+		for (uint32_t o: regs) {
+			if (sh.count(o) == 0 || sh.count(o + 1) == 0) {
+				continue;
+			}
+			FindHit at  = base;
+			at.user_reg = o;
+			check(reg(sh, o), reg(sh, o + 1), at);
+			std::vector<uint64_t> tables {static_cast<uint64_t>(reg(sh, o)) | (static_cast<uint64_t>(reg(sh, o + 1) & 0xffffu) << 32u)};
+			for (uint32_t depth = 1; depth <= 2 && !tables.empty(); depth++) {
+				std::vector<uint64_t> next;
+				for (uint64_t t: tables) {
+					if (!plausible(t) || visited.size() > 4096 || !visited.insert(t).second) {
+						continue;
+					}
+					// The first level may be a bindless descriptor heap: read 64 KiB of it.
+					static thread_local std::vector<uint32_t> d(16384);
+					const size_t n = read_safe(t, d.data(), depth == 1 ? 16384 : 128);
+					for (size_t j = 0; j + 1 < n; j++) {
+						at.depth = depth;
+						at.table = t;
+						at.word  = static_cast<uint32_t>(j);
+						check(d[j], d[j + 1], at);
+						const uint64_t p = static_cast<uint64_t>(d[j]) | (static_cast<uint64_t>(d[j + 1] & 0xffffu) << 32u);
+						if (depth < 2 && plausible(p) && next.size() < 64) {
+							next.push_back(p);
+						}
+					}
+				}
+				tables = std::move(next);
+			}
+		}
+	};
 	auto collect_refs = [&]() {
+		if (m_find_hi > m_find_lo) {
+			find_refs();
+		}
 		if (all_sh_dirty) {
 			for (const auto& [off, value]: sh) {
 				dirty_sh.push_back(off);
@@ -475,6 +567,51 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 
+	// Switches the context registers to `next` (a pop, a clear): the registers that change are set
+	// again, those `next` lacks go back to 0.
+	auto switch_context = [&](const std::map<uint32_t, uint32_t>& next) {
+		for (const auto& [off, value]: next) {
+			auto it = cx.find(off);
+			if (it == cx.end() || it->second != value) {
+				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
+				mark_cx(off);
+			}
+		}
+		for (const auto& [off, value]: cx) {
+			if (next.count(off) == 0 && value != 0) {
+				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, 0), false);
+				mark_cx(off);
+			}
+		}
+		cx = next;
+	};
+	// Agc context-state operations (AgcDcbContextStateOp, emulated by Kyty's command processor):
+	// 0 clear to the defaults, 1 push, 2 pop, 3 push then clear. The PS5 packets behind them save and
+	// restore the context registers; here the shadow does it and the differences are emitted.
+	auto context_state_op = [&](uint32_t operation) {
+		stats.context_ops++;
+		switch (operation) {
+			case 0: switch_context(m_cx_defaults); break;
+			case 1:
+				saved_cx  = cx;
+				cx_pushed = true;
+				break;
+			case 2:
+				if (cx_pushed) {
+					switch_context(saved_cx);
+					saved_cx.clear();
+					cx_pushed = false;
+				}
+				break;
+			case 3:
+				saved_cx  = cx;
+				cx_pushed = true;
+				switch_context(m_cx_defaults);
+				break;
+			default: break;
+		}
+	};
+
 	// True when the bound pixel shader is one SetSkippedPixelShaders named; the draw is then left out.
 	auto skip_draw = [&]() {
 		fix_fmask();
@@ -512,6 +649,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			return fail((header >> 8u) & 0xffu, dw);
 		}
 		const uint32_t op          = (header >> 8u) & 0xffu;
+		cur_op                     = op;
 		const uint32_t body_count  = size - 1u;
 		const uint32_t* const bptr = dcb.data() + dw + 1;
 		stats.packets++;
@@ -531,6 +669,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.marker_release++;
 				} else if (marker == R_WAIT_FLIP_DONE) {
 					stats.marker_wait_flip++;
+				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
+					context_state_op(bptr[0]);
 				}
 				break; // the CP ignores NOPs; present/sync markers are handled elsewhere later
 			}
@@ -703,6 +843,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			}
 			case IT_DMA_DATA:
+				if (m_find_hi > m_find_lo && body_count >= 6) {
+					const uint64_t dst = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
+					if (dst >= m_find_lo && dst < m_find_hi) {
+						FindHit h;
+						h.index  = stats.dma_data;
+						h.target = dst;
+						h.depth  = 99; // a DMA_DATA destination
+						r.find_hits.push_back(h);
+					}
+				}
 				if (body_count < 6 || !DmaDataAllowed(bptr[0], bptr[5], m_gds)) {
 					r.unknown_detail = {bptr[0], body_count >= 6 ? bptr[5] : 0u};
 					return fail(op, dw);
@@ -865,8 +1015,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.event_write++;
 				break;
 			case IT_CLEAR_STATE:
+				// The hardware resets the context to amdgpu's clear state, the PS5 CP to its own
+				// defaults (Kyty: the same as a context-state clear). Follow it with the defaults, every
+				// one of them, since the hardware no longer matches the shadow.
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				stats.clear_state++;
+				for (const auto& [off, value]: m_cx_defaults) {
+					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
+					mark_cx(off);
+				}
+				cx = m_cx_defaults;
 				break;
 
 			default:
@@ -892,7 +1050,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 
 	// Pass succeeded: commit the shadow, build the IB (preamble from the committed shadow, then the
 	// translated body), and return.
-	m_cx = std::move(cx);
+	m_cx        = std::move(cx);
+	m_saved_cx  = std::move(saved_cx);
+	m_cx_pushed = cx_pushed;
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
 

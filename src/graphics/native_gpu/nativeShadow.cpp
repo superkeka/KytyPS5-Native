@@ -18,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <span>
 #include <string>
 #include <thread>
@@ -99,6 +100,18 @@ public:
 		const double       t_translate = NowSecShadow();
 		Pm4TranslateResult result      = tr.Translate(dcb);
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
+		for (const auto& h: result.find_hits) {
+			const auto key = std::make_tuple(h.shader, h.user_reg, h.depth, h.word);
+			if (m_find_seen.insert(key).second && m_find_seen.size() <= 64) {
+				std::fprintf(stderr,
+				             "native shadow: FIND %s %llu %s %u: shader 0x%llx (es 0x%llx) user reg 0x%03x depth %u table 0x%llx "
+				             "word %u -> %s 0x%llx\n",
+				             kind, static_cast<unsigned long long>(frame), h.dispatch ? "dispatch" : "draw", h.index,
+				             static_cast<unsigned long long>(h.shader), static_cast<unsigned long long>(h.es), h.user_reg,
+				             h.depth, static_cast<unsigned long long>(h.table), h.word, h.image ? "T#" : "ptr",
+				             static_cast<unsigned long long>(h.target));
+			}
+		}
 		if (acb && SkipAcb(frame, result)) {
 			return;
 		}
@@ -776,6 +789,16 @@ private:
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetComputeQueue(true);
+		// KYTY_NATIVE_GPU_FIND=0xADDR:0xSIZE: log the draws/dispatches whose resources reach that range.
+		if (const char* find = std::getenv("KYTY_NATIVE_GPU_FIND"); find != nullptr) {
+			char*          end  = nullptr;
+			const uint64_t addr = std::strtoull(find, &end, 0);
+			const uint64_t size = (end != nullptr && *end == ':') ? std::strtoull(end + 1, nullptr, 0) : 1;
+			m_translator.SetFindRange(addr, size);
+			m_acb_translator.SetFindRange(addr, size);
+			std::fprintf(stderr, "native shadow: looking for references to [0x%llx, +0x%llx)\n",
+			             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
+		}
 		if (const char* acb = std::getenv("KYTY_NATIVE_GPU_ACB"); acb != nullptr && acb[0] != '\0' && acb[0] != '0') {
 			m_acb_mode = std::strcmp(acb, "dry") == 0 ? AcbMode::Dry : AcbMode::On;
 			std::fprintf(stderr, "native shadow: async compute buffers %s\n",
@@ -867,6 +890,7 @@ private:
 	std::set<uint32_t> m_unknown_acb_ops;
 	uint32_t      m_acb_dummy_writes = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
+	std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> m_find_seen; // KYTY_NATIVE_GPU_FIND hits logged
 	bool          m_stats          = false;
 	uint32_t      m_stats_logged   = 0;
 	int64_t       m_dump_regs_frame = -1;

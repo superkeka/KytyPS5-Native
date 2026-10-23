@@ -46,6 +46,7 @@ struct Pm4TranslateStats {
 	uint32_t draws_skipped     = 0; // draws left out (SetSkippedPixelShaders)
 	uint32_t fmask_fixed       = 0; // CB_COLORn_FMASK set to the target base (was 0) before a draw
 	uint32_t lod_stats_dropped = 0; // GET_LOD_STATS packets left out
+	uint32_t context_ops       = 0; // Agc context-state push/pop/clear markers applied
 	uint32_t packets_skipped   = 0; // packets left out (SetSkippedOpcodes)
 	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
@@ -104,6 +105,21 @@ struct DrawSnapshot {
 	uint32_t gs_user_data[32] = {}; // SPI_SHADER_USER_DATA_GS_*: the NGG (merged ES/GS) stage on gfx10
 };
 
+// A draw or dispatch whose resources point into the range given to SetFindRange: directly from a
+// user-data register, or through a table it points at (depth 1) or a table in that table (depth 2).
+struct FindHit {
+	bool     dispatch = false;
+	uint32_t index    = 0; // draw or dispatch number within the DCB
+	uint64_t shader   = 0; // CS for a dispatch, PS for a draw
+	uint64_t es       = 0; // the NGG (ES/GS) shader of a draw
+	uint32_t user_reg = 0; // SH offset of the user-data register the path starts from
+	uint32_t depth    = 0;
+	uint64_t table    = 0; // the table holding the reference (0 at depth 0)
+	uint32_t word     = 0; // dword index of the reference in that table
+	uint64_t target   = 0; // the address found
+	bool     image    = false; // a T# base (address >> 8) rather than a 48-bit V#/pointer
+};
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -117,6 +133,7 @@ struct Pm4TranslateResult {
 	std::vector<GpuRef>   refs;               // guest memory the DCB's draws/dispatches may touch
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
+	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -182,6 +199,13 @@ public:
 	// Packets of these opcodes are left out of the IB (bisecting a hang down to a packet type).
 	void SetSkippedOpcodes(std::set<uint32_t> ops) { m_skip_ops = std::move(ops); }
 
+	// Diagnostics: report every draw/dispatch whose resources reach [addr, addr + size) in
+	// Pm4TranslateResult::find_hits (user data, then tables two levels deep). 0 size: off.
+	void SetFindRange(uint64_t addr, uint64_t size) {
+		m_find_lo = addr;
+		m_find_hi = addr + size;
+	}
+
 	// Draws with this pixel shader are reported in Pm4TranslateResult::inspected (0: none).
 	void SetInspectedPixelShader(uint64_t ps) { m_inspect_ps = ps; }
 
@@ -194,6 +218,9 @@ private:
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
 
 	std::map<uint32_t, uint32_t> m_cx; // context registers (SET_CONTEXT_REG space)
+	std::map<uint32_t, uint32_t> m_cx_defaults; // what a context clear restores (the seeded defaults)
+	std::map<uint32_t, uint32_t> m_saved_cx;    // context pushed by an Agc context-state push
+	bool                         m_cx_pushed = false;
 	std::map<uint32_t, uint32_t> m_sh; // SH registers (SET_SH_REG space)
 	std::map<uint32_t, uint32_t> m_uc; // whitelisted UCONFIG registers
 	bool                         m_gds = false;
@@ -205,6 +232,8 @@ private:
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;
 	uint64_t                     m_inspect_ps = 0;
+	uint64_t                     m_find_lo    = 0;
+	uint64_t                     m_find_hi    = 0;
 };
 
 } // namespace Libs::Graphics::NativeGpu
