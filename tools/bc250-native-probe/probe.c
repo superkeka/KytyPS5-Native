@@ -1406,8 +1406,35 @@ static void ProbeDot2Emu(Device* d, Common* c) {
 	BoDestroy(d, &out);
 }
 
+// Runs a raw shader binary (e.g. one produced by patch_blob) as one 64-lane wave64 group whose
+// only input is the destination address in s[0:1], and prints the first two lanes' 4 dwords.
+static bool RunBlob(Device* d, Common* c, const char* path) {
+	printf("== blob: %s\n", path);
+	FILE* f = fopen(path, "rb");
+	if (f == NULL) {
+		printf("  open failed: %s\n", strerror(errno));
+		return false;
+	}
+	static uint8_t code[48 * 1024];
+	size_t         size = fread(code, 1, sizeof(code), f);
+	fclose(f);
+	if (size == 0 || (size & 3u) != 0) {
+		printf("  bad size %zu\n", size);
+		return false;
+	}
+	uint32_t out[64];
+	if (!RunLanes(d, c, code, size, NULL, out, 15.0)) {
+		return false;
+	}
+	for (int lane = 0; lane < 2; lane++) {
+		printf("  lane %d: 0x%08x 0x%08x 0x%08x 0x%08x\n", lane, out[lane * 4], out[lane * 4 + 1], out[lane * 4 + 2],
+		       out[lane * 4 + 3]);
+	}
+	return true;
+}
+
 static void Usage(const char* argv0) {
-	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [probe...]\n", argv0);
+	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [--blob FILE] [probe...]\n", argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit dot2emu (default: all)\n");
 	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds crossqueue uconfig\n");
 }
@@ -1416,6 +1443,7 @@ int main(int argc, char** argv) {
 	const char* path        = "/dev/dri/renderD128";
 	uint64_t    max_alloc   = 4 * GiB;
 	const char* danger      = NULL;
+	const char* blob        = NULL;
 	const char* selected[16];
 	int         num_selected = 0;
 	for (int i = 1; i < argc; i++) {
@@ -1425,6 +1453,8 @@ int main(int argc, char** argv) {
 			max_alloc = strtoull(argv[++i], NULL, 10) * GiB;
 		} else if (strcmp(argv[i], "--danger") == 0 && i + 1 < argc) {
 			danger = argv[++i];
+		} else if (strcmp(argv[i], "--blob") == 0 && i + 1 < argc) {
+			blob = argv[++i];
 		} else if (strcmp(argv[i], "--help") == 0) {
 			Usage(argv[0]);
 			return 0;
@@ -1442,6 +1472,13 @@ int main(int argc, char** argv) {
 	if (r != 0) {
 		fprintf(stderr, "common buffers: %s\n", ErrStr(r));
 		return 1;
+	}
+	if (blob != NULL) {
+		bool ok = RunBlob(&d, &c, blob);
+		BoDestroy(&d, &c.code);
+		BoDestroy(&d, &c.ib);
+		close(d.fd);
+		return ok ? 0 : 2;
 	}
 	if (danger != NULL) {
 		bool ok;

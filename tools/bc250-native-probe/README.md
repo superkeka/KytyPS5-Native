@@ -21,6 +21,10 @@ distrobox enter bc250-mesa-dev -- make
 
 `shaders.h` is generated from the `.s` files by `gen_shaders.sh` (LLVM `llvm-mc`, gfx1013).
 
+`--blob FILE` runs a raw shader binary as one wave64 group of 64 lanes (destination address in
+`s[0:1]`) and prints the first two lanes' 4 dwords. `patch_blob.cpp` applies the native_gpu shader
+patcher (`src/graphics/native_gpu/shaderPatcher.*`) to such a binary.
+
 ## Probes
 
 | Probe | What it checks |
@@ -136,3 +140,10 @@ devcoredump are the debugging path.
   `fma(a.hi, b.hi, fma(a.lo, b.lo, acc))` bit-exactly on 64 random lanes. They differ from a
   single-rounded dot by up to 52 ulp in cancellation-heavy lanes; how PS5 hardware rounds
   `v_dot2c_f32_f16` is unknown.
+
+### Shader patcher on hardware (2026-10-23)
+
+`dot2p.s` (three `v_dot2c_f32_f16`: VGPR src0, SGPR src0, zero inputs) assembled for gfx1030 and
+run with `--blob`: unpatched every lane reads `0 0 0 0xabcd0123`; after `patch_blob` (3 sites
+patched, 22 -> 48 dwords) every lane reads `0x41b40000 0x41b40000 0x41200000 0xabcd0123`, the
+correct results. Unit tests: `native_gpu_shader_patcher_tests` (ctest `native_gpu_shader_patcher`).
