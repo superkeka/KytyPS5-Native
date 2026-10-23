@@ -128,10 +128,12 @@ void RunStore(int fd, uint32_t ctx, const Buffer& ib, const Buffer& code, uint64
 	}
 	__sync_synchronize();
 
-	struct drm_amdgpu_bo_list_entry entries[8];
+	struct drm_amdgpu_bo_list_entry entries[32];
 	uint32_t                        count = 0;
 	entries[count++]                      = {ib.handle, 0};
-	entries[count++]                      = {code.handle, 0};
+	if (code.handle != 0) { // 0 => the code lives in an external BO passed via `extra`
+		entries[count++] = {code.handle, 0};
+	}
 	for (uint32_t i = 0; i < extra_count; i++) {
 		entries[count++] = {extra[i], 0};
 	}
@@ -299,6 +301,144 @@ int main() {
 		}
 		std::printf("NativeGpuGemBackingTests: GPU wrote %llu KiB through guest VA 0x%llx across chunks\n",
 		            static_cast<unsigned long long>(len / 1024), static_cast<unsigned long long>(va));
+	}
+
+	// Case 5: a guest range that is NOT part of the memfd backing — flexible/program/runtime/stack
+	// memory in the emulator: committed anonymous host pages at guest VA == host VA. BindExternal
+	// registers them as their own userptr buffer and maps them into the GPU VM at that VA; the GPU
+	// writes through it, and a partial unbind in the middle must leave both survivors usable while
+	// clearing only the hole.
+	{
+		const int fd = gem->DrmFd();
+		union drm_amdgpu_ctx c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+		Check(Ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &c) == 0, "external-case context allocation failed");
+		const uint32_t ctx = c.out.alloc.ctx_id;
+
+		const Buffer ib   = CreateBuffer(fd, 64 * 1024, 0x0082000000ull);
+		const Buffer code = CreateBuffer(fd, 64 * 1024, 0x0083000000ull);
+		std::memcpy(code.cpu, kStoreShader, sizeof(kStoreShader));
+
+		// Three 64 KiB thirds: an anonymous host mapping standing in for non-direct guest memory.
+		const uint64_t third = 0x10000;
+		const uint64_t len   = third * 3;
+		void*          host  = ::mmap(nullptr, len, PROT_READ | PROT_WRITE,
+		                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		Check(host != MAP_FAILED, "external host mapping failed");
+		const uint64_t va = reinterpret_cast<uint64_t>(host);
+		auto*          words = static_cast<uint32_t*>(host);
+
+		const size_t handles_before = gem->CreatedHandles().size();
+		Check(gem->BindExternal(va, len, true), "BindExternal of a non-backed range failed");
+		Check(gem->CreatedHandles().size() == handles_before + 1,
+		      "BindExternal must add exactly one resident buffer");
+
+		std::memset(host, 0, len);
+		{
+			const std::vector<uint32_t> extra = gem->CreatedHandles();
+			RunStore(fd, ctx, ib, code, va, 0x30000000u, static_cast<uint32_t>(len / 256), extra.data(),
+			         static_cast<uint32_t>(extra.size()));
+			for (uint32_t i = 0; i < len / 4; i++) {
+				Check(words[i] == 0x30000000u + i, "GPU write through an external guest VA not visible");
+			}
+		}
+
+		// Unbind the middle third: the hole is cleared, the two survivors get their own buffers.
+		Check(gem->UnbindExternal(va + third, third), "partial UnbindExternal failed");
+		Check(gem->CreatedHandles().size() == handles_before + 2,
+		      "a straddling unbind must leave two survivor buffers");
+
+		std::memset(host, 0, third); // first survivor only
+		{
+			const std::vector<uint32_t> extra = gem->CreatedHandles();
+			RunStore(fd, ctx, ib, code, va, 0x40000000u, static_cast<uint32_t>(third / 256),
+			         extra.data(), static_cast<uint32_t>(extra.size()));
+			for (uint32_t i = 0; i < third / 4; i++) {
+				Check(words[i] == 0x40000000u + i, "GPU write to the surviving third not visible");
+			}
+		}
+
+		Check(gem->UnbindExternal(va, len), "full UnbindExternal failed");
+		Check(gem->CreatedHandles().size() == handles_before,
+		      "UnbindExternal must release every external buffer it added");
+
+		// Read-only external range: shader code is mapped r-x, and amdgpu rejects a writable userptr
+		// whose host pages are not writable (the submission fails with EPERM), so the read-only
+		// registration path must work on its own. Put the shader in the range, drop host write
+		// permission to mirror code memory, bind it read-only, and have the GPU fetch and execute it
+		// to write a separate read-write output.
+		{
+			std::memcpy(host, kStoreShader, sizeof(kStoreShader));
+			Check(::mprotect(host, third, PROT_READ | PROT_EXEC) == 0, "mprotect of code to r-x failed");
+			Check(gem->BindExternal(va, third, false), "read-only BindExternal failed");
+
+			auto*          rw    = static_cast<uint32_t*>(ReserveGuest(third));
+			const uint64_t rw_va = reinterpret_cast<uint64_t>(rw);
+			Check(gem->MapView(rw_va, third, 0x80000, PROT_READ | PROT_WRITE),
+			      "MapView for the read-only shader's output failed");
+			Check(gem->BindView(rw_va, third, 0x80000), "BindView for the output failed");
+			std::memset(rw, 0, third);
+
+			// The read-only code BO and the output chunk are both resident via CreatedHandles(); the
+			// code is fetched from its guest VA, so RunStore takes a handle-less code buffer at `va`.
+			const std::vector<uint32_t> all = gem->CreatedHandles();
+			const Buffer                code_ro {0, nullptr, va};
+			RunStore(fd, ctx, ib, code_ro, rw_va, 0x50000000u, static_cast<uint32_t>(third / 256),
+			         all.data(), static_cast<uint32_t>(all.size()));
+			for (uint32_t i = 0; i < third / 4; i++) {
+				Check(rw[i] == 0x50000000u + i, "GPU did not execute code from a read-only userptr");
+			}
+			Check(gem->UnbindExternal(va, third), "read-only UnbindExternal failed");
+			Check(gem->UnbindView(rw_va, third), "output UnbindView failed");
+		}
+		::munmap(host, len);
+		std::printf("NativeGpuGemBackingTests: GPU wrote through an external (non-backed) guest VA "
+		            "and survived a straddling unbind\n");
+	}
+
+	// Case 6: a non-backed range with an unreadable hole in the middle, as program memory has (the
+	// shader is a readable slice with an execute-only tail). BindExternal must skip the hole — a
+	// userptr over it cannot be faulted in and would fail the whole submission — and bind the two
+	// readable slices, which the GPU then uses.
+	{
+		const int fd = gem->DrmFd();
+		union drm_amdgpu_ctx c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+		Check(Ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &c) == 0, "hole-case context allocation failed");
+		const uint32_t ctx = c.out.alloc.ctx_id;
+
+		const Buffer ib   = CreateBuffer(fd, 64 * 1024, 0x0084000000ull);
+		const Buffer code = CreateBuffer(fd, 64 * 1024, 0x0085000000ull);
+		std::memcpy(code.cpu, kStoreShader, sizeof(kStoreShader));
+
+		const uint64_t page = 0x10000;
+		const uint64_t len  = page * 3;
+		void* host = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		Check(host != MAP_FAILED, "hole-case host mapping failed");
+		const uint64_t va = reinterpret_cast<uint64_t>(host);
+		Check(::mprotect(reinterpret_cast<void*>(va + page), page, PROT_NONE) == 0,
+		      "punching the hole failed");
+
+		const size_t before = gem->CreatedHandles().size();
+		Check(gem->BindExternal(va, len, true), "BindExternal over a holed range failed");
+		Check(gem->CreatedHandles().size() == before + 2,
+		      "a middle hole must leave two readable slices bound");
+
+		auto* w0 = static_cast<uint32_t*>(host); // first readable slice
+		std::memset(w0, 0, page);
+		const std::vector<uint32_t> extra = gem->CreatedHandles();
+		RunStore(fd, ctx, ib, code, va, 0x60000000u, static_cast<uint32_t>(page / 256), extra.data(),
+		         static_cast<uint32_t>(extra.size()));
+		for (uint32_t i = 0; i < page / 4; i++) {
+			Check(w0[i] == 0x60000000u + i, "GPU write to the first readable slice failed");
+		}
+		Check(gem->UnbindExternal(va, len), "hole-case UnbindExternal failed");
+		Check(gem->CreatedHandles().size() == before, "unbind must release both readable slices");
+		::munmap(host, len);
+		std::printf("NativeGpuGemBackingTests: BindExternal split a holed range into readable slices "
+		            "the GPU used\n");
 	}
 
 	delete gem;

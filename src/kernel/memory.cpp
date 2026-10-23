@@ -86,6 +86,14 @@ static bool IsGpuAddressRange(uint64_t vaddr, uint64_t size) {
 	return Graphics::GuestRange {vaddr, size}.Valid();
 }
 
+#if KYTY_GEM_BACKING_SUPPORTED
+// Defined below, once g_guest_address_space and GetGemBacking() exist: the BC-250 native backend
+// mirrors every GPU-visible guest range into the amdgpu GPU VM. No-op unless the GEM switch is on.
+static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size);
+static void NativeGpuUnbindGpuRange(uint64_t vaddr, uint64_t size);
+static void NativeGpuRebindGpuRange(uint64_t vaddr, uint64_t size);
+#endif
+
 static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 	if (g_test_gpu_range != nullptr) g_test_gpu_range(true, vaddr, size);
@@ -94,6 +102,9 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	GetGpuResources().MapMemory(vaddr, size);
+#if KYTY_GEM_BACKING_SUPPORTED
+	NativeGpuBindGpuRange(vaddr, size);
+#endif
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -103,6 +114,9 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
+#if KYTY_GEM_BACKING_SUPPORTED
+	NativeGpuUnbindGpuRange(vaddr, size);
+#endif
 	GetGpuResources().UnmapMemory(vaddr, size);
 }
 
@@ -920,6 +934,67 @@ Libs::Graphics::NativeGpu::GemBacking* GetGemBacking() {
 	return nullptr;
 #endif
 }
+
+#if KYTY_GEM_BACKING_SUPPORTED
+// Bind a GPU-visible guest range into the native GPU VM. Direct and pooled memory are memfd-backed
+// and already bound into that VM by GuestBackingStore::BindView, so only the anon-committed ranges
+// the GPU can also read — flexible, program (code), runtime and stack memory, where guest shader
+// code lives — need a userptr binding here.
+static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size) {
+	auto* gem = GetGemBacking();
+	if (gem == nullptr) {
+		return;
+	}
+	if (g_guest_address_space != nullptr && g_guest_address_space->BackingContains(vaddr, size)) {
+		return;
+	}
+	// The caller publishes the range before mapping it to the GPU, so its protection tells us whether
+	// the GPU writes it (a read-only range such as shader code registers a read-only userptr). CPU
+	// stacks are never read by the GPU and are constantly written, which only churns userptr
+	// revalidation, so they are not bound. If the range is unknown, bind writable — a misread there
+	// costs at worst a clean submit refusal, never a GPU write fault on the board.
+	bool                 gpu_write = true;
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges != nullptr && g_virtual_ranges->Query(vaddr, 0, &range)) {
+		if (range.type == VirtualRangeType::Stack) {
+			return;
+		}
+		gpu_write = (range.protection & PROT_GPU_WRITE) != 0;
+	}
+	gem->BindExternal(vaddr, size, gpu_write);
+}
+
+static void NativeGpuUnbindGpuRange(uint64_t vaddr, uint64_t size) {
+	if (auto* gem = GetGemBacking(); gem != nullptr) {
+		gem->UnbindExternal(vaddr, size); // no-op on memfd-backed ranges (never bound here)
+	}
+}
+
+// A guest protection change (mprotect, program-memory protection) does not pass through
+// MapGpuRange, but it can turn a page read-only or execute-only after its external userptr was
+// registered, which then fails the submission's validation. Re-bind each affected non-stack,
+// non-direct range so its readable userptr slices track the new protection.
+static void NativeGpuRebindGpuRange(uint64_t vaddr, uint64_t size) {
+	auto* gem = GetGemBacking();
+	if (gem == nullptr || !IsGpuAddressRange(vaddr, size) || g_virtual_ranges == nullptr) {
+		return;
+	}
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+		return;
+	}
+	for (const auto& r: ranges) {
+		if (r.type == VirtualRangeType::Stack || !IsCommittedRangeType(r.type) ||
+		    !IsGpuAddressRange(r.start, r.size) ||
+		    (g_guest_address_space != nullptr &&
+		     g_guest_address_space->BackingContains(r.start, r.size))) {
+			continue;
+		}
+		gem->UnbindExternal(r.start, r.size);
+		gem->BindExternal(r.start, r.size, (r.protection & PROT_GPU_WRITE) != 0);
+	}
+}
+#endif
 
 struct PrtAperture {
 	uint64_t address = 0;
@@ -3855,6 +3930,9 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 	                                                      : VirtualMemory::Mode::ReadWrite;
 	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
+#if KYTY_GEM_BACKING_SUPPORTED
+	NativeGpuRebindGpuRange(vaddr, size);
+#endif
 }
 
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
@@ -3892,6 +3970,9 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		return false;
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_size, ProgramProtection(mode));
+#if KYTY_GEM_BACKING_SUPPORTED
+	NativeGpuRebindGpuRange(aligned_addr, aligned_size);
+#endif
 	return true;
 }
 
@@ -3966,6 +4047,9 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 		}
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
+#if KYTY_GEM_BACKING_SUPPORTED
+	NativeGpuRebindGpuRange(aligned_addr, aligned_len);
+#endif
 
 	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 

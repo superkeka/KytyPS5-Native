@@ -23,6 +23,8 @@ public:
 	// 0x800000000000, so this sits clear of both).
 	static constexpr uint64_t kIbVa      = 0x400000000000ull;
 	static constexpr uint64_t kIbSize    = 2ull * 1024 * 1024;
+	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
+	static constexpr int      kCsRetries = 64;
 
 	struct Result {
 		bool   submitted = false; // the CS ioctl was accepted
@@ -31,6 +33,7 @@ public:
 		bool   reset     = false; // the context reported a reset/guilty state afterwards
 		int    err       = 0;     // negative errno from a failed ioctl
 		double seconds   = 0.0;   // submit -> fence wall time
+		int    retries   = 0;     // extra CS attempts spent on userptr revalidation (EFAULT)
 	};
 
 	// Allocates a context and the IB buffer on `drm_fd`. Returns nullptr on failure.
@@ -135,7 +138,20 @@ public:
 		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs);
 
 		const double t0 = NowSec();
-		int          r  = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CS, &cs);
+		// userptr BOs (both the direct-memory chunks and the external ranges) are revalidated against
+		// the CPU page tables at submit; a guest write to one between validation passes makes the CS
+		// return -EFAULT, and the caller is expected to retry, exactly as Mesa does. The pages settle
+		// within a few attempts; cap it so a persistently bad range still disables the path cleanly.
+		int r = 0;
+		for (int attempt = 0; attempt <= kCsRetries; attempt++) {
+			r = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CS, &cs);
+			if (r != -EFAULT) {
+				break;
+			}
+			res.retries++;
+			struct timespec nap = {0, 500000}; // 0.5 ms
+			nanosleep(&nap, nullptr);
+		}
 		if (r != 0) {
 			res.err = r;
 			return res;

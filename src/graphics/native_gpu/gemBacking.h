@@ -18,6 +18,9 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -43,6 +46,13 @@ namespace Libs::Graphics::NativeGpu {
 // board's ~8 GiB GTT limit. BindView maps a guest view's chunks into the GPU VM of DrmFd() at the
 // view's own address; Lookup resolves a backing offset to (chunk handle, offset-in-chunk) for the
 // buffer list of a submission.
+//
+// Guest memory the GPU can touch also lives outside the direct-memory backing: flexible, program
+// (code), runtime and stack ranges are committed anonymous host pages at guest VA == host VA, not
+// slices of the memfd. BindExternal registers such a range's own host pages as a userptr GEM buffer
+// and maps it into the same GPU VM at its guest VA, so shader code and other non-direct guest memory
+// is resident on the GPU; UnbindExternal removes it. These buffers join CreatedHandles() so a
+// submission lists them resident. The direct-memory chunk path above stays unchanged.
 //
 // This class performs no command submission. userptr buffers cannot be dma-buf exported, so
 // presentable surfaces still need dedicated real-GEM allocations elsewhere.
@@ -95,6 +105,10 @@ public:
 	}
 
 	~GemBacking() {
+		for (const auto& [vaddr, ext]: m_external) {
+			VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, ext.end - vaddr);
+			GemClose(ext.handle);
+		}
 		for (const auto& chunk: m_chunks) {
 			if (chunk.created) {
 				GemClose(chunk.handle);
@@ -178,6 +192,46 @@ public:
 		return size == 0 || VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, size) == 0;
 	}
 
+	// Binds a guest range that is NOT part of the memfd backing — flexible, program (code), runtime
+	// or stack memory: committed anonymous host pages at guest VA == host VA — into this device's GPU
+	// VM at its own address, by registering the range's host pages as a userptr GEM buffer and
+	// mapping it there (REPLACE, so it is safe over whatever was mapped before). The caller maps the
+	// host pages before the GPU can reach the range, so they are resident. `gpu_write` must match the
+	// guest range's GPU protection: a range the GPU only reads — shader code is mapped r-x on the host
+	// — is registered read-only, because amdgpu's userptr validation faults a write onto a read-only
+	// host page and fails the whole submission (EPERM). Any overlapping prior external binding is
+	// dropped first, so a remap of the same guest address just works. The CPU and Vulkan paths are
+	// unaffected if this fails, so failures only log.
+	bool BindExternal(uint64_t vaddr, uint64_t size, bool gpu_write) {
+		if (vaddr == 0 || size == 0) {
+			return false;
+		}
+		std::lock_guard<std::mutex> lock(m_lock);
+		ClearExternalRangeUnlocked(vaddr, size);
+		// A single guest range can hold sub-ranges the guest reprotected to execute-only or no-access
+		// (seen in program memory: the shader is a readable slice, with an execute-only tail). A
+		// userptr cannot fault in an unreadable page, which fails the whole submission, so register one
+		// buffer per readable slice and skip the holes.
+		bool any = false;
+		ForEachReadableSubrange(vaddr, size, [&](uint64_t s, uint64_t sz, bool writable) {
+			any = RegisterExternalUnlocked(s, sz, gpu_write && writable) || any;
+		});
+		return any;
+	}
+
+	// Removes the external GPU binding(s) in [vaddr, vaddr + size) and closes the buffers they wholly
+	// freed. A VA with no external binding (direct or pooled memory, or an already-unmapped range) is
+	// left untouched, so this is a safe no-op on the memfd-backed ranges that flow through the same
+	// GPU-range unmap hook.
+	bool UnbindExternal(uint64_t vaddr, uint64_t size) {
+		if (size == 0) {
+			return true;
+		}
+		std::lock_guard<std::mutex> lock(m_lock);
+		ClearExternalRangeUnlocked(vaddr, size);
+		return true;
+	}
+
 	// The DRM file whose GPU VM holds the bindings; command submission must use the same file.
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
 
@@ -185,12 +239,16 @@ public:
 	// touches guest memory must name the chunks backing it as resident. Chunks are created lazily,
 	// so this grows as guest ranges are mapped.
 	[[nodiscard]] std::vector<uint32_t> CreatedHandles() const {
-		std::vector<uint32_t> handles;
-		handles.reserve(m_chunks.size());
+		std::lock_guard<std::mutex> lock(m_lock);
+		std::vector<uint32_t>       handles;
+		handles.reserve(m_chunks.size() + m_external.size());
 		for (const auto& chunk: m_chunks) {
 			if (chunk.created) {
 				handles.push_back(chunk.handle);
 			}
+		}
+		for (const auto& [vaddr, ext]: m_external) {
+			handles.push_back(ext.handle);
 		}
 		return handles;
 	}
@@ -201,7 +259,8 @@ public:
 		if (offset >= m_size) {
 			return false;
 		}
-		const uint64_t index = offset / kChunkSize;
+		std::lock_guard<std::mutex> lock(m_lock);
+		const uint64_t              index = offset / kChunkSize;
 		if (!m_chunks[index].created) {
 			return false;
 		}
@@ -231,12 +290,16 @@ private:
 		return r == -1 ? -errno : 0;
 	}
 
-	int VaOp(uint32_t op, uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t size) const {
+	static constexpr uint32_t kRwxPageFlags =
+	    AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE;
+
+	int VaOp(uint32_t op, uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t size,
+	         uint32_t page_flags = kRwxPageFlags) const {
 		struct drm_amdgpu_gem_va v;
 		std::memset(&v, 0, sizeof(v));
 		v.handle       = handle;
 		v.operation    = op;
-		v.flags        = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE;
+		v.flags        = page_flags;
 		v.va_address   = vaddr;
 		v.offset_in_bo = offset_in_bo;
 		v.map_size     = size;
@@ -257,7 +320,8 @@ private:
 	}
 
 	bool EnsureChunk(uint64_t index) {
-		Chunk& chunk = m_chunks[index];
+		std::lock_guard<std::mutex> lock(m_lock);
+		Chunk&                      chunk = m_chunks[index];
 		if (chunk.created) {
 			return true;
 		}
@@ -281,11 +345,115 @@ private:
 		return true;
 	}
 
-	int                m_drm_fd = -1;
-	int                m_mem_fd = -1;
-	uint8_t*           m_alias  = nullptr;
-	uint64_t           m_size   = 0;
-	std::vector<Chunk> m_chunks;
+	// Calls cb(start, size, writable) for each readable host VMA slice overlapping [vaddr, vaddr+size),
+	// read from /proc/self/maps. Guest memory is mapped at host VA == guest VA; `writable` is the
+	// slice's host write permission. Unreadable slices (no-access or execute-only) are skipped, since a
+	// userptr cannot fault them in. If maps cannot be read, the whole range is offered once as writable
+	// and the caller's protection choice still applies.
+	template <typename Cb>
+	static void ForEachReadableSubrange(uint64_t vaddr, uint64_t size, Cb&& cb) {
+		const uint64_t end  = vaddr + size;
+		FILE*          maps = ::fopen("/proc/self/maps", "re");
+		if (maps == nullptr) {
+			cb(vaddr, size, true);
+			return;
+		}
+		char line[512];
+		while (std::fgets(line, sizeof(line), maps) != nullptr) {
+			unsigned long long s = 0, e = 0;
+			char               perms[8] = {0};
+			if (std::sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3) {
+				continue;
+			}
+			if (e <= vaddr || s >= end || perms[0] != 'r') {
+				continue;
+			}
+			const uint64_t cs = std::max<uint64_t>(s, vaddr);
+			const uint64_t ce = std::min<uint64_t>(e, end);
+			if (cs < ce) {
+				cb(cs, ce - cs, perms[1] == 'w');
+			}
+		}
+		::fclose(maps);
+	}
+
+	// Registers [vaddr, vaddr + size) host pages as a userptr GEM buffer and maps it into the GPU VM
+	// at vaddr. `gpu_write` selects a writable or read-only buffer and page mapping. Caller holds
+	// m_lock and has already cleared any overlapping external binding.
+	bool RegisterExternalUnlocked(uint64_t vaddr, uint64_t size, bool gpu_write) {
+		struct drm_amdgpu_gem_userptr u;
+		std::memset(&u, 0, sizeof(u));
+		u.addr  = vaddr;
+		u.size  = size;
+		// REGISTER tracks the range via mmu-notifier without pinning, like the chunk path; the pages
+		// are faulted in (and re-faulted after a CPU write) when a submission validates them.
+		u.flags = AMDGPU_GEM_USERPTR_REGISTER | (gpu_write ? 0u : AMDGPU_GEM_USERPTR_READONLY);
+		if (Ioctl(DRM_IOCTL_AMDGPU_GEM_USERPTR, &u) != 0) {
+			std::fprintf(stderr, "GemBacking: external GEM_USERPTR 0x%llx (0x%llx, %s) failed: %s\n",
+			             static_cast<unsigned long long>(vaddr),
+			             static_cast<unsigned long long>(size), gpu_write ? "rw" : "ro",
+			             std::strerror(errno));
+			return false;
+		}
+		const uint32_t flags =
+		    gpu_write ? kRwxPageFlags : (AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+		if (VaOp(AMDGPU_VA_OP_REPLACE, u.handle, vaddr, 0, size, flags) != 0) {
+			GemClose(u.handle);
+			return false;
+		}
+		m_external.emplace(vaddr, External {vaddr + size, u.handle, gpu_write});
+		return true;
+	}
+
+	// Unmaps and closes every external buffer overlapping [vaddr, vaddr + size), re-registering the
+	// portions of a straddling buffer that fall outside the range as their own buffers (closing a GEM
+	// handle unmaps all of its VA, so a survivor needs its own handle). Chunk mappings never appear in
+	// m_external, so they are never touched. Caller holds m_lock.
+	void ClearExternalRangeUnlocked(uint64_t vaddr, uint64_t size) {
+		const uint64_t end = vaddr + size;
+
+		std::vector<std::pair<uint64_t, External>> overlapping;
+		auto                                       it = m_external.lower_bound(vaddr);
+		if (it != m_external.begin()) {
+			auto previous = std::prev(it);
+			if (previous->second.end > vaddr) {
+				it = previous;
+			}
+		}
+		while (it != m_external.end() && it->first < end) {
+			if (it->second.end > vaddr) {
+				overlapping.emplace_back(it->first, it->second);
+				it = m_external.erase(it);
+			} else {
+				++it;
+			}
+		}
+
+		for (const auto& [start, ext]: overlapping) {
+			VaOp(AMDGPU_VA_OP_CLEAR, 0, start, 0, ext.end - start);
+			GemClose(ext.handle);
+			if (start < vaddr) {
+				RegisterExternalUnlocked(start, vaddr - start, ext.writable);
+			}
+			if (end < ext.end) {
+				RegisterExternalUnlocked(end, ext.end - end, ext.writable);
+			}
+		}
+	}
+
+	struct External {
+		uint64_t end      = 0; // one past the last byte; start is the m_external key
+		uint32_t handle   = 0;
+		bool     writable = false;
+	};
+
+	int                           m_drm_fd = -1;
+	int                           m_mem_fd = -1;
+	uint8_t*                      m_alias  = nullptr;
+	uint64_t                      m_size   = 0;
+	std::vector<Chunk>            m_chunks;
+	std::map<uint64_t, External>  m_external; // guest VA -> userptr buffer for non-direct ranges
+	mutable std::mutex            m_lock;     // guards m_chunks creation, m_external, CreatedHandles
 };
 
 } // namespace Libs::Graphics::NativeGpu

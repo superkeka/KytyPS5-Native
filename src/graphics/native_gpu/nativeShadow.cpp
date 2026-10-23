@@ -64,13 +64,19 @@ public:
 		if (m_submitter == nullptr) {
 			return;
 		}
-		std::vector<uint32_t> handles = m_gem->CreatedHandles();
-		NativeSubmitter::Result r     = m_submitter->Submit(result.ib, handles, kTimeoutSec);
+		// Every GEM buffer the GPU may touch must be resident in the submission: the kernel only
+		// revalidates and fences userptr buffers that are listed, so one left out could have its pages
+		// migrated under a live GPU access. CreatedHandles() is the direct-memory chunks plus the
+		// readable external slices (CPU stacks are never bound, so they are not here).
+		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
+		NativeSubmitter::Result r       = m_submitter->Submit(result.ib, handles, m_timeout_sec);
 
 		const bool detail = frame < 3 || (frame % 120 == 0);
 		if (!r.submitted) {
-			std::fprintf(stderr, "native shadow: frame %llu submit failed: %s\n",
-			             static_cast<unsigned long long>(frame), std::strerror(-r.err));
+			std::fprintf(stderr,
+			             "native shadow: frame %llu submit failed: %s (after %d retries, %zu BOs)\n",
+			             static_cast<unsigned long long>(frame), std::strerror(-r.err), r.retries,
+			             handles.size());
 			Disable("submit error");
 			return;
 		}
@@ -89,14 +95,14 @@ public:
 		m_gpu_ms_total += r.seconds * 1e3;
 		if (detail) {
 			std::fprintf(stderr,
-			             "native shadow: frame %llu ok, gpu(submit->fence) %.2f ms, ib %zu dw "
-			             "(preamble cx/sh/uc %u/%u/%u), %u draws, %u/%u/%u loads, %u dispatch, "
+			             "native shadow: frame %llu ok, gpu(submit->fence) %.2f ms, %d cs-retries, "
+			             "ib %zu dw (preamble cx/sh/uc %u/%u/%u), %u draws, %u/%u/%u loads, %u dispatch, "
 			             "%u acquire, %u uc-skipped\n",
-			             static_cast<unsigned long long>(frame), r.seconds * 1e3, result.ib.size(),
-			             result.stats.preamble_cx, result.stats.preamble_sh, result.stats.preamble_uc,
-			             result.stats.draws, result.stats.loaded_cx_regs, result.stats.loaded_sh_regs,
-			             result.stats.loaded_uc_regs, result.stats.dispatches,
-			             result.stats.acquire_mem, result.stats.uconfig_skipped);
+			             static_cast<unsigned long long>(frame), r.seconds * 1e3, r.retries,
+			             result.ib.size(), result.stats.preamble_cx, result.stats.preamble_sh,
+			             result.stats.preamble_uc, result.stats.draws, result.stats.loaded_cx_regs,
+			             result.stats.loaded_sh_regs, result.stats.loaded_uc_regs,
+			             result.stats.dispatches, result.stats.acquire_mem, result.stats.uconfig_skipped);
 		}
 		if (m_completed > 0 && m_completed % 120 == 0) {
 			std::fprintf(stderr,
@@ -112,11 +118,20 @@ public:
 	}
 
 private:
-	static constexpr double kTimeoutSec = 2.0;
+	// The first native CS pays a large one-off cost while amdgpu validates the whole userptr
+	// backing (the shader-range binding does not remove that), so the wait must outlast it or a
+	// successful-but-slow submit is misread as a hang. Overridable with KYTY_NATIVE_GPU_TIMEOUT_SEC.
+	static constexpr double kDefaultTimeoutSec = 12.0;
 
 	void Init() {
 		if (!EnvOn("KYTY_NATIVE_GPU_SHADOW")) {
 			return;
+		}
+		if (const char* t = std::getenv("KYTY_NATIVE_GPU_TIMEOUT_SEC"); t != nullptr && t[0] != '\0') {
+			const double v = std::atof(t);
+			if (v > 0.0) {
+				m_timeout_sec = v;
+			}
 		}
 		if (!EnvOn("KYTY_NATIVE_GPU_GEM")) {
 			std::fprintf(stderr,
@@ -137,7 +152,7 @@ private:
 		}
 		m_enabled = true;
 		std::fprintf(stderr, "native shadow: enabled (gfx-ring shadow submission, %.1f s timeout)\n",
-		             kTimeoutSec);
+		             m_timeout_sec);
 #else
 		std::fprintf(stderr, "native shadow: not supported on this platform; staying off.\n");
 #endif
@@ -186,6 +201,7 @@ private:
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
 	double        m_gpu_ms_total   = 0.0;
+	double        m_timeout_sec    = kDefaultTimeoutSec;
 	uint32_t      m_shaders_scanned = 0;
 	uint32_t      m_dot2c_sites    = 0;
 	std::set<uint64_t> m_seen_shaders;
