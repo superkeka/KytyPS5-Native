@@ -52,6 +52,9 @@ public:
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Debug (BC-250 native shadow frame comparison): writes Kyty's GPU copy of the images in
+	// [vaddr, vaddr + size) back to guest memory and waits until it has landed.
+	uint32_t           DownloadMemoryForDebug(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);

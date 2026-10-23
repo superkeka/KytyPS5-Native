@@ -2054,6 +2054,18 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
+uint32_t TextureCache::DownloadRegionForDebug(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	uint32_t         queued = 0;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner != nullptr && owner->registered && owner->IsGpuModified() && DownloadImageMemory(id)) {
+			queued++;
+		}
+	}
+	return queued;
+}
+
 void TextureCache::ProcessDownloadImages() {
 	if (!m_readback_linear_images && !m_readback_tiled_images) {
 		return;

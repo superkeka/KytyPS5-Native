@@ -1145,7 +1145,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		                                  source_info.extent.width, source_info.extent.height,
 		                                  source_info.bytes_per_block,
 		                                  static_cast<uint32_t>(source_info.pixel_format),
-		                                  static_cast<uint32_t>(source_info.tile_mode));
+		                                  static_cast<uint32_t>(source_info.tile_mode), [&] {
+			                                  return m_presenter.Renderer().DownloadMemoryForDebug(
+			                                      source_info.data.address, source_info.data.size);
+		                                  });
 		if (Graphics::NativeGpu::ShadowShowsNativeFrames()) {
 			(void)m_presenter.Renderer().InvalidateMemory(source_info.data.address,
 			                                              source_info.data.size);

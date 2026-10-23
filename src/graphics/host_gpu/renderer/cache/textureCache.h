@@ -77,6 +77,9 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Debug (BC-250 native shadow frame comparison): queues a write-back of every GPU-modified
+	// image in [address, address + size) to guest memory. Returns how many were queued.
+	uint32_t DownloadRegionForDebug(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 
 private:

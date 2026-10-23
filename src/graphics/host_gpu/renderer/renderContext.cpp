@@ -82,6 +82,14 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+uint32_t RenderContext::DownloadMemoryForDebug(uint64_t vaddr, uint64_t size) {
+	const auto queued = m_texture_cache.DownloadRegionForDebug(vaddr, size);
+	const auto tick   = m_command_scheduler.CurrentTick();
+	m_command_scheduler.Finish();
+	m_command_scheduler.WaitPriorityOperations(tick);
+	return queued;
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;

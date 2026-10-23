@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <ctime>
 #include <mutex>
 #include <set>
 #include <span>
@@ -18,6 +20,12 @@
 namespace Libs::Graphics::NativeGpu {
 
 namespace {
+
+double NowSecShadow() {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+}
 
 bool EnvOn(const char* name) {
 	const char* v = std::getenv(name);
@@ -51,7 +59,9 @@ public:
 		}
 
 		const uint64_t frame = m_frames++;
-		Pm4TranslateResult result = m_translator.Translate(dcb);
+		const double       t_translate = NowSecShadow();
+		Pm4TranslateResult result      = m_translator.Translate(dcb);
+		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
 
 		DetectShaders(result.shader_addrs);
 		for (uint32_t off: result.skipped_uconfig) {
@@ -86,24 +96,30 @@ public:
 		// KYTY_NATIVE_GPU_STATS=1: bracket the IB with pipeline-statistics samples written into the
 		// submitter's scratch area, to see how far each frame gets (vertices, primitives, pixel
 		// shader invocations) when the output stays empty.
-		std::span<const uint32_t> ib = result.ib;
-		std::vector<uint32_t>     wrapped;
+		// Every IB is bracketed with two GPU timestamps (COPY_DATA from the GPU clock) in the
+		// scratch area, so the log can split submit->fence time into the CS ioctl, the GPU work and
+		// the rest. With KYTY_NATIVE_GPU_STATS=1 pipeline-statistics samples are added as well.
+		const uint64_t        sva = m_submitter->ScratchVa();
+		std::vector<uint32_t> wrapped;
+		wrapped.reserve(result.ib.size() + 32);
+		EmitTimestamp(wrapped, sva + kTimestampOffset);
 		if (m_stats) {
-			const uint64_t sva = m_submitter->ScratchVa();
 			for (uint32_t i = 0; i < 2 * kStatSlots * 8; i++) {
 				m_submitter->ScratchCpu()[i] = 0;
 			}
-			wrapped.reserve(result.ib.size() + 16);
 			wrapped.push_back(StatPkt3(kItEventWrite, 1));
 			wrapped.push_back(kEventPipelineStatStart);
 			EmitSample(wrapped, sva);
-			wrapped.insert(wrapped.end(), result.ib.begin(), result.ib.end());
-			EmitSample(wrapped, sva + kStatSlots * 8);
-			while ((wrapped.size() & 7u) != 0) {
-				wrapped.push_back(0xffff1000u);
-			}
-			ib = wrapped;
 		}
+		wrapped.insert(wrapped.end(), result.ib.begin(), result.ib.end());
+		if (m_stats) {
+			EmitSample(wrapped, sva + kStatSlots * 8);
+		}
+		EmitTimestamp(wrapped, sva + kTimestampOffset + 8);
+		while ((wrapped.size() & 7u) != 0) {
+			wrapped.push_back(0xffff1000u);
+		}
+		std::span<const uint32_t> ib = wrapped;
 		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
 
 		const bool detail = frame < 3 || (frame % 120 == 0);
@@ -128,6 +144,10 @@ public:
 
 		m_completed++;
 		m_gpu_ms_total += r.seconds * 1e3;
+		const double gpu_ms = GpuMs();
+		m_cs_ms_total += r.cs_seconds * 1e3;
+		m_gpu_only_ms_total += gpu_ms;
+		m_translate_ms_total += translate_ms;
 		if (m_stats && result.stats.draws > 0 && m_stats_logged < 12) {
 			LogStats(frame, result.stats.draws);
 			m_stats_logged++;
@@ -148,6 +168,12 @@ public:
 			             result.stats.waits_unmet, result.stats.waits_dropped);
 		}
 		if (m_completed > 0 && m_completed % 120 == 0) {
+			const double n = static_cast<double>(m_completed);
+			std::fprintf(stderr,
+			             "native shadow: avg per frame: translate %.2f ms, CS ioctl %.2f ms, GPU %.2f ms, "
+			             "submit->fence %.2f ms\n",
+			             m_translate_ms_total / n, m_cs_ms_total / n, m_gpu_only_ms_total / n,
+			             m_gpu_ms_total / n);
 			std::fprintf(stderr,
 			             "native shadow: %llu frames completed, avg gpu(submit->fence) %.2f ms, "
 			             "%u shaders scanned, %u v_dot2c_f32_f16 sites\n",
@@ -171,6 +197,35 @@ private:
 
 	static uint32_t StatPkt3(uint32_t op, uint32_t body_dw) {
 		return (3u << 30u) | (((body_dw - 1u) & 0x3fffu) << 16u) | (op << 8u);
+	}
+
+	// COPY_DATA SRC_SEL 9 (GPU clock, gpu_counter_freq = 100 MHz on BC-250) -> memory, 64 bit.
+	static constexpr uint32_t kItCopyData       = 0x40;
+	static constexpr uint32_t kTimestampOffset  = 512;
+	static constexpr double   kGpuClockHz       = 100e6;
+
+	static void EmitTimestamp(std::vector<uint32_t>& ib, uint64_t va) {
+		ib.push_back(StatPkt3(kItCopyData, 5));
+		ib.push_back(9u | (5u << 8u) | (1u << 16u) | (1u << 20u)); // SRC TIMESTAMP, DST MEM, 64-bit, confirm
+		ib.push_back(0);
+		ib.push_back(0);
+		ib.push_back(static_cast<uint32_t>(va));
+		ib.push_back(static_cast<uint32_t>(va >> 32u));
+	}
+
+	double GpuMs() const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		const volatile uint8_t* base  = m_submitter->ScratchCpu() + kTimestampOffset;
+		uint64_t                begin = 0;
+		uint64_t                end   = 0;
+		for (uint32_t b = 0; b < 8; b++) {
+			begin |= static_cast<uint64_t>(base[b]) << (8u * b);
+			end |= static_cast<uint64_t>(base[8 + b]) << (8u * b);
+		}
+		return end > begin ? static_cast<double>(end - begin) * 1e3 / kGpuClockHz : 0.0;
+#else
+		return 0.0;
+#endif
 	}
 
 	static void EmitSample(std::vector<uint32_t>& ib, uint64_t va) {
@@ -307,6 +362,9 @@ private:
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
 	double        m_gpu_ms_total   = 0.0;
+	double        m_cs_ms_total    = 0.0;
+	double        m_gpu_only_ms_total = 0.0;
+	double        m_translate_ms_total = 0.0;
 	double        m_timeout_sec    = kDefaultTimeoutSec;
 	uint32_t      m_shaders_scanned = 0;
 	uint32_t      m_dot2c_sites    = 0;
@@ -352,50 +410,88 @@ void ShadowToggleNativeFrames() {
 	std::fprintf(stderr, "native shadow: showing %s frames\n", now ? "NATIVE" : "Vulkan");
 }
 
+namespace {
+
+// KYTY_NATIVE_GPU_DUMP_FLIPS: comma-separated flip numbers or ranges "first-last" with an optional
+// "/step" ("300,600" or "300-2000/10").
+bool FlipWanted(const char* list, uint64_t n) {
+	for (const char* p = list; *p != '\0';) {
+		char*                    end   = nullptr;
+		const unsigned long long first = std::strtoull(p, &end, 10);
+		if (end == p) {
+			return false;
+		}
+		unsigned long long last = first;
+		unsigned long long step = 1;
+		p                       = end;
+		if (*p == '-') {
+			last = std::strtoull(p + 1, &end, 10);
+			p    = end;
+		}
+		if (*p == '/') {
+			step = std::strtoull(p + 1, &end, 10);
+			p    = end;
+		}
+		if (n >= first && n <= last && step != 0 && (n - first) % step == 0) {
+			return true;
+		}
+		if (*p == ',') {
+			p++;
+		} else if (*p != '\0') {
+			return false;
+		}
+	}
+	return false;
+}
+
+void WriteFile(const char* path, const void* data, uint64_t size) {
+	if (std::FILE* f = std::fopen(path, "wb"); f != nullptr) {
+		std::fwrite(data, 1, size, f);
+		std::fclose(f);
+	}
+}
+
+} // namespace
+
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
-                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode) {
+                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
+                  const std::function<uint32_t()>& download_vulkan) {
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
 	const char*                  list = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS");
-	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active()) {
-		return;
-	}
-	bool wanted = false;
-	for (const char* p = list; *p != '\0';) {
-		char*                    end = nullptr;
-		const unsigned long long v   = std::strtoull(p, &end, 10);
-		if (end == p) {
-			break;
-		}
-		wanted = wanted || v == n;
-		p      = (*end == ',') ? end + 1 : end;
-	}
-	if (!wanted) {
+	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active() ||
+	    !FlipWanted(list, n)) {
 		return;
 	}
 	const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
 	if (dir == nullptr || dir[0] == '\0') {
 		dir = ".";
 	}
-	char path[512];
-	std::snprintf(path, sizeof(path), "%s/flip_%llu.raw", dir, static_cast<unsigned long long>(n));
-	if (std::FILE* f = std::fopen(path, "wb"); f != nullptr) {
-		std::fwrite(reinterpret_cast<const void*>(address), 1, size, f);
-		std::fclose(f);
+	const auto flip = static_cast<unsigned long long>(n);
+	char       path[512];
+	// The native result first: it is what guest memory holds right now.
+	std::snprintf(path, sizeof(path), "%s/flip_%llu.native.raw", dir, flip);
+	WriteFile(path, reinterpret_cast<const void*>(address), size);
+	// Then Kyty's Vulkan rendering of the same DCBs, written back over the same guest bytes.
+	uint32_t vulkan_images = 0;
+	if (!PrimaryRendering() && download_vulkan) {
+		vulkan_images = download_vulkan();
+		if (vulkan_images > 0) {
+			std::snprintf(path, sizeof(path), "%s/flip_%llu.vulkan.raw", dir, flip);
+			WriteFile(path, reinterpret_cast<const void*>(address), size);
+		}
 	}
-	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, static_cast<unsigned long long>(n));
+	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, flip);
 	if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
 		std::fprintf(f,
 		             "address 0x%llx\nsize %llu\nwidth %u\nheight %u\nbytes_per_pixel %u\n"
-		             "pixel_format %u\ntile_mode 0x%x\nshowing_native %d\n",
+		             "pixel_format %u\ntile_mode 0x%x\nvulkan_images %u\n",
 		             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-		             width, height, bytes_per_pixel, pixel_format, tile_mode,
-		             ShowNative().load() ? 1 : 0);
+		             width, height, bytes_per_pixel, pixel_format, tile_mode, vulkan_images);
 		std::fclose(f);
 	}
-	std::fprintf(stderr, "native shadow: dumped flip %llu (%ux%u, %llu bytes) to %s\n",
-	             static_cast<unsigned long long>(n), width, height,
-	             static_cast<unsigned long long>(size), dir);
+	std::fprintf(stderr, "native shadow: dumped flip %llu (%ux%u) native%s to %s\n", flip, width,
+	             height, vulkan_images > 0 ? " + vulkan" : "", dir);
 }
 
 } // namespace Libs::Graphics::NativeGpu

@@ -36,6 +36,7 @@ public:
 		bool   reset     = false; // the context reported a reset/guilty state afterwards
 		int    err       = 0;     // negative errno from a failed ioctl
 		double seconds   = 0.0;   // submit -> fence wall time
+		double cs_seconds = 0.0;  // time spent inside the CS ioctl(s), retries included
 		int    retries   = 0;     // extra CS attempts spent on userptr revalidation (EFAULT)
 	};
 
@@ -160,6 +161,7 @@ public:
 			struct timespec nap = {0, 500000}; // 0.5 ms
 			nanosleep(&nap, nullptr);
 		}
+		res.cs_seconds = NowSec() - t0;
 		if (r != 0) {
 			res.err = r;
 			return res;

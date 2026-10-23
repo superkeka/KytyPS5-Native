@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESHADOW_H_
 
 #include <cstdint>
+#include <functional>
 
 // Shadow-mode native GPU submission for the BC-250. Called from Kyty's DCB submit path, it reads
 // the guest draw command buffer, translates it to a native amdgpu IB and submits it to the gfx
@@ -38,11 +39,17 @@ void ShadowToggleNativeFrames();
 // native path is not active, e.g. after it disabled itself, so Kyty falls back to rendering.
 bool PrimaryRendering();
 
-// Called at every video-out flip with the guest surface about to be presented. Writes the raw
-// guest bytes of the flips listed in KYTY_NATIVE_GPU_DUMP_FLIPS (e.g. "300,600") to
-// KYTY_NATIVE_GPU_DUMP_DIR (default ".") as flip_<n>.raw plus flip_<n>.txt with the layout.
+// Called at every video-out flip with the guest surface about to be presented. For the flips
+// listed in KYTY_NATIVE_GPU_DUMP_FLIPS ("300,600" or a range "300-2000/10"), writes to
+// KYTY_NATIVE_GPU_DUMP_DIR (default "."):
+//   flip_<n>.native.raw  the guest bytes as the native path rendered them,
+//   flip_<n>.vulkan.raw  the same surface after `download_vulkan` wrote Kyty's Vulkan copy back
+//                        (shadow mode only; skipped in primary mode, where Kyty draws nothing),
+//   flip_<n>.txt         the layout.
+// tools/bc250-frame-diff compares the pairs.
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
-                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode);
+                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
+                  const std::function<uint32_t()>& download_vulkan);
 
 } // namespace Libs::Graphics::NativeGpu
 
