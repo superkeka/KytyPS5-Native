@@ -218,3 +218,21 @@ direct memory (`0x2_01c00000`), with this packet mix:
 No other UCONFIG writes appear, so this title never touches the registers suspected in the
 `uconfig` crash.
 
+## gem_view_probe
+
+`gem_view_probe.c` is a standalone check that guest direct memory can be real GTT buffers
+(`src/graphics/native_gpu/gemBacking.h`) instead of userptr slices of a memfd. It covers:
+
+- dma-buf mmap at an inner offset, mapped twice plus a whole-buffer view, with CPU aliasing
+  between them;
+- mprotect on a view;
+- a GPU WRITE_DATA through the VM mapping, seen by every view;
+- CS cost with the buffer listed.
+
+```sh
+distrobox enter shadps4-dev -- sh -c "cc -O2 -o /tmp/gem_view_probe gem_view_probe.c && /tmp/gem_view_probe"
+```
+
+On 2026-10-23 every check passed. A CS listing a 256 MiB GTT buffer took 0.008 ms. The same
+buffer as userptr costs a page-table walk on every submit, about 31 ms per frame for Dead Cells'
+13.5 GiB backing.

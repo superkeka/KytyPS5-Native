@@ -147,7 +147,7 @@ public:
 		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs);
 
 		const double t0 = NowSec();
-		// userptr BOs (both the direct-memory chunks and the external ranges) are revalidated against
+		// userptr BOs (the external ranges outside direct memory) are revalidated against
 		// the CPU page tables at submit; a guest write to one between validation passes makes the CS
 		// return -EFAULT, and the caller is expected to retry, exactly as Mesa does. The pages settle
 		// within a few attempts; cap it so a persistently bad range still disables the path cleanly.

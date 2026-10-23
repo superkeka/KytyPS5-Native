@@ -936,8 +936,8 @@ Libs::Graphics::NativeGpu::GemBacking* GetGemBacking() {
 }
 
 #if KYTY_GEM_BACKING_SUPPORTED
-// Bind a GPU-visible guest range into the native GPU VM. Direct and pooled memory are memfd-backed
-// and already bound into that VM by GuestBackingStore::BindView, so only the anon-committed ranges
+// Bind a GPU-visible guest range into the native GPU VM. Direct and pooled memory are backed by the
+// GemBacking chunks and already bound into that VM by GuestBackingStore::BindView, so only the anon-committed ranges
 // the GPU can also read — flexible, program (code), runtime and stack memory, where guest shader
 // code lives — need a userptr binding here.
 static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size) {
@@ -966,7 +966,7 @@ static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size) {
 
 static void NativeGpuUnbindGpuRange(uint64_t vaddr, uint64_t size) {
 	if (auto* gem = GetGemBacking(); gem != nullptr) {
-		gem->UnbindExternal(vaddr, size); // no-op on memfd-backed ranges (never bound here)
+		gem->UnbindExternal(vaddr, size); // no-op on chunk-backed ranges (never bound here)
 	}
 }
 

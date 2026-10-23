@@ -26,7 +26,6 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <drm/amdgpu_drm.h>
@@ -37,33 +36,45 @@ namespace Libs::Graphics::NativeGpu {
 // Backs guest direct memory so every guest direct-memory mapping is also mapped into the GPU VM
 // at the same virtual address, on /dev/dri/renderD128.
 //
-// The CPU side stays a memfd with a single contiguous writable alias, exactly like the upstream
-// backing: the stock amdgpu driver can only CPU-map a GEM buffer whole and from its start (a
-// non-zero inner offset is EINVAL), so a real GEM buffer cannot provide the contiguous alias and
-// the arbitrary-offset guest views this backing needs. Instead each 256 MiB slice of the alias is
-// registered as a userptr GEM buffer (REGISTER, no ANONONLY — the pages are shared memfd pages),
-// created lazily on first touch; a job never pins more than it uses and no buffer approaches the
-// board's ~8 GiB GTT limit. BindView maps a guest view's chunks into the GPU VM of DrmFd() at the
-// view's own address; Lookup resolves a backing offset to (chunk handle, offset-in-chunk) for the
-// buffer list of a submission.
+// The backing is a row of real GTT GEM buffers, one per 256 MiB chunk, created lazily on first
+// touch. Each chunk is exported as a dma-buf: mmap through the DRM file only maps a GEM buffer whole
+// and from its start (a non-zero inner offset is EINVAL), but a dma-buf mmap takes any page offset,
+// which is what guest views need (any (offset, size) of direct memory at any address, the same
+// offset possibly several times). The contiguous CPU alias the address space uses is a PROT_NONE
+// reservation with each chunk mapped into its slot when the chunk is created.
+//
+// Real GEM buffers instead of userptr slices of a memfd are what makes submission cheap: the
+// kernel revalidates a listed userptr buffer by walking its CPU page tables, ~31 ms per frame for
+// the 13.5 GiB backing, while a listed GTT buffer that is already in place costs microseconds
+// (tools/bc250-native-probe/gem_view_probe.c: 0.008 ms for a 256 MiB buffer). The pages belong to
+// TTM, so they cannot be migrated under the GPU either. The chunks are not VM_ALWAYS_VALID because
+// amdgpu refuses to export such buffers; they are listed in each submission instead.
+//
+// The guest mappings are TTM mappings (VM_PFNMAP | VM_IO), so get_user_pages does not work on
+// direct memory: copy_to_user and friends are fine, process_vm_readv is not (Kyty only uses it to
+// probe stacks in crash reports). No chunk approaches the board's 8 GiB GTT limit, but the sum of
+// the chunks a game touches counts against it. BindView maps a guest view's chunks into the GPU VM
+// of DrmFd() at the view's own address; Lookup resolves a backing offset to (chunk handle,
+// offset-in-chunk).
 //
 // Guest memory the GPU can touch also lives outside the direct-memory backing: flexible, program
 // (code), runtime and stack ranges are committed anonymous host pages at guest VA == host VA, not
-// slices of the memfd. BindExternal registers such a range's own host pages as a userptr GEM buffer
+// slices of the chunks. BindExternal registers such a range's own host pages as a userptr GEM buffer
 // and maps it into the same GPU VM at its guest VA, so shader code and other non-direct guest memory
 // is resident on the GPU; UnbindExternal removes it. These buffers join CreatedHandles() so a
-// submission lists them resident. The direct-memory chunk path above stays unchanged.
+// submission lists them resident; as userptr buffers they still cost a page-table walk per submit,
+// in proportion to their size.
 //
-// This class performs no command submission. userptr buffers cannot be dma-buf exported, so
-// presentable surfaces still need dedicated real-GEM allocations elsewhere.
+// This class performs no command submission.
 class GemBacking {
 public:
 	// GEM chunk granularity. 256 MiB divides the 13.5 GiB backing (13824 MiB) evenly and stays
 	// well under the board's per-buffer and total GTT limits.
 	static constexpr uint64_t kChunkSize = 256ull * 1024 * 1024;
 
-	// Creates the backing for `size` bytes: opens the device, creates the memfd and its contiguous
-	// alias. Returns nullptr on failure. No GEM buffers are registered yet.
+	// Creates the backing for `size` bytes: opens the device and reserves the contiguous alias.
+	// Returns nullptr on failure. No GEM buffers exist yet; the alias is inaccessible until
+	// EnsureRange creates the chunks under it.
 	static GemBacking* Create(uint64_t size, const char* device = "/dev/dri/renderD128") {
 		if (size == 0) {
 			return nullptr;
@@ -73,26 +84,16 @@ public:
 			std::fprintf(stderr, "GemBacking: open %s failed: %s\n", device, std::strerror(errno));
 			return nullptr;
 		}
-		int mem_fd = static_cast<int>(::syscall(SYS_memfd_create, "KytyDirectMemoryGem", 0));
-		if (mem_fd < 0 || ::ftruncate(mem_fd, static_cast<off_t>(size)) != 0) {
-			std::fprintf(stderr, "GemBacking: memfd setup failed: %s\n", std::strerror(errno));
-			if (mem_fd >= 0) {
-				::close(mem_fd);
-			}
-			::close(drm_fd);
-			return nullptr;
-		}
-		void* alias = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, 0);
+		void* alias = ::mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+		                     -1, 0);
 		if (alias == MAP_FAILED) {
-			std::fprintf(stderr, "GemBacking: alias of %llu MiB failed: %s\n",
+			std::fprintf(stderr, "GemBacking: alias reservation of %llu MiB failed: %s\n",
 			             static_cast<unsigned long long>(size / (1024 * 1024)), std::strerror(errno));
-			::close(mem_fd);
 			::close(drm_fd);
 			return nullptr;
 		}
 		auto* self       = new GemBacking();
 		self->m_drm_fd   = drm_fd;
-		self->m_mem_fd   = mem_fd;
 		self->m_alias    = static_cast<uint8_t*>(alias);
 		self->m_size     = size;
 		const auto count = (size + kChunkSize - 1) / kChunkSize;
@@ -109,16 +110,14 @@ public:
 			VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, ext.end - vaddr);
 			GemClose(ext.handle);
 		}
-		for (const auto& chunk: m_chunks) {
-			if (chunk.created) {
-				GemClose(chunk.handle);
-			}
-		}
 		if (m_alias != nullptr) {
 			::munmap(m_alias, m_size);
 		}
-		if (m_mem_fd >= 0) {
-			::close(m_mem_fd);
+		for (const auto& chunk: m_chunks) {
+			if (chunk.created) {
+				::close(chunk.dmabuf_fd);
+				GemClose(chunk.handle);
+			}
 		}
 		if (m_drm_fd >= 0) {
 			::close(m_drm_fd);
@@ -131,8 +130,9 @@ public:
 	[[nodiscard]] uint8_t* AliasBase() const { return m_alias; }
 	[[nodiscard]] uint64_t Size() const { return m_size; }
 
-	// Registers every GEM chunk overlapping [offset, offset + size) as a userptr buffer, so the
-	// range is GPU-mappable later. Called before a guest range is mapped.
+	// Creates every GEM chunk overlapping [offset, offset + size) and maps it into the alias, so the
+	// range is CPU-accessible through the alias and GPU-mappable. Called before a guest range is
+	// zeroed or mapped.
 	bool EnsureRange(uint64_t offset, uint64_t size) {
 		if (size == 0) {
 			return true;
@@ -151,17 +151,32 @@ public:
 	}
 
 	// Maps the backing bytes [offset, offset + size) at guest address `vaddr` with protection
-	// `prot` (PROT_* flags), after ensuring the GEM chunks they belong to exist. The CPU mapping is
-	// a single memfd view (the memfd spans every chunk), so no chunk-crossing split is needed here.
-	// On success the region is mapped at exactly `vaddr`.
+	// `prot` (PROT_* flags), after ensuring the GEM chunks they belong to exist. A range that crosses
+	// chunks becomes one dma-buf mapping per chunk, back to back. On success the region is mapped at
+	// exactly `vaddr`.
 	bool MapView(uint64_t vaddr, uint64_t size, uint64_t offset, int prot) {
 		if (size == 0 || !EnsureRange(offset, size)) {
 			return false;
 		}
-		void* const dst = reinterpret_cast<void*>(vaddr);
-		void* const got = ::mmap(dst, size, prot, MAP_SHARED | MAP_FIXED, m_mem_fd,
-		                         static_cast<off_t>(offset));
-		return got != MAP_FAILED && got == dst;
+		uint64_t done = 0;
+		while (done < size) {
+			const uint64_t at    = offset + done;
+			const uint64_t index = at / kChunkSize;
+			const uint64_t inner = at - index * kChunkSize;
+			const uint64_t part  = std::min(size - done, m_chunks[index].size - inner);
+			void* const    dst   = reinterpret_cast<void*>(vaddr + done);
+			void* const    got   = ::mmap(dst, part, prot, MAP_SHARED | MAP_FIXED,
+			                              m_chunks[index].dmabuf_fd, static_cast<off_t>(inner));
+			if (got == MAP_FAILED || got != dst) {
+				std::fprintf(stderr, "GemBacking: view mmap at 0x%llx (+0x%llx, chunk %llu) failed: %s\n",
+				             static_cast<unsigned long long>(vaddr + done),
+				             static_cast<unsigned long long>(part),
+				             static_cast<unsigned long long>(index), std::strerror(errno));
+				return false;
+			}
+			done += part;
+		}
+		return true;
 	}
 
 	// Maps backing bytes [offset, offset + size) into this device's GPU VM at `vaddr`, the same
@@ -221,7 +236,7 @@ public:
 
 	// Removes the external GPU binding(s) in [vaddr, vaddr + size) and closes the buffers they wholly
 	// freed. A VA with no external binding (direct or pooled memory, or an already-unmapped range) is
-	// left untouched, so this is a safe no-op on the memfd-backed ranges that flow through the same
+	// left untouched, so this is a safe no-op on the chunk-backed ranges that flow through the same
 	// GPU-range unmap hook.
 	bool UnbindExternal(uint64_t vaddr, uint64_t size) {
 		if (size == 0) {
@@ -275,9 +290,10 @@ public:
 
 private:
 	struct Chunk {
-		uint32_t handle  = 0;
-		uint64_t size    = 0;
-		bool     created = false;
+		uint32_t handle    = 0;
+		int      dmabuf_fd = -1;
+		uint64_t size      = 0;
+		bool     created   = false;
 	};
 
 	GemBacking() = default;
@@ -326,22 +342,46 @@ private:
 			return true;
 		}
 
-		// Register the chunk's slice of the shared memfd alias as a GEM buffer. REGISTER tracks the
-		// CPU range via mmu-notifier without pinning; the later GPU-VM bind validates the pages.
-		struct drm_amdgpu_gem_userptr u;
-		std::memset(&u, 0, sizeof(u));
-		u.addr  = reinterpret_cast<uintptr_t>(m_alias + index * kChunkSize);
-		u.size  = chunk.size;
-		u.flags = AMDGPU_GEM_USERPTR_REGISTER;
-		if (Ioctl(DRM_IOCTL_AMDGPU_GEM_USERPTR, &u) != 0) {
-			std::fprintf(stderr, "GemBacking: GEM_USERPTR chunk %llu (%llu MiB) failed: %s\n",
+		// A cached GTT buffer (TTM zeroes the pages, like a fresh memfd), exported as a dma-buf for
+		// the CPU mappings and mapped into its alias slot.
+		union drm_amdgpu_gem_create c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.bo_size   = chunk.size;
+		c.in.alignment = 2ull * 1024 * 1024;
+		c.in.domains   = AMDGPU_GEM_DOMAIN_GTT;
+		int r          = Ioctl(DRM_IOCTL_AMDGPU_GEM_CREATE, &c);
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: GEM_CREATE chunk %llu (%llu MiB) failed: %s\n",
 			             static_cast<unsigned long long>(index),
-			             static_cast<unsigned long long>(chunk.size / (1024 * 1024)),
-			             std::strerror(errno));
+			             static_cast<unsigned long long>(chunk.size / (1024 * 1024)), std::strerror(-r));
 			return false;
 		}
-		chunk.handle  = u.handle;
-		chunk.created = true;
+		struct drm_prime_handle p;
+		std::memset(&p, 0, sizeof(p));
+		p.handle = c.out.handle;
+		p.flags  = DRM_CLOEXEC | DRM_RDWR;
+		r        = Ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD, &p);
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: dma-buf export of chunk %llu failed: %s\n",
+			             static_cast<unsigned long long>(index), std::strerror(-r));
+			GemClose(c.out.handle);
+			return false;
+		}
+		void* const slot = m_alias + index * kChunkSize;
+		if (::mmap(slot, chunk.size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, p.fd, 0) != slot) {
+			std::fprintf(stderr, "GemBacking: alias mmap of chunk %llu failed: %s\n",
+			             static_cast<unsigned long long>(index), std::strerror(errno));
+			::close(p.fd);
+			GemClose(c.out.handle);
+			return false;
+		}
+		chunk.handle    = c.out.handle;
+		chunk.dmabuf_fd = p.fd;
+		chunk.created   = true;
+		m_created_bytes += chunk.size;
+		std::fprintf(stderr, "GemBacking: chunk %llu created, %llu MiB of GTT in guest direct memory\n",
+		             static_cast<unsigned long long>(index),
+		             static_cast<unsigned long long>(m_created_bytes / (1024 * 1024)));
 		return true;
 	}
 
@@ -448,9 +488,9 @@ private:
 	};
 
 	int                           m_drm_fd = -1;
-	int                           m_mem_fd = -1;
 	uint8_t*                      m_alias  = nullptr;
 	uint64_t                      m_size   = 0;
+	uint64_t                      m_created_bytes = 0;
 	std::vector<Chunk>            m_chunks;
 	std::map<uint64_t, External>  m_external; // guest VA -> userptr buffer for non-direct ranges
 	mutable std::mutex            m_lock;     // guards m_chunks creation, m_external, CreatedHandles
