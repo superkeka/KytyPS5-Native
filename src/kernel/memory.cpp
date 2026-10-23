@@ -924,6 +924,13 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+#if KYTY_GEM_BACKING_SUPPORTED
+	// The native GPU backend write-protects a block of direct memory while it moves the block into a
+	// GPU buffer; a write that hit it is retried once the move is done.
+	if (access == Graphics::PageFaultAccess::Write && Libs::Graphics::NativeGpu::GemBacking::WaitIfPromoting()) {
+		return true;
+	}
+#endif
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 

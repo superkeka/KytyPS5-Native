@@ -189,8 +189,8 @@ int main() {
 	}
 	::close(probe);
 
-	const uint64_t chunk = GemBacking::kChunkSize;
-	// 2.5 chunks: two full chunks plus a half-size tail chunk, so the last chunk is partial.
+	const uint64_t chunk = GemBacking::kBlockSize;
+	// 2.5 blocks: two full blocks plus a half-size tail block, so the last block is partial.
 	const uint64_t size = chunk * 2 + chunk / 2;
 
 	GemBacking* gem = GemBacking::Create(size);
@@ -216,9 +216,9 @@ int main() {
 		}
 	}
 
-	// Case 2: a view straddling the chunk 0 / chunk 1 boundary. The CPU view is one contiguous
-	// memfd mapping, but the range spans two GEM chunks, so both must register and resolve
-	// separately. Check coherency both directions and the chunk lookup across the seam.
+	// Case 2: a view straddling the block 0 / block 1 boundary. Writes through it make both blocks
+	// touched; PromoteTouched must then move them (and the case 1 range in block 0) into two GEM
+	// buffers without losing data, with view and alias still coherent. Lookup resolves across the seam.
 	{
 		const uint64_t len = 0x40000;        // 256 KiB
 		const uint64_t off = chunk - len / 2; // half in chunk 0, half in chunk 1
@@ -233,6 +233,15 @@ int main() {
 		for (uint32_t i = 0; i < len / 4; i++) {
 			Check(a[i] == 0x5a000000u + i, "alias did not see view write (crossing)");
 		}
+
+		Check(!gem->Lookup(off, nullptr, nullptr), "a block must not be resident before promotion");
+		Check(gem->PromoteTouched() == 2, "PromoteTouched must promote exactly the two touched blocks");
+		Check(gem->PromoteTouched() == 0, "promoted blocks must not be found touched again");
+		for (uint32_t i = 0; i < len / 4; i++) {
+			Check(view[i] == 0x5a000000u + i, "promotion lost data written before it");
+		}
+		Check(reinterpret_cast<const uint32_t*>(alias + 0x40000)[0] == 0xa5000000u,
+		      "promotion lost the case 1 data in block 0");
 
 		// Alias write must be visible through the view: same GEM pages, two mappings.
 		reinterpret_cast<uint32_t*>(alias + off)[0] = 0xdeadbeefu;
@@ -250,12 +259,12 @@ int main() {
 		Check(high_inner == 0, "chunk 1 inner offset must be 0 at the chunk start");
 	}
 
-	// Case 3: the half-size tail chunk was never touched, so it is not created and does not resolve.
+	// Case 3: the half-size tail block was never touched, so it is not resident and does not resolve.
 	{
 		uint32_t handle = 0;
 		uint64_t inner  = 0;
 		Check(!gem->Lookup(chunk * 2 + 0x1000, &handle, &inner),
-		      "an untouched chunk must not resolve (lazy allocation)");
+		      "an untouched block must not resolve (lazy residency)");
 	}
 
 
@@ -284,6 +293,7 @@ int main() {
 		const Buffer code = CreateBuffer(fd, 64 * 1024, 0x0081000000ull);
 		std::memcpy(code.cpu, kStoreShader, sizeof(kStoreShader));
 
+		gem->PromoteGuestRange(va, len);
 		uint32_t chunks[2] = {};
 		Check(gem->Lookup(off, &chunks[0], nullptr) && gem->Lookup(off + len - 1, &chunks[1], nullptr),
 		      "chunk lookup for the GPU case failed");
@@ -301,6 +311,28 @@ int main() {
 		}
 		std::printf("NativeGpuGemBackingTests: GPU wrote %llu KiB through guest VA 0x%llx across chunks\n",
 		            static_cast<unsigned long long>(len / 1024), static_cast<unsigned long long>(va));
+
+		// Case 4b: a GPU write to a view of the untouched tail block lands in the dummy (no fault),
+		// is reported by DummyWritten, and after PromoteGuestRange the same write reaches the view.
+		const uint64_t tail_off = chunk * 2 + 0x10000;
+		auto*          tail     = static_cast<uint32_t*>(ReserveGuest(0x10000));
+		const uint64_t tail_va  = reinterpret_cast<uint64_t>(tail);
+		Check(gem->MapView(tail_va, 0x10000, tail_off, PROT_READ | PROT_WRITE), "MapView of the tail failed");
+		Check(gem->BindView(tail_va, 0x10000, tail_off), "BindView of the tail failed");
+		Check(!gem->DummyWritten(), "dummy must start clean");
+		std::vector<uint32_t> all = gem->CreatedHandles();
+		RunStore(fd, ctx, ib, code, tail_va, 0x66000000u, 0x10000 / 256, all.data(),
+		         static_cast<uint32_t>(all.size()));
+		Check(tail[0] == 0, "a GPU write to a non-resident block must not reach the view");
+		Check(gem->DummyWritten(), "DummyWritten must report the stray GPU write");
+		Check(gem->PromoteGuestRange(tail_va, 0x10000) == 1, "PromoteGuestRange must promote the tail block");
+		all = gem->CreatedHandles();
+		RunStore(fd, ctx, ib, code, tail_va, 0x77000000u, 0x10000 / 256, all.data(),
+		         static_cast<uint32_t>(all.size()));
+		for (uint32_t i = 0; i < 0x10000 / 4; i++) {
+			Check(tail[i] == 0x77000000u + i, "GPU write after promotion not visible in the view");
+		}
+		Check(gem->ResidentBytes() == chunk * 2 + chunk / 2, "all three blocks must now be resident");
 	}
 
 	// Case 5: a guest range that is NOT part of the memfd backing — flexible/program/runtime/stack
@@ -378,6 +410,7 @@ int main() {
 			Check(gem->MapView(rw_va, third, 0x80000, PROT_READ | PROT_WRITE),
 			      "MapView for the read-only shader's output failed");
 			Check(gem->BindView(rw_va, third, 0x80000), "BindView for the output failed");
+			gem->PromoteGuestRange(rw_va, third);
 			std::memset(rw, 0, third);
 
 			// The read-only code BO and the output chunk are both resident via CreatedHandles(); the
