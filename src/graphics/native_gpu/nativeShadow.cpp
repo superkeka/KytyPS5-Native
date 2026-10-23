@@ -54,6 +54,12 @@ public:
 		Pm4TranslateResult result = m_translator.Translate(dcb);
 
 		DetectShaders(result.shader_addrs);
+		for (uint32_t off: result.skipped_uconfig) {
+			if (m_skipped_uconfig.insert(off).second) {
+				std::fprintf(stderr, "native shadow: dropping non-whitelisted UCONFIG 0x%05x (offset 0x%03x)\n",
+				             0x30000u + off * 4u, off);
+			}
+		}
 
 		if (!result.ok) {
 			if (m_refused < 8) {
@@ -305,6 +311,7 @@ private:
 	uint32_t      m_shaders_scanned = 0;
 	uint32_t      m_dot2c_sites    = 0;
 	std::set<uint64_t> m_seen_shaders;
+	std::set<uint32_t> m_skipped_uconfig;
 #if KYTY_GEM_BACKING_SUPPORTED
 	GemBacking*      m_gem       = nullptr;
 	NativeSubmitter* m_submitter = nullptr;

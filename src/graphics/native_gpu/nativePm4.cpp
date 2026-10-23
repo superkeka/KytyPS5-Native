@@ -13,6 +13,7 @@ constexpr uint32_t IT_DRAW_INDEX_2             = 0x27;
 constexpr uint32_t IT_CONTEXT_CONTROL          = 0x28;
 constexpr uint32_t IT_WAIT_REG_MEM             = 0x3C;
 constexpr uint32_t IT_WAIT_REG_MEM_64          = 0x93;
+constexpr uint32_t IT_DMA_DATA                 = 0x50;
 constexpr uint32_t IT_WRITE_DATA               = 0x37;
 constexpr uint32_t IT_EVENT_WRITE              = 0x46;
 constexpr uint32_t IT_ACQUIRE_MEM             = 0x58;
@@ -100,6 +101,17 @@ bool WaitConditionMet(uint32_t function, uint64_t value, uint64_t reference) {
 		case 6: return value > reference;
 		default: return false;
 	}
+}
+
+// DMA_DATA between guest memory (or an immediate source) only: DST_SEL 0/3 (memory), SRC_SEL 0/2/3
+// (memory or immediate data), and both address-space bits (SAS bit 26, DAS bit 27 of the command
+// dword) clear. GDS and register transfers are refused.
+bool DmaDataMemoryOnly(uint32_t control, uint32_t command) {
+	const uint32_t dst_sel = (control >> 20u) & 0x3u;
+	const uint32_t src_sel = (control >> 29u) & 0x3u;
+	const bool     dst_ok  = dst_sel == 0u || dst_sel == 3u;
+	const bool     src_ok  = src_sel == 0u || src_sel == 2u || src_sel == 3u;
+	return dst_ok && src_ok && (command & (3u << 26u)) == 0u;
 }
 
 // WRITE_DATA DST_SEL values that target memory (1 = memory via GRBM, 2 = TC/L2, 5 = memory).
@@ -319,6 +331,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				} else {
 					stats.uconfig_skipped++;
+					if (body_count >= 1) {
+						r.skipped_uconfig.insert((op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
+						                                                          : Normalize(bptr[0]));
+					}
 				}
 				break;
 			}
@@ -368,6 +384,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						}
 						if (!UconfigAllowed(off)) {
 							stats.uconfig_skipped++;
+							r.skipped_uconfig.insert(off);
 							continue;
 						}
 						uc[off] = value;
@@ -410,6 +427,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			}
+			case IT_DMA_DATA:
+				if (body_count < 6 || !DmaDataMemoryOnly(bptr[0], bptr[5])) {
+					return fail(op, dw);
+				}
+				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				stats.dma_data++;
+				break;
 			case IT_WRITE_DATA:
 				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
 					return fail(op, dw);

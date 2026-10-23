@@ -322,6 +322,21 @@ void TestWaitRegMemDropped() {
 	Check(!t.Translate(reg_wait).ok, "register wait refused");
 }
 
+void TestDmaData() {
+	Pm4Translator t;
+	std::vector<uint32_t> dcb;
+	// memory -> memory (SRC_SEL 0, DST_SEL 0, SAS/DAS clear), 256 bytes.
+	Append(dcb, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.dma_data == 1, "memory DMA_DATA passed through");
+	std::vector<uint32_t> to_reg;
+	Append(to_reg, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2c00u, 0x0u, 4u | (1u << 27u)}, false);
+	Check(!t.Translate(to_reg).ok, "DMA_DATA into the register space refused");
+	std::vector<uint32_t> gds;
+	Append(gds, 0x50u, {1u << 20u, 0x1000u, 0x2u, 0x0u, 0x0u, 4u}, false);
+	Check(!t.Translate(gds).ok, "DMA_DATA into GDS refused");
+}
+
 void TestWriteData() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
@@ -402,6 +417,7 @@ int main() {
 	TestWriteData();
 	TestPs5Defaults();
 	TestWaitRegMemDropped();
+	TestDmaData();
 	TestPassthroughPackets();
 	TestUnknownRefused();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");

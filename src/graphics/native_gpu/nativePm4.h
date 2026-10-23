@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -42,6 +43,7 @@ struct Pm4TranslateStats {
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
 	uint32_t write_data        = 0; // IT_WRITE_DATA to memory passed through
+	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
 	uint32_t clear_state       = 0; // IT_CLEAR_STATE
@@ -58,6 +60,7 @@ struct Pm4TranslateResult {
 	std::vector<uint32_t> ib;                 // the self-contained IB (empty when !ok)
 	Pm4TranslateStats     stats;
 	std::vector<uint64_t> shader_addrs;       // shader base VAs from PGM_LO writes this DCB
+	std::set<uint32_t>    skipped_uconfig;    // non-whitelisted UCONFIG offsets dropped this DCB
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
