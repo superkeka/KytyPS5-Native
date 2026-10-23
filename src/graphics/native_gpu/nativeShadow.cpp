@@ -91,7 +91,14 @@ public:
 		// revalidates and fences userptr buffers that are listed, so one left out could have its pages
 		// migrated under a live GPU access. CreatedHandles() is the direct-memory chunks plus the
 		// readable external slices (CPU stacks are never bound, so they are not here).
-		std::vector<uint32_t> handles = m_gem->CreatedHandles();
+		// KYTY_NATIVE_GPU_FAST=1 lists them only on the first submit and every kFastFullListEvery-th
+		// one after it. The CS ioctl then stops revalidating all of guest memory each frame (~31 ms on
+		// Dead Cells), at the cost of the safety above: a guest page the kernel migrates in between
+		// can be read stale by the GPU. For measuring performance only.
+		std::vector<uint32_t> handles;
+		if (!m_fast || frame % kFastFullListEvery == 0) {
+			handles = m_gem->CreatedHandles();
+		}
 
 		// KYTY_NATIVE_GPU_STATS=1: bracket the IB with pipeline-statistics samples written into the
 		// submitter's scratch area, to see how far each frame gets (vertices, primitives, pixel
@@ -203,6 +210,7 @@ private:
 	static constexpr uint32_t kItCopyData       = 0x40;
 	static constexpr uint32_t kTimestampOffset  = 512;
 	static constexpr double   kGpuClockHz       = 100e6;
+	static constexpr uint64_t kFastFullListEvery = 300;
 
 	static void EmitTimestamp(std::vector<uint32_t>& ib, uint64_t va) {
 		ib.push_back(StatPkt3(kItCopyData, 5));
@@ -282,6 +290,11 @@ private:
 		}
 		m_translator.SeedPs5Defaults();
 		m_stats = EnvOn("KYTY_NATIVE_GPU_STATS");
+		m_fast  = EnvOn("KYTY_NATIVE_GPU_FAST");
+		if (m_fast) {
+			std::fprintf(stderr, "native shadow: fast submit, full BO list every %llu frames only\n",
+			             static_cast<unsigned long long>(kFastFullListEvery));
+		}
 		if (const char* d = std::getenv("KYTY_NATIVE_GPU_DUMP_REGS"); d != nullptr && d[0] != '\0') {
 			m_dump_regs_frame = std::atoll(d);
 		}
@@ -356,6 +369,7 @@ private:
 	bool          m_disabled    = false;
 	Pm4Translator m_translator;
 	bool          m_stats          = false;
+	bool          m_fast           = false;
 	uint32_t      m_stats_logged   = 0;
 	int64_t       m_dump_regs_frame = -1;
 	uint64_t      m_frames         = 0;
