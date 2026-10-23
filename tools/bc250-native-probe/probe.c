@@ -1050,7 +1050,7 @@ static bool DangerLong(Device* d, Common* c) {
 
 // Runs a 64-lane shader that takes only a destination address and returns the lane values.
 static bool RunLanes(Device* d, Common* c, const uint8_t* code, size_t size, Bo* extra, uint32_t out[64],
-                     double timeout_sec) {
+                     double timeout_sec, uint32_t vgprs) {
 	Bo  dst;
 	int r = MemCreate(d, &dst, MEM_GTT, 64 * KiB, NULL);
 	if (r == 0) {
@@ -1064,7 +1064,7 @@ static bool RunLanes(Device* d, Common* c, const uint8_t* code, size_t size, Bo*
 	memset(dst.cpu, 0xee, 64 * 4);
 	LoadCode(c, code, size);
 	uint32_t ud[2] = {(uint32_t)dst.va, (uint32_t)(dst.va >> 32)};
-	Dispatch p     = {c->code.va, 64, 16, 2, false, 64, 1, ud};
+	Dispatch p     = {c->code.va, 64, vgprs, 2, false, 64, 1, ud};
 	Ib       ib    = {.n = 0};
 	IbDispatch(&ib, &p);
 	IbPad(&ib);
@@ -1086,7 +1086,7 @@ static bool RunLanes(Device* d, Common* c, const uint8_t* code, size_t size, Bo*
 static bool DangerDot2c(Device* d, Common* c) {
 	printf("== danger dot2c: v_dot2c_f32_f16 (gfx10.3 encoding, VOP2 0x02), expect 22.5 in all lanes\n");
 	uint32_t out[64];
-	if (!RunLanes(d, c, k_dot2c_w64, sizeof(k_dot2c_w64), NULL, out, 15.0)) {
+	if (!RunLanes(d, c, k_dot2c_w64, sizeof(k_dot2c_w64), NULL, out, 15.0, 16)) {
 		return false;
 	}
 	uint32_t good = 0;
@@ -1102,7 +1102,7 @@ static bool DangerDot2c(Device* d, Common* c) {
 static bool DangerDot2x(Device* d, Common* c) {
 	printf("== danger dot2x: what VOP2 opcode 0x02 does on this GPU (see dot2x.s)\n");
 	uint32_t out[64];
-	if (!RunLanes(d, c, k_dot2x_w64, sizeof(k_dot2x_w64), NULL, out, 15.0)) {
+	if (!RunLanes(d, c, k_dot2x_w64, sizeof(k_dot2x_w64), NULL, out, 15.0, 16)) {
 		return false;
 	}
 	static const char* const what[4] = {"acc 10.0, (1.5,2).(3,4)  expect 0x41b40000",
@@ -1138,7 +1138,7 @@ static bool DangerGds(Device* d, Common* c) {
 		return true;
 	}
 	uint32_t out[64];
-	bool     ok = RunLanes(d, c, k_gds_w64, sizeof(k_gds_w64), &gds, out, 15.0);
+	bool     ok = RunLanes(d, c, k_gds_w64, sizeof(k_gds_w64), &gds, out, 15.0, 16);
 	BoDestroy(d, &gds);
 	if (!ok) {
 		return false;
@@ -1408,8 +1408,8 @@ static void ProbeDot2Emu(Device* d, Common* c) {
 
 // Runs a raw shader binary (e.g. one produced by patch_blob) as one 64-lane wave64 group whose
 // only input is the destination address in s[0:1], and prints the first two lanes' 4 dwords.
-static bool RunBlob(Device* d, Common* c, const char* path) {
-	printf("== blob: %s\n", path);
+static bool RunBlob(Device* d, Common* c, const char* path, uint32_t vgprs) {
+	printf("== blob: %s (vgprs %u)\n", path, vgprs);
 	FILE* f = fopen(path, "rb");
 	if (f == NULL) {
 		printf("  open failed: %s\n", strerror(errno));
@@ -1423,7 +1423,7 @@ static bool RunBlob(Device* d, Common* c, const char* path) {
 		return false;
 	}
 	uint32_t out[64];
-	if (!RunLanes(d, c, code, size, NULL, out, 15.0)) {
+	if (!RunLanes(d, c, code, size, NULL, out, 15.0, vgprs)) {
 		return false;
 	}
 	for (int lane = 0; lane < 2; lane++) {
@@ -1434,7 +1434,8 @@ static bool RunBlob(Device* d, Common* c, const char* path) {
 }
 
 static void Usage(const char* argv0) {
-	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [--blob FILE] [probe...]\n", argv0);
+	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [--blob FILE [--vgprs N]] [probe...]\n",
+	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit dot2emu (default: all)\n");
 	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds crossqueue uconfig\n");
 }
@@ -1444,6 +1445,7 @@ int main(int argc, char** argv) {
 	uint64_t    max_alloc   = 4 * GiB;
 	const char* danger      = NULL;
 	const char* blob        = NULL;
+	uint32_t    blob_vgprs  = 16;
 	const char* selected[16];
 	int         num_selected = 0;
 	for (int i = 1; i < argc; i++) {
@@ -1455,6 +1457,8 @@ int main(int argc, char** argv) {
 			danger = argv[++i];
 		} else if (strcmp(argv[i], "--blob") == 0 && i + 1 < argc) {
 			blob = argv[++i];
+		} else if (strcmp(argv[i], "--vgprs") == 0 && i + 1 < argc) {
+			blob_vgprs = (uint32_t)strtoul(argv[++i], NULL, 10);
 		} else if (strcmp(argv[i], "--help") == 0) {
 			Usage(argv[0]);
 			return 0;
@@ -1474,7 +1478,7 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	if (blob != NULL) {
-		bool ok = RunBlob(&d, &c, blob);
+		bool ok = RunBlob(&d, &c, blob, blob_vgprs);
 		BoDestroy(&d, &c.code);
 		BoDestroy(&d, &c.ib);
 		close(d.fd);

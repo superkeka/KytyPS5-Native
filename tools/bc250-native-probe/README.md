@@ -21,9 +21,13 @@ distrobox enter bc250-mesa-dev -- make
 
 `shaders.h` is generated from the `.s` files by `gen_shaders.sh` (LLVM `llvm-mc`, gfx1013).
 
-`--blob FILE` runs a raw shader binary as one wave64 group of 64 lanes (destination address in
-`s[0:1]`) and prints the first two lanes' 4 dwords. `patch_blob.cpp` applies the native_gpu shader
-patcher (`src/graphics/native_gpu/shaderPatcher.*`) to such a binary.
+`--blob FILE [--vgprs N]` runs a raw shader binary as one wave64 group of 64 lanes (destination
+address in `s[0:1]`) and prints the first two lanes' 4 dwords; `--vgprs` (default 16) sets the
+dispatch's VGPR count, which must cover any scratch register the patched stubs use. `patch_blob
+IN.bin OUT.bin NUM_VGPRS` applies the native_gpu shader patcher
+(`src/graphics/native_gpu/shaderPatcher.*`) to such a binary; `NUM_VGPRS` is the VGPR count the
+shader allocates (the stubs use `v[NUM_VGPRS]` as scratch for the literal/DPP/aliasing forms) and
+it prints the minimum `--vgprs` the patched blob needs.
 
 ## Probes
 
@@ -147,6 +151,41 @@ devcoredump are the debugging path.
 run with `--blob`: unpatched every lane reads `0 0 0 0xabcd0123`; after `patch_blob` (3 sites
 patched, 22 -> 48 dwords) every lane reads `0x41b40000 0x41b40000 0x41200000 0xabcd0123`, the
 correct results. Unit tests: `native_gpu_shader_patcher_tests` (ctest `native_gpu_shader_patcher`).
+
+The patcher also covers the forms a plain VOP2 rewrite cannot reach. `v_fma_mix_f32` is VOP3P, so
+it takes no 32-bit literal and gfx10 VOP3P has no DPP; the literal (8-byte), DPP16/DPP8 and
+vdst-aliasing forms therefore materialise the effective src0 — or a preserved copy of vdst — into
+one scratch VGPR at the top of the stub before the two FMAs. The scratch register is `v[num_vgprs]`
+(the first VGPR past the shader's own allocation, passed to `PatchDot2c`), so a patched site raises
+the shader's VGPR count by one and the caller must widen `COMPUTE_PGM_RSRC1` VGPRS to match. The
+stub shapes are:
+
+- **literal src0**: `v_mov_b32 scratch, <literal>`, then the FMAs read `scratch` (the literal's
+  packed f16 halves selected by op_sel, same as a register src0).
+- **DPP16/DPP8 src0**: `v_mov_b32_dpp scratch, v<src0> <dpp>` with the original DPP control word
+  copied verbatim (the control word is opcode-independent), so `scratch` holds the swizzled src0;
+  vsrc1 is read straight, matching `v_dot2c` where only src0 is swizzled.
+- **vdst aliasing** (`v_dot2c vN, vN, …` / `… , vN`): `v_mov_b32 scratch, vN` preserves the input
+  that aliases the accumulator before the first FMA overwrites `vN`; one copy serves both operands
+  of `v_dot2c vN, vN, vN`.
+
+Still counted as unsupported: SDWA src0 (its dst_sel / sub-dword semantics cannot be reproduced by
+a full-dword VOP3P write), a literal or DPP src0 whose vsrc1 also aliases vdst (would need a second
+scratch), and inline-constant src0 (unchanged).
+
+`dot2p2.s` exercises all three on hardware (gfx1030, `patch_blob dot2p2.bin dot2p2.patched.bin 12`,
+run with `--vgprs 13` — 3 sites patched, 27 -> 48 dwords, one scratch VGPR). Unpatched every lane
+reads `0 0 0 0xabcd0123`; patched:
+
+| dword | form | lane 0 | lane 1 | expected |
+|---|---|---|---|---|
+| +0 | literal src0 `10.0 + (1.5,2.0)·(3.0,4.0)` | `0x41b40000` | `0x41b40000` | 22.5 |
+| +4 | DPP src0 `quad_perm:[1,0,3,2]` (swaps lane pairs) | `0x40c00000` | `0x40800000` | 6.0 / 4.0 |
+| +8 | vdst aliasing `v5=8.0 (f16 0.0,2.5)`, `8.0 + 2.5²` | `0x41640000` | `0x41640000` | 14.25 |
+| +12 | control | `0xabcd0123` | `0xabcd0123` | — |
+
+The DPP lanes differ (6.0 vs 4.0) exactly as the quad swap predicts, so the swizzle is preserved,
+not elided. Job signaled in 0.1 ms, context state `0x0`, no reset; CU bitmap unchanged after.
 
 ## Dead Cells PM4 census (2026-10-23, Vulkan-path baseline)
 
