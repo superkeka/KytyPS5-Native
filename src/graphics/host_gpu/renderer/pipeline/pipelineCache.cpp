@@ -448,9 +448,22 @@ struct PipelineCache::ProgramCache {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			const bool materialized = ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			    entry->second.specialization);
+			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				// ASTRO BOT: a compute shader whose SRT holds a null resource pointer cannot be
+				// specialized. Skip its dispatches like the unsupported-callable case above instead of
+				// terminating, so the rest of the frame (and the game) can go on.
+				if (!materialized) {
+					PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} "
+					                 "reason=shader resource specialization failed; rendering is incomplete",
+					                 params.hash);
+					entry->second.skip_dispatch = true;
+					return {};
+				}
+			}
+			EXIT_IF(!materialized);
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {

@@ -397,7 +397,11 @@ std::atomic<bool>& ShowNative() {
 
 bool PrimaryRendering() {
 	static const bool primary = EnvOn("KYTY_NATIVE_GPU_PRIMARY");
-	return primary && Shadow::Instance().Active();
+	// KYTY_NATIVE_GPU_NULL=1: nothing renders at all, natively or through Vulkan, while the game and
+	// Kyty's command processor run on. For measuring what a game does on the CPU side (e.g. how much
+	// guest memory it really touches) when rendering is what stops it.
+	static const bool null_rendering = EnvOn("KYTY_NATIVE_GPU_NULL");
+	return null_rendering || (primary && Shadow::Instance().Active());
 }
 
 bool ShadowShowsNativeFrames() {

@@ -37,6 +37,7 @@ void ShadowToggleNativeFrames();
 // the native path renders and Kyty's command processor still runs every DCB for synchronization,
 // labels and flips, but skips its own Vulkan draws and DCB dispatches. Returns false whenever the
 // native path is not active, e.g. after it disabled itself, so Kyty falls back to rendering.
+// KYTY_NATIVE_GPU_NULL=1 makes it true with nothing rendering at all, for CPU-side measurements.
 bool PrimaryRendering();
 
 // Called at every video-out flip with the guest surface about to be presented. For the flips
