@@ -133,12 +133,13 @@ public:
 			std::fprintf(stderr,
 			             "native shadow: frame %llu ok, gpu(submit->fence) %.2f ms, %d cs-retries, "
 			             "ib %zu dw (preamble cx/sh/uc %u/%u/%u), %u draws, %u/%u/%u loads, %u dispatch, "
-			             "%u acquire, %u uc-skipped\n",
+			             "%u acquire, %u uc-skipped, %u/%u waits unmet/dropped\n",
 			             static_cast<unsigned long long>(frame), r.seconds * 1e3, r.retries,
 			             result.ib.size(), result.stats.preamble_cx, result.stats.preamble_sh,
 			             result.stats.preamble_uc, result.stats.draws, result.stats.loaded_cx_regs,
 			             result.stats.loaded_sh_regs, result.stats.loaded_uc_regs,
-			             result.stats.dispatches, result.stats.acquire_mem, result.stats.uconfig_skipped);
+			             result.stats.dispatches, result.stats.acquire_mem, result.stats.uconfig_skipped,
+			             result.stats.waits_unmet, result.stats.waits_dropped);
 		}
 		if (m_completed > 0 && m_completed % 120 == 0) {
 			std::fprintf(stderr,

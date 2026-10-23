@@ -42,6 +42,8 @@ struct Pm4TranslateStats {
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
 	uint32_t write_data        = 0; // IT_WRITE_DATA to memory passed through
+	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
+	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
 	uint32_t clear_state       = 0; // IT_CLEAR_STATE
 	uint32_t uconfig_skipped   = 0; // non-whitelisted UCONFIG writes dropped for board safety
 	uint32_t preamble_cx       = 0; // context registers emitted in the IB preamble

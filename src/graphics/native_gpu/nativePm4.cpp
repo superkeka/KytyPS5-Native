@@ -11,6 +11,8 @@ constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_DISPATCH_DIRECT          = 0x15;
 constexpr uint32_t IT_DRAW_INDEX_2             = 0x27;
 constexpr uint32_t IT_CONTEXT_CONTROL          = 0x28;
+constexpr uint32_t IT_WAIT_REG_MEM             = 0x3C;
+constexpr uint32_t IT_WAIT_REG_MEM_64          = 0x93;
 constexpr uint32_t IT_WRITE_DATA               = 0x37;
 constexpr uint32_t IT_EVENT_WRITE              = 0x46;
 constexpr uint32_t IT_ACQUIRE_MEM             = 0x58;
@@ -83,6 +85,20 @@ void EmitSetUconfig(std::vector<uint32_t>& ib, uint32_t offset, uint32_t value) 
 		case 0x242: EmitSet(ib, IT_SET_UCONFIG_REG_INDEX, (1u << 28u) | offset, value, false); break;
 		case 0x243: EmitSet(ib, IT_SET_UCONFIG_REG_INDEX, (2u << 28u) | offset, value, false); break;
 		default: EmitSet(ib, IT_SET_UCONFIG_REG, offset, value, false); break;
+	}
+}
+
+// WAIT_REG_MEM compare function (CONTROL bits 2:0), as Kyty's command processor evaluates it.
+bool WaitConditionMet(uint32_t function, uint64_t value, uint64_t reference) {
+	switch (function) {
+		case 0: return true;
+		case 1: return value < reference;
+		case 2: return value <= reference;
+		case 3: return value == reference;
+		case 4: return value != reference;
+		case 5: return value >= reference;
+		case 6: return value > reference;
+		default: return false;
 	}
 }
 
@@ -362,6 +378,38 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			}
 
+			case IT_WAIT_REG_MEM:
+			case IT_WAIT_REG_MEM_64: {
+				// Shadow mode drops guest waits: native IBs run one at a time and to completion before
+				// Kyty records the same DCB, and Kyty's Vulkan path does the real synchronization. Passing
+				// a wait through would hang the gfx ring on a label that Kyty only writes later. The
+				// condition is still evaluated against guest memory now, so the stats show which waits a
+				// primary (non-shadow) native path will have to honour.
+				const bool     wide     = op == IT_WAIT_REG_MEM_64;
+				const uint32_t need     = wide ? 8u : 6u;
+				if (body_count < need || (bptr[0] & 0x10u) == 0) {
+					return fail(op, dw); // register waits are refused
+				}
+				const uint64_t addr = (static_cast<uint64_t>(bptr[1]) & (wide ? ~0x7ull : ~0x3ull)) |
+				                      (static_cast<uint64_t>(bptr[2] & 0x3ffffu) << 32u);
+				uint64_t ref  = bptr[3];
+				uint64_t mask = wide ? bptr[5] : bptr[4];
+				if (wide) {
+					ref |= static_cast<uint64_t>(bptr[4]) << 32u;
+					mask |= static_cast<uint64_t>(bptr[6]) << 32u;
+				}
+				bool met = false;
+				if (addr != 0) {
+					const uint64_t value = wide ? *reinterpret_cast<const volatile uint64_t*>(addr)
+					                            : *reinterpret_cast<const volatile uint32_t*>(addr);
+					met = WaitConditionMet(bptr[0] & 0x7u, value & mask, ref);
+				}
+				stats.waits_dropped++;
+				if (!met) {
+					stats.waits_unmet++;
+				}
+				break;
+			}
 			case IT_WRITE_DATA:
 				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
 					return fail(op, dw);

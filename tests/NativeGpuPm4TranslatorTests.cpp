@@ -302,6 +302,26 @@ void TestPs5Defaults() {
 	Check(cb_guest, "guest CB_COLOR_CONTROL overrides the seeded default");
 }
 
+void TestWaitRegMemDropped() {
+	alignas(8) static volatile uint64_t label = 5;
+	const auto addr = reinterpret_cast<uint64_t>(&label);
+	Pm4Translator t;
+	std::vector<uint32_t> dcb;
+	// WAIT_REG_MEM_64, memory space, function ">=": met (5 >= 5) and unmet (5 >= 6).
+	Append(dcb, 0x93u, {0x15u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 5u, 0u,
+	                    0xffffffffu, 0xffffffffu, 10u}, false);
+	Append(dcb, 0x93u, {0x15u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 6u, 0u,
+	                    0xffffffffu, 0xffffffffu, 10u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.waits_dropped == 2 && r.stats.waits_unmet == 1, "waits counted and dropped");
+	for (const auto& p: Decode(r.ib)) {
+		Check(p.op != 0x93u, "WAIT_REG_MEM_64 must not reach the shadow IB");
+	}
+	std::vector<uint32_t> reg_wait;
+	Append(reg_wait, 0x93u, {0x05u, 0x1234u, 0u, 0u, 0u, 0u, 0u, 10u}, false);
+	Check(!t.Translate(reg_wait).ok, "register wait refused");
+}
+
 void TestWriteData() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
@@ -381,6 +401,7 @@ int main() {
 	TestUconfigIndexedRegisters();
 	TestWriteData();
 	TestPs5Defaults();
+	TestWaitRegMemDropped();
 	TestPassthroughPackets();
 	TestUnknownRefused();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
