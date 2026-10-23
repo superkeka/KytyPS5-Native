@@ -23,6 +23,9 @@ public:
 	// 0x800000000000, so this sits clear of both).
 	static constexpr uint64_t kIbVa      = 0x400000000000ull;
 	static constexpr uint64_t kIbSize    = 2ull * 1024 * 1024;
+	// The last bytes of the IB buffer are a scratch area the IB itself may write into (pipeline
+	// statistics samples); IBs must stay below it.
+	static constexpr uint64_t kScratchSize = 4096;
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;
 
@@ -79,6 +82,11 @@ public:
 		}
 	}
 
+	[[nodiscard]] uint64_t ScratchVa() const { return m_ib_va + kIbSize - kScratchSize; }
+	[[nodiscard]] volatile uint8_t* ScratchCpu() const {
+		return static_cast<volatile uint8_t*>(m_ib_cpu) + kIbSize - kScratchSize;
+	}
+
 	NativeSubmitter(const NativeSubmitter&)            = delete;
 	NativeSubmitter& operator=(const NativeSubmitter&) = delete;
 
@@ -87,7 +95,7 @@ public:
 	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
 	              double timeout_sec) {
 		Result res;
-		if (ib.size() * 4 > kIbSize) {
+		if (ib.size() * 4 > kIbSize - kScratchSize) {
 			res.err = -E2BIG;
 			return res;
 		}

@@ -31,6 +31,7 @@ constexpr uint32_t IT_SET_UCONFIG_REG_INDIRECT = 0x64;
 constexpr uint32_t IT_SET_CONTEXT_REG          = 0x69;
 constexpr uint32_t IT_SET_SH_REG               = 0x76;
 constexpr uint32_t IT_SET_UCONFIG_REG          = 0x79;
+constexpr uint32_t IT_WRITE_DATA               = 0x37;
 constexpr uint32_t IT_SET_UCONFIG_REG_INDEX    = 0x7A;
 constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT = 0x9F;
 
@@ -233,11 +234,88 @@ void TestUconfigWhitelist() {
 	Check(r.stats.loaded_uc_regs == 1, "only the whitelisted uc reg kept");
 	Check(r.stats.uconfig_skipped == 1, "non-whitelisted uc reg skipped");
 	auto pkts = Decode(r.ib);
+	bool index_type = false;
 	for (const auto& p: pkts) {
-		if (p.op == IT_SET_UCONFIG_REG) {
-			Check(!p.body.empty() && p.body[0] == 0x243u, "only VGT_INDEX_TYPE emitted");
+		Check(p.op != IT_SET_UCONFIG_REG || (!p.body.empty() && p.body[0] != 0x300u),
+		      "non-whitelisted uc reg emitted");
+		index_type = index_type || (p.op == IT_SET_UCONFIG_REG_INDEX && p.body[0] == 0x20000243u);
+	}
+	Check(index_type, "VGT_INDEX_TYPE emitted with SET_UCONFIG_REG_INDEX index 2");
+}
+
+// GFX9+ only updates the CP's copy of VGT_PRIMITIVE_TYPE / VGT_INDEX_TYPE through
+// SET_UCONFIG_REG_INDEX (index 1 / 2), in the body and in the preamble of the next IB alike.
+void TestUconfigIndexedRegisters() {
+	Pm4Translator         t;
+	std::vector<uint32_t> pairs = {0x242u, 0x4u, 0x243u, 0x1u, 0x25Bu, 0x8040u};
+	std::vector<uint32_t> dcb;
+	AppendIndirect(dcb, IT_SET_UCONFIG_REG_INDIRECT, pairs);
+	Append(dcb, IT_SET_UCONFIG_REG, {0x242u, 0x5u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.loaded_uc_regs == 3, "indirect uc regs expanded");
+	uint32_t prim_idx1 = 0, type_idx2 = 0, ge_plain = 0, prim_plain = 0;
+	for (const auto& p: Decode(r.ib)) {
+		if (p.op == IT_SET_UCONFIG_REG_INDEX && p.body[0] == 0x10000242u) {
+			prim_idx1++;
+		}
+		if (p.op == IT_SET_UCONFIG_REG_INDEX && p.body[0] == 0x20000243u) {
+			type_idx2++;
+		}
+		if (p.op == IT_SET_UCONFIG_REG && p.body[0] == 0x25Bu) {
+			ge_plain++;
+		}
+		if (p.op == IT_SET_UCONFIG_REG && p.body[0] == 0x242u) {
+			prim_plain++;
 		}
 	}
+	// The preamble replays the committed shadow too, so each register shows up there and in the body.
+	Check(prim_idx1 == 3 && prim_plain == 0, "VGT_PRIMITIVE_TYPE must use index 1, also when the guest wrote it plain");
+	Check(type_idx2 == 2, "VGT_INDEX_TYPE must use index 2");
+	Check(ge_plain == 2, "GE_CNTL stays a plain SET_UCONFIG_REG");
+
+	// The next IB's preamble replays the shadow with the same encodings.
+	std::vector<uint32_t> next;
+	Append(next, IT_NOP, {0u}, false);
+	auto r2 = t.Translate(next);
+	uint32_t pre_prim = 0, pre_type = 0;
+	for (const auto& p: Decode(r2.ib)) {
+		pre_prim += (p.op == IT_SET_UCONFIG_REG_INDEX && p.body[0] == 0x10000242u && p.body[1] == 0x5u) ? 1 : 0;
+		pre_type += (p.op == IT_SET_UCONFIG_REG_INDEX && p.body[0] == 0x20000243u && p.body[1] == 0x1u) ? 1 : 0;
+	}
+	Check(pre_prim == 1 && pre_type == 1, "preamble replays indexed uc regs with their last values");
+}
+
+void TestPs5Defaults() {
+	Pm4Translator t;
+	t.SeedPs5Defaults();
+	std::vector<uint32_t> dcb;
+	// The guest's own value wins over a seeded default.
+	Append(dcb, IT_SET_CONTEXT_REG, {0x202u, 0x00cc0000u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.preamble_cx == 5, "five seeded defaults in the preamble");
+	bool vte = false, cb_guest = false;
+	for (const auto& p: Decode(r.ib)) {
+		vte = vte || (p.op == IT_SET_CONTEXT_REG && p.body[0] == 0x206u && p.body[1] == 0x43fu);
+		cb_guest = cb_guest || (p.op == IT_SET_CONTEXT_REG && p.body[0] == 0x202u && p.body[1] == 0x00cc0000u);
+	}
+	Check(vte, "PA_CL_VTE_CNTL seeded with the PS5 viewport-transform default");
+	Check(cb_guest, "guest CB_COLOR_CONTROL overrides the seeded default");
+}
+
+void TestWriteData() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_WRITE_DATA, {(5u << 8u) | (1u << 20u), 0x1000u, 0x2u, 0xabcdu}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.write_data == 1, "WRITE_DATA to memory passed through");
+	const auto    pkts = Decode(r.ib);
+	const Packet* p    = FindFirst(pkts, IT_WRITE_DATA);
+	Check(p != nullptr && p->body.size() == 4 && p->body[3] == 0xabcdu, "WRITE_DATA body preserved");
+
+	std::vector<uint32_t> to_reg;
+	Append(to_reg, IT_WRITE_DATA, {0u, 0x2c00u, 0x0u, 0x1u}, false);
+	auto r2 = t.Translate(to_reg);
+	Check(!r2.ok && r2.unknown_op == IT_WRITE_DATA, "WRITE_DATA to a register refused");
 }
 
 void TestUconfigIndexPassthrough() {
@@ -300,6 +378,9 @@ int main() {
 	TestIndirectShComputeBit();
 	TestUconfigWhitelist();
 	TestUconfigIndexPassthrough();
+	TestUconfigIndexedRegisters();
+	TestWriteData();
+	TestPs5Defaults();
 	TestPassthroughPackets();
 	TestUnknownRefused();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");

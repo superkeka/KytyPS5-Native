@@ -75,8 +75,30 @@ public:
 		// revalidates and fences userptr buffers that are listed, so one left out could have its pages
 		// migrated under a live GPU access. CreatedHandles() is the direct-memory chunks plus the
 		// readable external slices (CPU stacks are never bound, so they are not here).
-		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
-		NativeSubmitter::Result r       = m_submitter->Submit(result.ib, handles, m_timeout_sec);
+		std::vector<uint32_t> handles = m_gem->CreatedHandles();
+
+		// KYTY_NATIVE_GPU_STATS=1: bracket the IB with pipeline-statistics samples written into the
+		// submitter's scratch area, to see how far each frame gets (vertices, primitives, pixel
+		// shader invocations) when the output stays empty.
+		std::span<const uint32_t> ib = result.ib;
+		std::vector<uint32_t>     wrapped;
+		if (m_stats) {
+			const uint64_t sva = m_submitter->ScratchVa();
+			for (uint32_t i = 0; i < 2 * kStatSlots * 8; i++) {
+				m_submitter->ScratchCpu()[i] = 0;
+			}
+			wrapped.reserve(result.ib.size() + 16);
+			wrapped.push_back(StatPkt3(kItEventWrite, 1));
+			wrapped.push_back(kEventPipelineStatStart);
+			EmitSample(wrapped, sva);
+			wrapped.insert(wrapped.end(), result.ib.begin(), result.ib.end());
+			EmitSample(wrapped, sva + kStatSlots * 8);
+			while ((wrapped.size() & 7u) != 0) {
+				wrapped.push_back(0xffff1000u);
+			}
+			ib = wrapped;
+		}
+		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
 
 		const bool detail = frame < 3 || (frame % 120 == 0);
 		if (!r.submitted) {
@@ -100,6 +122,13 @@ public:
 
 		m_completed++;
 		m_gpu_ms_total += r.seconds * 1e3;
+		if (m_stats && result.stats.draws > 0 && m_stats_logged < 12) {
+			LogStats(frame, result.stats.draws);
+			m_stats_logged++;
+		}
+		if (m_dump_regs_frame >= 0 && frame == static_cast<uint64_t>(m_dump_regs_frame)) {
+			DumpRegs(frame);
+		}
 		if (detail) {
 			std::fprintf(stderr,
 			             "native shadow: frame %llu ok, gpu(submit->fence) %.2f ms, %d cs-retries, "
@@ -125,6 +154,61 @@ public:
 	}
 
 private:
+	// Pipeline statistics: 11 64-bit counters per sample on GFX10, in hardware slot order
+	// (RADV pipeline_statistics_indices): PS invocations, clipper primitives, clipper invocations,
+	// VS invocations, GS invocations, GS primitives, IA primitives, IA vertices, HS, DS, CS.
+	static constexpr uint32_t kStatSlots              = 11;
+	static constexpr uint32_t kItEventWrite           = 0x46;
+	static constexpr uint32_t kEventPipelineStatStart = 0x19;
+	static constexpr uint32_t kEventSamplePipelineStat = 0x1e | (2u << 8u); // EVENT_INDEX 2
+
+	static uint32_t StatPkt3(uint32_t op, uint32_t body_dw) {
+		return (3u << 30u) | (((body_dw - 1u) & 0x3fffu) << 16u) | (op << 8u);
+	}
+
+	static void EmitSample(std::vector<uint32_t>& ib, uint64_t va) {
+		ib.push_back(StatPkt3(kItEventWrite, 3));
+		ib.push_back(kEventSamplePipelineStat);
+		ib.push_back(static_cast<uint32_t>(va));
+		ib.push_back(static_cast<uint32_t>(va >> 32u));
+	}
+
+	void LogStats(uint64_t frame, uint32_t draws) const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		static const char* const kNames[kStatSlots] = {"ps", "c_prim", "c_inv", "vs", "gs", "gs_prim",
+		                                               "ia_prim", "ia_vert", "hs", "ds", "cs"};
+		const volatile uint8_t*  base               = m_submitter->ScratchCpu();
+		std::fprintf(stderr, "native shadow: frame %llu pipeline stats (%u draws):",
+		             static_cast<unsigned long long>(frame), draws);
+		for (uint32_t i = 0; i < kStatSlots; i++) {
+			uint64_t begin = 0;
+			uint64_t end   = 0;
+			for (uint32_t b = 0; b < 8; b++) {
+				begin |= static_cast<uint64_t>(base[i * 8 + b]) << (8u * b);
+				end |= static_cast<uint64_t>(base[kStatSlots * 8 + i * 8 + b]) << (8u * b);
+			}
+			std::fprintf(stderr, " %s=%llu", kNames[i], static_cast<unsigned long long>(end - begin));
+		}
+		std::fprintf(stderr, "\n");
+#else
+		(void)frame;
+		(void)draws;
+#endif
+	}
+
+	void DumpRegs(uint64_t frame) const {
+		const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+		char        path[512];
+		std::snprintf(path, sizeof(path), "%s/shadow_regs_%llu.txt",
+		              (dir != nullptr && dir[0] != '\0') ? dir : ".", static_cast<unsigned long long>(frame));
+		if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+			m_translator.DumpShadow(f);
+			std::fclose(f);
+			std::fprintf(stderr, "native shadow: dumped shadow registers of frame %llu to %s\n",
+			             static_cast<unsigned long long>(frame), path);
+		}
+	}
+
 	// The first native CS pays a large one-off cost while amdgpu validates the whole userptr
 	// backing (the shader-range binding does not remove that), so the wait must outlast it or a
 	// successful-but-slow submit is misread as a hang. Overridable with KYTY_NATIVE_GPU_TIMEOUT_SEC.
@@ -133,6 +217,11 @@ private:
 	void Init() {
 		if (!EnvOn("KYTY_NATIVE_GPU_SHADOW")) {
 			return;
+		}
+		m_translator.SeedPs5Defaults();
+		m_stats = EnvOn("KYTY_NATIVE_GPU_STATS");
+		if (const char* d = std::getenv("KYTY_NATIVE_GPU_DUMP_REGS"); d != nullptr && d[0] != '\0') {
+			m_dump_regs_frame = std::atoll(d);
 		}
 		if (const char* t = std::getenv("KYTY_NATIVE_GPU_TIMEOUT_SEC"); t != nullptr && t[0] != '\0') {
 			const double v = std::atof(t);
@@ -204,6 +293,9 @@ private:
 	bool          m_enabled     = false;
 	bool          m_disabled    = false;
 	Pm4Translator m_translator;
+	bool          m_stats          = false;
+	uint32_t      m_stats_logged   = 0;
+	int64_t       m_dump_regs_frame = -1;
 	uint64_t      m_frames         = 0;
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;

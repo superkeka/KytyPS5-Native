@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVEPM4_H_
 
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <span>
 #include <vector>
@@ -40,6 +41,7 @@ struct Pm4TranslateStats {
 	uint32_t dispatches        = 0; // IT_DISPATCH_DIRECT
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
+	uint32_t write_data        = 0; // IT_WRITE_DATA to memory passed through
 	uint32_t clear_state       = 0; // IT_CLEAR_STATE
 	uint32_t uconfig_skipped   = 0; // non-whitelisted UCONFIG writes dropped for board safety
 	uint32_t preamble_cx       = 0; // context registers emitted in the IB preamble
@@ -74,6 +76,17 @@ public:
 
 	// Drops the shadowed state (e.g. after a context reset forces a fresh context).
 	void ResetShadow();
+
+	// Seeds the context shadow with the values the PS5 system driver programs before a title's
+	// first command buffer, for registers games rely on but never write themselves. CLEAR_STATE on
+	// amdgpu leaves them at different defaults (PA_CL_VTE_CNTL = 0 disables the viewport transform,
+	// so every primitive collapses into the corner and no pixel shader ever runs). Guest writes
+	// override these like any other shadowed value.
+	void SeedPs5Defaults();
+
+	// Writes the shadowed registers as "cx|sh|uc <offset> <value>" lines (dword offsets within each
+	// register space), for comparing against the state Kyty sees.
+	void DumpShadow(std::FILE* f) const;
 
 	// UCONFIG registers the backend is allowed to write. Everything else is dropped, because one
 	// experiment writing other UCONFIG registers froze the whole board (see the probe README).

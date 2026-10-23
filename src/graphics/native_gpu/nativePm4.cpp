@@ -11,6 +11,7 @@ constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_DISPATCH_DIRECT          = 0x15;
 constexpr uint32_t IT_DRAW_INDEX_2             = 0x27;
 constexpr uint32_t IT_CONTEXT_CONTROL          = 0x28;
+constexpr uint32_t IT_WRITE_DATA               = 0x37;
 constexpr uint32_t IT_EVENT_WRITE              = 0x46;
 constexpr uint32_t IT_ACQUIRE_MEM             = 0x58;
 constexpr uint32_t IT_SET_SH_REG_INDIRECT      = 0x63;
@@ -74,6 +75,24 @@ void EmitSet(std::vector<uint32_t>& ib, uint32_t op, uint32_t offset, uint32_t v
 	ib.push_back(value);
 }
 
+// UCONFIG writes. On GFX9+ the CP keeps its own copy of VGT_PRIMITIVE_TYPE and VGT_INDEX_TYPE and
+// only updates it from SET_UCONFIG_REG_INDEX with index 1 / 2 (RADV: radeon_set_uconfig_reg_idx);
+// a plain SET_UCONFIG_REG leaves the draw engine with a stale primitive or index type.
+void EmitSetUconfig(std::vector<uint32_t>& ib, uint32_t offset, uint32_t value) {
+	switch (offset) {
+		case 0x242: EmitSet(ib, IT_SET_UCONFIG_REG_INDEX, (1u << 28u) | offset, value, false); break;
+		case 0x243: EmitSet(ib, IT_SET_UCONFIG_REG_INDEX, (2u << 28u) | offset, value, false); break;
+		default: EmitSet(ib, IT_SET_UCONFIG_REG, offset, value, false); break;
+	}
+}
+
+// WRITE_DATA DST_SEL values that target memory (1 = memory via GRBM, 2 = TC/L2, 5 = memory).
+// DST_SEL 0 writes a register and is refused, like any non-whitelisted register write.
+bool WriteDataToMemory(uint32_t control) {
+	const uint32_t dst_sel = (control >> 8u) & 0xfu;
+	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
+}
+
 } // namespace
 
 bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
@@ -84,6 +103,39 @@ bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
 		case 0x262: // GE_USER_VGPR_EN
 			return true;
 		default: return false;
+	}
+}
+
+void Pm4Translator::DumpShadow(std::FILE* f) const {
+	for (const auto& [offset, value]: m_cx) {
+		std::fprintf(f, "cx 0x%03x 0x%08x\n", offset, value);
+	}
+	for (const auto& [offset, value]: m_sh) {
+		std::fprintf(f, "sh 0x%03x 0x%08x\n", offset, value);
+	}
+	for (const auto& [offset, value]: m_uc) {
+		std::fprintf(f, "uc 0x%03x 0x%08x\n", offset, value);
+	}
+}
+
+void Pm4Translator::SeedPs5Defaults() {
+	struct Default {
+		uint32_t offset;
+		uint32_t value;
+	};
+	static constexpr Default kDefaults[] = {
+	    // PA_CL_VTE_CNTL: X/Y/Z scale and offset enabled, VTX_W0_FMT (Kyty's PS5 default, 1087).
+	    {0x206, 0x0000043Fu},
+	    // PA_SC_MODE_CNTL_0: VPORT_SCISSOR_ENABLE (Kyty assumes the viewport scissor is on).
+	    {0x292, 0x00000002u},
+	    // PA_SC_AA_MASK_X0Y0_X1Y0 / X0Y1_X1Y1: every sample enabled.
+	    {0x30E, 0xFFFFFFFFu},
+	    {0x30F, 0xFFFFFFFFu},
+	    // CB_COLOR_CONTROL: MODE = CB_NORMAL, ROP3 = copy.
+	    {0x202, 0x00CC0010u},
+	};
+	for (const auto& d: kDefaults) {
+		m_cx.emplace(d.offset, d.value);
 	}
 }
 
@@ -113,7 +165,7 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 		stats.preamble_sh++;
 	}
 	for (const auto& [offset, value]: m_uc) {
-		EmitSet(ib, IT_SET_UCONFIG_REG, offset, value, false);
+		EmitSetUconfig(ib, offset, value);
 		stats.preamble_uc++;
 	}
 }
@@ -239,7 +291,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				}
 				if (allowed) {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
+					                                                        : Normalize(bptr[0]);
+					for (uint32_t i = 1; i < body_count; i++) {
+						EmitSetUconfig(body, base + (i - 1), bptr[i]);
+					}
 					if (op == IT_SET_UCONFIG_REG_INDEX) {
 						stats.set_uconfig_index++;
 					} else {
@@ -299,13 +355,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							continue;
 						}
 						uc[off] = value;
-						EmitSet(body, IT_SET_UCONFIG_REG, off, value, false);
+						EmitSetUconfig(body, off, value);
 						stats.loaded_uc_regs++;
 					}
 				}
 				break;
 			}
 
+			case IT_WRITE_DATA:
+				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
+					return fail(op, dw);
+				}
+				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				stats.write_data++;
+				break;
 			case IT_DRAW_INDEX_2:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				stats.draws++;

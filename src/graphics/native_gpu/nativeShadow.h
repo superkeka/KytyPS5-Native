@@ -11,6 +11,10 @@
 //   KYTY_NATIVE_GPU_GEM=1    guest memory is backed by amdgpu GEM buffers and bound into the GPU VM
 //   KYTY_NATIVE_GPU_SHADOW=1 translate and submit each DCB natively
 //
+// Diagnostics: KYTY_NATIVE_GPU_STATS=1 logs pipeline statistics (vertices, primitives, pixel shader
+// invocations) of the first frames with draws; KYTY_NATIVE_GPU_DUMP_REGS=<frame> writes the
+// shadowed register state of that frame to KYTY_NATIVE_GPU_DUMP_DIR.
+//
 // It never changes what the Vulkan path does, so default behaviour (either switch unset) is
 // byte-for-byte upstream.
 
