@@ -20,6 +20,20 @@ namespace Libs::Graphics::NativeGpu {
 // GPU timeout or context reset it disables itself for the rest of the run.
 void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
 
+// While shadow submission is active, each guest DCB has already run natively before Kyty records
+// it, so at a flip the guest's display surface in guest memory holds the native result. When this
+// returns true the presenter re-reads that surface from guest memory instead of showing Kyty's own
+// Vulkan copy, i.e. the screen shows the native frame. F9 toggles it; KYTY_NATIVE_GPU_SHOW=1 starts
+// with it on. Always false when shadow submission is off or has disabled itself.
+bool ShadowShowsNativeFrames();
+void ShadowToggleNativeFrames();
+
+// Called at every video-out flip with the guest surface about to be presented. Writes the raw
+// guest bytes of the flips listed in KYTY_NATIVE_GPU_DUMP_FLIPS (e.g. "300,600") to
+// KYTY_NATIVE_GPU_DUMP_DIR (default ".") as flip_<n>.raw plus flip_<n>.txt with the layout.
+void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
+                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode);
+
 } // namespace Libs::Graphics::NativeGpu
 
 #endif // EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESHADOW_H_

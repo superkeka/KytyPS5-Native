@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
@@ -1138,6 +1139,17 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
+		// BC-250 native GPU shadow path: dump and optionally show the natively rendered surface,
+		// which the shadow submit already left in guest memory. No-op unless shadow mode is on.
+		Graphics::NativeGpu::ShadowOnFlip(source_info.data.address, source_info.data.size,
+		                                  source_info.extent.width, source_info.extent.height,
+		                                  source_info.bytes_per_block,
+		                                  static_cast<uint32_t>(source_info.pixel_format),
+		                                  static_cast<uint32_t>(source_info.tile_mode));
+		if (Graphics::NativeGpu::ShadowShowsNativeFrames()) {
+			(void)m_presenter.Renderer().InvalidateMemory(source_info.data.address,
+			                                              source_info.data.size);
+		}
 		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
 		if (headset) {
 			g_headset_mirror = true;

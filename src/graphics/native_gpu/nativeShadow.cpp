@@ -6,6 +6,7 @@
 
 #include "kernel/memory.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +32,12 @@ public:
 	static Shadow& Instance() {
 		static Shadow s;
 		return s;
+	}
+
+	// True once shadow submission is set up and has not disabled itself.
+	bool Active() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		return m_initialized && m_enabled && !m_disabled;
 	}
 
 	void Submit(std::span<const uint32_t> dcb) {
@@ -218,6 +225,71 @@ void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords) {
 		return;
 	}
 	Shadow::Instance().Submit(std::span<const uint32_t>(dcb, size_in_dwords));
+}
+
+namespace {
+
+std::atomic<bool>& ShowNative() {
+	static std::atomic<bool> show {EnvOn("KYTY_NATIVE_GPU_SHOW")};
+	return show;
+}
+
+} // namespace
+
+bool ShadowShowsNativeFrames() {
+	return ShowNative().load(std::memory_order_relaxed) && Shadow::Instance().Active();
+}
+
+void ShadowToggleNativeFrames() {
+	const bool now = !ShowNative().load(std::memory_order_relaxed);
+	ShowNative().store(now, std::memory_order_relaxed);
+	std::fprintf(stderr, "native shadow: showing %s frames\n", now ? "NATIVE" : "Vulkan");
+}
+
+void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
+                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode) {
+	static std::atomic<uint64_t> flips {0};
+	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
+	const char*                  list = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS");
+	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active()) {
+		return;
+	}
+	bool wanted = false;
+	for (const char* p = list; *p != '\0';) {
+		char*                    end = nullptr;
+		const unsigned long long v   = std::strtoull(p, &end, 10);
+		if (end == p) {
+			break;
+		}
+		wanted = wanted || v == n;
+		p      = (*end == ',') ? end + 1 : end;
+	}
+	if (!wanted) {
+		return;
+	}
+	const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+	if (dir == nullptr || dir[0] == '\0') {
+		dir = ".";
+	}
+	char path[512];
+	std::snprintf(path, sizeof(path), "%s/flip_%llu.raw", dir, static_cast<unsigned long long>(n));
+	if (std::FILE* f = std::fopen(path, "wb"); f != nullptr) {
+		std::fwrite(reinterpret_cast<const void*>(address), 1, size, f);
+		std::fclose(f);
+	}
+	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, static_cast<unsigned long long>(n));
+	if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+		std::fprintf(f,
+		             "address 0x%llx\nsize %llu\nwidth %u\nheight %u\nbytes_per_pixel %u\n"
+		             "pixel_format %u\ntile_mode 0x%x\nshowing_native %d\n",
+		             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+		             width, height, bytes_per_pixel, pixel_format, tile_mode,
+		             ShowNative().load() ? 1 : 0);
+		std::fclose(f);
+	}
+	std::fprintf(stderr, "native shadow: dumped flip %llu (%ux%u, %llu bytes) to %s\n",
+	             static_cast<unsigned long long>(n), width, height,
+	             static_cast<unsigned long long>(size), dir);
 }
 
 } // namespace Libs::Graphics::NativeGpu

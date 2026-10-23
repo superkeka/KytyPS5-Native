@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -470,6 +471,11 @@ void WindowContext::ProcessEvent(double time_s) {
 			case SDLK_F8:
 				if (pressed) {
 					Controller::CycleKeyboardPlayer();
+				}
+				return;
+			case SDLK_F9: // BC-250 native GPU shadow path: show native or Vulkan frames
+				if (pressed) {
+					NativeGpu::ShadowToggleNativeFrames();
 				}
 				return;
 #if defined(__APPLE__)
