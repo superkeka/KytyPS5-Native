@@ -272,6 +272,17 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 		if ((w >> 31u) == 0u && (w >> 25u) == OpVop2Dot2cF32F16) {
 			scan.sites++;
 		}
+		// DS (gfx10): bits 31:26 = 0x36, OP in 25:18, GDS in bit 17.
+		if ((w >> 26u) == 0x36u) {
+			const uint32_t op = (w >> 18u) & 0xffu;
+			if (op == 0x3fu) {
+				scan.ordered_ops++;
+			} else if (op >= 0x18u && op <= 0x1du) {
+				scan.gws_ops++;
+			} else if (((w >> 17u) & 1u) != 0u) {
+				scan.gds_ops++;
+			}
+		}
 		scan.instructions++;
 		dw += len;
 	}

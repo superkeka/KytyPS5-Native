@@ -505,6 +505,12 @@ private:
 				             static_cast<unsigned long long>(va), scan.sites, scan.instructions,
 				             scan.ended ? "s_endpgm" : (scan.decode_error ? "decode stop" : "capped"));
 			}
+			if (scan.gds_ops + scan.ordered_ops + scan.gws_ops > 0) {
+				std::fprintf(stderr,
+				             "native shadow: shader 0x%llx uses GDS: %u gds, %u ds_ordered_count, %u ds_gws (%u instrs, %s)\n",
+				             static_cast<unsigned long long>(va), scan.gds_ops, scan.ordered_ops, scan.gws_ops,
+				             scan.instructions, scan.ended ? "s_endpgm" : (scan.decode_error ? "decode stop" : "capped"));
+			}
 		}
 	}
 

@@ -45,11 +45,15 @@ ShaderPatchResult PatchDot2c(std::span<const uint32_t> code, uint32_t num_vgprs)
 struct Dot2cScan {
 	uint32_t sites        = 0;     // v_dot2c_f32_f16 instructions found before s_endpgm
 	uint32_t instructions = 0;     // instructions decoded
+	uint32_t gds_ops      = 0;     // DS instructions with the GDS bit (GDS memory, append/consume)
+	uint32_t ordered_ops  = 0;     // ds_ordered_count (ordered append; needs the GDS OA engine)
+	uint32_t gws_ops      = 0;     // ds_gws_* (global wave sync)
 	bool     ended        = false; // true if an s_endpgm terminated the sweep
 	bool     decode_error = false; // true if an instruction could not be decoded
 };
 
-// Linear-sweeps a shader whose exact length is unknown, counting v_dot2c_f32_f16 sites. The sweep
+// Linear-sweeps a shader whose exact length is unknown, counting v_dot2c_f32_f16 sites and the
+// instructions that need GDS, ordered append or GWS set up for the wave. The sweep
 // stops at the first s_endpgm, a decode error, or after `max_dwords` dwords. Used to detect (not
 // patch) the opcode the BC-250 mis-executes in shaders referenced by a command buffer.
 Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords = 1u << 16u);

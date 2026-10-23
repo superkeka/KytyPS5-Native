@@ -9,11 +9,12 @@
 
 #if KYTY_GEM_BACKING_SUPPORTED
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <span>
 #include <vector>
-#include <algorithm>
 
 namespace Libs::Graphics::NativeGpu {
 
@@ -59,7 +60,12 @@ public:
 			delete self;
 			return nullptr;
 		}
-		self->CreateGds();
+		// Opt-in: with GDS, GWS and OA buffers in every submission (so amdgpu reprograms the GDS
+		// partition for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even
+		// when no packet or shader used GDS.
+		if (const char* opt = std::getenv("KYTY_NATIVE_GPU_GDS"); opt != nullptr && opt[0] == '1') {
+			self->CreateGds();
+		}
 		return self;
 	}
 
