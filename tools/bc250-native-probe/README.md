@@ -164,14 +164,23 @@ stub shapes are:
   packed f16 halves selected by op_sel, same as a register src0).
 - **DPP16/DPP8 src0**: `v_mov_b32_dpp scratch, v<src0> <dpp>` with the original DPP control word
   copied verbatim (the control word is opcode-independent), so `scratch` holds the swizzled src0;
-  vsrc1 is read straight, matching `v_dot2c` where only src0 is swizzled.
+  vsrc1 is read straight, matching `v_dot2c` where only src0 is swizzled. DPP8 has no masks or
+  modifiers and is always reproducible. A DPP16 word is only reproducible, and only then patched,
+  when: row_mask and bank_mask (bits 31:28 / 27:24) are both `0xf` (otherwise masked-out lanes keep
+  vdst in the original but the unmasked FMAs here would overwrite them from stale scratch); src0 and
+  src1 neg/abs (bits 23:20) are clear (`v_mov_b32` applies neg/abs to the whole f32, not per f16
+  half, and the FMAs read vsrc1 unmodified); and the lane select is a quad_perm (`dpp_ctrl <= 0xff`,
+  always in range) or `bound_ctrl` (bit 19) is set (so a shift/rotate/broadcast reading an invalid
+  lane substitutes 0 and writes, rather than disabling the lane and leaving vdst). Every other DPP16
+  word is counted unsupported.
 - **vdst aliasing** (`v_dot2c vN, vN, …` / `… , vN`): `v_mov_b32 scratch, vN` preserves the input
   that aliases the accumulator before the first FMA overwrites `vN`; one copy serves both operands
   of `v_dot2c vN, vN, vN`.
 
 Still counted as unsupported: SDWA src0 (its dst_sel / sub-dword semantics cannot be reproduced by
-a full-dword VOP3P write), a literal or DPP src0 whose vsrc1 also aliases vdst (would need a second
-scratch), and inline-constant src0 (unchanged).
+a full-dword VOP3P write), a non-reducible DPP16 word (masks, neg/abs, or an out-of-range lane
+select without bound_ctrl, as above), a literal or DPP src0 whose vsrc1 also aliases vdst (would
+need a second scratch), and inline-constant src0 (unchanged).
 
 `dot2p2.s` exercises all three on hardware (gfx1030, `patch_blob dot2p2.bin dot2p2.patched.bin 12`,
 run with `--vgprs 13` — 3 sites patched, 27 -> 48 dwords, one scratch VGPR). Unpatched every lane

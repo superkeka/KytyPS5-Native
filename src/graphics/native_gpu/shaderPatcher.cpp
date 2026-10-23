@@ -43,6 +43,24 @@ bool IsVop2AlwaysLiteral(uint32_t op) {
 	return op == 0x20u || op == 0x21u || op == 0x2cu || op == 0x2du || op == 0x37u || op == 0x38u;
 }
 
+// True when a DPP16 control word can be reproduced by copying it onto v_mov_b32_dpp. The mov
+// swizzles src0 into scratch and the two FMAs then write vdst in every active lane, so the form is
+// only equivalent when the original also writes every active lane with an unmodified src0:
+//   - row_mask and bank_mask (bits 31:28 / 27:24) must be 0xf, else masked-out lanes keep vdst in
+//     the original but would be overwritten from stale scratch here;
+//   - src0/src1 neg and abs (bits 23:20) must be clear: on v_mov_b32 neg/abs act on the whole f32,
+//     not per f16 half as v_dot2c needs, and src1's modifiers are dropped by the FMAs entirely;
+//   - the lane select must be a quad_perm (dpp_ctrl <= 0xff, always in-range) or bound_ctrl (bit
+//     19) must be set, so a shift/rotate/broadcast that reads an invalid lane substitutes 0 (and
+//     writes) instead of disabling the lane (and leaving vdst) as bound_ctrl == 0 does.
+bool Dpp16Reducible(uint32_t ctrl) {
+	const bool full_masks = (ctrl >> 24) == 0xffu;
+	const bool no_mods    = (ctrl & 0x00f00000u) == 0u;
+	const bool quad_perm  = ((ctrl >> 8) & 0x1ffu) <= 0xffu;
+	const bool bound_ctrl = ((ctrl >> 19) & 1u) != 0u;
+	return full_masks && no_mods && (quad_perm || bound_ctrl);
+}
+
 uint32_t Vop3LiteralDwords(uint32_t word1) {
 	bool literal = (word1 & 0x1ffu) == SrcLiteral || ((word1 >> 9) & 0x1ffu) == SrcLiteral ||
 	               ((word1 >> 18) & 0x1ffu) == SrcLiteral;
@@ -149,7 +167,9 @@ ShaderPatchResult PatchDot2c(std::span<const uint32_t> code, uint32_t num_vgprs)
 			const uint32_t vdst_src = SrcVgpr0 | vdst;
 			const bool     reg_src0 = src0 >= SrcVgpr0 || src0 <= 107u;
 			const bool     literal  = src0 == SrcLiteral && len == 2;
-			const bool     dpp      = (src0 == SrcDpp16 || src0 == SrcDpp8 || src0 == SrcDpp8Fi) && len == 2;
+			const bool     dpp16    = src0 == SrcDpp16 && len == 2;
+			const bool     dpp8     = (src0 == SrcDpp8 || src0 == SrcDpp8Fi) && len == 2;
+			const bool     dpp      = dpp16 || dpp8;
 
 			bool supported = false;
 			bool scratch   = false;
@@ -157,7 +177,8 @@ ShaderPatchResult PatchDot2c(std::span<const uint32_t> code, uint32_t num_vgprs)
 				// v_fma_mix_f32 takes neither a literal nor DPP, so src0 is materialised into the
 				// scratch VGPR. vsrc1 is read straight by both FMAs, so it must not alias vdst
 				// (that would need a second scratch to preserve it); such a combo stays unsupported.
-				supported = src1 != vdst_src;
+				// DPP8 has no masks or modifiers and copies verbatim; DPP16 only when it reduces.
+				supported = src1 != vdst_src && (!dpp16 || Dpp16Reducible(code[dw + 1]));
 				scratch   = true;
 			} else if (reg_src0 && len == 1) {
 				// Plain VOP2 with a VGPR/SGPR (incl. VCC) src0. The FMAs accumulate into vdst, so an

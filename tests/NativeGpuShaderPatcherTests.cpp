@@ -137,6 +137,39 @@ void TestPatchesDppSrc0() {
 	Check(r8.code[3] == 0x7e2002e9u && r8.code[4] == 0xfac68801u, "DPP8 stub marker/word wrong");
 }
 
+// Copying a DPP16 control word onto v_mov_b32_dpp is only equivalent for a subset of words; the
+// rest must stay unsupported. Control words below are from llvm-mc (v_mov/v_add_f32 _dpp).
+void TestDpp16ReductionGate() {
+	// main word: v_dot2c_f32_f16_dpp v3, v1, v2 (src0 = 0xfa marker, vsrc1 = v2, vdst = v3).
+	const uint32_t main = 0x040604fau;
+	struct Reject {
+		uint32_t    ctrl;
+		const char* what;
+	};
+	const Reject rejects[] = {
+	    {0x3f00b101u, "row_mask != 0xf"},          // quad_perm[1,0,3,2] row_mask:0x3
+	    {0xf500b101u, "bank_mask != 0xf"},         // quad_perm bank_mask:0x5
+	    {0xff10b101u, "src0_neg (bit 20)"},        // per-half neg can't be reproduced on v_mov
+	    {0xff20b101u, "src0_abs (bit 21)"},
+	    {0xff40b101u, "src1_neg (bit 22)"},        // the FMAs read vsrc1 without modifiers
+	    {0xff80b101u, "src1_abs (bit 23)"},
+	    {0xff010101u, "row_shl with bound_ctrl 0"}, // OOB lanes are disabled, not zeroed
+	};
+	for (const auto& rj: rejects) {
+		const std::vector<uint32_t> in = {main, rj.ctrl, SEndpgm};
+		const auto                  r  = PatchDot2c(in, 16);
+		Check(r.patched_sites == 0 && r.unsupported_sites == 1, rj.what);
+		Check(r.scratch_vgprs == 0 && r.code == in, "a non-reducible DPP16 site was modified");
+	}
+
+	// A shift/rotate with bound_ctrl 1 writes every lane (OOB reads 0), so it reduces.
+	const std::vector<uint32_t> in = {main, 0xff092201u, SEndpgm}; // row_ror:2 bound_ctrl:1
+	const auto                  r  = PatchDot2c(in, 16);
+	Check(r.patched_sites == 1 && r.unsupported_sites == 0 && r.scratch_vgprs == 1, "bound_ctrl row_ror not patched");
+	const uint32_t n = static_cast<uint32_t>(in.size());
+	Check(r.code[n] == 0x7e2002fau && r.code[n + 1] == 0xff092201u, "bound_ctrl DPP16 stub copied the wrong word");
+}
+
 // v_dot2c v1, v1, v1 : vdst aliases both inputs, so a scratch copy of vdst feeds both FMA operands.
 void TestPatchesAliasingSites() {
 	const std::vector<uint32_t> in = {0x04020301u, SEndpgm};
@@ -212,6 +245,7 @@ int main() {
 	TestPatchesVgprAndSgprSites();
 	TestPatchesLiteralSrc0();
 	TestPatchesDppSrc0();
+	TestDpp16ReductionGate();
 	TestPatchesAliasingSites();
 	TestScratchIndexFollowsVgprCount();
 	TestLeavesUnsupportedSitesAlone();
