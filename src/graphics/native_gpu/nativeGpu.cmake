@@ -23,3 +23,16 @@ if(BUILD_TESTING)
 	add_test(NAME native_gpu_gem_backing COMMAND $<TARGET_FILE:native_gpu_gem_backing_tests>)
 	add_dependencies(kyty_tests native_gpu_gem_backing_tests)
 endif()
+
+# PM4 translator test: pure data transform (no hardware), so it runs everywhere including the dev
+# machine.
+add_executable(native_gpu_pm4_translator_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuPm4TranslatorTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/native_gpu/nativePm4.cpp"
+)
+target_include_directories(native_gpu_pm4_translator_tests PRIVATE ${inc_headers})
+
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_pm4_translator COMMAND $<TARGET_FILE:native_gpu_pm4_translator_tests>)
+	add_dependencies(kyty_tests native_gpu_pm4_translator_tests)
+endif()

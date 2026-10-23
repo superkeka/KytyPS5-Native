@@ -10,6 +10,10 @@ class RenderContext;
 enum class PageFaultAccess;
 } // namespace Libs::Graphics
 
+namespace Libs::Graphics::NativeGpu {
+class GemBacking;
+} // namespace Libs::Graphics::NativeGpu
+
 namespace Libs::LibKernel::Memory {
 
 void Initialize();
@@ -139,6 +143,11 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
+
+// The amdgpu GEM backing for guest direct memory, or nullptr unless the opt-in KYTY_NATIVE_GPU_GEM
+// switch is on and it was created. The BC-250 native GPU shadow path binds guest ranges into, and
+// submits commands on, this backing's DRM file. See src/graphics/native_gpu/gemBacking.h.
+[[nodiscard]] Libs::Graphics::NativeGpu::GemBacking* GetGemBacking();
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,

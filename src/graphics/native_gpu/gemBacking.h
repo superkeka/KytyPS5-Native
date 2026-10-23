@@ -181,6 +181,20 @@ public:
 	// The DRM file whose GPU VM holds the bindings; command submission must use the same file.
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
 
+	// Every GEM chunk created so far, for the buffer list of a submission: a command buffer that
+	// touches guest memory must name the chunks backing it as resident. Chunks are created lazily,
+	// so this grows as guest ranges are mapped.
+	[[nodiscard]] std::vector<uint32_t> CreatedHandles() const {
+		std::vector<uint32_t> handles;
+		handles.reserve(m_chunks.size());
+		for (const auto& chunk: m_chunks) {
+			if (chunk.created) {
+				handles.push_back(chunk.handle);
+			}
+		}
+		return handles;
+	}
+
 	// Looks up the GEM buffer backing `offset`, for a later GPU-VM mapping step. Returns false if
 	// `offset` is out of range or its chunk has not been created yet.
 	bool Lookup(uint64_t offset, uint32_t* handle, uint64_t* offset_in_chunk) const {

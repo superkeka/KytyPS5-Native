@@ -33,6 +33,18 @@ struct ShaderPatchResult {
 // patched and `code` is returned unchanged.
 ShaderPatchResult PatchDot2c(std::span<const uint32_t> code);
 
+struct Dot2cScan {
+	uint32_t sites        = 0;     // v_dot2c_f32_f16 instructions found before s_endpgm
+	uint32_t instructions = 0;     // instructions decoded
+	bool     ended        = false; // true if an s_endpgm terminated the sweep
+	bool     decode_error = false; // true if an instruction could not be decoded
+};
+
+// Linear-sweeps a shader whose exact length is unknown, counting v_dot2c_f32_f16 sites. The sweep
+// stops at the first s_endpgm, a decode error, or after `max_dwords` dwords. Used to detect (not
+// patch) the opcode the BC-250 mis-executes in shaders referenced by a command buffer.
+Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords = 1u << 16u);
+
 } // namespace Libs::Graphics::NativeGpu
 
 #endif // EMULATOR_SRC_GRAPHICS_NATIVE_GPU_SHADERPATCHER_H_

@@ -210,6 +210,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/command_processor/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/native_gpu/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/native_gpu/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/*.cpp"

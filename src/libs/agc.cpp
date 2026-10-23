@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
@@ -4115,6 +4116,9 @@ static TessellationDriverState g_tessellation_driver_state {};
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
+	// BC-250 native GPU shadow path: translate and submit this DCB to the amdgpu gfx ring next to
+	// the Vulkan path. No-op unless KYTY_NATIVE_GPU_SHADOW and KYTY_NATIVE_GPU_GEM are both set.
+	Libs::Graphics::NativeGpu::ShadowSubmitDcb(dcb, size_in_dwords);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
 }
 

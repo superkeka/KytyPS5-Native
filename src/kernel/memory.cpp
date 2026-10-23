@@ -913,6 +913,14 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+Libs::Graphics::NativeGpu::GemBacking* GetGemBacking() {
+#if KYTY_GEM_BACKING_SUPPORTED
+	return g_guest_address_space != nullptr ? g_guest_address_space->Gem() : nullptr;
+#else
+	return nullptr;
+#endif
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;

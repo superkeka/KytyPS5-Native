@@ -1,0 +1,261 @@
+#ifndef EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESUBMIT_H_
+#define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESUBMIT_H_
+
+#include "graphics/native_gpu/gemBacking.h" // KYTY_GEM_BACKING_SUPPORTED + amdgpu uAPI headers
+
+// Submits a translated IB to the amdgpu gfx ring for the BC-250 native backend, on the same DRM
+// file whose GPU VM holds the guest memory bindings (GemBacking::DrmFd()). Only real Linux with the
+// amdgpu uAPI has it; elsewhere this header is empty and the shadow hook compiles to a no-op.
+
+#if KYTY_GEM_BACKING_SUPPORTED
+
+#include <cstdint>
+#include <ctime>
+#include <span>
+#include <vector>
+
+namespace Libs::Graphics::NativeGpu {
+
+class NativeSubmitter {
+public:
+	// The IB lives at a GPU VA above every guest range (guest memory tops out well below this and
+	// the extended-memory aperture is at 0x80000000000; the device's low VA range reaches
+	// 0x800000000000, so this sits clear of both).
+	static constexpr uint64_t kIbVa      = 0x400000000000ull;
+	static constexpr uint64_t kIbSize    = 2ull * 1024 * 1024;
+
+	struct Result {
+		bool   submitted = false; // the CS ioctl was accepted
+		bool   completed = false; // the fence signalled before the timeout
+		bool   timed_out = false; // the wait timed out
+		bool   reset     = false; // the context reported a reset/guilty state afterwards
+		int    err       = 0;     // negative errno from a failed ioctl
+		double seconds   = 0.0;   // submit -> fence wall time
+	};
+
+	// Allocates a context and the IB buffer on `drm_fd`. Returns nullptr on failure.
+	static NativeSubmitter* Create(int drm_fd) {
+		union drm_amdgpu_ctx ctx;
+		std::memset(&ctx, 0, sizeof(ctx));
+		ctx.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+		if (Ioctl(drm_fd, DRM_IOCTL_AMDGPU_CTX, &ctx) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: context alloc failed: %s\n", std::strerror(errno));
+			return nullptr;
+		}
+
+		auto* self     = new NativeSubmitter();
+		self->m_drm_fd = drm_fd;
+		self->m_ctx    = ctx.out.alloc.ctx_id;
+
+		if (!self->CreateIb()) {
+			delete self;
+			return nullptr;
+		}
+		return self;
+	}
+
+	~NativeSubmitter() {
+		if (m_ib_va != 0) {
+			VaOp(AMDGPU_VA_OP_UNMAP, m_ib_handle, m_ib_va);
+		}
+		if (m_ib_cpu != nullptr) {
+			::munmap(m_ib_cpu, kIbSize);
+		}
+		if (m_ib_handle != 0) {
+			struct drm_gem_close c;
+			std::memset(&c, 0, sizeof(c));
+			c.handle = m_ib_handle;
+			Ioctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &c);
+		}
+		if (m_ctx != 0) {
+			union drm_amdgpu_ctx ctx;
+			std::memset(&ctx, 0, sizeof(ctx));
+			ctx.in.op     = AMDGPU_CTX_OP_FREE_CTX;
+			ctx.in.ctx_id = m_ctx;
+			Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CTX, &ctx);
+		}
+	}
+
+	NativeSubmitter(const NativeSubmitter&)            = delete;
+	NativeSubmitter& operator=(const NativeSubmitter&) = delete;
+
+	// Copies `ib` into the IB buffer, submits it to the gfx ring with `bo_handles` (plus the IB)
+	// resident, waits up to `timeout_sec` and queries the context state.
+	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
+	              double timeout_sec) {
+		Result res;
+		if (ib.size() * 4 > kIbSize) {
+			res.err = -E2BIG;
+			return res;
+		}
+		std::memcpy(m_ib_cpu, ib.data(), ib.size() * 4);
+		__sync_synchronize();
+
+		std::vector<drm_amdgpu_bo_list_entry> entries;
+		entries.reserve(bo_handles.size() + 1);
+		drm_amdgpu_bo_list_entry e;
+		std::memset(&e, 0, sizeof(e));
+		e.bo_handle = m_ib_handle;
+		entries.push_back(e);
+		for (uint32_t h: bo_handles) {
+			e.bo_handle = h;
+			entries.push_back(e);
+		}
+
+		struct drm_amdgpu_bo_list_in list;
+		std::memset(&list, 0, sizeof(list));
+		list.operation    = ~0u;
+		list.list_handle  = ~0u;
+		list.bo_number    = static_cast<uint32_t>(entries.size());
+		list.bo_info_size = sizeof(entries[0]);
+		list.bo_info_ptr  = reinterpret_cast<uintptr_t>(entries.data());
+
+		struct drm_amdgpu_cs_chunk_ib ib_info;
+		std::memset(&ib_info, 0, sizeof(ib_info));
+		ib_info.va_start = m_ib_va;
+		ib_info.ib_bytes = static_cast<uint32_t>(ib.size() * 4);
+		ib_info.ip_type  = AMDGPU_HW_IP_GFX;
+		ib_info.ring     = 0;
+
+		struct drm_amdgpu_cs_chunk chunks[2];
+		std::memset(chunks, 0, sizeof(chunks));
+		chunks[0].chunk_id   = AMDGPU_CHUNK_ID_IB;
+		chunks[0].length_dw  = sizeof(ib_info) / 4;
+		chunks[0].chunk_data = reinterpret_cast<uintptr_t>(&ib_info);
+		chunks[1].chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES;
+		chunks[1].length_dw  = sizeof(list) / 4;
+		chunks[1].chunk_data = reinterpret_cast<uintptr_t>(&list);
+		uint64_t chunk_ptrs[2] = {reinterpret_cast<uintptr_t>(&chunks[0]),
+		                          reinterpret_cast<uintptr_t>(&chunks[1])};
+
+		union drm_amdgpu_cs cs;
+		std::memset(&cs, 0, sizeof(cs));
+		cs.in.ctx_id     = m_ctx;
+		cs.in.num_chunks = 2;
+		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs);
+
+		const double t0 = NowSec();
+		int          r  = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CS, &cs);
+		if (r != 0) {
+			res.err = r;
+			return res;
+		}
+		res.submitted      = true;
+		const uint64_t seq = cs.out.handle;
+
+		union drm_amdgpu_wait_cs w;
+		std::memset(&w, 0, sizeof(w));
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		w.in.handle  = seq;
+		w.in.timeout = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+		               static_cast<uint64_t>(ts.tv_nsec) + static_cast<uint64_t>(timeout_sec * 1e9);
+		w.in.ip_type = AMDGPU_HW_IP_GFX;
+		w.in.ring    = 0;
+		w.in.ctx_id  = m_ctx;
+		r            = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w);
+		res.seconds  = NowSec() - t0;
+		if (r != 0) {
+			res.err = r;
+			return res;
+		}
+		if (w.out.status != 0) {
+			res.timed_out = true;
+		} else {
+			res.completed = true;
+		}
+		res.reset = ContextReset();
+		return res;
+	}
+
+	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
+
+private:
+	NativeSubmitter() = default;
+
+	static int Ioctl(int fd, unsigned long request, void* arg) {
+		int r = -1;
+		do {
+			r = ::ioctl(fd, request, arg);
+		} while (r == -1 && (errno == EINTR || errno == EAGAIN));
+		return r == -1 ? -errno : 0;
+	}
+
+	static double NowSec() {
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+	}
+
+	int VaOp(uint32_t op, uint32_t handle, uint64_t va) const {
+		struct drm_amdgpu_gem_va v;
+		std::memset(&v, 0, sizeof(v));
+		v.handle       = handle;
+		v.operation    = op;
+		v.flags        = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE;
+		v.va_address   = va;
+		v.offset_in_bo = 0;
+		v.map_size     = kIbSize;
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_VA, &v);
+	}
+
+	bool CreateIb() {
+		union drm_amdgpu_gem_create c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.bo_size      = kIbSize;
+		c.in.alignment    = 64 * 1024;
+		c.in.domains      = AMDGPU_GEM_DOMAIN_GTT;
+		c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC; // write-combined, like Mesa's IBs
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: IB GEM_CREATE failed: %s\n", std::strerror(errno));
+			return false;
+		}
+		m_ib_handle = c.out.handle;
+
+		union drm_amdgpu_gem_mmap m;
+		std::memset(&m, 0, sizeof(m));
+		m.in.handle = m_ib_handle;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_MMAP, &m) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: IB GEM_MMAP failed: %s\n", std::strerror(errno));
+			return false;
+		}
+		void* p = ::mmap(nullptr, kIbSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_drm_fd,
+		                 static_cast<off_t>(m.out.addr_ptr));
+		if (p == MAP_FAILED) {
+			std::fprintf(stderr, "NativeSubmitter: IB mmap failed: %s\n", std::strerror(errno));
+			return false;
+		}
+		m_ib_cpu = p;
+
+		if (VaOp(AMDGPU_VA_OP_MAP, m_ib_handle, kIbVa) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: IB GEM_VA at 0x%llx failed: %s\n",
+			             static_cast<unsigned long long>(kIbVa), std::strerror(errno));
+			return false;
+		}
+		m_ib_va = kIbVa;
+		return true;
+	}
+
+	bool ContextReset() const {
+		union drm_amdgpu_ctx ctx;
+		std::memset(&ctx, 0, sizeof(ctx));
+		ctx.in.op     = AMDGPU_CTX_OP_QUERY_STATE2;
+		ctx.in.ctx_id = m_ctx;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CTX, &ctx) != 0) {
+			return false;
+		}
+		return ctx.out.state.flags != 0;
+	}
+
+	int      m_drm_fd    = -1;
+	uint32_t m_ctx       = 0;
+	uint32_t m_ib_handle = 0;
+	void*    m_ib_cpu    = nullptr;
+	uint64_t m_ib_va     = 0;
+};
+
+} // namespace Libs::Graphics::NativeGpu
+
+#endif // KYTY_GEM_BACKING_SUPPORTED
+
+#endif // EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESUBMIT_H_

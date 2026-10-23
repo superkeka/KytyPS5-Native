@@ -1,5 +1,8 @@
 #include "graphics/native_gpu/shaderPatcher.h"
 
+#include <algorithm>
+#include <cstddef>
+
 namespace Libs::Graphics::NativeGpu {
 
 namespace {
@@ -166,6 +169,31 @@ ShaderPatchResult PatchDot2c(std::span<const uint32_t> code) {
 		} while ((r.code.size() & 15u) != 0);
 	}
 	return r;
+}
+
+Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
+	Dot2cScan scan;
+	const uint32_t limit = static_cast<uint32_t>(std::min<size_t>(code.size(), max_dwords));
+	for (uint32_t dw = 0; dw < limit;) {
+		const uint32_t w = code[dw];
+		// SOPP s_endpgm (enc9 0x17d via bits 31:23 == 0x17f, op 0x01) ends the program.
+		if ((w >> 23u) == 0x17fu && ((w >> 16u) & 0x7fu) == 0x01u) {
+			scan.instructions++;
+			scan.ended = true;
+			break;
+		}
+		const uint32_t len = InstructionDwords(code.subspan(dw));
+		if (len == 0) {
+			scan.decode_error = true;
+			break;
+		}
+		if ((w >> 31u) == 0u && (w >> 25u) == OpVop2Dot2cF32F16) {
+			scan.sites++;
+		}
+		scan.instructions++;
+		dw += len;
+	}
+	return scan;
 }
 
 } // namespace Libs::Graphics::NativeGpu
