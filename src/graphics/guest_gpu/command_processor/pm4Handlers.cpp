@@ -2,6 +2,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -2268,6 +2269,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	}
 
 	if (data_sel == 5) {
+		// The BC-250 native path wrote this GDS data itself, from the partition its jobs own; Kyty's
+		// GDS buffer was never written, so only the interrupt is left to raise.
+		if (cp.IsAsyncComputeQueue() ? NativeGpu::NativeAsyncCompute() : NativeGpu::PrimaryRendering()) {
+			trigger_interrupt();
+			return 7;
+		}
 		if (gl2_writeback) {
 			cache_action = 0;
 		}

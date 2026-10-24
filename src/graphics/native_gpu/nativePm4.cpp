@@ -712,6 +712,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.marker_flip++;
 				} else if (marker == R_RELEASE_MEM) {
 					stats.marker_release++;
+					// Kyty's marker carries a hardware RELEASE_MEM. One that sends GDS data (DATA_SEL 5:
+					// counters the guest reads back) must run here, where the GDS partition lives: Kyty
+					// would copy its own, never written, GDS buffer instead. Without the interrupt, which
+					// Kyty still raises.
+					if (body_count >= 7 && ((bptr[1] >> 29u) & 0x7u) == 5u && m_gds) {
+						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_queue));
+						body.push_back(bptr[0]);
+						body.push_back(bptr[1] & ~(0x7u << 24u)); // INT_SEL 0
+						for (uint32_t i = 2; i < 7; i++) {
+							body.push_back(i == 6 ? 0u : bptr[i]);
+						}
+						add_ref(static_cast<uint64_t>(bptr[2]) | (static_cast<uint64_t>(bptr[3]) << 32u), 4, false);
+						stats.gds_releases++;
+					}
 				} else if (marker == R_WAIT_FLIP_DONE) {
 					stats.marker_wait_flip++;
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {

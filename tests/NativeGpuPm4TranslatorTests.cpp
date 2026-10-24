@@ -600,6 +600,27 @@ void TestCompactRefs() {
 	Check(r.ok && found && r.refs.empty(), "compact refs report the render target's bucket, no GpuRef list");
 }
 
+void TestGdsReleaseMem() {
+	Pm4Translator t;
+	t.SetGdsAvailable(true);
+	std::vector<uint32_t> dcb;
+	// Kyty's R_RELEASE_MEM marker: NOP header + hardware RELEASE_MEM body, DATA_SEL 5 (GDS), INT_SEL 2.
+	dcb.push_back((3u << 30u) | (6u << 16u) | (0x10u << 8u) | (0x18u << 2u));
+	dcb.push_back(0x2fu | (6u << 8u));
+	dcb.push_back((5u << 29u) | (2u << 24u));
+	dcb.push_back(0x00001000u);
+	dcb.push_back(0x2u);
+	dcb.push_back(0xc64u | (1u << 16u));
+	dcb.push_back(0u);
+	dcb.push_back(0x55u);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.gds_releases == 1, "GDS release marker translated");
+	const Packet* rel = FindFirst(Decode(r.ib), 0x49u);
+	Check(rel != nullptr && rel->body.size() == 7 && ((rel->body[1] >> 24u) & 0x7u) == 0u &&
+	          ((rel->body[1] >> 29u) & 0x7u) == 5u && rel->body[4] == (0xc64u | (1u << 16u)) && rel->body[6] == 0u,
+	      "native RELEASE_MEM sends the GDS dword, without the interrupt");
+}
+
 void TestContextDefaults() {
 	Pm4Translator t;
 	t.SeedPs5Defaults();
@@ -688,6 +709,7 @@ int main() {
 	TestContextStatePushPop();
 	TestWaitBarrier();
 	TestCompactRefs();
+	TestGdsReleaseMem();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

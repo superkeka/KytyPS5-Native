@@ -48,6 +48,7 @@ struct Pm4TranslateStats {
 	uint32_t lod_stats_dropped = 0; // GET_LOD_STATS packets left out
 	uint32_t context_ops       = 0; // Agc context-state push/pop/clear markers applied
 	uint32_t wait_barriers     = 0; // guest waits replaced by an end-of-pipe fence and a wait on it
+	uint32_t gds_releases      = 0; // RELEASE_MEM markers that send GDS data, run natively
 	uint32_t packets_skipped   = 0; // packets left out (SetSkippedOpcodes)
 	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
