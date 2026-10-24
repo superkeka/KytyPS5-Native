@@ -1107,7 +1107,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
-		(void)command.Handle();
+		EXIT_IF(command.IsInvalid());
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1150,7 +1150,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				auto write64 = [&] {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
-					(void)command.Handle();
+					EXIT_IF(command.IsInvalid());
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1259,7 +1259,7 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 		m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 		return;
 	}
-	(void)CurrentBuffer().Handle();
+	EXIT_IF(CurrentBuffer().IsInvalid());
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 		    renderer.TriggerInterrupt(event_id, interrupt_context_id);
@@ -1348,7 +1348,7 @@ void CommandProcessor::Flip() {
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
-	(void)command.Handle();
+	EXIT_IF(command.IsInvalid());
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	GetScheduler().Flush();
@@ -1368,7 +1368,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
-	(void)command.Handle();
+	EXIT_IF(command.IsInvalid());
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
 	GetScheduler().Flush();
@@ -1394,7 +1394,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
-	(void)command.Handle();
+	EXIT_IF(command.IsInvalid());
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, request] {
 		    renderer.GetVideoOut().CompleteFlip(request);

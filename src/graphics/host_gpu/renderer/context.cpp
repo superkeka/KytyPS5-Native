@@ -25,6 +25,7 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	m_used = true;
 	return m_buffer;
 }
 
@@ -38,6 +39,7 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_used = false;
 }
 
 void CommandBuffer::End() const {

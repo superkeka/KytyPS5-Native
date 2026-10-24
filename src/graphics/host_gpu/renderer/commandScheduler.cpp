@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -172,6 +173,20 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	// The command processor flushes after every label, interrupt and suspend point. When nothing was
+	// recorded (always so while the BC-250 native path renders), the submission would only cost a
+	// CS ioctl, so the command buffer stays open unless something waits on its tick.
+	static const bool keep_empty = [] {
+		const char* v = std::getenv("KYTY_KEEP_EMPTY_SUBMITS");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (!keep_empty && !m_command.IsInvalid() && !m_command.Used() && submit.num_wait_semaphores == 0 &&
+	    submit.num_signal_semaphores == 0) {
+		std::lock_guard lock(m_operation_mutex);
+		if (m_deferred_tick != CurrentTick()) {
+			return;
+		}
+	}
 	Submit(submit);
 	BeginNext();
 }
@@ -241,6 +256,7 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	if (m_operation_state == OperationState::Open) {
 		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
+		m_deferred_tick = CurrentTick();
 		lock.unlock();
 		if (priority) {
 			m_operation_available.notify_one();

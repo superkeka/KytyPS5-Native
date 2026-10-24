@@ -101,6 +101,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	uint64_t                     m_deferred_tick        = 0; // tick of the last deferred operation
 };
 
 } // namespace Libs::Graphics
