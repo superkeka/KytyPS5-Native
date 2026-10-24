@@ -51,7 +51,9 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
-	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// `discard_gpu_copies`: the guest bytes are authoritative (BC-250 native rendering), so cached
+	// GPU copies are dropped instead of being written back over them first.
+	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size, bool discard_gpu_copies = false);
 	// Debug (BC-250 native shadow frame comparison): writes Kyty's GPU copy of the images in
 	// [vaddr, vaddr + size) back to guest memory and waits until it has landed.
 	uint32_t           DownloadMemoryForDebug(uint64_t vaddr, uint64_t size);

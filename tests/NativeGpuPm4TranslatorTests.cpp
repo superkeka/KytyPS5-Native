@@ -564,6 +564,25 @@ void TestContextStatePushPop() {
 	Check(last == 0x1111u, "the pop restores the pushed CB_COLOR0_BASE");
 }
 
+void TestWaitBarrier() {
+	Pm4Translator t;
+	t.SetFenceAddress(0x2000001000ull);
+	static uint32_t label = 0; // unmet: the guest waits for 1
+	std::vector<uint32_t> dcb;
+	const uint64_t        addr = reinterpret_cast<uint64_t>(&label);
+	Append(dcb, 0x3Cu /* IT_WAIT_REG_MEM */,
+	       {3u | (1u << 4u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0xffffffffu, 4u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.wait_barriers == 1 && r.stats.waits_unmet == 1, "guest wait becomes a barrier");
+	const auto    pkts = Decode(r.ib);
+	const Packet* rel  = FindFirst(pkts, 0x49u);
+	const Packet* wait = FindFirst(pkts, 0x3Cu);
+	Check(rel != nullptr && rel->body.size() == 7 && rel->body[2] == 0x1000u && rel->body[3] == 0x20u && rel->body[4] == 1u,
+	      "RELEASE_MEM writes fence 1 to the fence address");
+	Check(wait != nullptr && wait->body.size() == 6 && wait->body[1] == 0x1000u && wait->body[3] == 1u,
+	      "WAIT_REG_MEM waits for that fence");
+}
+
 void TestContextDefaults() {
 	Pm4Translator t;
 	t.SeedPs5Defaults();
@@ -650,6 +669,7 @@ int main() {
 	TestComputeQueueDispatchIndirect();
 	TestIndirectDraws();
 	TestContextStatePushPop();
+	TestWaitBarrier();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

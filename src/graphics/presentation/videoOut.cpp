@@ -1150,8 +1150,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			                                  return m_presenter.Renderer().DownloadMemoryForDebug(addr, bytes);
 		                                  });
 		if (Graphics::NativeGpu::ShadowShowsNativeFrames()) {
-			(void)m_presenter.Renderer().InvalidateMemory(source_info.data.address,
-			                                              source_info.data.size);
+			// In primary mode Kyty never rendered this surface, so its cached copies are stale and
+			// must not be written back over the native result.
+			(void)m_presenter.Renderer().InvalidateMemory(source_info.data.address, source_info.data.size,
+			                                              Graphics::NativeGpu::PrimaryRendering());
 		}
 		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
 		if (headset) {

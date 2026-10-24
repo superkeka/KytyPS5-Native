@@ -72,11 +72,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
-bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size, bool discard_gpu_copies) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
-	m_buffer_cache.InvalidateMemory(vaddr, size);
+	if (discard_gpu_copies) {
+		m_buffer_cache.DiscardGpuCopies(vaddr, size);
+	} else {
+		m_buffer_cache.InvalidateMemory(vaddr, size);
+	}
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;

@@ -47,6 +47,7 @@ struct Pm4TranslateStats {
 	uint32_t fmask_fixed       = 0; // CB_COLORn_FMASK set to the target base (was 0) before a draw
 	uint32_t lod_stats_dropped = 0; // GET_LOD_STATS packets left out
 	uint32_t context_ops       = 0; // Agc context-state push/pop/clear markers applied
+	uint32_t wait_barriers     = 0; // guest waits replaced by an end-of-pipe fence and a wait on it
 	uint32_t packets_skipped   = 0; // packets left out (SetSkippedOpcodes)
 	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
@@ -134,6 +135,16 @@ struct Pm4TranslateResult {
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
+	struct UnmetWait {
+		uint64_t addr;
+		uint64_t ref;
+		uint64_t value;
+		uint32_t function;
+		uint32_t dw;       // dword offset of the wait in the guest buffer
+		uint32_t draws;    // draws before it in this buffer
+		uint32_t dispatches;
+	};
+	std::vector<UnmetWait>        unmet_waits;    // WAIT_REG_MEM conditions not met at translation time
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -184,6 +195,10 @@ public:
 	// Experiment: CB_TARGET_MASK is ANDed with `mask`, e.g. 0xf keeps only MRT0 writable.
 	void SetTargetMask(uint32_t mask) { m_target_mask = mask; }
 
+	// Guest WAIT_REG_MEMs become a full GPU barrier on a fence of ours at `va` (4 bytes in a buffer
+	// that every submission maps); 0 drops them as before.
+	void SetFenceAddress(uint64_t va) { m_fence_va = va; }
+
 	// The buffers come from a compute queue (ACBs), whose packets differ from the gfx ring's
 	// (DISPATCH_INDIRECT carries its argument address); they are rewritten for the gfx ring.
 	void SetComputeQueue(bool compute_queue) { m_compute_queue = compute_queue; }
@@ -229,6 +244,8 @@ private:
 	uint32_t                     m_target_mask = 0xffffffffu;
 	bool                         m_no_cmask_clear = false;
 	bool                         m_compute_queue  = false;
+	uint64_t                     m_fence_va       = 0;
+	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;
 	uint64_t                     m_inspect_ps = 0;

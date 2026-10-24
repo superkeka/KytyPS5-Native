@@ -112,6 +112,23 @@ public:
 				             static_cast<unsigned long long>(h.target));
 			}
 		}
+		// KYTY_NATIVE_GPU_LOG_WAITS=N: report the waits of the first N buffers that were not met when
+		// translated, i.e. work the native path runs before what the guest made it wait for.
+		static const unsigned long log_waits = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_LOG_WAITS");
+			return v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
+		}();
+		if (log_waits != 0 && m_waits_logged < log_waits && !result.unmet_waits.empty()) {
+			m_waits_logged++;
+			for (const auto& w: result.unmet_waits) {
+				std::fprintf(stderr,
+				             "native shadow: WAIT %s %llu dw %u (after %u draws, %u dispatches): [0x%llx] = 0x%llx, "
+				             "needs func %u ref 0x%llx\n",
+				             kind, static_cast<unsigned long long>(frame), w.dw, w.draws, w.dispatches,
+				             static_cast<unsigned long long>(w.addr), static_cast<unsigned long long>(w.value), w.function,
+				             static_cast<unsigned long long>(w.ref));
+			}
+		}
 		if (acb && SkipAcb(frame, result)) {
 			return;
 		}
@@ -446,7 +463,13 @@ private:
 			::fdatasync(fd);
 			::close(fd);
 		};
-		const unsigned slot = static_cast<unsigned>(frame % 4u);
+		// KYTY_NATIVE_GPU_BREADCRUMB_SLOTS: how many recent submissions to keep (default 4).
+		static const unsigned slots = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_BREADCRUMB_SLOTS");
+			const unsigned long n = v != nullptr ? std::strtoul(v, nullptr, 0) : 4ul;
+			return static_cast<unsigned>(n == 0 ? 4ul : n);
+		}();
+		const unsigned slot = static_cast<unsigned>(frame % slots);
 		write_file(prefix + "dcb_" + std::to_string(slot) + ".bin", dcb.data(), dcb.size_bytes());
 		write_file(prefix + "ib_" + std::to_string(slot) + ".bin", ib.data(), ib.size_bytes());
 		char summary[512];
@@ -789,6 +812,11 @@ private:
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetComputeQueue(true);
+		if (EnvOn("KYTY_NATIVE_GPU_WAIT_BARRIERS")) {
+			m_translator.SetFenceAddress(m_submitter->ScratchVa() + 1024);
+			m_acb_translator.SetFenceAddress(m_submitter->ScratchVa() + 1032);
+			std::fprintf(stderr, "native shadow: guest waits become GPU barriers\n");
+		}
 		// KYTY_NATIVE_GPU_FIND=0xADDR:0xSIZE: log the draws/dispatches whose resources reach that range.
 		if (const char* find = std::getenv("KYTY_NATIVE_GPU_FIND"); find != nullptr) {
 			char*          end  = nullptr;
@@ -889,6 +917,7 @@ private:
 	uint64_t      m_acbs_refused   = 0;
 	std::set<uint32_t> m_unknown_acb_ops;
 	uint32_t      m_acb_dummy_writes = 0;
+	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
 	std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> m_find_seen; // KYTY_NATIVE_GPU_FIND hits logged
 	bool          m_stats          = false;

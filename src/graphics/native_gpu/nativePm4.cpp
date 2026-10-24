@@ -19,6 +19,7 @@ constexpr uint32_t IT_INDEX_BUFFER_SIZE        = 0x13;
 constexpr uint32_t IT_DISPATCH_DIRECT          = 0x15;
 constexpr uint32_t IT_DISPATCH_INDIRECT        = 0x16;
 constexpr uint32_t IT_DRAW_INDIRECT            = 0x24;
+constexpr uint32_t IT_RELEASE_MEM              = 0x49;
 constexpr uint32_t IT_DRAW_INDEX_INDIRECT      = 0x25;
 constexpr uint32_t IT_GET_LOD_STATS            = 0x8E;
 constexpr uint32_t IT_INDEX_BASE               = 0x26;
@@ -434,6 +435,21 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			for (uint32_t o = 0x00C; o < 0x02C; o++) regs.push_back(o);
 			for (uint32_t o = 0x08C; o < 0x0AC; o++) regs.push_back(o);
 		}
+		if (!dispatch) {
+			// Color targets, whatever CB_TARGET_MASK says (depth 100 + MRT slot).
+			for (uint32_t i = 0; i < 8; i++) {
+				const uint64_t cb = (static_cast<uint64_t>(reg(cx, kCbColor0Base + i * kCbColorStride)) << 8u) |
+				                    (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt + i) & 0xffu) << 40u);
+				if (in_range(cb)) {
+					FindHit at = base;
+					at.depth   = 100 + i;
+					at.word    = reg(cx, kCbTargetMask);
+					at.target  = cb;
+					at.image   = true;
+					r.find_hits.push_back(at);
+				}
+			}
+		}
 		std::set<uint64_t> visited;
 		for (uint32_t o: regs) {
 			if (sh.count(o) == 0 || sh.count(o + 1) == 0) {
@@ -821,15 +837,43 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					ref |= static_cast<uint64_t>(bptr[4]) << 32u;
 					mask |= static_cast<uint64_t>(bptr[6]) << 32u;
 				}
-				bool met = false;
+				bool     met   = false;
+				uint64_t value = 0;
 				if (addr != 0) {
-					const uint64_t value = wide ? *reinterpret_cast<const volatile uint64_t*>(addr)
-					                            : *reinterpret_cast<const volatile uint32_t*>(addr);
-					met = WaitConditionMet(bptr[0] & 0x7u, value & mask, ref);
+					value = wide ? *reinterpret_cast<const volatile uint64_t*>(addr)
+					             : *reinterpret_cast<const volatile uint32_t*>(addr);
+					met   = WaitConditionMet(bptr[0] & 0x7u, value & mask, ref);
 				}
 				stats.waits_dropped++;
 				if (!met) {
 					stats.waits_unmet++;
+					r.unmet_waits.push_back({addr, ref, value, bptr[0] & 0x7u, dw, stats.draws, stats.dispatches});
+				}
+				// The guest waits for its own end-of-pipe label: everything before has finished and its
+				// writes are visible. The label itself is written by Kyty later, so give the GPU the same
+				// guarantee with a fence of ours: an end-of-pipe RELEASE_MEM that flushes and invalidates
+				// the caches (Mesa's gfx10 wait-for-idle), and a wait on that fence.
+				if (m_fence_va != 0) {
+					const uint32_t seq = ++m_fence_seq;
+					body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+					// EVENT_TYPE CACHE_FLUSH_AND_INV_TS_EVENT (0x14), EVENT_INDEX 5 (end of pipe), GCR_CNTL:
+					// GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB.
+					body.push_back(0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
+					               (1u << 20u) | (1u << 21u));
+					body.push_back(1u << 29u); // DATA_SEL 1: 32-bit data; DST_SEL 0 memory; no interrupt
+					body.push_back(static_cast<uint32_t>(m_fence_va));
+					body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
+					body.push_back(seq);
+					body.push_back(0u);
+					body.push_back(0u);
+					body.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
+					body.push_back(3u | (1u << 4u)); // function EQUAL, memory space, ME engine
+					body.push_back(static_cast<uint32_t>(m_fence_va));
+					body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
+					body.push_back(seq);
+					body.push_back(0xffffffffu);
+					body.push_back(4u); // poll interval
+					stats.wait_barriers++;
 				}
 				// A wait the prefetch parser does (ENGINE_SEL = PFP) on a label the micro engine has just
 				// written is how the guest keeps the PFP from fetching ahead of the ME past a cache flush.
