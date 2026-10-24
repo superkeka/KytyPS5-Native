@@ -21,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -1319,8 +1320,15 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	if (NativeGpu::NativeLodStats() && NativeGpu::PrimaryRendering()) {
 		return 4;
 	}
+	// Games stream texture mips by these statistics. All zeros reads as "never sampled": ASTRO BOT then
+	// keeps only the smallest mips (flat, overexposed terrain). All ones keeps every texture at full
+	// detail. KYTY_LOD_STATS_FILL=<byte> overrides the fill.
+	static const int fill = [] {
+		const char* v = std::getenv("KYTY_LOD_STATS_FILL");
+		return v != nullptr ? static_cast<int>(std::strtol(v, nullptr, 0)) : 0xff;
+	}();
 	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, 0, buffer_size);
+		memset(dst, fill, buffer_size);
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);
