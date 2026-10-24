@@ -67,7 +67,14 @@ public:
 		// them for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even when
 		// no packet or shader used GDS. KYTY_NATIVE_GPU_GDS=1 asks for the whole partitions,
 		// "gds=<bytes>,gws=<n>,oa=<n>" for chosen sizes (0 or absent: none of that resource).
-		if (const char* opt = std::getenv("KYTY_NATIVE_GPU_GDS"); opt != nullptr && opt[0] != '\0' && opt[0] != '0') {
+		// Native primary mode defaults to a 4 KiB GDS partition (what PS5 titles' counters use), with
+		// no GWS or OA, which is what ran ASTRO BOT and Dead Cells without hangs.
+		const char* opt     = std::getenv("KYTY_NATIVE_GPU_GDS");
+		const char* primary = std::getenv("KYTY_NATIVE_GPU_PRIMARY");
+		if (opt == nullptr && primary != nullptr && primary[0] != '\0' && primary[0] != '0') {
+			opt = "gds=4096,gws=0,oa=0";
+		}
+		if (opt != nullptr && opt[0] != '\0' && opt[0] != '0') {
 			self->CreateGds(opt);
 		}
 		return self;

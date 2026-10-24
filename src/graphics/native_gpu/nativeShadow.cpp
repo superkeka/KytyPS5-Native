@@ -45,6 +45,16 @@ bool EnvOn(const char* name) {
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// What native primary mode needs to run games correctly is on there by default; setting the switch
+// to 0 turns a feature off (and setting it turns it on outside primary mode).
+bool PrimaryFeature(const char* name) {
+	const char* v = std::getenv(name);
+	if (v != nullptr && v[0] != '\0') {
+		return v[0] != '0';
+	}
+	return EnvOn("KYTY_NATIVE_GPU_PRIMARY");
+}
+
 // Shadow-mode state, built lazily on the first DCB so it sees the final env and the created GEM
 // backing. One instance for the process; submit_dcb is driven from the guest graphics thread, but
 // a mutex keeps it safe if that ever changes.
@@ -883,7 +893,7 @@ private:
 			m_translator.SetNoDcc(true);
 			std::fprintf(stderr, "native shadow: render targets without DCC (experiment)\n");
 		}
-		if (EnvOn("KYTY_NATIVE_GPU_NO_CMASK_CLEAR")) {
+		if (PrimaryFeature("KYTY_NATIVE_GPU_NO_CMASK_CLEAR")) {
 			m_translator.SetNoCmaskClear(true);
 			std::fprintf(stderr, "native shadow: no CMASK fast clear on targets without DCC (experiment)\n");
 		}
@@ -926,6 +936,8 @@ private:
 		if (const char* g = std::getenv("KYTY_NATIVE_GPU_GDS_SHADERS"); g != nullptr) {
 			m_skip_gds_shaders  = std::strcmp(g, "skip") == 0;
 			m_allow_gds_shaders = !m_skip_gds_shaders && g[0] == '1';
+		} else {
+			m_allow_gds_shaders = EnvOn("KYTY_NATIVE_GPU_PRIMARY"); // primary mode has the GDS partition
 		}
 		m_collect_targets = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr;
 		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
@@ -973,11 +985,11 @@ private:
 		}
 		// KYTY_NATIVE_GPU_ASYNC=1: submissions return without waiting for the GPU (experiment; the
 		// guest's labels are still written by Kyty's CPU command processor, possibly too early).
-		if (EnvOn("KYTY_NATIVE_GPU_ASYNC") || EnvOn("KYTY_NATIVE_GPU_THREAD")) {
+		if (EnvOn("KYTY_NATIVE_GPU_ASYNC") || ShadowThreaded()) {
 			m_submitter->SetAsync(true);
 			std::fprintf(stderr, "native shadow: asynchronous submission (experiment)\n");
 		}
-		if (EnvOn("KYTY_NATIVE_GPU_WAIT_BARRIERS")) {
+		if (PrimaryFeature("KYTY_NATIVE_GPU_WAIT_BARRIERS")) {
 			m_translator.SetFenceAddress(m_submitter->ScratchVa() + 1024);
 			m_acb_translator.SetFenceAddress(m_submitter->ScratchVa() + 1032);
 			std::fprintf(stderr, "native shadow: guest waits become GPU barriers\n");
@@ -992,8 +1004,9 @@ private:
 			std::fprintf(stderr, "native shadow: looking for references to [0x%llx, +0x%llx)\n",
 			             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
 		}
-		if (const char* acb = std::getenv("KYTY_NATIVE_GPU_ACB"); acb != nullptr && acb[0] != '\0' && acb[0] != '0') {
-			m_acb_mode = std::strcmp(acb, "dry") == 0 ? AcbMode::Dry : AcbMode::On;
+		if (const char* acb = std::getenv("KYTY_NATIVE_GPU_ACB"); acb == nullptr ? EnvOn("KYTY_NATIVE_GPU_PRIMARY")
+		                                                                       : (acb[0] != '\0' && acb[0] != '0')) {
+			m_acb_mode = acb != nullptr && std::strcmp(acb, "dry") == 0 ? AcbMode::Dry : AcbMode::On;
 			std::fprintf(stderr, "native shadow: async compute buffers %s\n",
 			             m_acb_mode == AcbMode::Dry ? "translated only (dry run)" : "run natively on the gfx ring");
 		}
@@ -1258,7 +1271,7 @@ bool ShadowOnPipelineThread() {
 }
 
 bool ShadowThreaded() {
-	static const bool on = EnvOn("KYTY_NATIVE_GPU_THREAD");
+	static const bool on = PrimaryFeature("KYTY_NATIVE_GPU_THREAD");
 	return on;
 }
 
