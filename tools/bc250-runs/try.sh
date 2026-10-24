@@ -1,6 +1,9 @@
 #!/bin/bash
 # Runs one native experiment on the BC-250 from the Mac and recovers the board on its own.
 # Usage: try.sh TAG SECONDS "ENV=VALUE ..." [TITLE] ["EMULATOR ARGS"]
+# TRY_CMD="..." runs that command on the board instead of a game (cmd-run.sh: inside the distrobox,
+# in $RUNS/TAG, with the ENV list set), e.g. the frame replay tool, under the same lock and hang
+# recovery.
 # Prints HANG or DONE. On a gfx ring hang (needs amdgpu.gpu_recovery=0) it saves the breadcrumbs and
 # the devcoredump next to the run, reboots the board (sudoers: NOPASSWD systemctl reboot) and waits
 # until SSH answers again.
@@ -26,7 +29,11 @@ fi
 ssh -o BatchMode=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=5 $H 'journalctl -kf -n 0 --no-pager -o short-monotonic' > "$LOCAL/kernel.log" 2>&1 &
 KLOG=$!
 sleep 2
-ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS $CRUMBS\" --setenv=EXTRA_ARGS=\"$ARGS\" ${TRY_NO_OVERLAY:+--setenv=OVERLAY=} ${TRY_EMU:+--setenv=KYTY_EMU=$TRY_EMU} $RUNS/game-run.sh $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
+if [ -n "${TRY_CMD:-}" ]; then
+	ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS\" --setenv=CMD=\"$TRY_CMD\" $RUNS/cmd-run.sh $SECS $TAG" > /dev/null 2>&1
+else
+	ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS $CRUMBS\" --setenv=EXTRA_ARGS=\"$ARGS\" ${TRY_NO_OVERLAY:+--setenv=OVERLAY=} ${TRY_EMU:+--setenv=KYTY_EMU=$TRY_EMU} $RUNS/game-run.sh $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
+fi
 result=TIMEOUT
 for i in $(seq 1 $(( (SECS + 60) / 5 ))); do
 	sleep 5
