@@ -16,7 +16,7 @@ case $MODE in
 esac
 restore() { DISPLAY=:0 xprop -root -f GAMESCOPECTRL_BASELAYER_APPID 32co -set GAMESCOPECTRL_BASELAYER_APPID 769; }
 trap restore EXIT
-(cd "$OUT" && distrobox enter shadps4-dev -- env DISPLAY=:1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 ${EXTRA_ENV:-} $ENVS timeout -s INT "$SECS" "$EMU" --game /home/deck/Games/$TITLE --no-splash --skip-notice-screen --perf-overlay ${EXTRA_ARGS:-} > run.log 2>&1; echo "exit=$?" >> run.log) &
+(cd "$OUT" && distrobox enter shadps4-dev -- env DISPLAY=:1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 ${EXTRA_ENV:-} $ENVS timeout -s INT "$SECS" "$EMU" --game /home/deck/Games/$TITLE --no-splash --skip-notice-screen ${OVERLAY---perf-overlay} ${EXTRA_ARGS:-} > run.log 2>&1; echo "exit=$?" >> run.log) &
 EMUPID=$!
 WID=""
 for i in $(seq 1 90); do sleep 1; WID=$(DISPLAY=:1 xdotool search --name "$TITLE" 2>/dev/null | head -1); [ -n "$WID" ] && break; kill -0 $EMUPID 2>/dev/null || break; done
@@ -27,6 +27,8 @@ if [ -n "$WID" ]; then
   t=0
   while kill -0 $EMUPID 2>/dev/null; do
     sleep "$EVERY"; t=$((t+EVERY))
+    # Steam sometimes takes the base layer back during a run; the game stays in front.
+    DISPLAY=:0 xprop -root -f GAMESCOPECTRL_BASELAYER_APPID 32co -set GAMESCOPECTRL_BASELAYER_APPID 424242
     DISPLAY=:0 xprop -root -f GAMESCOPECTRL_DEBUG_REQUEST_SCREENSHOT 32c -set GAMESCOPECTRL_DEBUG_REQUEST_SCREENSHOT 1; sleep 2
     cp /tmp/gamescope.png "$OUT/shot-$t.png" 2>/dev/null
     echo "$t,$(DISPLAY=:1 xprop -id "$WID" WM_NAME 2>/dev/null | grep -oE "fps: [0-9.]+" | grep -oE "[0-9.]+")" >> "$OUT/fps.csv"
