@@ -1184,6 +1184,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (body_count >= 3) {
 					add_ref((static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), 256, false);
 				}
+				// The CP only forwards EVENT_TYPE to VGT_EVENT_INITIATOR; CB/DB do the actual CMASK/FMASK/
+				// HTILE flush. Record which the title issues so the squares work can see any CB/DB meta flush.
+				if (body_count >= 1) {
+					stats.event_type[bptr[0] & 0x3fu]++;
+					stats.event_index[(bptr[0] >> 8u) & 0xfu]++;
+				}
 				stats.event_write++;
 				break;
 			case IT_CLEAR_STATE:
@@ -1200,6 +1206,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 
 			default:
+				// A raw RELEASE_MEM (0x49) has no case and refuses the DCB below; the title sends its EOP
+				// sync as NOP markers instead. Still record its event control dword if one ever appears.
+				if (op == IT_RELEASE_MEM && body_count >= 1) {
+					stats.event_type[bptr[0] & 0x3fu]++;
+					stats.event_index[(bptr[0] >> 8u) & 0xfu]++;
+				}
 				// Keep walking so one refused DCB names every packet the translator lacks.
 				if (r.unknown_ops.empty()) {
 					r.unknown_op = op;

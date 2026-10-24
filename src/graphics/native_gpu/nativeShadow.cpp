@@ -124,6 +124,12 @@ public:
 		const double       t_translate = NowSecShadow();
 		Pm4TranslateResult result      = tr.Translate(dcb);
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
+		for (uint32_t i = 0; i < result.stats.event_type.size(); i++) {
+			m_event_type_hist[i] += result.stats.event_type[i];
+		}
+		for (uint32_t i = 0; i < result.stats.event_index.size(); i++) {
+			m_event_index_hist[i] += result.stats.event_index[i];
+		}
 		for (const auto& h: result.find_hits) {
 			const auto key = std::make_tuple(h.shader, h.user_reg, h.depth, h.word);
 			if (m_find_seen.insert(key).second && m_find_seen.size() <= 64) {
@@ -482,6 +488,32 @@ public:
 			             static_cast<unsigned long long>(m_promoted_by[0]), static_cast<unsigned long long>(m_promoted_by[1]),
 			             static_cast<unsigned long long>(m_promoted_by[2]), static_cast<unsigned long long>(m_promoted_by[3]),
 			             static_cast<unsigned long long>(m_promoted_by[4]), static_cast<unsigned long long>(m_promoted_by[5]));
+			if (m_stats) {
+				const auto evname = [](uint32_t t) -> const char* {
+					switch (t) {
+						case 0x04: return "PS_PARTIAL_FLUSH";
+						case 0x14: return "CACHE_FLUSH_AND_INV_TS";
+						case 0x15: return "BOTTOM_OF_PIPE_TS";
+						case 0x2c: return "FLUSH_AND_INV_DB_META";
+						case 0x2e: return "FLUSH_AND_INV_CB_META";
+						default: return "";
+					}
+				};
+				std::fprintf(stderr, "native shadow: EVENT_WRITE/RELEASE_MEM EVENT_TYPE histogram:");
+				for (uint32_t t = 0; t < 64; t++) {
+					if (m_event_type_hist[t] != 0) {
+						std::fprintf(stderr, " 0x%02x%s%s=%llu", t, evname(t)[0] != '\0' ? ":" : "", evname(t),
+						             static_cast<unsigned long long>(m_event_type_hist[t]));
+					}
+				}
+				std::fprintf(stderr, "\nnative shadow: EVENT_INDEX histogram:");
+				for (uint32_t i = 0; i < 16; i++) {
+					if (m_event_index_hist[i] != 0) {
+						std::fprintf(stderr, " %u=%llu", i, static_cast<unsigned long long>(m_event_index_hist[i]));
+					}
+				}
+				std::fprintf(stderr, "\n");
+			}
 			std::fprintf(stderr,
 			             "native shadow: %llu frames completed, avg gpu(submit->fence) %.2f ms, "
 			             "%u shaders scanned, %u v_dot2c_f32_f16 sites\n",
@@ -1369,6 +1401,8 @@ private:
 	std::set<uint32_t> m_unknown_acb_ops;
 	uint32_t      m_acb_dummy_writes = 0;
 	uint64_t      m_promoted_by[6]   = {};
+	uint64_t      m_event_type_hist[64]  = {}; // EVENT_WRITE/RELEASE_MEM EVENT_TYPE counts, all frames
+	uint64_t      m_event_index_hist[16] = {}; // EVENT_WRITE/RELEASE_MEM EVENT_INDEX counts, all frames
 	uint64_t      m_last_seq         = 0;
 	bool          m_pipelined        = false;
 	std::vector<uint32_t> m_batch;

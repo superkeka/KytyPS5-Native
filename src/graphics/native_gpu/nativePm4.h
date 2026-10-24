@@ -151,6 +151,10 @@ struct Pm4TranslateStats {
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
+	// Histograms of the event control dword (bptr[0]) of EVENT_WRITE (0x46) and any raw RELEASE_MEM
+	// (0x49): which CB/DB meta/EOP events the title issues. EVENT_TYPE is bits [5:0], EVENT_INDEX [11:8].
+	std::array<uint32_t, 64> event_type  {}; // count by EVENT_TYPE (0x2e CB_META, 0x2c DB_META, 0x14 TS...)
+	std::array<uint32_t, 16> event_index {}; // count by EVENT_INDEX (0 generic, 5 end-of-pipe, 6 end-of-shader)
 	uint32_t write_data_dropped = 0; // IT_WRITE_DATA to memory, left to Kyty (see Translate)
 	uint32_t write_data_native  = 0; // IT_WRITE_DATA to memory also kept in the IB (SetWriteDataNative)
 	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
