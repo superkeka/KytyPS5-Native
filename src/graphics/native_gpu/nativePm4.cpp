@@ -675,6 +675,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		return !m_skip_ps.empty() && m_skip_ps.count(ps) != 0;
 	};
 
+	// Indirect arguments are often written by the CP itself just before (DMA_DATA copying a GDS counter,
+	// WRITE_DATA). On the gfx ring the PFP fetches them ahead of the ME that performs those writes,
+	// which a compute queue (one engine) never does: sync the PFP to the ME first, as RADV does.
+	auto pfp_sync_me = [&]() {
+		if (m_pfp_sync_indirect) {
+			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
+			body.push_back(0);
+			stats.pfp_syncs_emitted++;
+		}
+	};
+
 	auto fail = [&](uint32_t op, uint32_t dw) {
 		r.ok         = false;
 		r.unknown_op = op;
@@ -955,6 +966,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint64_t bytes = bptr[5] & 0x1fffffu;
 					const uint32_t src_sel = (bptr[0] >> 29u) & 0x3u; // 1 GDS, 2 immediate data
 					const uint32_t dst_sel = (bptr[0] >> 20u) & 0x3u; // 1 GDS
+					stats.dma_gds_dst += dst_sel == 1u ? 1u : 0u;
+					stats.dma_gds_src += src_sel == 1u ? 1u : 0u;
+					if (dst_sel == 1u) {
+						r.gds_dma.emplace_back(bptr[3] | 0x80000000u, static_cast<uint32_t>(bytes));
+					}
+					if (src_sel == 1u) {
+						r.gds_dma.emplace_back(bptr[1], static_cast<uint32_t>(bytes));
+					}
 					if (src_sel != 1u && src_sel != 2u) {
 						add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bytes, false);
 					}
@@ -1034,6 +1053,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
+					pfp_sync_me();
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				}
 				stats.draws++;
@@ -1073,6 +1093,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
+				pfp_sync_me();
 				if (m_compute_queue) {
 					// A compute-queue buffer carries the argument address itself (ADDR_LO, ADDR_HI,
 					// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,

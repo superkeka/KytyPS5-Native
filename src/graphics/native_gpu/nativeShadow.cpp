@@ -194,6 +194,15 @@ public:
 				}
 			}
 		}
+		for (const auto& [off, bytes]: result.gds_dma) {
+			if (m_gds_seen.insert((static_cast<uint64_t>(acb) << 63u) | (static_cast<uint64_t>(off) << 20u) | bytes).second &&
+			    m_gds_seen.size() <= 64) {
+				std::fprintf(stderr, "native shadow: GDS DMA %s %s offset 0x%x, %u bytes\n", acb ? "acb" : "dcb",
+				             (off & 0x80000000u) != 0 ? "write" : "read", off & 0x7fffffffu, bytes);
+			}
+		}
+		(acb ? m_gds_dma_acb : m_gds_dma_dcb)[0] += result.stats.dma_gds_dst;
+		(acb ? m_gds_dma_acb : m_gds_dma_dcb)[1] += result.stats.dma_gds_src;
 		DetectShaders(result.shader_addrs);
 		// KYTY_NATIVE_GPU_INSPECT_AFTER_S: only inspect draws this many seconds after start (past the title).
 		static const double inspect_after = [] {
@@ -519,6 +528,11 @@ public:
 			if (m_dummy_writes > 0) {
 				std::fprintf(stderr, "native shadow: %u checks found GPU writes to non-resident guest memory\n",
 				             m_dummy_writes);
+			}
+			if (m_gds_dma_dcb[0] + m_gds_dma_dcb[1] + m_gds_dma_acb[0] + m_gds_dma_acb[1] > 0) {
+				std::fprintf(stderr, "native shadow: DMA_DATA with GDS: dcb %llu to / %llu from, acb %llu to / %llu from\n",
+				             static_cast<unsigned long long>(m_gds_dma_dcb[0]), static_cast<unsigned long long>(m_gds_dma_dcb[1]),
+				             static_cast<unsigned long long>(m_gds_dma_acb[0]), static_cast<unsigned long long>(m_gds_dma_acb[1]));
 			}
 			if (m_chain_n > 0) {
 				const double per_buf = 1e3 / static_cast<double>(m_chain_n);
@@ -1094,6 +1108,10 @@ private:
 			m_translator.SetCompactRefs(true);
 			m_acb_translator.SetCompactRefs(true);
 		}
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT"); v != nullptr && v[0] == '0') {
+			m_translator.SetPfpSyncIndirect(false);
+			m_acb_translator.SetPfpSyncIndirect(false);
+		}
 		if (NativeLodStats()) {
 			m_translator.SetLodStats(true);
 			m_acb_translator.SetLodStats(true);
@@ -1244,6 +1262,9 @@ private:
 	std::map<uint64_t, PendingWait> m_unmet_by_addr; // label -> the wait no earlier buffer satisfies
 	std::map<uint64_t, uint64_t>    m_last_label;    // label -> last value written by a translated buffer
 	uint64_t      m_late_writers = 0;
+	std::set<uint64_t> m_gds_seen; // distinct (queue, direction, offset, size) of GDS DMA, for the log
+	uint64_t      m_gds_dma_dcb[2]  = {}; // DMA_DATA to / from GDS in graphics buffers
+	uint64_t      m_gds_dma_acb[2]  = {}; // and in async compute buffers
 	uint64_t      m_chain_n         = 0; // pipelined buffers finished since the last flip report
 	double        m_chain_queued_s  = 0.0;
 	double        m_chain_latency_s = 0.0;
@@ -1622,7 +1643,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			WriteFile(path, reinterpret_cast<const void*>(address), size);
 		}
 		DumpRenderTargets(dir, flip, download_region);
-	} else if (PrimaryRendering()) {
+	} else if (PrimaryRendering() && EnvOn("KYTY_NATIVE_GPU_DUMP_RTS")) {
 		DumpRenderTargets(dir, flip, nullptr);
 	}
 	// KYTY_NATIVE_GPU_DUMP_RANGES=0xADDR:0xSIZE[,...]: guest ranges saved next to the flip, e.g. a
