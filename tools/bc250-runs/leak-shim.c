@@ -64,10 +64,15 @@ static void track(void* p, size_t size) {
 		if (g_stacks[si].hash == 0) { g_stacks[si].hash = h; g_stacks[si].n = n; memcpy(g_stacks[si].pc, pc + 2, n * sizeof(void*)); break; }
 	}
 	g_stacks[si].bytes += size; g_stacks[si].count++;
+	// Count the allocation only when it fits the table, so a full probe chain cannot fake a leak; a
+	// tombstone slot is reused.
 	uint32_t e = slot_of(p);
+	int stored = 0;
 	for (int probe = 0; probe < 64; probe++, e = (e + 1) & (TABLE - 1)) {
-		if (g_table[e].p == NULL || g_table[e].p == p) { g_table[e].p = p; g_table[e].size = (uint32_t)size; g_table[e].stack = si; break; }
+		void* q = g_table[e].p;
+		if (q == NULL || q == (void*)1 || q == p) { g_table[e].p = p; g_table[e].size = (uint32_t)size; g_table[e].stack = si; stored = 1; break; }
 	}
+	if (!stored) { g_stacks[si].bytes -= size; g_stacks[si].count--; }
 	time_t now = time(NULL);
 	if (g_last == 0) g_last = now;
 	if (now - g_last >= 10) { g_last = now; dump(); }

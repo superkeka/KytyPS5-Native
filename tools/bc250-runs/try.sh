@@ -31,7 +31,13 @@ echo "$result $(cat "$LOCAL/crumbs-$TAG/last.txt" 2>/dev/null)"
 if [ $result != DONE ]; then
 	ssh -o ConnectTimeout=5 $H 'sudo -n /usr/bin/systemctl reboot -ff || sudo -n /usr/bin/systemctl reboot' > /dev/null 2>&1
 	sleep 30
-	until ssh -o ConnectTimeout=5 -o BatchMode=yes $H true 2>/dev/null; do sleep 5; done
+	# A reboot after a GPU hang sometimes stalls in shutdown (network up, sshd gone): give up after
+	# TRY_BOOT_WAIT seconds so the caller can report it instead of waiting forever.
+	waited=0
+	until ssh -o ConnectTimeout=5 -o BatchMode=yes $H true 2>/dev/null; do
+		sleep 5; waited=$((waited + 5))
+		if [ $waited -ge ${TRY_BOOT_WAIT:-600} ]; then echo "BOARD DOWN (needs a power cycle)"; exit 2; fi
+	done
 	sleep 20 # let the session and gamescope come up before the next run
 	echo "board back"
 fi
