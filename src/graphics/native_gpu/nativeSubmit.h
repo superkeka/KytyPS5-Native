@@ -18,6 +18,15 @@
 
 namespace Libs::Graphics::NativeGpu {
 
+// Which amdgpu ring a submission runs on. The default is the gfx ring; compute rings are
+// AMDGPU_HW_IP_COMPUTE, ip_instance 0, ring index a bit set in NativeSubmitter::ComputeRingMask().
+// Outside the class: a default argument of the class's own member functions cannot use a nested
+// type's default member initializers.
+struct NativeRingTarget {
+	uint32_t ip_type = AMDGPU_HW_IP_GFX;
+	uint32_t ring    = 0;
+};
+
 class NativeSubmitter {
 public:
 	// The IB lives at a GPU VA above every guest range (guest memory tops out well below this and
@@ -33,12 +42,7 @@ public:
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;
 
-	// Which amdgpu ring a submission runs on. The default is the gfx ring; compute rings are
-	// AMDGPU_HW_IP_COMPUTE, ip_instance 0, ring index a bit set in ComputeRingMask().
-	struct RingTarget {
-		uint32_t ip_type = AMDGPU_HW_IP_GFX;
-		uint32_t ring    = 0;
-	};
+	using RingTarget = NativeRingTarget;
 
 	struct Result {
 		bool   submitted = false; // the CS ioctl was accepted
