@@ -8,6 +8,10 @@
 #include <vector>
 
 using Libs::Graphics::NativeGpu::GpuRef;
+using Libs::Graphics::NativeGpu::LabelOracle;
+using Libs::Graphics::NativeGpu::Pm4Segment;
+using Libs::Graphics::NativeGpu::TrackerPoint;
+using Libs::Graphics::NativeGpu::WaitCond;
 using Libs::Graphics::NativeGpu::Pm4TranslateResult;
 using Libs::Graphics::NativeGpu::Pm4Translator;
 
@@ -615,7 +619,8 @@ void TestGdsReleaseMem() {
 	dcb.push_back(0x55u);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.gds_releases == 1, "GDS release marker translated");
-	const Packet* rel = FindFirst(Decode(r.ib), 0x49u);
+	const auto    pkts = Decode(r.ib);
+	const Packet* rel  = FindFirst(pkts, 0x49u);
 	Check(rel != nullptr && rel->body.size() == 7 && ((rel->body[1] >> 24u) & 0x7u) == 0u &&
 	          ((rel->body[1] >> 29u) & 0x7u) == 5u && rel->body[4] == (0xc64u | (1u << 16u)) && rel->body[6] == 0u,
 	      "native RELEASE_MEM sends the GDS dword, without the interrupt");
@@ -685,6 +690,239 @@ void TestGpuRefs() {
 	Check(rt == 1, "carried-over render target reported once");
 }
 
+
+// Native labels: a backend stand-in that answers every wait the same way.
+class TestOracle: public LabelOracle {
+public:
+	bool GpuWritable(uint64_t addr) override { return writable && addr != unwritable; }
+	Plan PlanWait(const WaitCond& wait) override {
+		asked++;
+		last = wait;
+		return plan;
+	}
+	bool     writable   = true;
+	uint64_t unwritable = 0;
+	Plan     plan       = Plan::Split;
+	uint32_t asked      = 0;
+	WaitCond last;
+};
+
+constexpr uint64_t kTrackerVa = 0x400000fff410ull;
+constexpr uint64_t kFenceVa   = 0x400000fff400ull;
+
+// The tracker RELEASE_MEM a point's sequence value sits in.
+bool IsTrackerPacket(const std::vector<uint32_t>& ib, uint32_t dw) {
+	return dw >= 5 && dw + 2 < ib.size() && ((ib[dw - 5] >> 8u) & 0xffu) == 0x49u && ib[dw - 2] == static_cast<uint32_t>(kTrackerVa) &&
+	       ib[dw - 1] == static_cast<uint32_t>(kTrackerVa >> 32u) && ((ib[dw - 3] >> 29u) & 0x7u) == 2u;
+}
+
+// Kyty's R_RELEASE_MEM marker around a hardware RELEASE_MEM body.
+void AppendReleaseMarker(std::vector<uint32_t>& dcb, uint32_t data_sel, uint32_t int_sel, uint64_t dst, uint64_t value,
+                         uint32_t ctx) {
+	dcb.push_back((3u << 30u) | (6u << 16u) | (IT_NOP << 8u) | (0x18u << 2u));
+	dcb.push_back(0x28u | (5u << 8u));
+	dcb.push_back((data_sel << 29u) | (int_sel << 24u));
+	dcb.push_back(static_cast<uint32_t>(dst));
+	dcb.push_back(static_cast<uint32_t>(dst >> 32u));
+	dcb.push_back(static_cast<uint32_t>(value));
+	dcb.push_back(static_cast<uint32_t>(value >> 32u));
+	dcb.push_back(ctx);
+}
+
+void AppendWait(std::vector<uint32_t>& dcb, uint64_t addr, uint32_t ref) {
+	Append(dcb, 0x3Cu, {3u | (1u << 4u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), ref, 0xffffffffu, 4u},
+	       false);
+}
+
+void TestLabelsWriteData() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(dcb, IT_WRITE_DATA, {5u << 8u, 0x02000100u, 0x2u, 7u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 1 && !r.segments[0].held, "one segment, not held");
+	const auto pkts = Decode(r.ib);
+	const Packet* wd = FindFirst(pkts, IT_WRITE_DATA);
+	Check(wd != nullptr && wd->body[1] == 0x02000100u && wd->body[3] == 7u, "the label WRITE_DATA runs on the GPU");
+	const auto& s = r.segments[0];
+	Check(s.points.size() == 1 && s.points[0].kind == TrackerPoint::Kind::End && IsTrackerPacket(r.ib, s.points[0].dw),
+	      "the segment ends with a tracker point");
+	Check(s.writes.size() == 1 && s.writes[0].addr == 0x202000100ull && s.writes[0].value == 7u && s.writes[0].gpu,
+	      "the write is reported as a GPU label write");
+	Check(s.begin == 0 && s.end == r.ib.size() && IbAligned(r.ib), "the segment spans the aligned IB");
+	Check(r.stats.labels_native == 1 && r.cpu_tail.empty(), "native label counted, nothing left for Kyty");
+
+	// Memory the GPU cannot write: the tracker writes it.
+	o.unwritable = 0x202000200ull;
+	std::vector<uint32_t> cpu;
+	Append(cpu, IT_WRITE_DATA, {5u << 8u, 0x02000200u, 0x2u, 9u}, false);
+	auto rc = t.Translate(cpu);
+	Check(FindFirst(Decode(rc.ib), IT_WRITE_DATA) == nullptr, "an unwritable label is not written by the GPU");
+	const auto& sc = rc.segments[0];
+	Check(sc.points.size() == 2 && sc.points[0].kind == TrackerPoint::Kind::CpuWrite && sc.points[0].addr == 0x202000200ull &&
+	          sc.points[0].data.size() == 1 && sc.points[0].data[0] == 9u && IsTrackerPacket(rc.ib, sc.points[0].dw),
+	      "the tracker writes it at its point");
+	Check(sc.writes.size() == 1 && !sc.writes[0].gpu, "reported as a CPU write");
+}
+
+void TestLabelsReleaseMem() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	std::vector<uint32_t> dcb;
+	AppendReleaseMarker(dcb, 1, 2, 0x202000300ull, 5, 0x1234);
+	AppendReleaseMarker(dcb, 2, 1, 0x202000308ull, 6, 0x55); // gfx INT_SEL 1: Kyty writes no data
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 1, "release markers translated");
+	std::vector<const Packet*> rels;
+	const auto pkts = Decode(r.ib);
+	for (const auto& p: pkts) {
+		if (p.op == 0x49u && p.body[2] != static_cast<uint32_t>(kTrackerVa)) {
+			rels.push_back(&p);
+		}
+	}
+	Check(rels.size() == 2, "both guest releases run natively");
+	Check(((rels[0]->body[1] >> 29u) & 7u) == 1u && ((rels[0]->body[1] >> 24u) & 7u) == 0u && rels[0]->body[4] == 5u &&
+	          rels[0]->body[6] == 0u,
+	      "the first writes its 32-bit label, without the hardware interrupt");
+	Check(((rels[1]->body[1] >> 29u) & 7u) == 0u, "INT_SEL 1 on the graphics queue writes nothing");
+	const auto& pts = r.segments[0].points;
+	Check(pts.size() == 3 && pts[0].kind == TrackerPoint::Kind::Interrupt && pts[0].ctx == 0x1234 &&
+	          pts[1].kind == TrackerPoint::Kind::Interrupt && pts[1].ctx == 0x55 && pts[2].kind == TrackerPoint::Kind::End,
+	      "each interrupt is a tracker point, in order, before the end");
+	Check(r.stats.interrupts == 2 && r.stats.labels_native == 1, "stats");
+
+	// A timestamp goes through the tracker (Kyty writes its reference clock).
+	std::vector<uint32_t> ts;
+	AppendReleaseMarker(ts, 3, 0, 0x202000310ull, 0, 0);
+	auto rt = t.Translate(ts);
+	Check(rt.segments[0].points.size() == 2 && rt.segments[0].points[0].kind == TrackerPoint::Kind::Timestamp &&
+	          rt.segments[0].points[0].addr == 0x202000310ull,
+	      "timestamp written by the tracker");
+}
+
+void TestLabelsLocalWait() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	static uint32_t label = 3; // stale, the guest waits for 1
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(dcb, 1, 0, addr, 1, 0);
+	AppendWait(dcb, addr, 1);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 1 && o.asked == 0, "a wait on a label written earlier in the buffer is decided locally");
+	const auto    pkts = Decode(r.ib);
+	const Packet* wait = FindFirst(pkts, 0x3Cu);
+	Check(wait != nullptr && wait->body[1] == static_cast<uint32_t>(addr) && r.stats.waits_native == 1 && r.stats.wait_barriers == 0,
+	      "and passes through natively");
+
+	// The same wait with the label reset to 0 after the release: nobody satisfies it, so the IB is cut.
+	std::vector<uint32_t> reset;
+	Append(reset, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(reset, 1, 0, addr, 1, 0);
+	Append(reset, IT_WRITE_DATA, {5u << 8u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 0u}, false);
+	AppendWait(reset, addr, 1);
+	auto rr = t.Translate(reset);
+	Check(rr.segments.size() == 2 && rr.segments[1].held && o.asked == 0, "a write that does not satisfy the wait cuts the IB");
+}
+
+void TestLabelsSplit() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	static uint32_t label = 0;
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x240u, 0x11u}, true);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(dcb, IT_SET_SH_REG, {0x240u, 0x22u}, true);
+	AppendWait(dcb, addr, 1);
+	Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 2 && o.asked == 1 && o.last.addr == addr && o.last.ref == 1u, "the oracle cuts the IB");
+	const Pm4Segment& a = r.segments[0];
+	const Pm4Segment& b = r.segments[1];
+	Check(!a.held && b.held && a.end == b.begin && b.end == r.ib.size() && (b.begin & 7u) == 0, "two aligned segments");
+	Check(a.points.size() == 1 && a.points[0].kind == TrackerPoint::Kind::End && b.points.size() == 1 &&
+	          b.points[0].kind == TrackerPoint::Kind::End && IsTrackerPacket(r.ib, a.points[0].dw) &&
+	          IsTrackerPacket(r.ib, b.points[0].dw) && a.points[0].dw < a.end && b.points[0].dw >= b.begin,
+	      "each segment ends with its own tracker point");
+	std::vector<uint32_t> second(r.ib.begin() + b.begin, r.ib.begin() + b.end);
+	const auto            pkts = Decode(second);
+	CheckPreambleHead(pkts);
+	bool user_data = false;
+	for (const auto& p: pkts) {
+		user_data = user_data || (p.op == IT_SET_SH_REG && p.body[0] == 0x240u && p.body[1] == 0x22u);
+	}
+	Check(user_data, "the second segment's preamble holds the state at the cut");
+	Check(b.barrier_len == 15 && ((r.ib[b.barrier_dw] >> 8u) & 0xffu) == 0x49u, "the barrier block comes first");
+	Check(b.wait_len == 7 && b.wait_dw == b.barrier_dw + b.barrier_len && ((r.ib[b.wait_dw] >> 8u) & 0xffu) == 0x3Cu &&
+	          r.ib[b.wait_dw + 2] == static_cast<uint32_t>(addr),
+	      "then the guest wait");
+	Check(Count(Decode(std::vector<uint32_t>(r.ib.begin() + b.wait_dw + b.wait_len, r.ib.begin() + b.end)), IT_DISPATCH_DIRECT) == 1,
+	      "and the rest of the buffer");
+
+	// NopOut turns either one into a NOP of the same length.
+	Libs::Graphics::NativeGpu::NopOut(r.ib, b.barrier_dw, b.barrier_len);
+	Check(PacketSizeDw(r.ib[b.barrier_dw]) == b.barrier_len && ((r.ib[b.barrier_dw] >> 8u) & 0xffu) == IT_NOP, "NOP of the same size");
+
+	// A wait before any work: the empty first segment is left out.
+	std::vector<uint32_t> first;
+	Append(first, IT_SET_SH_REG, {0x240u, 0x33u}, true);
+	AppendWait(first, addr, 1);
+	Append(first, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	auto rf = t.Translate(first);
+	Check(rf.segments.size() == 1 && rf.segments[0].held && rf.segments[0].begin == 0, "a buffer that starts with the wait is held whole");
+
+	// Met: a barrier, as without native labels.
+	o.plan = LabelOracle::Plan::Met;
+	auto rm = t.Translate(first);
+	Check(rm.segments.size() == 1 && !rm.segments[0].held && rm.stats.wait_barriers == 1, "a met wait is a barrier");
+	// Native: passed through.
+	o.plan  = LabelOracle::Plan::Native;
+	auto rn = t.Translate(first);
+	Check(rn.segments.size() == 1 && rn.stats.waits_native == 1 && rn.stats.wait_barriers == 0, "a native wait passes through");
+	t.SetNativeWaits(false);
+	auto rb = t.Translate(first);
+	Check(rb.stats.waits_native == 0 && rb.stats.wait_barriers == 1, "KYTY_NATIVE_GPU_NATIVE_WAITS=0: a barrier instead");
+}
+
+void TestLabelsCpuTail() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_NOP, {0u, 1u, 2u, 3u, 4u}, false, R_FLIP);
+	Append(dcb, IT_NOP, {0x68750778u, 0x02000400u, 0x2u, 1u}, false);
+	Append(dcb, IT_NOP, {0x68750004u}, false); // a user-data marker: Kyty's own state, not needed
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.cpu_tail.size() == 6 + 5 && r.cpu_tail[0] == dcb[0] && r.cpu_tail[6] == dcb[6],
+	      "flips are copied for Kyty's command processor");
+	Check(r.segments.size() == 1 && r.segments[0].writes.size() == 1 && !r.segments[0].writes[0].gpu &&
+	          r.segments[0].writes[0].addr == 0x202000400ull,
+	      "the flip's label is a CPU write");
+}
+
+void TestLabelWriteCovers() {
+	using Libs::Graphics::NativeGpu::LabelWrite;
+	uint64_t   v = 0;
+	LabelWrite w32 {0x1000, 5, true, true, false};
+	LabelWrite w64 {0x2000, 0x0000000700000006ull, true, true, true};
+	Check(w32.Covers(0x1000, false, &v) == 1 && v == 5, "32-bit write, 32-bit wait");
+	Check(w32.Covers(0x1000, true, &v) == 2, "32-bit write, 64-bit wait: unknown");
+	Check(w64.Covers(0x2000, false, &v) == 1 && v == 6, "64-bit write, low half");
+	Check(w64.Covers(0x2004, false, &v) == 1 && v == 7, "64-bit write, high half");
+	Check(w64.Covers(0x2000, true, &v) == 1 && v == 0x0000000700000006ull, "64-bit write, 64-bit wait");
+	Check(w32.Covers(0x1008, false, &v) == 0, "unrelated");
+}
+
 int main() {
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
@@ -710,6 +948,12 @@ int main() {
 	TestWaitBarrier();
 	TestCompactRefs();
 	TestGdsReleaseMem();
+	TestLabelsWriteData();
+	TestLabelsReleaseMem();
+	TestLabelsLocalWait();
+	TestLabelsSplit();
+	TestLabelsCpuTail();
+	TestLabelWriteCovers();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

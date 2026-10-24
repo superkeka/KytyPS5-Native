@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +34,9 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 namespace Libs::Graphics::NativeGpu {
 
@@ -98,7 +103,10 @@ public:
 
 	// `acb`: an asynchronous compute buffer. ACBs go through their own translator (their own shadow
 	// of the compute registers) and run on the same gfx ring as the DCBs, in guest submission order.
-	void Submit(std::span<const uint32_t> dcb, bool acb = false) {
+	// With `out` (native labels) the buffer is translated and made resident, and the result goes to
+	// the caller, who schedules its segments; false means it is not run natively (refused, or the
+	// native path is off) and Kyty has to run it.
+	bool Submit(std::span<const uint32_t> dcb, bool acb = false, Pm4TranslateResult* out = nullptr) {
 		const double                t_enter = NowSecShadow();
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double                t_locked = NowSecShadow();
@@ -113,7 +121,7 @@ public:
 			m_initialized = true;
 		}
 		if (!m_enabled || m_disabled || (acb && m_acb_mode == AcbMode::Off)) {
-			return;
+			return false;
 		}
 
 		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
@@ -153,7 +161,7 @@ public:
 			}
 		}
 		if (acb && SkipAcb(frame, result)) {
-			return;
+			return false;
 		}
 
 		// A wait the GPU runs past (guest waits become barriers) is only safe when the label's writer
@@ -227,7 +235,7 @@ public:
 			skip.insert(m_skip_ps.begin(), m_skip_ps.end());
 			m_translator.SetSkippedPixelShaders(skip);
 			m_refused++;
-			return;
+			return false;
 		}
 		if (result.ok && !m_allow_gds_shaders && !m_skip_gds_shaders) {
 			for (uint64_t va: result.shader_addrs) {
@@ -237,7 +245,7 @@ public:
 						             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(va));
 					}
 					m_refused++;
-					return;
+					return false;
 				}
 			}
 		}
@@ -277,12 +285,12 @@ public:
 				}
 			}
 			m_refused++;
-			return;
+			return false;
 		}
 
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_submitter == nullptr) {
-			return;
+			return false;
 		}
 		// Guest direct memory is resident on the GPU only where needed (gemBacking.h): before the IB
 		// runs, promote what the CPU has written and what this DCB references.
@@ -290,6 +298,21 @@ public:
 		SetStage(Stage::Residency, frame);
 		MakeResident(result);
 		m_residency_ms_total += (NowSecShadow() - t_residency) * 1e3;
+		SetStage(Stage::Idle, frame);
+		if (out != nullptr) {
+			if (!m_breadcrumbs.empty()) {
+				WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, result.ib);
+			}
+			m_translate_ms_total += translate_ms;
+			m_labels_stats[0] += result.stats.labels_native;
+			m_labels_stats[1] += result.stats.labels_cpu;
+			m_labels_stats[2] += result.stats.interrupts;
+			m_labels_stats[3] += result.stats.waits_native;
+			m_labels_stats[4] += result.stats.waits_split;
+			m_labels_stats[5] += result.stats.wait_barriers;
+			*out = std::move(result);
+			return true;
+		}
 
 		// Every GEM buffer the GPU may touch must be resident in the submission: the kernel only
 		// validates and fences buffers that are listed, so a userptr one left out could have its pages
@@ -333,7 +356,7 @@ public:
 				SubmitBatchLocked();
 			}
 			m_batch.insert(m_batch.end(), wrapped.begin(), wrapped.end());
-			return;
+			return true;
 		}
 		std::span<const uint32_t> ib = wrapped;
 		SetStage(Stage::Gpu, frame);
@@ -353,7 +376,7 @@ public:
 			             static_cast<unsigned long long>(frame), std::strerror(-r.err), r.retries,
 			             handles.size());
 			Disable("submit error");
-			return;
+			return false;
 		}
 		m_last_seq = r.seq;
 		if (r.timed_out || r.reset || !r.completed) {
@@ -364,7 +387,7 @@ public:
 			             r.timed_out ? "TIMED OUT" : (r.reset ? "context RESET" : "did not complete"),
 			             r.seconds * 1e3, result.ib.size(), result.stats.draws);
 			Disable("timeout or reset");
-			return;
+			return false;
 		}
 
 		if (acb) {
@@ -380,7 +403,7 @@ public:
 				             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(m_acbs_completed),
 				             r.seconds * 1e3, result.ib.size(), result.stats.dispatches);
 			}
-			return;
+			return true;
 		}
 		m_completed++;
 		if (m_completed % 30 == 0 && WaitIdle() && m_gem->DummyWritten()) {
@@ -440,7 +463,9 @@ public:
 		}
 #else
 		(void)result;
+		(void)out;
 #endif
+		return true;
 	}
 
 	// Display buffers are written by the GPU (often by compute through a descriptor the translator
@@ -487,7 +512,8 @@ public:
 	// One pipelined buffer finished: `queued` waiting for the worker, `latency` from the guest's
 	// submit to its continuation being done, `then` the continuation (Kyty's command processor).
 	void AddChain(double queued, double latency, double then) {
-		std::lock_guard<std::mutex> lock(m_mutex);
+		// Its own lock: the native labels tracker calls this, and m_mutex is held for whole translations.
+		std::lock_guard<std::mutex> lock(m_chain_mutex);
 		m_chain_n++;
 		m_chain_queued_s += queued;
 		m_chain_latency_s += latency;
@@ -534,6 +560,15 @@ public:
 				             static_cast<unsigned long long>(m_gds_dma_dcb[0]), static_cast<unsigned long long>(m_gds_dma_dcb[1]),
 				             static_cast<unsigned long long>(m_gds_dma_acb[0]), static_cast<unsigned long long>(m_gds_dma_acb[1]));
 			}
+			if (m_labels) {
+				std::fprintf(stderr,
+				             "native shadow: native labels so far: %llu GPU label writes, %llu by the tracker, %llu interrupts; "
+				             "waits: %llu native, %llu cut, %llu barriers\n",
+				             static_cast<unsigned long long>(m_labels_stats[0]), static_cast<unsigned long long>(m_labels_stats[1]),
+				             static_cast<unsigned long long>(m_labels_stats[2]), static_cast<unsigned long long>(m_labels_stats[3]),
+				             static_cast<unsigned long long>(m_labels_stats[4]), static_cast<unsigned long long>(m_labels_stats[5]));
+			}
+			std::lock_guard<std::mutex> chain_lock(m_chain_mutex);
 			if (m_chain_n > 0) {
 				const double per_buf = 1e3 / static_cast<double>(m_chain_n);
 				std::fprintf(stderr,
@@ -568,6 +603,71 @@ public:
 		(void)size;
 		(void)out;
 		return false;
+#endif
+	}
+
+	// Native labels: the translators write labels natively and report tracker points that write the
+	// tracker slot in the scratch area; `oracle` decides the guest waits. False when the native path
+	// cannot run (nothing is translated then).
+	bool EnableLabels(LabelOracle* oracle) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (!m_initialized) {
+			Init();
+			m_initialized = true;
+		}
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (!m_enabled || m_disabled || m_submitter == nullptr || !m_submitter->Async()) {
+			return false;
+		}
+		*reinterpret_cast<volatile uint64_t*>(m_submitter->ScratchCpu() + kTrackerOffset) = 0;
+		const uint64_t va      = m_submitter->ScratchVa() + kTrackerOffset;
+		const char*    native  = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
+		const bool     waits   = native == nullptr || native[0] != '0';
+		m_translator.SetNativeLabels(oracle, va);
+		m_acb_translator.SetNativeLabels(oracle, va);
+		m_translator.SetNativeWaits(waits);
+		m_acb_translator.SetNativeWaits(waits);
+		m_labels = true;
+		std::fprintf(stderr, "native shadow: native labels (the GPU writes labels, a tracker raises interrupts%s)\n",
+		             waits ? ", guest waits pass through" : "; guest waits stay barriers");
+		return true;
+#else
+		(void)oracle;
+		return false;
+#endif
+	}
+
+	// The tracker slot: the sequence number of the last tracker point the GPU has passed.
+	uint64_t TrackerValue() const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return *reinterpret_cast<const volatile uint64_t*>(m_submitter->ScratchCpu() + kTrackerOffset);
+#else
+		return 0;
+#endif
+	}
+
+	// Whether the GPU may write a label at `addr`. Called while translating (the lock is held).
+	bool GpuWritable(uint64_t addr) const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return m_gem != nullptr && m_gem->IsGpuWritable(addr);
+#else
+		(void)addr;
+		return false;
+#endif
+	}
+
+	double TimeoutSec() const { return m_timeout_sec; }
+
+	// Native labels: appends a ready segment to the batch FlushBatch submits.
+	void AppendBatch(std::span<const uint32_t> ib) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if ((m_batch.size() + ib.size()) * 4 > NativeSubmitter::kSlotSize) {
+			SubmitBatchLocked();
+		}
+		m_batch.insert(m_batch.end(), ib.begin(), ib.end());
+#else
+		(void)ib;
 #endif
 	}
 
@@ -920,6 +1020,8 @@ private:
 	// COPY_DATA SRC_SEL 9 (GPU clock, gpu_counter_freq = 100 MHz on BC-250) -> memory, 64 bit.
 	static constexpr uint32_t kItCopyData       = 0x40;
 	static constexpr uint32_t kTimestampOffset  = 512;
+	// Native labels: the 64-bit slot tracker points write (the fences are at 1024 and 1032).
+	static constexpr uint32_t kTrackerOffset    = 1040;
 	static constexpr double   kGpuClockHz       = 100e6;
 
 	static void EmitTimestamp(std::vector<uint32_t>& ib, uint64_t va) {
@@ -1245,6 +1347,8 @@ private:
 	uint64_t      m_promoted_by[6]   = {};
 	uint64_t      m_last_seq         = 0;
 	bool          m_pipelined        = false;
+	bool          m_labels           = false;
+	uint64_t      m_labels_stats[6]  = {}; // GPU labels, tracker labels, interrupts, native/cut/barrier waits
 	std::vector<uint32_t> m_batch;
 	std::atomic<bool> m_active {false};
 	unsigned long m_waits_logged     = 0;
@@ -1265,6 +1369,7 @@ private:
 	std::set<uint64_t> m_gds_seen; // distinct (queue, direction, offset, size) of GDS DMA, for the log
 	uint64_t      m_gds_dma_dcb[2]  = {}; // DMA_DATA to / from GDS in graphics buffers
 	uint64_t      m_gds_dma_acb[2]  = {}; // and in async compute buffers
+	std::mutex    m_chain_mutex;
 	uint64_t      m_chain_n         = 0; // pipelined buffers finished since the last flip report
 	double        m_chain_queued_s  = 0.0;
 	double        m_chain_latency_s = 0.0;
@@ -1430,7 +1535,422 @@ private:
 	double                  m_last_end   = 0.0;
 };
 
+// The host side native labels signal (ShadowSetHost).
+struct Host {
+	std::function<void(int, uint32_t)> interrupt;
+	std::function<uint64_t()>          reference_clock;
+};
+Host& HostCallbacks() {
+	static Host host;
+	return host;
+}
+
+// Native labels (KYTY_NATIVE_GPU_LABELS, on in primary mode with the pipeline): the GPU writes the
+// guest's labels and Kyty's command processor no longer reads the guest buffers. A worker translates
+// each buffer as it arrives, while the guest cannot have reused it yet, and puts its segments on its
+// queue (graphics, or the guest compute queue of an ACB). A segment that starts at a guest wait nobody
+// is known to satisfy is held, and so is everything behind it on that queue, until a write ahead in
+// the ring satisfies the wait (then the guest wait runs natively) or the label is seen written in
+// memory (then a barrier replaces it). Other queues go on meanwhile, which is what lets an ACB wait
+// for a label a later DCB writes, as PS5 titles do. Ready segments join one batch and one CS.
+//
+// A tracker thread polls the slot every tracker point writes its sequence number to (about every
+// 50 us while points are outstanding) and performs what each point stands for as soon as the GPU
+// passes it: EOP interrupts, labels the GPU cannot write, the end of a buffer (its continuation:
+// Kyty's command processor runs the few packets it still needs, flips and waits for flips, copied
+// out at translation; refused buffers whole).
+class LabelPipeline final: public LabelOracle {
+public:
+	using Then = std::function<void(std::span<const uint32_t>)>;
+
+	static LabelPipeline& Instance() {
+		static LabelPipeline p;
+		return p;
+	}
+
+	void Enqueue(const uint32_t* buffer, uint32_t size_dw, uint32_t queue, Then then) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_jobs.push_back(Job {buffer, size_dw, queue, std::move(then), NowSecShadow()});
+		m_cv.notify_one();
+	}
+
+	bool GpuWritable(uint64_t addr) override { return Shadow::Instance().GpuWritable(addr); }
+
+	// A wait in a buffer of m_translating's queue that no earlier write of that buffer decides: the
+	// pieces of the same queue still held come before it, then writes ahead in the ring that have not
+	// landed yet, then guest memory.
+	Plan PlanWait(const WaitCond& wait) override {
+		auto decide = [&](const LabelWrite& w) -> std::optional<Plan> {
+			uint64_t  v = 0;
+			const int c = w.Covers(wait.addr, wait.wide, &v);
+			if (c == 0) {
+				return std::nullopt;
+			}
+			return c == 1 && wait.Met(v) && w.gpu ? Plan::Native : Plan::Split;
+		};
+		if (auto q = m_pending.find(m_translating); q != m_pending.end()) {
+			for (auto p = q->second.rbegin(); p != q->second.rend(); ++p) {
+				for (auto w = p->seg.writes.rbegin(); w != p->seg.writes.rend(); ++w) {
+					if (auto plan = decide(*w)) {
+						return *plan;
+					}
+				}
+			}
+		}
+		if (const LabelWrite* w = PendingRingWrite(wait.addr)) {
+			if (auto plan = decide(*w)) {
+				return *plan;
+			}
+		}
+		return wait.Met(ReadLabel(wait)) ? Plan::Met : Plan::Split;
+	}
+
+private:
+	struct Job {
+		const uint32_t* buffer;
+		uint32_t        size_dw;
+		uint32_t        queue;
+		Then            then;
+		double          enqueued;
+	};
+	// What runs once a buffer is done.
+	struct Done {
+		Then                  then;
+		const uint32_t*       buffer  = nullptr;
+		uint32_t              size_dw = 0;
+		bool                  whole   = false; // Kyty runs the guest buffer itself (refused, Kyty's own submissions)
+		std::vector<uint32_t> tail;            // otherwise the packets it still needs
+		double                enqueued = 0.0;
+		double                picked   = 0.0;
+	};
+	struct Piece {
+		std::vector<uint32_t> ib;  // empty: no GPU work (refused buffers, Kyty's own submissions)
+		Pm4Segment            seg; // offsets relative to `ib`
+		std::shared_ptr<Done> done; // on the last piece of a buffer
+	};
+	struct Entry {
+		uint64_t              seq;
+		uint32_t              queue;
+		TrackerPoint          point;
+		std::shared_ptr<Done> done;
+	};
+	struct RingWrite {
+		LabelWrite write;
+		uint64_t   landed; // the tracker value once its segment is done
+	};
+	enum class Release { No, Plain, Native, Observed };
+
+	LabelPipeline() {
+		m_native = Shadow::Instance().EnableLabels(this);
+		m_timeout = Shadow::Instance().TimeoutSec();
+		std::thread([this] { Work(); }).detach();
+		std::thread([this] { Track(); }).detach();
+	}
+
+	static uint64_t ReadLabel(const WaitCond& w) {
+		return w.wide ? *reinterpret_cast<const volatile uint64_t*>(w.addr) : *reinterpret_cast<const volatile uint32_t*>(w.addr);
+	}
+
+	// The latest write to `addr` in the ring whose segment the GPU has not finished yet (after that,
+	// guest memory says more), or nullptr.
+	const LabelWrite* PendingRingWrite(uint64_t addr) {
+		auto it = m_ring.find(addr);
+		if (it == m_ring.end()) {
+			return nullptr;
+		}
+		if (it->second.landed <= Shadow::Instance().TrackerValue()) {
+			m_ring.erase(it);
+			return nullptr;
+		}
+		return &it->second.write;
+	}
+
+	void Work() {
+		for (;;) {
+			std::deque<Job> jobs;
+			{
+				std::unique_lock<std::mutex> lock(m_mutex);
+				if (m_held > 0) {
+					// Something waits for a label: look at memory again soon even without new buffers.
+					m_cv.wait_for(lock, std::chrono::microseconds(50), [this] { return !m_jobs.empty(); });
+				} else {
+					m_cv.wait(lock, [this] { return !m_jobs.empty(); });
+				}
+				jobs.swap(m_jobs);
+			}
+			const double picked = NowSecShadow();
+			for (auto& job: jobs) {
+				Translate(job, picked);
+				Pump();
+			}
+			if (jobs.empty()) {
+				Pump();
+			}
+			if (m_appended) {
+				Shadow::Instance().FlushBatch();
+				m_last_cs.store(Shadow::Instance().TakeLastSeq(), std::memory_order_release);
+				m_appended = false;
+			}
+		}
+	}
+
+	void Translate(Job& job, double picked) {
+		auto done      = std::make_shared<Done>();
+		done->then     = std::move(job.then);
+		done->buffer   = job.buffer;
+		done->size_dw  = job.size_dw;
+		done->enqueued = job.enqueued;
+		done->picked   = picked;
+		auto& queue    = m_pending[job.queue];
+		Pm4TranslateResult r;
+		m_translating = job.queue;
+		if (job.buffer == nullptr || !m_native ||
+		    !Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.queue != 0, &r) ||
+		    r.segments.empty()) {
+			done->whole = true;
+			queue.push_back(Piece {{}, {}, std::move(done)});
+			return;
+		}
+		done->tail = std::move(r.cpu_tail);
+		for (size_t k = 0; k < r.segments.size(); k++) {
+			Piece p;
+			p.seg = std::move(r.segments[k]);
+			p.ib.assign(r.ib.begin() + p.seg.begin, r.ib.begin() + p.seg.end);
+			for (auto& point: p.seg.points) {
+				point.dw -= p.seg.begin;
+			}
+			p.seg.barrier_dw -= p.seg.held ? p.seg.begin : 0;
+			p.seg.wait_dw -= p.seg.held ? p.seg.begin : 0;
+			m_held += p.seg.held ? 1 : 0;
+			if (k + 1 == r.segments.size()) {
+				p.done = done;
+			}
+			queue.push_back(std::move(p));
+		}
+	}
+
+	Release Ready(const Piece& p) {
+		if (!p.seg.held) {
+			return Release::Plain;
+		}
+		if (!Shadow::Instance().Active()) {
+			return Release::Observed; // nothing runs any more; let the continuations through
+		}
+		const WaitCond& wait = p.seg.wait;
+		if (const LabelWrite* w = PendingRingWrite(wait.addr)) {
+			uint64_t  v = 0;
+			const int c = w->Covers(wait.addr, wait.wide, &v);
+			if (c != 0) {
+				return c == 1 && wait.Met(v) && w->gpu ? Release::Native : Release::No;
+			}
+		}
+		return wait.Met(ReadLabel(wait)) ? Release::Observed : Release::No;
+	}
+
+	// Emits what is ready, queue by queue, until nothing more is.
+	void Pump() {
+		for (bool progress = true; progress;) {
+			progress = false;
+			for (auto& [queue, pieces]: m_pending) {
+				while (!pieces.empty()) {
+					const Release how = Ready(pieces.front());
+					if (how == Release::No) {
+						break;
+					}
+					Emit(queue, pieces.front(), how);
+					pieces.pop_front();
+					progress = true;
+				}
+			}
+		}
+	}
+
+	void Emit(uint32_t queue, Piece& p, Release how) {
+		if (p.seg.held) {
+			m_held--;
+			if (how == Release::Native) {
+				NopOut(p.ib, p.seg.barrier_dw, p.seg.barrier_len); // the write ahead in the ring satisfies the wait
+				m_released_native++;
+			} else {
+				NopOut(p.ib, p.seg.wait_dw, p.seg.wait_len); // the label is there; keep the barrier
+				m_released_observed++;
+			}
+		}
+		std::vector<Entry> entries;
+		for (auto& point: p.seg.points) {
+			const uint64_t seq = ++m_seq;
+			p.ib[point.dw]     = static_cast<uint32_t>(seq);
+			p.ib[point.dw + 1] = static_cast<uint32_t>(seq >> 32u);
+			const bool last    = &point == &p.seg.points.back();
+			entries.push_back(Entry {seq, queue, std::move(point), last ? p.done : nullptr});
+		}
+		if (p.ib.empty()) {
+			// No GPU work: done once everything ahead of it in the ring is.
+			entries.push_back(Entry {m_seq, queue, TrackerPoint {}, p.done});
+		}
+		for (const auto& w: p.seg.writes) {
+			m_ring[w.addr] = RingWrite {w, m_seq};
+			if (w.wide) {
+				m_ring[w.addr + 4] = RingWrite {LabelWrite {w.addr + 4, w.value >> 32u, w.known, w.gpu, false}, m_seq};
+			}
+		}
+		if (m_ring.size() > 16384) {
+			const uint64_t landed = Shadow::Instance().TrackerValue();
+			for (auto it = m_ring.begin(); it != m_ring.end();) {
+				it = it->second.landed <= landed ? m_ring.erase(it) : std::next(it);
+			}
+		}
+		if (!p.ib.empty()) {
+			Shadow::Instance().AppendBatch(p.ib);
+			m_appended = true;
+		}
+		std::lock_guard<std::mutex> lock(m_track_mutex);
+		for (auto& e: entries) {
+			m_entries.push_back(std::move(e));
+		}
+		m_track_cv.notify_one();
+	}
+
+	void Track() {
+		t_pipeline_thread = true;
+#if defined(__linux__)
+		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul); // 50 us naps, not the default 50 us + slack
+#endif
+		double stuck_since = 0.0;
+		for (;;) {
+			std::vector<Entry> ready;
+			{
+				std::unique_lock<std::mutex> lock(m_track_mutex);
+				m_track_cv.wait(lock, [this] { return !m_entries.empty(); });
+				const uint64_t value = m_native ? Shadow::Instance().TrackerValue() : ~0ull;
+				while (!m_entries.empty() && (m_entries.front().seq <= value || m_drain)) {
+					ready.push_back(std::move(m_entries.front()));
+					m_entries.pop_front();
+				}
+			}
+			if (!ready.empty()) {
+				stuck_since = 0.0;
+				for (auto& e: ready) {
+					Run(e);
+				}
+				continue;
+			}
+			const double now = NowSecShadow();
+			stuck_since      = stuck_since == 0.0 ? now : stuck_since;
+			if (now - stuck_since > m_timeout) {
+				// The GPU has not passed a point for the whole timeout: wait for what was submitted. If
+				// that completes, the point was lost (run it anyway); if not, the path disables itself
+				// and everything outstanding runs.
+				const bool idle = Shadow::Instance().WaitSubmission(m_last_cs.load(std::memory_order_acquire));
+				std::fprintf(stderr, "native shadow: tracker stuck at %llu for %.0f s; %s\n",
+				             static_cast<unsigned long long>(Shadow::Instance().TrackerValue()), now - stuck_since,
+				             idle ? "the GPU is idle, running the next point" : "draining");
+				std::lock_guard<std::mutex> lock(m_track_mutex);
+				if (idle && !m_entries.empty()) {
+					m_entries.front().seq = 0;
+				} else {
+					m_drain = true;
+				}
+				stuck_since = 0.0;
+				continue;
+			}
+			struct timespec nap = {0, 50000};
+			nanosleep(&nap, nullptr);
+		}
+	}
+
+	void Run(Entry& e) {
+		const TrackerPoint& p = e.point;
+		switch (p.kind) {
+			case TrackerPoint::Kind::Interrupt:
+				// The queue's EOP event: the graphics queue's is 0, an ACB's its guest queue number.
+				if (HostCallbacks().interrupt) {
+					HostCallbacks().interrupt(static_cast<int>(e.queue), p.ctx);
+				}
+				break;
+			case TrackerPoint::Kind::CpuWrite: {
+				auto* dst = reinterpret_cast<volatile uint32_t*>(p.addr);
+				for (size_t i = 0; i < p.data.size(); i++) {
+					dst[p.one_addr ? 0 : i] = p.data[i];
+				}
+				break;
+			}
+			case TrackerPoint::Kind::Timestamp: {
+				const uint64_t clock = HostCallbacks().reference_clock ? HostCallbacks().reference_clock() : 0;
+				std::memcpy(reinterpret_cast<void*>(p.addr), &clock, std::min<uint32_t>(p.size, 8));
+				break;
+			}
+			case TrackerPoint::Kind::LodStats: {
+				// As Kyty's command processor fills it (CpOpGetLodStats): every texture fully used, and
+				// the first dword 1.
+				static const int fill = [] {
+					const char* v = std::getenv("KYTY_LOD_STATS_FILL");
+					return v != nullptr ? static_cast<int>(std::strtol(v, nullptr, 0)) : 0xff;
+				}();
+				std::memset(reinterpret_cast<void*>(p.addr), fill, p.size);
+				if (p.size >= 4) {
+					*reinterpret_cast<volatile uint32_t*>(p.addr) = 1;
+				}
+				break;
+			}
+			case TrackerPoint::Kind::End: break;
+		}
+		if (e.done != nullptr) {
+			Finish(*e.done);
+		}
+	}
+
+	void Finish(Done& done) {
+		const double start = NowSecShadow();
+		if (done.whole) {
+			done.then(std::span<const uint32_t>(done.buffer, done.size_dw));
+		} else if (!done.tail.empty()) {
+			// Kyty keeps a span to the packets until its command processor has run them: keep the last
+			// tails alive, far more than it ever has queued.
+			m_tails.push_back(std::move(done.tail));
+			if (m_tails.size() > 1024) {
+				m_tails.pop_front();
+			}
+			done.then(std::span<const uint32_t>(m_tails.back()));
+		}
+		const double end = NowSecShadow();
+		Shadow::Instance().AddChain(done.picked - done.enqueued, end - done.enqueued, end - start);
+	}
+
+	// Worker side.
+	std::mutex                              m_mutex;
+	std::condition_variable                 m_cv;
+	std::deque<Job>                         m_jobs;
+	bool                                    m_native  = false;
+	double                                  m_timeout = 12.0;
+	std::map<uint32_t, std::deque<Piece>>   m_pending; // by queue
+	uint32_t                                m_translating = 0;
+	uint64_t                                m_held        = 0;
+	uint64_t                                m_seq         = 0;
+	bool                                    m_appended    = false;
+	std::map<uint64_t, RingWrite>           m_ring; // label -> the latest write emitted into the ring
+	uint64_t                                m_released_native   = 0;
+	uint64_t                                m_released_observed = 0;
+	std::atomic<uint64_t>                   m_last_cs {0};
+	// Tracker side.
+	std::mutex                              m_track_mutex;
+	std::condition_variable                 m_track_cv;
+	std::deque<Entry>                       m_entries;
+	bool                                    m_drain = false;
+	std::deque<std::vector<uint32_t>>       m_tails;
+};
+
 } // namespace
+
+bool ShadowNativeLabels() {
+	static const bool on = EnvOn("KYTY_NATIVE_GPU_PRIMARY") && ShadowThreaded() && PrimaryFeature("KYTY_NATIVE_GPU_LABELS");
+	return on;
+}
+
+void ShadowSetHost(std::function<void(int, uint32_t)> interrupt, std::function<uint64_t()> reference_clock) {
+	HostCallbacks().interrupt       = std::move(interrupt);
+	HostCallbacks().reference_clock = std::move(reference_clock);
+}
 
 bool ShadowOnPipelineThread() {
 	return t_pipeline_thread;
@@ -1441,8 +1961,16 @@ bool ShadowThreaded() {
 	return on;
 }
 
-void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, bool acb, std::function<void()> then) {
-	Pipeline::Instance().Enqueue(buffer, size_in_dwords, acb, std::move(then));
+void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, uint32_t queue,
+                   std::function<void(std::span<const uint32_t>)> then) {
+	if (ShadowNativeLabels()) {
+		LabelPipeline::Instance().Enqueue(buffer, size_in_dwords, queue, std::move(then));
+		return;
+	}
+	Pipeline::Instance().Enqueue(buffer, size_in_dwords, queue != 0,
+	                             [then = std::move(then), buffer, size_in_dwords] {
+		                             then(std::span<const uint32_t>(buffer, size_in_dwords));
+	                             });
 }
 
 bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out) {

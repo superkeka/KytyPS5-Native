@@ -152,6 +152,11 @@ struct Pm4TranslateStats {
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
 	uint32_t write_data_dropped = 0; // IT_WRITE_DATA to memory, left to Kyty (see Translate)
+	uint32_t labels_native     = 0; // native labels: WRITE_DATA / RELEASE_MEM label writes run on the GPU
+	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU
+	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
+	uint32_t waits_native      = 0; // native labels: guest waits passed through (an earlier GPU write satisfies them)
+	uint32_t waits_split       = 0; // native labels: guest waits the IB is cut at (no known writer yet)
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
@@ -219,6 +224,90 @@ struct FindHit {
 	bool     image    = false; // a T# base (address >> 8) rather than a 48-bit V#/pointer
 };
 
+// Native labels (Pm4Translator::SetNativeLabels). The GPU writes the guest's completion labels
+// itself, and the CPU-side effects of a buffer (EOP interrupts, labels the GPU cannot write) hang off
+// tracker points: end-of-pipe RELEASE_MEMs that write a sequence number into a slot the backend
+// polls. Guest waits pass through when an earlier write in ring order satisfies them; otherwise the
+// IB is cut there and the rest is held back until the label is written.
+
+// A guest WAIT_REG_MEM(_64) on memory: (value & mask) <function> ref.
+struct WaitCond {
+	uint64_t addr     = 0;
+	uint64_t ref      = 0;
+	uint64_t mask     = ~0ull;
+	uint32_t function = 3;
+	bool     wide     = false; // WAIT_REG_MEM_64
+	bool     pfp      = false; // ENGINE_SEL = PFP
+
+	[[nodiscard]] bool Met(uint64_t value) const;
+};
+
+// A label write a buffer performs, for deciding who satisfies later waits.
+struct LabelWrite {
+	uint64_t addr  = 0;
+	uint64_t value = 0;
+	bool     known = true;  // false: the value is not known when translating (GDS data, timestamps)
+	bool     gpu   = true;  // written by the GPU (false: by the tracker or Kyty on the CPU)
+	bool     wide  = false; // 64 bits
+
+	// What a WAIT at `a` (64-bit when `wide_wait`) reads once this write has landed: 0 unrelated,
+	// 1 the value in `out`, 2 touched but unknown.
+	int Covers(uint64_t a, bool wide_wait, uint64_t* out) const;
+};
+
+struct TrackerPoint {
+	enum class Kind : uint8_t {
+		End,       // the end of a segment (the last one: the buffer is done)
+		Interrupt, // RELEASE_MEM INT_SEL: raise the queue's EOP interrupt with `ctx`
+		CpuWrite,  // write `data` (dwords) at `addr`, all to one address when `one_addr`
+		Timestamp, // write the reference clock at `addr` (`size` bytes)
+		LodStats,  // fill `size` bytes at `addr` like Kyty's GET_LOD_STATS
+	};
+	Kind                  kind     = Kind::End;
+	uint32_t              dw       = 0; // the point's 64-bit sequence value in the IB (patched before submission)
+	uint32_t              ctx      = 0;
+	uint64_t              addr     = 0;
+	uint32_t              size     = 0;
+	bool                  one_addr = false;
+	std::vector<uint32_t> data;
+};
+
+// One self-contained piece of a translated buffer, IB dwords [begin, end) of Pm4TranslateResult::ib.
+// Every segment after the first starts held, at a guest wait that no earlier write satisfied: its
+// IB begins with the preamble, a barrier block (our fence) and the guest wait, so the backend can
+// keep the wait (a GPU write ahead in the ring will satisfy it) or the barrier (the label was seen
+// written) and NOP the other.
+struct Pm4Segment {
+	uint32_t                  begin       = 0;
+	uint32_t                  end         = 0;
+	bool                      held        = false;
+	WaitCond                  wait;
+	uint32_t                  barrier_dw  = 0;
+	uint32_t                  barrier_len = 0;
+	uint32_t                  wait_dw     = 0;
+	uint32_t                  wait_len    = 0;
+	std::vector<TrackerPoint> points;
+	std::vector<LabelWrite>   writes;
+};
+
+// Rewrites `len` dwords at `ib[dw]` as one NOP packet (len >= 2).
+void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len);
+
+// What the backend knows about labels beyond the buffer being translated.
+class LabelOracle {
+public:
+	enum class Plan {
+		Native, // a GPU write ahead in the ring satisfies the wait: pass it through
+		Met,    // the label already holds a satisfying value: a barrier, as without native labels
+		Split,  // nobody known satisfies it yet: cut the IB here
+	};
+	virtual ~LabelOracle() = default;
+	// True when the GPU may write `addr` (GPU-mapped, writable guest memory).
+	virtual bool GpuWritable(uint64_t addr) = 0;
+	// Decides a wait no earlier write of the same buffer decides.
+	virtual Plan PlanWait(const WaitCond& wait) = 0;
+};
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -246,6 +335,11 @@ struct Pm4TranslateResult {
 	std::vector<UnmetWait>        unmet_waits;    // WAIT_REG_MEM conditions not met at translation time
 	std::vector<std::pair<uint64_t, uint64_t>> label_writes; // (address, value) of this buffer's labels
 	std::vector<std::pair<uint32_t, uint32_t>> gds_dma;      // (GDS offset | 0x80000000 if written, bytes)
+	// Native labels only: the IB's segments in order (empty without native labels), and the packets
+	// Kyty's command processor still has to run once the buffer is done (flips, waits for a flip),
+	// copied out of the guest buffer.
+	std::vector<Pm4Segment> segments;
+	std::vector<uint32_t>   cpu_tail;
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -304,6 +398,17 @@ public:
 	// that every submission maps); 0 drops them as before.
 	void SetFenceAddress(uint64_t va) { m_fence_va = va; }
 
+	// Native labels: label writes run on the GPU (or at tracker points that write `tracker_va`),
+	// waits pass through, become barriers or cut the IB as `oracle` decides; Kyty's command processor
+	// only gets Pm4TranslateResult::cpu_tail. nullptr turns it off. The fence (SetFenceAddress) is
+	// needed for the barriers of held segments.
+	void SetNativeLabels(LabelOracle* oracle, uint64_t tracker_va) {
+		m_labels     = oracle;
+		m_tracker_va = tracker_va;
+	}
+	// With native labels: false turns the waits an earlier GPU write satisfies into barriers too.
+	void SetNativeWaits(bool on) { m_native_waits = on; }
+
 	// The buffers come from a compute queue (ACBs), whose packets differ from the gfx ring's
 	// (DISPATCH_INDIRECT carries its argument address); they are rewritten for the gfx ring.
 	void SetComputeQueue(bool compute_queue) { m_compute_queue = compute_queue; }
@@ -345,7 +450,8 @@ public:
 	static bool UconfigAllowed(uint32_t normalized_offset);
 
 private:
-	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats) const;
+	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
+	                      const RegFile& uc) const;
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
 
 	RegFile                      m_cx; // context registers (SET_CONTEXT_REG space)
@@ -362,6 +468,9 @@ private:
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
 	uint64_t                     m_fence_va       = 0;
+	LabelOracle*                 m_labels         = nullptr;
+	uint64_t                     m_tracker_va     = 0;
+	bool                         m_native_waits   = true;
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;

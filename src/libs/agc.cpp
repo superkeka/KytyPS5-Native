@@ -82,6 +82,9 @@ void Initialize() {
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
+	// BC-250 native labels raise EOP interrupts and write timestamps from their tracker thread.
+	NativeGpu::ShadowSetHost([](int event_id, uint32_t context_id) { g_renderer->TriggerInterrupt(event_id, context_id); },
+	                         [] { return Sync::ReadReferenceClock(); });
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(Gen5Driver::Initialize() != OK);
 	ShaderInit();
@@ -4133,8 +4136,9 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
-		Libs::Graphics::NativeGpu::ShadowEnqueue(dcb, size_in_dwords, false, [dcb, size_in_dwords] {
-			g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
+		// With native labels the continuation gets only what Kyty's command processor still runs.
+		Libs::Graphics::NativeGpu::ShadowEnqueue(dcb, size_in_dwords, 0, [](std::span<const uint32_t> commands) {
+			g_renderer->GetGpu().Submit(commands, {});
 		});
 		return;
 	}
@@ -4201,8 +4205,10 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 
 	EXIT_IF(g_renderer == nullptr);
 	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
-		Libs::Graphics::NativeGpu::ShadowEnqueue(acb, size_in_dwords, true, [queue, acb, size_in_dwords] {
-			g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
+		Libs::Graphics::NativeGpu::ShadowEnqueue(acb, size_in_dwords, queue, [queue](std::span<const uint32_t> commands) {
+			if (!commands.empty()) {
+				g_renderer->GetGpu().SubmitCompute(queue, commands);
+			}
 		});
 		return;
 	}

@@ -44,6 +44,7 @@ constexpr uint32_t IT_SET_UCONFIG_REG_INDEX    = 0x7A;
 constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT = 0x9F;
 
 // IT_NOP marker codes carried in the register field (Kyty custom codes in pm4.h).
+constexpr uint32_t R_ZERO           = 0x00;
 constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
@@ -195,7 +196,65 @@ bool WriteDataToMemory(uint32_t control) {
 	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
 }
 
+// R_ZERO NOP payloads Kyty's command processor runs as flips (pm4Handlers.cpp CpOpMarker): a flip, a
+// flip that writes a label first, and one that also raises the EOP interrupt.
+bool IsFlipMarker(uint32_t tag) {
+	return tag == 0x68750777u || tag == 0x68750778u || tag == 0x68750781u;
+}
+
+// Packets that make the GPU do something (as opposed to setting state), for dropping an empty first
+// segment. Labels, waits and LOD statistics say so themselves.
+bool IsWork(uint32_t op) {
+	switch (op) {
+		case IT_DRAW_INDEX_2:
+		case IT_DRAW_INDEX_OFFSET_2:
+		case IT_DRAW_INDIRECT:
+		case IT_DRAW_INDEX_INDIRECT:
+		case IT_DRAW_INDEX_AUTO:
+		case IT_DISPATCH_DIRECT:
+		case IT_DISPATCH_INDIRECT:
+		case IT_DMA_DATA:
+		case IT_EVENT_WRITE:
+		case IT_ACQUIRE_MEM:
+		case IT_PFP_SYNC_ME:
+		case IT_GET_LOD_STATS: return true;
+		default: return false;
+	}
+}
+
 } // namespace
+
+bool WaitCond::Met(uint64_t value) const {
+	return WaitConditionMet(function, value & mask, ref);
+}
+
+int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out) const {
+	if (a == addr) {
+		if (wide_wait && !wide) {
+			return 2; // half of what the wait reads
+		}
+		*out = wide_wait ? value : (value & 0xffffffffull);
+		return known ? 1 : 2;
+	}
+	if (wide && !wide_wait && a == addr + 4) {
+		*out = value >> 32u;
+		return known ? 1 : 2;
+	}
+	if (wide_wait && !wide && a + 4 == addr) {
+		return 2;
+	}
+	return 0;
+}
+
+void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
+	if (len < 2 || dw + len > ib.size()) {
+		return;
+	}
+	ib[dw] = Pkt3(IT_NOP, len - 1u, false);
+	for (uint32_t i = 1; i < len; i++) {
+		ib[dw + i] = 0;
+	}
+}
 
 uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
 	// CB_COLORn_INFO.DCC_ENABLE (bit 28) off, for the no-DCC experiment.
@@ -287,7 +346,8 @@ void Pm4Translator::ResetShadow() {
 	m_uc.clear();
 }
 
-void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats) const {
+void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx,
+                                 const RegFile& sh, const RegFile& uc) const {
 	// RADV-style preamble: take back context ownership, clear to defaults, then replay the whole
 	// shadowed state. Other processes share the gfx ring between our submissions, so nothing from
 	// the previous DCB is assumed to survive on the hardware.
@@ -298,18 +358,18 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
 	ib.push_back(0u);
 
-	for (const auto& [offset, value]: m_cx) {
+	for (const auto& [offset, value]: cx) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
 		stats.preamble_cx++;
 	}
-	if (m_depth_mode == DepthDebugMode::HizOff && m_cx.count(kDbRenderOverride) == 0) {
+	if (m_depth_mode == DepthDebugMode::HizOff && cx.count(kDbRenderOverride) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
 	}
-	for (const auto& [offset, value]: m_sh) {
+	for (const auto& [offset, value]: sh) {
 		EmitSet(ib, IT_SET_SH_REG, offset, value, offset >= kShComputeBase);
 		stats.preamble_sh++;
 	}
-	for (const auto& [offset, value]: m_uc) {
+	for (const auto& [offset, value]: uc) {
 		EmitSetUconfig(ib, offset, value);
 		stats.preamble_uc++;
 	}
@@ -686,6 +746,102 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 
+	// A guest wait turned into a full barrier on our fence: an end-of-pipe RELEASE_MEM that flushes and
+	// invalidates the caches (Mesa's gfx10 wait-for-idle) and a wait on that fence. A wait the prefetch
+	// parser does (ENGINE_SEL = PFP) on a label the micro engine has just written is how the guest keeps
+	// the PFP from fetching ahead of the ME past a cache flush; PFP_SYNC_ME is that synchronization
+	// without memory.
+	auto emit_barrier = [&](bool pfp) {
+		if (m_fence_va != 0) {
+			const uint32_t seq = ++m_fence_seq;
+			body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+			// EVENT_TYPE CACHE_FLUSH_AND_INV_TS_EVENT (0x14), EVENT_INDEX 5 (end of pipe), GCR_CNTL:
+			// GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB.
+			body.push_back(0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
+			               (1u << 20u) | (1u << 21u));
+			body.push_back(1u << 29u); // DATA_SEL 1: 32-bit data; DST_SEL 0 memory; no interrupt
+			body.push_back(static_cast<uint32_t>(m_fence_va));
+			body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
+			body.push_back(seq);
+			body.push_back(0u);
+			body.push_back(0u);
+			body.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
+			body.push_back(3u | (1u << 4u)); // function EQUAL, memory space, ME engine
+			body.push_back(static_cast<uint32_t>(m_fence_va));
+			body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
+			body.push_back(seq);
+			body.push_back(0xffffffffu);
+			body.push_back(4u); // poll interval
+			stats.wait_barriers++;
+		}
+		if (pfp) {
+			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u)); // PKT3 PFP_SYNC_ME, one body dword
+			body.push_back(0);
+			stats.pfp_syncs_emitted++;
+		}
+	};
+
+	// Native labels: the segments of the IB (body offsets until it is assembled), where each starts in
+	// the body, the preamble of each one after the first (the state where it starts) and whether it
+	// does anything (an empty first segment is left out), plus every label write so far in order.
+	const bool                         labels = m_labels != nullptr;
+	std::vector<Pm4Segment>            segs(1);
+	std::vector<uint32_t>              seg_body(1, 0);
+	std::vector<std::vector<uint32_t>> seg_pre(1);
+	std::vector<bool>                  seg_keep(1, true);
+	bool                               seg_effects = false;
+	std::vector<LabelWrite>            local_writes;
+	auto tracker_point = [&](TrackerPoint p) {
+		p.dw = static_cast<uint32_t>(body.size()) + 5u;
+		body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+		body.push_back(0x28u | (5u << 8u)); // BOTTOM_OF_PIPE_TS, EVENT_INDEX 5: end of pipe, no cache action
+		body.push_back(2u << 29u);          // DATA_SEL 2: 64-bit data; DST_SEL 0 memory; no interrupt
+		body.push_back(static_cast<uint32_t>(m_tracker_va));
+		body.push_back(static_cast<uint32_t>(m_tracker_va >> 32u));
+		body.push_back(0u); // the sequence number, patched by the backend
+		body.push_back(0u);
+		body.push_back(0u);
+		segs.back().points.push_back(std::move(p));
+		seg_effects = true;
+	};
+	auto note_write = [&](const LabelWrite& w) {
+		segs.back().writes.push_back(w);
+		local_writes.push_back(w);
+	};
+	// Ends the current segment with its End point; a first segment that does nothing is dropped (the
+	// next segment's preamble holds its register writes).
+	auto close_segment = [&](bool last) {
+		if (seg_effects || last || segs.size() > 1) {
+			TrackerPoint end;
+			end.kind = TrackerPoint::Kind::End;
+			tracker_point(end);
+		} else {
+			seg_keep.back() = false;
+		}
+		seg_effects = false;
+	};
+	// Cuts the IB at a guest wait nobody known satisfies yet: the rest starts held, with its own
+	// preamble, a barrier block and the guest wait (the backend NOPs one of the two).
+	auto split_at_wait = [&](const WaitCond& w, uint32_t wait_at, uint32_t wait_size) {
+		close_segment(false);
+		segs.emplace_back();
+		seg_body.push_back(static_cast<uint32_t>(body.size()));
+		seg_pre.emplace_back();
+		seg_keep.push_back(true);
+		EmitPreamble(seg_pre.back(), stats, cx, sh, uc);
+		auto& s = segs.back();
+		s.held  = true;
+		s.wait  = w;
+		s.barrier_dw = static_cast<uint32_t>(body.size());
+		emit_barrier(w.pfp);
+		s.barrier_len = static_cast<uint32_t>(body.size()) - s.barrier_dw;
+		s.wait_dw     = static_cast<uint32_t>(body.size());
+		body.insert(body.end(), dcb.begin() + wait_at, dcb.begin() + wait_at + wait_size);
+		s.wait_len  = wait_size;
+		seg_effects = true;
+		stats.waits_split++;
+	};
+
 	auto fail = [&](uint32_t op, uint32_t dw) {
 		r.ok         = false;
 		r.unknown_op = op;
@@ -722,6 +878,84 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const uint32_t marker = (header >> 2u) & 0x3fu;
 				if (marker == R_FLIP) {
 					stats.marker_flip++;
+					if (labels) {
+						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
+				} else if (marker == R_ZERO && labels && body_count >= 1 && IsFlipMarker(bptr[0])) {
+					stats.marker_flip++;
+					r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (bptr[0] != 0x68750777u && body_count >= 4) { // writes a label first, on the CPU
+						note_write({static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bptr[3], true,
+						            false, false});
+					}
+				} else if (marker == R_RELEASE_MEM && labels) {
+					stats.marker_release++;
+					if (body_count < 7) {
+						return fail(op, dw);
+					}
+					const uint64_t dst = static_cast<uint64_t>(bptr[2]) | (static_cast<uint64_t>(bptr[3]) << 32u);
+					const uint64_t value = static_cast<uint64_t>(bptr[4]) | (static_cast<uint64_t>(bptr[5]) << 32u);
+					const uint32_t data_sel = (bptr[1] >> 29u) & 0x7u;
+					const uint32_t int_sel  = (bptr[1] >> 24u) & 0x7u;
+					r.label_writes.emplace_back(dst, value);
+					// What Kyty's command processor does with it (CpOpReleaseMem, WriteAtEndOfPipe): no data
+					// for INT_SEL 4, nor for INT_SEL 1 on the graphics queue (the interrupt alone); 32-bit
+					// (1) or 64-bit (2) data; the reference clock for a timestamp (3); GDS data (5).
+					uint32_t sel = data_sel;
+					if (dst == 0 || int_sel == 4 || (int_sel == 1 && !m_compute_queue && data_sel != 5)) {
+						sel = 0;
+					}
+					if (sel == 5 && !m_gds) {
+						r.unknown_ops.insert(op); // GDS data without a GDS partition: leave the buffer to Kyty
+						break;
+					}
+					if (sel != 0 && sel != 1 && sel != 2 && sel != 3 && sel != 5) {
+						r.unknown_detail = {bptr[0], bptr[1]};
+						return fail(op, dw);
+					}
+					TrackerPoint cpu;
+					bool         cpu_point = false;
+					if (sel == 3) {
+						cpu.kind  = TrackerPoint::Kind::Timestamp;
+						cpu.addr  = dst;
+						cpu.size  = 8;
+						cpu_point = true;
+						sel       = 0;
+					} else if ((sel == 1 || sel == 2) && !m_labels->GpuWritable(dst)) {
+						cpu.kind  = TrackerPoint::Kind::CpuWrite;
+						cpu.addr  = dst;
+						cpu.data  = sel == 1 ? std::vector<uint32_t> {bptr[4]} : std::vector<uint32_t> {bptr[4], bptr[5]};
+						cpu_point = true;
+						sel       = 0;
+					}
+					// The guest's event and cache actions run as they are; the interrupt goes through the
+					// tracker instead.
+					body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_queue));
+					body.push_back(bptr[0]);
+					body.push_back((bptr[1] & ~((0x7u << 24u) | (0x7u << 29u))) | (sel << 29u));
+					for (uint32_t i = 2; i < 7; i++) {
+						body.push_back(i == 6 ? 0u : bptr[i]);
+					}
+					seg_effects = true;
+					if (sel != 0) {
+						add_ref(dst, 8, false);
+						note_write({dst, sel == 1 ? (value & 0xffffffffull) : value, sel != 5, true, sel == 2});
+						stats.labels_native++;
+						stats.gds_releases += sel == 5 ? 1u : 0u;
+					}
+					if (cpu_point) {
+						note_write({dst, cpu.data.size() == 1 ? (value & 0xffffffffull) : value, cpu.kind != TrackerPoint::Kind::Timestamp,
+						            false, cpu.data.size() != 1});
+						tracker_point(std::move(cpu));
+						stats.labels_cpu++;
+					}
+					if (int_sel == 1 || int_sel == 2 || int_sel == 4) {
+						TrackerPoint irq;
+						irq.kind = TrackerPoint::Kind::Interrupt;
+						irq.ctx  = bptr[6] & 0x07ffffffu;
+						tracker_point(irq);
+						stats.interrupts++;
+					}
 				} else if (marker == R_RELEASE_MEM) {
 					stats.marker_release++;
 					if (body_count >= 4) {
@@ -744,6 +978,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				} else if (marker == R_WAIT_FLIP_DONE) {
 					stats.marker_wait_flip++;
+					if (labels) {
+						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
 					context_state_op(bptr[0]);
 				}
@@ -908,41 +1145,45 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.waits_unmet++;
 					r.unmet_waits.push_back({addr, ref, value, bptr[0] & 0x7u, dw, stats.draws, stats.dispatches});
 				}
+				const bool pfp = (bptr[0] & (1u << 8u)) != 0;
+				if (labels) {
+					// The latest label write of this buffer decides; otherwise the backend does, from what is
+					// ahead in the ring and from guest memory.
+					WaitCond w {addr, ref, mask, bptr[0] & 0x7u, wide, pfp};
+					LabelOracle::Plan plan    = LabelOracle::Plan::Split;
+					bool              decided = false;
+					for (auto it = local_writes.rbegin(); it != local_writes.rend() && !decided; ++it) {
+						uint64_t  v = 0;
+						const int c = it->Covers(addr, wide, &v);
+						if (c != 0) {
+							decided = true;
+							plan    = c == 1 && w.Met(v) && it->gpu ? LabelOracle::Plan::Native : LabelOracle::Plan::Split;
+						}
+					}
+					if (!decided) {
+						plan = m_labels->PlanWait(w);
+					}
+					if (plan == LabelOracle::Plan::Native && !m_native_waits) {
+						plan = LabelOracle::Plan::Met;
+					}
+					switch (plan) {
+						case LabelOracle::Plan::Native:
+							body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+							stats.waits_native++;
+							seg_effects = true;
+							break;
+						case LabelOracle::Plan::Met:
+							emit_barrier(pfp);
+							seg_effects = true;
+							break;
+						case LabelOracle::Plan::Split: split_at_wait(w, dw, size); break;
+					}
+					break;
+				}
 				// The guest waits for its own end-of-pipe label: everything before has finished and its
 				// writes are visible. The label itself is written by Kyty later, so give the GPU the same
-				// guarantee with a fence of ours: an end-of-pipe RELEASE_MEM that flushes and invalidates
-				// the caches (Mesa's gfx10 wait-for-idle), and a wait on that fence.
-				if (m_fence_va != 0) {
-					const uint32_t seq = ++m_fence_seq;
-					body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
-					// EVENT_TYPE CACHE_FLUSH_AND_INV_TS_EVENT (0x14), EVENT_INDEX 5 (end of pipe), GCR_CNTL:
-					// GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB.
-					body.push_back(0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
-					               (1u << 20u) | (1u << 21u));
-					body.push_back(1u << 29u); // DATA_SEL 1: 32-bit data; DST_SEL 0 memory; no interrupt
-					body.push_back(static_cast<uint32_t>(m_fence_va));
-					body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
-					body.push_back(seq);
-					body.push_back(0u);
-					body.push_back(0u);
-					body.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
-					body.push_back(3u | (1u << 4u)); // function EQUAL, memory space, ME engine
-					body.push_back(static_cast<uint32_t>(m_fence_va));
-					body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
-					body.push_back(seq);
-					body.push_back(0xffffffffu);
-					body.push_back(4u); // poll interval
-					stats.wait_barriers++;
-				}
-				// A wait the prefetch parser does (ENGINE_SEL = PFP) on a label the micro engine has just
-				// written is how the guest keeps the PFP from fetching ahead of the ME past a cache flush.
-				// The label pair cannot run natively, but PFP_SYNC_ME is that same synchronization
-				// without memory.
-				if ((bptr[0] & (1u << 8u)) != 0) {
-					body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u)); // PKT3 PFP_SYNC_ME, one body dword
-					body.push_back(0);
-					stats.pfp_syncs_emitted++;
-				}
+				// guarantee with a fence of ours.
+				emit_barrier(pfp);
 				break;
 			}
 			case IT_DMA_DATA:
@@ -990,6 +1231,40 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// write itself, in order, so the native IB leaves it out.
 				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
 					return fail(op, dw);
+				}
+				if (labels) {
+					// Native labels: Kyty no longer reads the buffer once it is translated, so the GPU writes
+					// the label where the guest put it. Memory the GPU cannot write (or a constant-engine
+					// write) is written by the tracker once the GPU gets there.
+					const uint64_t dst      = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					const uint32_t n        = body_count - 3u;
+					const bool     one_addr = ((bptr[0] >> 16u) & 1u) != 0;
+					const uint32_t engine   = bptr[0] >> 30u;
+					const uint64_t bytes    = one_addr ? 4u : 4u * static_cast<uint64_t>(n);
+					if (n == 0 || dst == 0) {
+						break;
+					}
+					const bool gpu = engine <= 1 && m_labels->GpuWritable(dst) && m_labels->GpuWritable(dst + bytes - 1);
+					if (gpu) {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						add_ref(dst, bytes, false);
+						stats.labels_native++;
+						seg_effects = true;
+					}
+					for (uint32_t i = 0; i < std::min<uint32_t>(n, 64); i++) {
+						note_write({one_addr ? dst : dst + 4u * i, bptr[3 + i], true, gpu, false});
+					}
+					if (!gpu) {
+						TrackerPoint cpu;
+						cpu.kind     = TrackerPoint::Kind::CpuWrite;
+						cpu.addr     = dst;
+						cpu.one_addr = one_addr;
+						cpu.data.assign(bptr + 3, bptr + 3 + n);
+						tracker_point(std::move(cpu));
+						stats.labels_cpu++;
+					}
+					r.label_writes.emplace_back(dst, bptr[3]);
+					break;
 				}
 				stats.write_data_dropped++;
 				r.label_writes.emplace_back(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bptr[3]);
@@ -1072,6 +1347,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.lod_stats_issued++;
 				} else {
 					stats.lod_stats_dropped++;
+					// Native labels: Kyty's command processor never sees the packet, so the tracker fills the
+					// statistics as Kyty would (its first dword reads as a label: 1).
+					const uint64_t dst = (static_cast<uint64_t>(bptr[1]) & ~0x3full) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					if (labels && body_count >= 3 && dst != 0 && bptr[0] != 0) {
+						TrackerPoint fill;
+						fill.kind = TrackerPoint::Kind::LodStats;
+						fill.addr = dst;
+						fill.size = bptr[0];
+						tracker_point(std::move(fill));
+						note_write({dst, 1u, true, false, false});
+					}
 				}
 				break;
 			case IT_DRAW_INDEX_AUTO: // a non-indexed draw: no index buffer to reference
@@ -1163,6 +1449,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				r.unknown_ops.insert(op);
 				break;
 		}
+		if (IsWork(op)) {
+			seg_effects = true;
+		}
 
 		dw += size;
 	}
@@ -1183,13 +1472,48 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
 
-	r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
-	EmitPreamble(r.ib, stats);
-	r.ib.insert(r.ib.end(), body.begin(), body.end());
+	if (labels) {
+		close_segment(true);
+		// Each kept segment: its preamble (the first one's from the committed shadow, as without native
+		// labels), its body, padding; tracker points and patch sites move from body to IB offsets.
+		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 * segs.size() + 8 * segs.size());
+		for (size_t k = 0; k < segs.size(); k++) {
+			if (!seg_keep[k]) {
+				continue;
+			}
+			Pm4Segment& s = segs[k];
+			s.begin       = static_cast<uint32_t>(r.ib.size());
+			if (k == 0) {
+				EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc);
+			} else {
+				r.ib.insert(r.ib.end(), seg_pre[k].begin(), seg_pre[k].end());
+			}
+			const uint32_t from  = seg_body[k];
+			const uint32_t to    = k + 1 < segs.size() ? seg_body[k + 1] : static_cast<uint32_t>(body.size());
+			const int64_t  shift = static_cast<int64_t>(r.ib.size()) - static_cast<int64_t>(from);
+			r.ib.insert(r.ib.end(), body.begin() + from, body.begin() + to);
+			while ((r.ib.size() & 7u) != 0) {
+				r.ib.push_back(0xffff1000u);
+			}
+			s.end = static_cast<uint32_t>(r.ib.size());
+			for (auto& p: s.points) {
+				p.dw = static_cast<uint32_t>(p.dw + shift);
+			}
+			if (s.held) {
+				s.barrier_dw = static_cast<uint32_t>(s.barrier_dw + shift);
+				s.wait_dw    = static_cast<uint32_t>(s.wait_dw + shift);
+			}
+			r.segments.push_back(std::move(s));
+		}
+	} else {
+		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
+		EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc);
+		r.ib.insert(r.ib.end(), body.begin(), body.end());
 
-	// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
-	while ((r.ib.size() & 7u) != 0) {
-		r.ib.push_back(0xffff1000u);
+		// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
+		while ((r.ib.size() & 7u) != 0) {
+			r.ib.push_back(0xffff1000u);
+		}
 	}
 
 	r.stats        = stats;

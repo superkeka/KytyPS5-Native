@@ -436,7 +436,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	// stays in guest order behind the command buffers still being run natively.
 	if (NativeGpu::ShadowThreaded() && !NativeGpu::ShadowOnPipelineThread()) {
 		auto held = std::make_shared<Submission>(std::move(submission));
-		NativeGpu::ShadowEnqueue(nullptr, 0, false, [this, held] { Enqueue(std::move(*held)); });
+		NativeGpu::ShadowEnqueue(nullptr, 0, 0, [this, held](std::span<const uint32_t>) { Enqueue(std::move(*held)); });
 		return;
 	}
 	Common::LockGuard lock(m_queue_mutex);
