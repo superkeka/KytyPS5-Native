@@ -26,6 +26,7 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1155,7 +1156,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			(void)m_presenter.Renderer().InvalidateMemory(source_info.data.address, source_info.data.size,
 			                                              Graphics::NativeGpu::PrimaryRendering());
 		}
+		const auto prepare_t0 = std::chrono::steady_clock::now();
 		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
+		Graphics::NativeGpu::ShadowFlipStats(
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - prepare_t0).count());
 		if (headset) {
 			g_headset_mirror = true;
 		}

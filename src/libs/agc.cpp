@@ -4132,6 +4132,12 @@ static TessellationDriverState g_tessellation_driver_state {};
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
+	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
+		Libs::Graphics::NativeGpu::ShadowEnqueue(dcb, size_in_dwords, false, [dcb, size_in_dwords] {
+			g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
+		});
+		return;
+	}
 	// BC-250 native GPU shadow path: translate and submit this DCB to the amdgpu gfx ring next to
 	// the Vulkan path. No-op unless KYTY_NATIVE_GPU_SHADOW and KYTY_NATIVE_GPU_GEM are both set.
 	Libs::Graphics::NativeGpu::ShadowSubmitDcb(dcb, size_in_dwords);
@@ -4194,6 +4200,12 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 
 	EXIT_IF(g_renderer == nullptr);
+	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
+		Libs::Graphics::NativeGpu::ShadowEnqueue(acb, size_in_dwords, true, [queue, acb, size_in_dwords] {
+			g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
+		});
+		return;
+	}
 	// BC-250 native GPU path: run the ACB natively too (KYTY_NATIVE_GPU_ACB); no-op otherwise.
 	Libs::Graphics::NativeGpu::ShadowSubmitAcb(acb, size_in_dwords);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});

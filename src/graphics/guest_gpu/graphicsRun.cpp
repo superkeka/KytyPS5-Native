@@ -422,6 +422,13 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	// BC-250 native pipeline: whatever reaches Kyty's queues (flip preparations, suspend points)
+	// stays in guest order behind the command buffers still being run natively.
+	if (NativeGpu::ShadowThreaded() && !NativeGpu::ShadowOnPipelineThread()) {
+		auto held = std::make_shared<Submission>(std::move(submission));
+		NativeGpu::ShadowEnqueue(nullptr, 0, false, [this, held] { Enqueue(std::move(*held)); });
+		return;
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -1230,6 +1237,12 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
+	// The BC-250 native path ran this buffer to completion before Kyty parsed it, and Kyty's own
+	// command buffer is empty: signal now instead of after a round trip through the Vulkan queue.
+	if (IsAsyncComputeQueue() ? NativeGpu::NativeAsyncCompute() : NativeGpu::PrimaryRendering()) {
+		m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
+		return;
+	}
 	(void)CurrentBuffer().Handle();
 	GetScheduler().DeferPriorityOperation(
 	    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {

@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <ctime>
 #include <map>
@@ -22,6 +24,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -53,10 +56,9 @@ public:
 	}
 
 	// True once shadow submission is set up and has not disabled itself.
-	bool Active() {
-		std::lock_guard<std::mutex> lock(m_mutex);
-		return m_initialized && m_enabled && !m_disabled;
-	}
+	// Lock-free: Kyty's command processor asks for every draw and dispatch, while the pipeline's
+	// worker may hold m_mutex for a whole submission.
+	bool Active() const { return m_active.load(std::memory_order_acquire); }
 
 	// The color targets the DCBs bound since the last call, for the flip dump.
 	std::vector<RenderTargetInfo> TakeFrameTargets() {
@@ -84,7 +86,15 @@ public:
 	// `acb`: an asynchronous compute buffer. ACBs go through their own translator (their own shadow
 	// of the compute registers) and run on the same gfx ring as the DCBs, in guest submission order.
 	void Submit(std::span<const uint32_t> dcb, bool acb = false) {
+		const double                t_enter = NowSecShadow();
 		std::lock_guard<std::mutex> lock(m_mutex);
+		const double                t_locked = NowSecShadow();
+		m_wait_lock_s += t_locked - t_enter;
+		struct BusyScope {
+			double& total;
+			double  start;
+			~BusyScope() { total += NowSecShadow() - start; }
+		} busy {m_busy_s, t_locked};
 		if (!m_initialized) {
 			Init();
 			m_initialized = true;
@@ -267,6 +277,7 @@ public:
 			Disable("submit error");
 			return;
 		}
+		m_last_seq = r.seq;
 		if (r.timed_out || r.reset || !r.completed) {
 			std::fprintf(stderr,
 			             "native shadow: %s %llu %s after %.1f ms (ib %zu dw, %u draws); "
@@ -280,7 +291,7 @@ public:
 
 		if (acb) {
 			m_acbs_completed++;
-			if (m_acbs_completed % 30 == 0 && m_gem->DummyWritten() && m_acb_dummy_writes++ < 8) {
+			if (m_acbs_completed % 30 == 0 && WaitIdle() && m_gem->DummyWritten() && m_acb_dummy_writes++ < 8) {
 				std::fprintf(stderr,
 				             "native shadow: acb %llu: the GPU wrote to guest memory that was not resident "
 				             "(a reference the translator missed)\n",
@@ -294,7 +305,7 @@ public:
 			return;
 		}
 		m_completed++;
-		if (m_completed % 30 == 0 && m_gem->DummyWritten()) {
+		if (m_completed % 30 == 0 && WaitIdle() && m_gem->DummyWritten()) {
 			m_dummy_writes++;
 			if (m_dummy_writes <= 8) {
 				std::fprintf(stderr,
@@ -371,9 +382,64 @@ public:
 #endif
 	}
 
-	bool NativeAcb() {
+	// The dummy check needs an idle GPU; in async mode that means waiting for what is in flight.
+	bool WaitIdle() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return !m_submitter->Async() || m_submitter->WaitIdle(m_timeout_sec);
+#else
+		return true;
+#endif
+	}
+
+	// Per-flip timing (KYTY_NATIVE_GPU_FLIP_STATS=1): native time spent in Submit and waiting for its
+	// lock between flips, with the presenter's share passed in.
+	void FlipStats(double present_s) {
 		std::lock_guard<std::mutex> lock(m_mutex);
-		return m_initialized && m_enabled && !m_disabled && m_acb_mode == AcbMode::On;
+		const double now = NowSecShadow();
+		m_flips++;
+		m_present_s += present_s;
+		if (m_flip_t0 == 0.0) {
+			m_flip_t0 = now;
+			m_busy_s = m_wait_lock_s = m_present_s = 0.0;
+			m_flips  = 0;
+			return;
+		}
+		if (m_flips == 120) {
+			const double per = 1e3 / static_cast<double>(m_flips);
+			std::fprintf(stderr,
+			             "native shadow: per flip: interval %.1f ms, native submit %.1f ms, waiting for the native "
+			             "lock %.1f ms, presenter %.1f ms\n",
+			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per);
+			m_flip_t0 = now;
+			m_busy_s = m_wait_lock_s = m_present_s = 0.0;
+			m_flips  = 0;
+		}
+	}
+
+	bool NativeAcb() const { return Active() && m_acb_mode == AcbMode::On; }
+
+	// The submission the last Submit queued in async mode (0: none), for the pipeline to wait on.
+	uint64_t TakeLastSeq() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		return std::exchange(m_last_seq, 0);
+	}
+
+	// Waits for an async submission; false on a timeout (the native path then disables itself).
+	bool WaitSubmission(uint64_t seq) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_submitter != nullptr && m_submitter->WaitSeq(seq, m_timeout_sec)) {
+			return true;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (!m_disabled) {
+			std::fprintf(stderr, "native shadow: submission %llu TIMED OUT; disabling native path\n",
+			             static_cast<unsigned long long>(seq));
+			Disable("timeout");
+		}
+#else
+		(void)seq;
+#endif
+		return false;
 	}
 
 private:
@@ -828,6 +894,12 @@ private:
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetComputeQueue(true);
+		// KYTY_NATIVE_GPU_ASYNC=1: submissions return without waiting for the GPU (experiment; the
+		// guest's labels are still written by Kyty's CPU command processor, possibly too early).
+		if (EnvOn("KYTY_NATIVE_GPU_ASYNC") || EnvOn("KYTY_NATIVE_GPU_THREAD")) {
+			m_submitter->SetAsync(true);
+			std::fprintf(stderr, "native shadow: asynchronous submission (experiment)\n");
+		}
 		if (EnvOn("KYTY_NATIVE_GPU_WAIT_BARRIERS")) {
 			m_translator.SetFenceAddress(m_submitter->ScratchVa() + 1024);
 			m_acb_translator.SetFenceAddress(m_submitter->ScratchVa() + 1032);
@@ -857,6 +929,7 @@ private:
 			std::fprintf(stderr, "native shadow: depth experiment %s\n", depth);
 		}
 		m_enabled = true;
+		m_active.store(true, std::memory_order_release);
 		std::fprintf(stderr, "native shadow: enabled (gfx-ring shadow submission, %.1f s timeout)\n",
 		             m_timeout_sec);
 #else
@@ -866,9 +939,13 @@ private:
 
 	void Disable(const char* reason) {
 		m_disabled = true;
+		m_active.store(false, std::memory_order_release);
 #if KYTY_GEM_BACKING_SUPPORTED
-		delete m_submitter;
-		m_submitter = nullptr;
+		// The pipeline's completion thread may still wait on submissions of this submitter.
+		if (m_submitter != nullptr && !m_submitter->Async()) {
+			delete m_submitter;
+			m_submitter = nullptr;
+		}
 #endif
 		std::fprintf(stderr,
 		             "native shadow: disabled (%s) after %llu completed frames, avg %.2f ms, "
@@ -934,8 +1011,15 @@ private:
 	std::set<uint32_t> m_unknown_acb_ops;
 	uint32_t      m_acb_dummy_writes = 0;
 	uint64_t      m_promoted_by[6]   = {};
+	uint64_t      m_last_seq         = 0;
+	std::atomic<bool> m_active {false};
 	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
+	double        m_busy_s      = 0.0;
+	double        m_wait_lock_s = 0.0;
+	double        m_present_s   = 0.0;
+	double        m_flip_t0     = 0.0;
+	uint32_t      m_flips       = 0;
 	std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> m_find_seen; // KYTY_NATIVE_GPU_FIND hits logged
 	bool          m_stats          = false;
 	uint32_t      m_stats_logged   = 0;
@@ -987,6 +1071,111 @@ void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords) {
 		return;
 	}
 	Shadow::Instance().Submit(std::span<const uint32_t>(dcb, size_in_dwords));
+}
+
+namespace {
+
+// KYTY_NATIVE_GPU_THREAD=1: guest submissions leave the game thread at once. A worker translates and
+// submits them in order without waiting for the GPU; a completion thread waits for each one and only
+// then hands the buffer to Kyty's command processor, so the labels, EOP events and flips Kyty
+// produces still follow the GPU work they stand for.
+thread_local bool t_pipeline_thread = false;
+
+class Pipeline {
+public:
+	static Pipeline& Instance() {
+		static Pipeline p;
+		return p;
+	}
+
+	void Enqueue(const uint32_t* buffer, uint32_t size_dw, bool acb, std::function<void()> then) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_jobs.push_back(Job {buffer, size_dw, acb, std::move(then)});
+		m_cv.notify_one();
+	}
+
+private:
+	struct Job {
+		const uint32_t*       buffer;
+		uint32_t              size_dw;
+		bool                  acb;
+		std::function<void()> then;
+	};
+	struct Done {
+		uint64_t              seq;
+		std::function<void()> then;
+	};
+
+	Pipeline() {
+		std::thread([this] { Work(); }).detach();
+		std::thread([this] { Complete(); }).detach();
+	}
+
+	void Work() {
+		for (;;) {
+			Job job;
+			{
+				std::unique_lock<std::mutex> lock(m_mutex);
+				m_cv.wait(lock, [this] { return !m_jobs.empty(); });
+				job = std::move(m_jobs.front());
+				m_jobs.pop_front();
+			}
+			uint64_t seq = 0;
+			if (job.buffer != nullptr) { // nullptr: only keeps `then` in order
+				Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.acb);
+				seq = Shadow::Instance().TakeLastSeq();
+			}
+			std::lock_guard<std::mutex> lock(m_done_mutex);
+			m_done.push_back(Done {seq, std::move(job.then)});
+			m_done_cv.notify_one();
+		}
+	}
+
+	void Complete() {
+		t_pipeline_thread = true;
+		for (;;) {
+			Done done;
+			{
+				std::unique_lock<std::mutex> lock(m_done_mutex);
+				m_done_cv.wait(lock, [this] { return !m_done.empty(); });
+				done = std::move(m_done.front());
+				m_done.pop_front();
+			}
+			if (done.seq != 0) {
+				(void)Shadow::Instance().WaitSubmission(done.seq);
+			}
+			done.then();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_cv;
+	std::deque<Job>         m_jobs;
+	std::mutex              m_done_mutex;
+	std::condition_variable m_done_cv;
+	std::deque<Done>        m_done;
+};
+
+} // namespace
+
+bool ShadowOnPipelineThread() {
+	return t_pipeline_thread;
+}
+
+bool ShadowThreaded() {
+	static const bool on = EnvOn("KYTY_NATIVE_GPU_THREAD");
+	return on;
+}
+
+void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, bool acb, std::function<void()> then) {
+	Pipeline::Instance().Enqueue(buffer, size_in_dwords, acb, std::move(then));
+}
+
+void ShadowFlipStats(double present_seconds) {
+	static const bool on = EnvOn("KYTY_NATIVE_GPU_FLIP_STATS");
+	if (on && Shadow::Instance().Active()) {
+		Shadow::Instance().FlipStats(present_seconds);
+	}
 }
 
 void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords) {

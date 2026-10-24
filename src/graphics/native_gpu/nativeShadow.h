@@ -29,6 +29,18 @@ void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
 // and report). ACBs run on the gfx ring in guest submission order with the DCBs.
 void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords);
 
+// KYTY_NATIVE_GPU_THREAD=1: submissions go through a pipeline (ShadowEnqueue) instead of running on the
+// caller's thread: `then` (handing the buffer to Kyty's command processor) runs once the native GPU
+// work has completed, in submission order.
+bool ShadowThreaded();
+// True on the pipeline thread that hands finished buffers to Kyty.
+bool ShadowOnPipelineThread();
+void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, bool acb, std::function<void()> then);
+
+// KYTY_NATIVE_GPU_FLIP_STATS=1: called at each flip with the time the presenter spent preparing it;
+// logs per-flip averages (flip interval, native submission time, presenter time).
+void ShadowFlipStats(double present_seconds);
+
 // True in primary mode with native async compute: Kyty then skips its own dispatches of ACBs too.
 bool NativeAsyncCompute();
 

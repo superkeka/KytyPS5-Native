@@ -25,9 +25,11 @@ public:
 	// 0x800000000000, so this sits clear of both).
 	static constexpr uint64_t kIbVa      = 0x400000000000ull;
 	static constexpr uint64_t kIbSize    = 2ull * 1024 * 1024;
+	static constexpr uint32_t kSlots     = 4;
 	// The last bytes of the IB buffer are a scratch area the IB itself may write into (pipeline
 	// statistics samples); IBs must stay below it.
 	static constexpr uint64_t kScratchSize = 4096;
+	static constexpr uint64_t kSlotSize    = ((kIbSize - kScratchSize) / kSlots) & ~0xfffull;
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;
 
@@ -40,6 +42,7 @@ public:
 		double seconds   = 0.0;   // submit -> fence wall time
 		double cs_seconds = 0.0;  // time spent inside the CS ioctl(s), retries included
 		int    retries   = 0;     // extra CS attempts spent on userptr revalidation (EFAULT)
+		uint64_t seq       = 0;     // async mode: the submission to wait for
 	};
 
 	// Allocates a context and the IB buffer on `drm_fd`. Returns nullptr on failure.
@@ -113,14 +116,38 @@ public:
 
 	// Copies `ib` into the IB buffer, submits it to the gfx ring with `bo_handles` (plus the IB)
 	// resident, waits up to `timeout_sec` and queries the context state.
+	// Async mode (SetAsync): the IB buffer is a ring of kSlots slots and Submit returns right after
+	// the CS ioctl; it only waits for the submission that last used the slot it is about to reuse.
+	void SetAsync(bool async) { m_async = async; }
+	[[nodiscard]] bool Async() const { return m_async; }
+
+	// Waits until every async submission so far has completed. Returns false on a timeout.
+	bool WaitIdle(double timeout_sec) {
+		for (uint64_t& seq: m_slot_seq) {
+			if (seq != 0 && !WaitSeq(seq, timeout_sec)) {
+				return false;
+			}
+			seq = 0;
+		}
+		return true;
+	}
+
 	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
 	              double timeout_sec) {
 		Result res;
-		if (ib.size() * 4 > kIbSize - kScratchSize) {
+		const uint32_t slot = m_async ? m_next_slot : 0;
+		if (ib.size() * 4 > (m_async ? kSlotSize : kIbSize - kScratchSize)) {
 			res.err = -E2BIG;
 			return res;
 		}
-		std::memcpy(m_ib_cpu, ib.data(), ib.size() * 4);
+		if (m_async && m_slot_seq[slot] != 0) {
+			if (!WaitSeq(m_slot_seq[slot], timeout_sec)) {
+				res.timed_out = true;
+				return res;
+			}
+			m_slot_seq[slot] = 0;
+		}
+		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
 		__sync_synchronize();
 
 		std::vector<drm_amdgpu_bo_list_entry> entries;
@@ -149,7 +176,7 @@ public:
 
 		struct drm_amdgpu_cs_chunk_ib ib_info;
 		std::memset(&ib_info, 0, sizeof(ib_info));
-		ib_info.va_start = m_ib_va;
+		ib_info.va_start = m_ib_va + slot * kSlotSize;
 		ib_info.ib_bytes = static_cast<uint32_t>(ib.size() * 4);
 		ib_info.ip_type  = AMDGPU_HW_IP_GFX;
 		ib_info.ring     = 0;
@@ -193,6 +220,14 @@ public:
 		}
 		res.submitted      = true;
 		const uint64_t seq = cs.out.handle;
+		if (m_async) {
+			m_slot_seq[slot] = seq;
+			m_next_slot      = (slot + 1) % kSlots;
+			res.completed    = true;
+			res.seq          = seq;
+			res.seconds      = NowSec() - t0;
+			return res;
+		}
 
 		union drm_amdgpu_wait_cs w;
 		std::memset(&w, 0, sizeof(w));
@@ -220,6 +255,20 @@ public:
 	}
 
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
+
+	bool WaitSeq(uint64_t seq, double timeout_sec) {
+		union drm_amdgpu_wait_cs w;
+		std::memset(&w, 0, sizeof(w));
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		w.in.handle  = seq;
+		w.in.timeout = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec) +
+		               static_cast<uint64_t>(timeout_sec * 1e9);
+		w.in.ip_type = AMDGPU_HW_IP_GFX;
+		w.in.ring    = 0;
+		w.in.ctx_id  = m_ctx;
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w) == 0 && w.out.status == 0;
+	}
 
 private:
 	NativeSubmitter() = default;
@@ -360,6 +409,9 @@ private:
 	uint32_t m_ib_handle = 0;
 	void*    m_ib_cpu    = nullptr;
 	uint64_t m_ib_va     = 0;
+	bool     m_async     = false;
+	uint32_t m_next_slot = 0;
+	uint64_t m_slot_seq[kSlots] = {};
 	std::vector<uint32_t> m_gds_handles; // GDS, GWS and OA buffers listed in every submission
 	uint32_t              m_gds_size = 0;
 };
