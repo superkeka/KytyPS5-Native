@@ -156,8 +156,55 @@ public:
 			return;
 		}
 
+		// A wait the GPU runs past (guest waits become barriers) is only safe when the label's writer
+		// was submitted before it. Report writers that come later: their work runs after the waiter here.
+		if (m_check_order) {
+			auto satisfies = [](const Pm4TranslateResult::UnmetWait& w, uint64_t v) {
+				switch (w.function) {
+					case 1: return v < w.ref;
+					case 2: return v <= w.ref;
+					case 4: return v != w.ref;
+					case 5: return v >= w.ref;
+					case 6: return v > w.ref;
+					default: return v == w.ref;
+				}
+			};
+			for (const auto& [a, v]: result.label_writes) {
+				if (auto it = m_unmet_by_addr.find(a); it != m_unmet_by_addr.end() && satisfies(it->second.wait, v)) {
+					m_late_writers++;
+					if (m_late_writers <= 24) {
+						std::fprintf(stderr,
+						             "native shadow: ORDER label 0x%llx (needs 0x%llx) waited for by %s %llu is written by %s %llu, "
+						             "submitted later\n",
+						             static_cast<unsigned long long>(a), static_cast<unsigned long long>(it->second.wait.ref),
+						             it->second.acb ? "acb" : "frame", static_cast<unsigned long long>(it->second.buffer), kind,
+						             static_cast<unsigned long long>(frame));
+					}
+					m_unmet_by_addr.erase(it);
+				}
+				m_last_label[a] = v;
+			}
+			for (const auto& w: result.unmet_waits) {
+				// Already satisfied by a write in an earlier buffer, which runs first: no hazard.
+				if (auto it = m_last_label.find(w.addr); it != m_last_label.end() && satisfies(w, it->second)) {
+					continue;
+				}
+				if (m_unmet_by_addr.size() < 4096) {
+					m_unmet_by_addr[w.addr] = {w, acb, frame};
+				}
+			}
+		}
 		DetectShaders(result.shader_addrs);
+		// KYTY_NATIVE_GPU_INSPECT_AFTER_S: only inspect draws this many seconds after start (past the title).
+		static const double inspect_after = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_INSPECT_AFTER_S");
+			return v != nullptr ? std::strtod(v, nullptr) : 0.0;
+		}();
+		static const double start_s = NowSecShadow();
 		for (const auto& snap: result.inspected) {
+			if (NowSecShadow() - start_s < inspect_after) {
+				break;
+			}
 			InspectDraw(frame, snap);
 		}
 		// A shader that uses GDS hung the board in ASTRO BOT even with a GDS partition; until that is
@@ -464,6 +511,11 @@ public:
 				             mi.arena >> 20u, mi.hblkhd >> 20u, (mi.uordblks + mi.hblkhd) >> 20u);
 			}
 #endif
+			// The pipelined path never reaches the per-submission check: look at the dummy here. The GPU
+			// may be writing it right now; a write that lands during the clear is caught next time.
+			if (m_gem != nullptr && m_gem->DummyWritten()) {
+				m_dummy_writes++;
+			}
 			if (m_dummy_writes > 0) {
 				std::fprintf(stderr, "native shadow: %u checks found GPU writes to non-resident guest memory\n",
 				             m_dummy_writes);
@@ -698,7 +750,7 @@ private:
 	// decode the descriptors around them: inline V#s in the user data, and V#/T# in the 0x200 bytes
 	// behind every user-data pointer, each with whether its base is mapped for the GPU.
 	void InspectDraw(uint64_t frame, const DrawSnapshot& snap) {
-		if (m_inspected++ >= 3) {
+		if (m_inspected++ >= 6) {
 			return;
 		}
 		auto mapped = [&](uint64_t a) { return a == 0 ? "null" : (m_gem->IsGpuMapped(a) ? "mapped" : "NOT MAPPED"); };
@@ -724,6 +776,18 @@ private:
 						std::fprintf(stderr, "    +0x%03zx: %08x %08x %08x %08x  as V# 0x%llx (%s) stride %u records %u | as T# 0x%llx (%s)\n",
 						             k * 4, t[k], t[k + 1], t[k + 2], t[k + 3], static_cast<unsigned long long>(vbase), mapped(vbase),
 						             (t[k + 1] >> 16u) & 0x3fffu, t[k + 2], static_cast<unsigned long long>(tbase), mapped(tbase));
+						// Small buffers (constants, exposure and other per-frame scalars): their first values.
+						const uint32_t stride = (t[k + 1] >> 16u) & 0x3fffu;
+						const uint64_t bytes  = static_cast<uint64_t>(t[k + 2]) * (stride != 0 ? stride : 1u);
+						if (vbase >= 0x100000000ull && vbase < 0x10000000000ull && bytes != 0 && bytes <= 4096) {
+							float f[8] = {};
+							const size_t got = m_gem->ReadGuest(vbase, f, std::min<uint64_t>(sizeof(f), bytes)) / 4;
+							std::fprintf(stderr, "      V# 0x%llx data:", static_cast<unsigned long long>(vbase));
+							for (size_t q = 0; q < got; q++) {
+								std::fprintf(stderr, " %g", static_cast<double>(f[q]));
+							}
+							std::fprintf(stderr, "\n");
+						}
 					}
 				}
 			}
@@ -1026,6 +1090,11 @@ private:
 			m_translator.SetCompactRefs(true);
 			m_acb_translator.SetCompactRefs(true);
 		}
+		if (NativeLodStats()) {
+			m_translator.SetLodStats(true);
+			m_acb_translator.SetLodStats(true);
+			std::fprintf(stderr, "native shadow: GET_LOD_STATS runs on the GPU (experiment)\n");
+		}
 		// KYTY_NATIVE_GPU_GUESS_SPAN_KIB: residency for each user-data value that may be an image base.
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_GUESS_SPAN_KIB"); v != nullptr) {
 			const uint64_t bytes = std::strtoull(v, nullptr, 0) << 10u;
@@ -1162,6 +1231,15 @@ private:
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
 	double        m_gpu_busy_s  = 0.0;
+	bool          m_check_order = EnvOn("KYTY_NATIVE_GPU_CHECK_ORDER");
+	struct PendingWait {
+		Pm4TranslateResult::UnmetWait wait;
+		bool                          acb;
+		uint64_t                      buffer;
+	};
+	std::map<uint64_t, PendingWait> m_unmet_by_addr; // label -> the wait no earlier buffer satisfies
+	std::map<uint64_t, uint64_t>    m_last_label;    // label -> last value written by a translated buffer
+	uint64_t      m_late_writers = 0;
 	uint64_t      m_chain_n         = 0; // pipelined buffers finished since the last flip report
 	double        m_chain_queued_s  = 0.0;
 	double        m_chain_latency_s = 0.0;
@@ -1374,6 +1452,11 @@ std::atomic<bool>& ShowNative() {
 
 } // namespace
 
+bool NativeLodStats() {
+	static const bool on = EnvOn("KYTY_NATIVE_GPU_LOD_STATS");
+	return on;
+}
+
 bool PrimaryRendering() {
 	static const bool primary = EnvOn("KYTY_NATIVE_GPU_PRIMARY");
 	// KYTY_NATIVE_GPU_NULL=1: nothing renders at all, natively or through Vulkan, while the game and
@@ -1483,7 +1566,11 @@ void DumpRenderTargets(const char* dir, unsigned long long flip,
 		std::fprintf(summary, "0x%llx %u %u %u 0x%x %u %llu %u %llu\n", static_cast<unsigned long long>(t.addr),
 		             t.width, t.height, (t.info >> 2u) & 0x1fu, t.attrib3 & 0x1fu, t.draws,
 		             static_cast<unsigned long long>(got), images, static_cast<unsigned long long>(differing));
-		if (differing != 0) {
+		if (!download_region) { // primary mode: nothing to compare with, keep every native target
+			std::snprintf(path, sizeof(path), "%s/flip_%llu.rt_%llx.native.raw", dir, flip,
+			              static_cast<unsigned long long>(t.addr));
+			WriteFile(path, native.data(), got);
+		} else if (differing != 0) {
 			std::snprintf(path, sizeof(path), "%s/flip_%llu.rt_%llx.native.raw", dir, flip,
 			              static_cast<unsigned long long>(t.addr));
 			WriteFile(path, native.data(), got);
@@ -1531,6 +1618,8 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			WriteFile(path, reinterpret_cast<const void*>(address), size);
 		}
 		DumpRenderTargets(dir, flip, download_region);
+	} else if (PrimaryRendering()) {
+		DumpRenderTargets(dir, flip, nullptr);
 	}
 	// KYTY_NATIVE_GPU_DUMP_RANGES=0xADDR:0xSIZE[,...]: guest ranges saved next to the flip, e.g. a
 	// game's intermediate targets when the presented surface stays empty.

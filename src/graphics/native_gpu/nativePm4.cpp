@@ -712,6 +712,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.marker_flip++;
 				} else if (marker == R_RELEASE_MEM) {
 					stats.marker_release++;
+					if (body_count >= 4) {
+						r.label_writes.emplace_back(static_cast<uint64_t>(bptr[2]) | (static_cast<uint64_t>(bptr[3]) << 32u),
+						                            static_cast<uint64_t>(bptr[4]) | (static_cast<uint64_t>(bptr[5]) << 32u));
+					}
 					// Kyty's marker carries a hardware RELEASE_MEM. One that sends GDS data (DATA_SEL 5:
 					// counters the guest reads back) must run here, where the GDS partition lives: Kyty
 					// would copy its own, never written, GDS buffer instead. Without the interrupt, which
@@ -968,6 +972,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					return fail(op, dw);
 				}
 				stats.write_data_dropped++;
+				r.label_writes.emplace_back(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bptr[3]);
 				break;
 			case IT_DRAW_INDEX_2:
 				if (skip_draw()) {
@@ -1036,8 +1041,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
 				}
 				break;
-			case IT_GET_LOD_STATS: // texture LOD statistics for the game's streaming: not issued
-				stats.lod_stats_dropped++;
+			case IT_GET_LOD_STATS: // texture LOD statistics, which the game's texture streaming reads
+				if (m_lod_stats && body_count >= 4) {
+					// A gfx10 packet (PAL: GET_LOD_STATS): BU_SIZE, BASE_LO (64-byte aligned), BASE_HI, and
+					// the interval / reset control word.
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					add_ref((static_cast<uint64_t>(bptr[1]) & ~0x3full) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u),
+					        bptr[0] != 0 ? bptr[0] : 64u, false);
+					stats.lod_stats_issued++;
+				} else {
+					stats.lod_stats_dropped++;
+				}
 				break;
 			case IT_DRAW_INDEX_AUTO: // a non-indexed draw: no index buffer to reference
 				if (skip_draw()) {
@@ -1099,6 +1113,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			case IT_EVENT_WRITE:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				// Events with an address (ZPASS_DONE occlusion counters, 16 DBs x begin/end) write there.
+				if (body_count >= 3) {
+					add_ref((static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), 256, false);
+				}
 				stats.event_write++;
 				break;
 			case IT_CLEAR_STATE:

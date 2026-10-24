@@ -1315,6 +1315,10 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	// The BC-250 native path ran the packet on the GPU, which wrote the real statistics.
+	if (NativeGpu::NativeLodStats() && NativeGpu::PrimaryRendering()) {
+		return 4;
+	}
 	if (dst != nullptr && buffer_size != 0) {
 		memset(dst, 0, buffer_size);
 		// Hack?

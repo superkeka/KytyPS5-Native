@@ -140,6 +140,7 @@ struct Pm4TranslateStats {
 	uint32_t draws_skipped     = 0; // draws left out (SetSkippedPixelShaders)
 	uint32_t fmask_fixed       = 0; // CB_COLORn_FMASK set to the target base (was 0) before a draw
 	uint32_t lod_stats_dropped = 0; // GET_LOD_STATS packets left out
+	uint32_t lod_stats_issued  = 0; // GET_LOD_STATS packets run on the GPU (SetLodStats)
 	uint32_t context_ops       = 0; // Agc context-state push/pop/clear markers applied
 	uint32_t wait_barriers     = 0; // guest waits replaced by an end-of-pipe fence and a wait on it
 	uint32_t gds_releases      = 0; // RELEASE_MEM markers that send GDS data, run natively
@@ -241,6 +242,7 @@ struct Pm4TranslateResult {
 		uint32_t dispatches;
 	};
 	std::vector<UnmetWait>        unmet_waits;    // WAIT_REG_MEM conditions not met at translation time
+	std::vector<std::pair<uint64_t, uint64_t>> label_writes; // (address, value) of this buffer's labels
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -314,6 +316,8 @@ public:
 	// (ref_buckets); refs then keeps just the index buffers. What residency needs, without sorting a
 	// list that grows with every draw.
 	void SetCompactRefs(bool compact) { m_compact_refs = compact; }
+	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
+	void SetLodStats(bool on) { m_lod_stats = on; }
 	// How much memory a user-data value that may be an image base (address >> 8) makes resident.
 	void SetGuessSpan(uint64_t bytes) { m_guess_span = bytes != 0 ? bytes : 1; }
 
@@ -354,6 +358,7 @@ private:
 	uint64_t                     m_inspect_ps = 0;
 	bool                         m_compact_refs = false;
 	uint64_t                     m_guess_span   = 32ull << 20u;
+	bool                         m_lod_stats    = false;
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;

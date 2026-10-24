@@ -70,6 +70,8 @@ void ShadowToggleNativeFrames();
 // native path is not active, e.g. after it disabled itself, so Kyty falls back to rendering.
 // KYTY_NATIVE_GPU_NULL=1 makes it true with nothing rendering at all, for CPU-side measurements.
 bool PrimaryRendering();
+// KYTY_NATIVE_GPU_LOD_STATS=1: the native path runs GET_LOD_STATS, so Kyty must not fill the buffer.
+bool NativeLodStats();
 
 // Called at every video-out flip with the guest surface about to be presented. For the flips
 // listed in KYTY_NATIVE_GPU_DUMP_FLIPS ("300,600" or a range "300-2000/10"), writes to
