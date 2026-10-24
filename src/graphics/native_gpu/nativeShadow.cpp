@@ -412,6 +412,14 @@ public:
 
 	// Per-flip timing (KYTY_NATIVE_GPU_FLIP_STATS=1): native time spent in Submit and waiting for its
 	// lock between flips, with the presenter's share passed in.
+	uint64_t ResidentMiB() const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return m_gem != nullptr ? m_gem->ResidentBytes() >> 20u : 0;
+#else
+		return 0;
+#endif
+	}
+
 	void AddGpuBusy(double seconds) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_gpu_busy_s += seconds;
@@ -432,9 +440,9 @@ public:
 			const double per = 1e3 / static_cast<double>(m_flips);
 			std::fprintf(stderr,
 			             "native shadow: per flip: interval %.1f ms, native submit %.1f ms, waiting for the native "
-			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms\n",
+			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms; %llu MiB guest memory resident\n",
 			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per,
-			             m_gpu_busy_s * per);
+			             m_gpu_busy_s * per, static_cast<unsigned long long>(ResidentMiB()));
 			m_flip_t0 = now;
 			m_busy_s = m_wait_lock_s = m_present_s = m_gpu_busy_s = 0.0;
 			m_flips  = 0;
