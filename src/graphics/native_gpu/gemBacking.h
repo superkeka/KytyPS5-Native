@@ -1042,14 +1042,19 @@ private:
 		if (job->src != nullptr) {
 			std::memcpy(job->bo_cpu, job->src, job->size);
 		} else if (job->src_fd >= 0) {
-			uint64_t done = 0;
-			while (done < job->size) {
-				const ssize_t n = ::pread(job->src_fd, job->bo_cpu + done, job->size - done,
-				                          static_cast<off_t>(job->start + done));
-				if (n <= 0) {
-					break;
+			// Piece by piece: the range can have unmapped holes, where a read stops.
+			for (const auto& p: job->pieces) {
+				uint64_t done = 0;
+				while (done < p.len) {
+					const ssize_t n = ::pread(job->src_fd, job->bo_cpu + p.inner + done, p.len - done,
+					                          static_cast<off_t>(p.addr + done));
+					if (n <= 0) {
+						std::fprintf(stderr, "GemBacking: reading 0x%llx failed: %s\n",
+						             static_cast<unsigned long long>(p.addr + done), std::strerror(errno));
+						break;
+					}
+					done += static_cast<uint64_t>(n);
 				}
-				done += static_cast<uint64_t>(n);
 			}
 		} else {
 			// pread rather than a mapping of the memfd, which would allocate pages for the holes; holes
@@ -1068,7 +1073,12 @@ private:
 		}
 		bool moved = true;
 		for (const auto& p: job->pieces) {
-			moved = MapBo(job->bo, p.inner, p.len, p.prot, reinterpret_cast<void*>(p.addr)) && moved;
+			if (!MapBo(job->bo, p.inner, p.len, p.prot, reinterpret_cast<void*>(p.addr))) {
+				std::fprintf(stderr, "GemBacking: mapping 0x%llx (+0x%llx, prot %d) onto buffer offset 0x%llx failed: %s\n",
+				             static_cast<unsigned long long>(p.addr), static_cast<unsigned long long>(p.len), p.prot,
+				             static_cast<unsigned long long>(p.inner), std::strerror(errno));
+				moved = false;
+			}
 		}
 		job->moved = moved;
 		s_promoting.fetch_sub(1, std::memory_order_acq_rel);

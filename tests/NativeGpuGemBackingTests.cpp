@@ -583,6 +583,26 @@ int main() {
 		}
 		const uint64_t ext_va = reinterpret_cast<uint64_t>(host);
 		::mprotect(host + 0x10000 / 4, 0x10000, PROT_NONE); // a no-access hole inside the range
+		// Program memory as games leave it: read-execute, execute-only and no-access slices, moved with
+		// their protection; no GPU job needed.
+		{
+			const uint64_t code_len = 0x100000;
+			auto*          code_host = static_cast<uint8_t*>(
+			    ::mmap(nullptr, code_len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+			Check(code_host != MAP_FAILED, "exact: code range allocation failed");
+			std::memset(code_host, 0xc3, code_len);
+			::mprotect(code_host, 0x40000, PROT_READ | PROT_EXEC);
+			::mprotect(code_host + 0x40000, 0x40000, PROT_EXEC);
+			::mprotect(code_host + 0x80000, 0x40000, PROT_NONE);
+			const uint64_t code_va = reinterpret_cast<uint64_t>(code_host);
+			Check(ex->BindExternal(code_va, code_len, false), "exact: BindExternal of a code range failed");
+			::mprotect(code_host, code_len, PROT_READ);
+			Check(code_host[0] == 0xc3 && code_host[0x40000] == 0xc3 && code_host[0x80000] == 0xc3 &&
+			          code_host[code_len - 1] == 0xc3,
+			      "exact: moving a code range lost its bytes");
+			Check(ex->UnbindExternal(code_va, code_len), "exact: UnbindExternal of the code range failed");
+			::munmap(code_host, code_len);
+		}
 		const size_t listed_before = ex->CreatedHandles().size();
 		Check(ex->BindExternal(ext_va, ext_len, true), "exact: BindExternal failed");
 		Check(ex->CreatedHandles().size() == listed_before, "exact: an external buffer must not be listed");

@@ -526,9 +526,13 @@ public:
 			const double per = 1e3 / static_cast<double>(m_flips);
 			std::fprintf(stderr,
 			             "native shadow: per flip: interval %.1f ms, native submit %.1f ms, waiting for the native "
-			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms; %llu MiB guest memory resident\n",
+			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms, CS ioctl %.2f ms in %.1f CS; %llu MiB guest "
+			             "memory resident\n",
 			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per,
-			             m_gpu_busy_s * per, static_cast<unsigned long long>(ResidentMiB()));
+			             m_gpu_busy_s * per, m_flip_cs_s * per, static_cast<double>(m_flip_cs_n) / static_cast<double>(m_flips),
+			             static_cast<unsigned long long>(ResidentMiB()));
+			m_flip_cs_s = 0.0;
+			m_flip_cs_n = 0;
 #if defined(__GLIBC__)
 			if (EnvOn("KYTY_NATIVE_GPU_MALLOC_STATS")) {
 				const struct mallinfo2 mi = mallinfo2();
@@ -657,6 +661,8 @@ private:
 			return;
 		}
 		m_cs_ms_total += r.cs_seconds * 1e3;
+		m_flip_cs_s += r.cs_seconds;
+		m_flip_cs_n++;
 		m_last_seq = r.seq;
 #endif
 	}
@@ -1322,6 +1328,8 @@ private:
 	uint32_t      m_refused        = 0;
 	double        m_gpu_ms_total   = 0.0;
 	double        m_cs_ms_total    = 0.0;
+	double        m_flip_cs_s      = 0.0; // CS ioctl time of batch submissions since the last per-flip report
+	uint64_t      m_flip_cs_n      = 0;
 	double        m_gpu_only_ms_total = 0.0;
 	double        m_translate_ms_total = 0.0;
 	double        m_residency_ms_total = 0.0;
