@@ -148,6 +148,19 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 // switch is on and it was created. The BC-250 native GPU shadow path binds guest ranges into, and
 // submits commands on, this backing's DRM file. See src/graphics/native_gpu/gemBacking.h.
 [[nodiscard]] Libs::Graphics::NativeGpu::GemBacking* GetGemBacking();
+
+// Guest direct-memory mappings: bytes mapped, bytes mapped with GPU access, and the distinct direct
+// memory (backing) the GPU-visible mappings cover.
+struct DirectMappingStats {
+	uint64_t mapped      = 0;
+	uint64_t gpu_mapped  = 0;
+	uint64_t gpu_backing = 0;
+};
+[[nodiscard]] DirectMappingStats GetDirectMappingStats();
+
+// GemBacking's exact model: makes every direct mapping the GPU may access resident, for mappings made
+// before the GPU-range hooks were active. A no-op otherwise.
+void PromoteGpuVisibleDirectMemory();
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,

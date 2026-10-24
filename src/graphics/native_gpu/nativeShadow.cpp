@@ -445,10 +445,26 @@ public:
 
 	// Display buffers are written by the GPU (often by compute through a descriptor the translator
 	// cannot see), so whatever is flipped is made resident; until then such writes land in the dummy.
+	// In the exact memory model they are resident already, but Kyty's presenter imports them as
+	// dma-bufs, which the always-valid blocks cannot give: the first flip moves each into a buffer of
+	// its own, once nothing in flight on the GPU can still be writing the old copy.
 	void KeepResident(uint64_t addr, uint64_t size) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (m_gem == nullptr || !m_flipped.insert(addr).second) {
+			return;
+		}
+		if (m_gem->Exact()) {
+			if (m_submitter != nullptr && !WaitIdle()) {
+				std::fprintf(stderr, "native shadow: display buffer 0x%llx not exported: GPU busy\n",
+				             static_cast<unsigned long long>(addr));
+				m_flipped.erase(addr);
+				return;
+			}
+			const bool exported = m_gem->ExportRange(addr, size);
+			std::fprintf(stderr, "native shadow: display buffer 0x%llx (%llu MiB) %s\n", static_cast<unsigned long long>(addr),
+			             static_cast<unsigned long long>(size >> 20u),
+			             exported ? "has its own exportable buffer" : "could NOT be exported");
 			return;
 		}
 		const uint32_t promoted = m_gem->PromoteGuestRange(addr, size);
@@ -520,6 +536,21 @@ public:
 				             mi.arena >> 20u, mi.hblkhd >> 20u, (mi.uordblks + mi.hblkhd) >> 20u);
 			}
 #endif
+			if (m_gem != nullptr) {
+				const auto direct = LibKernel::Memory::GetDirectMappingStats();
+				std::fprintf(stderr,
+				             "native shadow: guest memory: %llu MiB mapped (%llu MiB in 16 MiB blocks, %llu MiB in 256 MiB "
+				             "blocks), %llu MiB resident, %llu MiB external; direct mappings %llu MiB, %llu MiB of them "
+				             "GPU-visible over %llu MiB of direct memory\n",
+				             static_cast<unsigned long long>(m_gem->MappedBytes(4096) >> 20u),
+				             static_cast<unsigned long long>(m_gem->MappedBytes(16ull << 20u) >> 20u),
+				             static_cast<unsigned long long>(m_gem->MappedBytes(256ull << 20u) >> 20u),
+				             static_cast<unsigned long long>(ResidentMiB()),
+				             static_cast<unsigned long long>(m_gem->ExternalBytes() >> 20u),
+				             static_cast<unsigned long long>(direct.mapped >> 20u),
+				             static_cast<unsigned long long>(direct.gpu_mapped >> 20u),
+				             static_cast<unsigned long long>(direct.gpu_backing >> 20u));
+			}
 			// The pipelined path never reaches the per-submission check: look at the dummy here. The GPU
 			// may be writing it right now; a write that lands during the clear is caught next time.
 			if (m_gem != nullptr && m_gem->DummyWritten()) {
@@ -811,6 +842,11 @@ private:
 	}
 
 	void MakeResident(const Pm4TranslateResult& result) {
+		// The exact memory model has every GPU-visible block resident already (unless it deferred some
+		// past its budget); only the unmapped-reference log still needs the walk then.
+		if (!m_gem->LazyResidency() && !m_log_unmapped) {
+			return;
+		}
 		constexpr uint64_t kTableSpan = 4096;
 		constexpr uint64_t kImageSpan = 32ull << 20u;
 		constexpr uint64_t kBufferCap = 64ull << 20u;
@@ -1094,7 +1130,9 @@ private:
 			std::fprintf(stderr, "native shadow: GEM backing unavailable; staying off.\n");
 			return;
 		}
-		m_submitter = NativeSubmitter::Create(m_gem->DrmFd());
+		// Mappings made before Kyty's GPU resources existed did not pass the exact model's hook.
+		LibKernel::Memory::PromoteGpuVisibleDirectMemory();
+		m_submitter = NativeSubmitter::Create(m_gem->DrmFd(), m_gem->Exact());
 		if (m_submitter == nullptr) {
 			std::fprintf(stderr, "native shadow: submitter init failed; staying off.\n");
 			return;

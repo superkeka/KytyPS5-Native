@@ -401,6 +401,15 @@ public:
 		return true;
 	}
 
+	// Calls fn(range) for every range, in address order.
+	template <typename Fn>
+	void ForEach(Fn&& fn) {
+		Common::LockGuard lock(m_mutex);
+		for (const auto& [start, range]: m_ranges) {
+			fn(range);
+		}
+	}
+
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
@@ -934,6 +943,52 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+void PromoteGpuVisibleDirectMemory() {
+#if KYTY_GEM_BACKING_SUPPORTED
+	auto* gem = GetGemBacking();
+	if (gem == nullptr || !gem->Exact() || g_virtual_ranges == nullptr) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> gpu;
+	g_virtual_ranges->ForEach([&](const VirtualRanges::Range& r) {
+		if (r.type == VirtualRangeType::Direct && (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+			gpu.emplace_back(r.start, r.size);
+		}
+	});
+	for (const auto& [start, size]: gpu) {
+		gem->MapGpuVisible(start, size);
+	}
+#endif
+}
+
+DirectMappingStats GetDirectMappingStats() {
+	DirectMappingStats stats;
+	if (g_virtual_ranges == nullptr) {
+		return stats;
+	}
+	std::vector<std::pair<uint64_t, uint64_t>> gpu; // backing ranges a GPU-visible mapping maps
+	g_virtual_ranges->ForEach([&](const VirtualRanges::Range& r) {
+		if (r.type != VirtualRangeType::Direct) {
+			return;
+		}
+		stats.mapped += r.size;
+		if ((r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+			stats.gpu_mapped += r.size;
+			gpu.emplace_back(r.offset, r.offset + r.size);
+		}
+	});
+	std::sort(gpu.begin(), gpu.end());
+	uint64_t end = 0;
+	for (const auto& [s, e]: gpu) {
+		const uint64_t from = std::max(s, end);
+		if (e > from) {
+			stats.gpu_backing += e - from;
+			end = e;
+		}
+	}
+	return stats;
+}
+
 Libs::Graphics::NativeGpu::GemBacking* GetGemBacking() {
 #if KYTY_GEM_BACKING_SUPPORTED
 	return g_guest_address_space != nullptr ? g_guest_address_space->Gem() : nullptr;
@@ -947,12 +1002,30 @@ Libs::Graphics::NativeGpu::GemBacking* GetGemBacking() {
 // GemBacking chunks and already bound into that VM by GuestBackingStore::BindView, so only the anon-committed ranges
 // the GPU can also read — flexible, program (code), runtime and stack memory, where guest shader
 // code lives — need a userptr binding here.
+// The exact memory model (GemBacking::Exact) makes direct memory resident on the GPU exactly where
+// the guest maps it with GPU access, as the PS5 does; mappings without GPU access stay CPU-only.
+static void NativeGpuPromoteGpuVisible(Libs::Graphics::NativeGpu::GemBacking* gem, uint64_t vaddr, uint64_t size) {
+	std::vector<VirtualRanges::Range> ranges;
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->QuerySpan(vaddr, size, &ranges)) {
+		gem->MapGpuVisible(vaddr, size); // unknown protection: assume the GPU may access it
+		return;
+	}
+	for (const auto& r: ranges) {
+		if ((r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+			gem->MapGpuVisible(r.start, r.size);
+		}
+	}
+}
+
 static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size) {
 	auto* gem = GetGemBacking();
 	if (gem == nullptr) {
 		return;
 	}
 	if (g_guest_address_space != nullptr && g_guest_address_space->BackingContains(vaddr, size)) {
+		if (gem->Exact()) {
+			NativeGpuPromoteGpuVisible(gem, vaddr, size);
+		}
 		return;
 	}
 	// The caller publishes the range before mapping it to the GPU, so its protection tells us whether
@@ -991,13 +1064,20 @@ static void NativeGpuRebindGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	for (const auto& r: ranges) {
+		if (r.type == VirtualRangeType::Direct && gem->Exact() && IsGpuAddressRange(r.start, r.size) &&
+		    (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+			gem->MapGpuVisible(r.start, r.size); // a direct mapping that gained GPU access
+			continue;
+		}
 		if (r.type == VirtualRangeType::Stack || !IsCommittedRangeType(r.type) ||
 		    !IsGpuAddressRange(r.start, r.size) ||
 		    (g_guest_address_space != nullptr &&
 		     g_guest_address_space->BackingContains(r.start, r.size))) {
 			continue;
 		}
-		gem->UnbindExternal(r.start, r.size);
+		if (!gem->Exact()) { // the exact model keeps the range's buffer and only updates its GPU permission
+			gem->UnbindExternal(r.start, r.size);
+		}
 		gem->BindExternal(r.start, r.size, (r.protection & PROT_GPU_WRITE) != 0);
 	}
 }

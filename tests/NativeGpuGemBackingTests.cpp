@@ -65,7 +65,8 @@ Buffer CreateBuffer(int fd, uint64_t size, uint64_t gpu_va) {
 	c.in.bo_size      = size;
 	c.in.alignment    = 4096;
 	c.in.domains      = AMDGPU_GEM_DOMAIN_GTT;
-	c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC;
+	// Uncached for the GPU: the same IB is reused, and a cached one can be fetched stale from L2.
+	c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC | AMDGPU_GEM_CREATE_UNCACHED;
 	Check(Ioctl(fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) == 0, "GEM_CREATE of a command buffer failed");
 	b.handle = c.out.handle;
 	union drm_amdgpu_gem_mmap m;
@@ -475,6 +476,139 @@ int main() {
 	}
 
 	delete gem;
+
+	// Case 7: the exact model (small 1 MiB blocks here). Blocks are always-valid buffers, resident from
+	// the moment a GPU-visible view maps them (memory.cpp calls MapGpuVisible for those), and the
+	// GPU reaches them with none of them listed. Views at page offsets inside a block map the buffer
+	// through the DRM file (mmap + mremap). A display range gets an exportable buffer of its own.
+	{
+		const uint64_t block = 1ull << 20;
+		::setenv("KYTY_NATIVE_GPU_MEM_BUDGET_MIB", "1", 1); // one block, to see a deferred one below
+		GemBacking*    ex    = GemBacking::Create(4 * block, device, GemBacking::Model::Exact, block);
+		::unsetenv("KYTY_NATIVE_GPU_MEM_BUDGET_MIB");
+		Check(ex != nullptr && ex->Exact() && ex->BlockSize() == block, "exact-model Create failed");
+		auto* ex_alias = ex->AliasBase();
+
+		// A CPU-only view: stays in the memfd, nothing resident.
+		const uint64_t cpu_off = 0x3000, cpu_len = 0x5000;
+		auto*          cpu_view = static_cast<uint32_t*>(ReserveGuest(cpu_len));
+		Check(ex->MapView(reinterpret_cast<uint64_t>(cpu_view), cpu_len, cpu_off, PROT_READ | PROT_WRITE),
+		      "exact: MapView of a CPU-only view failed");
+		Check(ex->BindView(reinterpret_cast<uint64_t>(cpu_view), cpu_len, cpu_off), "exact: BindView of it failed");
+		for (uint32_t i = 0; i < cpu_len / 4; i++) {
+			cpu_view[i] = 0x31000000u + i;
+		}
+		Check(!ex->Lookup(cpu_off, nullptr, nullptr) && ex->ResidentBytes() == 0, "exact: a CPU-only view is not resident");
+		Check(ex->PromoteTouched() == 0, "exact: CPU writes promote nothing");
+
+		// A GPU-visible view aliasing it, starting one page earlier: its block becomes resident, the
+		// CPU-only view moves onto the buffer with it, and no data is lost.
+		const uint64_t off = 0x2000, len = 0x10000;
+		auto*          view = static_cast<uint32_t*>(ReserveGuest(len));
+		const uint64_t va   = reinterpret_cast<uint64_t>(view);
+		Check(ex->MapView(va, len, off, PROT_READ | PROT_WRITE) && ex->BindView(va, len, off),
+		      "exact: MapView/BindView of a GPU-visible view failed");
+		Check(ex->MapGpuVisible(va, len) == 1 && ex->ResidentBytes() == block, "exact: one block made resident");
+		uint32_t handle = 0;
+		Check(ex->Lookup(off, &handle, nullptr) && handle != 0, "exact: the block resolves to a buffer");
+		for (uint32_t i = 0; i < cpu_len / 4; i++) {
+			Check(cpu_view[i] == 0x31000000u + i && view[(cpu_off - off) / 4 + i] == 0x31000000u + i,
+			      "exact: promotion lost the CPU-only view's data");
+		}
+		view[0] = 0xfeedf00du;
+		Check(reinterpret_cast<const uint32_t*>(ex_alias + off)[0] == 0xfeedf00du, "exact: alias does not see a view write");
+
+		// Past the budget a GPU-visible block is deferred: lazy residency, here through a CPU write.
+		{
+			auto* late = static_cast<uint32_t*>(ReserveGuest(0x4000));
+			const uint64_t late_va = reinterpret_cast<uint64_t>(late);
+			Check(ex->MapView(late_va, 0x4000, 2 * block, PROT_READ | PROT_WRITE) && ex->BindView(late_va, 0x4000, 2 * block),
+			      "exact: MapView past the budget failed");
+			Check(!ex->LazyResidency() && ex->MapGpuVisible(late_va, 0x4000) == 0 && ex->LazyResidency(),
+			      "exact: a block past the budget must be deferred");
+			late[0] = 1;
+			Check(ex->PromoteTouched() == 1 && !ex->LazyResidency() && late[0] == 1,
+			      "exact: a deferred block becomes resident when written");
+		}
+
+				// The GPU writes the view with only the dummy listed (CPU-only views of other blocks map it).
+		const int      fd = ex->DrmFd();
+		union drm_amdgpu_ctx c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+		Check(Ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &c) == 0, "exact: context allocation failed");
+		const Buffer         ib   = CreateBuffer(fd, 64 * 1024, 0x0080000000ull);
+		const Buffer         code = CreateBuffer(fd, 64 * 1024, 0x0081000000ull);
+		std::memcpy(code.cpu, kStoreShader, sizeof(kStoreShader));
+		std::vector<uint32_t> listed = ex->CreatedHandles();
+		Check(listed.size() <= 1, "exact: resident blocks must not be listed");
+		RunStore(fd, c.out.alloc.ctx_id, ib, code, va, 0x44000000u, static_cast<uint32_t>(len / 256), listed.data(),
+		         static_cast<uint32_t>(listed.size()));
+		for (uint32_t i = 0; i < len / 4; i++) {
+			Check(view[i] == 0x44000000u + i, "exact: GPU write not visible in the view");
+		}
+		Check(cpu_view[0] == 0x44000000u + (cpu_off - off) / 4, "exact: GPU write not visible in the aliasing view");
+
+		// A display range inside the view gets its own exportable buffer, with its data, and the GPU
+		// and every view follow it there.
+		const uint64_t disp = va + 0x4000, disp_len = 0x8000;
+		Check(ex->ExportRange(disp, disp_len), "exact: ExportRange failed");
+		Check(ex->ExportRange(disp, disp_len), "exact: ExportRange of an exported range must succeed");
+		std::vector<GemBacking::DmabufPiece> pieces;
+		Check(ex->DmabufPieces(disp, disp_len, pieces) && pieces.size() == 1 && pieces[0].len == disp_len,
+		      "exact: an exported range is one dma-buf piece");
+		auto* exported = static_cast<uint32_t*>(
+		    ::mmap(nullptr, pieces[0].bo_size, PROT_READ | PROT_WRITE, MAP_SHARED, pieces[0].fd, 0));
+		Check(exported != MAP_FAILED, "exact: mmap of the exported dma-buf failed");
+		Check(exported[pieces[0].bo_offset / 4] == 0x44000000u + 0x4000 / 4, "exact: export lost the range's data");
+		Check(!ex->DmabufPieces(va, len, pieces), "exact: the rest of the view is not exportable");
+		listed = ex->CreatedHandles();
+		RunStore(fd, c.out.alloc.ctx_id, ib, code, va, 0x55000000u, static_cast<uint32_t>(len / 256), listed.data(),
+		         static_cast<uint32_t>(listed.size()));
+		for (uint32_t i = 0; i < len / 4; i++) {
+			Check(view[i] == 0x55000000u + i, "exact: GPU write after the export not visible in the view");
+		}
+		Check(exported[pieces[0].bo_offset / 4] == 0x55000000u + 0x4000 / 4, "exact: GPU write missed the exported buffer");
+		::munmap(exported, pieces[0].bo_size);
+
+		// An external (non-direct) range moves into an always-valid buffer: its data and protection
+		// survive, the GPU writes it with nothing listed, a protection change keeps the buffer, and a
+		// partial unbind keeps the rest bound.
+		const uint64_t ext_len = 0x40000;
+		auto*          host    = static_cast<uint32_t*>(
+		    ::mmap(nullptr, ext_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+		Check(host != MAP_FAILED, "exact: external host range allocation failed");
+		for (uint32_t i = 0; i < ext_len / 4; i++) {
+			host[i] = 0x66000000u + i;
+		}
+		const uint64_t ext_va = reinterpret_cast<uint64_t>(host);
+		::mprotect(host + 0x10000 / 4, 0x10000, PROT_NONE); // a no-access hole inside the range
+		const size_t listed_before = ex->CreatedHandles().size();
+		Check(ex->BindExternal(ext_va, ext_len, true), "exact: BindExternal failed");
+		Check(ex->CreatedHandles().size() == listed_before, "exact: an external buffer must not be listed");
+		::mprotect(host + 0x10000 / 4, 0x10000, PROT_READ | PROT_WRITE);
+		for (uint32_t i = 0; i < ext_len / 4; i++) {
+			Check(host[i] == 0x66000000u + i, "exact: moving an external range lost its data");
+		}
+		Check(ex->BindExternal(ext_va, ext_len, true), "exact: re-binding a moved range must succeed");
+		listed = ex->CreatedHandles();
+		RunStore(fd, c.out.alloc.ctx_id, ib, code, ext_va, 0x77000000u, static_cast<uint32_t>(ext_len / 256),
+		         listed.data(), static_cast<uint32_t>(listed.size()));
+		for (uint32_t i = 0; i < ext_len / 4; i++) {
+			Check(host[i] == 0x77000000u + i, "exact: GPU write to an external range not visible");
+		}
+		Check(ex->UnbindExternal(ext_va, 0x10000), "exact: partial UnbindExternal failed");
+		Check(ex->ExternalBytes() == ext_len - 0x10000, "exact: the rest of the range stays bound");
+		RunStore(fd, c.out.alloc.ctx_id, ib, code, ext_va + 0x10000, 0x78000000u, static_cast<uint32_t>((ext_len - 0x10000) / 256),
+		         listed.data(), static_cast<uint32_t>(listed.size()));
+		Check(host[0x10000 / 4] == 0x78000000u && host[ext_len / 4 - 1] == 0x78000000u + (ext_len - 0x10000) / 4 - 1,
+		      "exact: GPU write to the surviving part not visible");
+		Check(ex->UnbindExternal(ext_va, ext_len) && ex->ExternalBytes() == 0, "exact: UnbindExternal failed");
+		::munmap(host, ext_len);
+		delete ex;
+		std::puts("NativeGpuGemBackingTests: exact model: always-valid blocks, offset views, export, external ranges");
+	}
+
 	std::puts("NativeGpuGemBackingTests: all cases passed");
 	return 0;
 }

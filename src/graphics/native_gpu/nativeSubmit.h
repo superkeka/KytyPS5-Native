@@ -45,8 +45,9 @@ public:
 		uint64_t seq       = 0;     // async mode: the submission to wait for
 	};
 
-	// Allocates a context and the IB buffer on `drm_fd`. Returns nullptr on failure.
-	static NativeSubmitter* Create(int drm_fd) {
+	// Allocates a context and the IB buffer on `drm_fd`. Returns nullptr on failure. `whole_gds`: the
+	// primary-mode default is the whole GDS and OA (GemBacking's exact model) instead of 4 KiB of GDS.
+	static NativeSubmitter* Create(int drm_fd, bool whole_gds = false) {
 		union drm_amdgpu_ctx ctx;
 		std::memset(&ctx, 0, sizeof(ctx));
 		ctx.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
@@ -63,16 +64,19 @@ public:
 			delete self;
 			return nullptr;
 		}
-		// Opt-in: with the whole GDS, GWS and OA partitions in every submission (so amdgpu reprograms
-		// them for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even when
-		// no packet or shader used GDS. KYTY_NATIVE_GPU_GDS=1 asks for the whole partitions,
-		// "gds=<bytes>,gws=<n>,oa=<n>" for chosen sizes (0 or absent: none of that resource).
-		// Native primary mode defaults to a 4 KiB GDS partition (what PS5 titles' counters use), with
-		// no GWS or OA, which is what ran ASTRO BOT and Dead Cells without hangs.
+		// KYTY_NATIVE_GPU_GDS=1 asks for the whole GDS, GWS and OA in every submission,
+		// "gds=<bytes>,gws=<n>,oa=<n>" for chosen sizes (0 or absent: none of that resource). With the
+		// whole partitions the BC-250 once hung within ~30 s in Dead Cells and ASTRO BOT alike; the IB
+		// buffer was cached in the GPU's L2 then, and a stale IB from L2 hangs the ring by itself (see
+		// CreateIb), so that is no longer evidence against GDS. Native primary mode defaults to the
+		// whole GDS (base 0, guest GDS offsets unchanged; DMA_DATA addresses GDS relative to the job's
+		// partition, like shaders) and OA for ds_ordered_count with the exact memory model, and to a
+		// 4 KiB GDS partition without GWS or OA otherwise. The partition is the same in every job, so
+		// amdgpu only switches GDS when the job lands on a VMID last used with other GDS settings.
 		const char* opt     = std::getenv("KYTY_NATIVE_GPU_GDS");
 		const char* primary = std::getenv("KYTY_NATIVE_GPU_PRIMARY");
 		if (opt == nullptr && primary != nullptr && primary[0] != '\0' && primary[0] != '0') {
-			opt = "gds=4096,gws=0,oa=0";
+			opt = whole_gds ? "gds=0xffffffff,gws=0,oa=0xffffffff" : "gds=4096,gws=0,oa=0";
 		}
 		if (opt != nullptr && opt[0] != '\0' && opt[0] != '0') {
 			self->CreateGds(opt);
@@ -121,7 +125,7 @@ public:
 	NativeSubmitter(const NativeSubmitter&)            = delete;
 	NativeSubmitter& operator=(const NativeSubmitter&) = delete;
 
-	// Copies `ib` into the IB buffer, submits it to the gfx ring with `bo_handles` (plus the IB)
+	// Copies `ib` into the IB buffer, submits it to the gfx ring with `bo_handles` (and the GDS buffers)
 	// resident, waits up to `timeout_sec` and queries the context state.
 	// Async mode (SetAsync): the IB buffer is a ring of kSlots slots and Submit returns right after
 	// the CS ioctl; it only waits for the submission that last used the slot it is about to reuse.
@@ -157,12 +161,12 @@ public:
 		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
 		__sync_synchronize();
 
+		// The IB buffer is always valid, so it is never listed: with GemBacking's exact model and no GDS
+		// a job has no BO list at all.
 		std::vector<drm_amdgpu_bo_list_entry> entries;
-		entries.reserve(bo_handles.size() + 1);
+		entries.reserve(bo_handles.size() + m_gds_handles.size());
 		drm_amdgpu_bo_list_entry e;
 		std::memset(&e, 0, sizeof(e));
-		e.bo_handle = m_ib_handle;
-		entries.push_back(e);
 		// A GDS, GWS or OA buffer in the list is what gives the job its GDS partition.
 		for (uint32_t h: m_gds_handles) {
 			e.bo_handle = h;
@@ -202,7 +206,7 @@ public:
 		union drm_amdgpu_cs cs;
 		std::memset(&cs, 0, sizeof(cs));
 		cs.in.ctx_id     = m_ctx;
-		cs.in.num_chunks = 2;
+		cs.in.num_chunks = entries.empty() ? 1 : 2;
 		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs);
 
 		const double t0 = NowSec();
@@ -312,7 +316,12 @@ private:
 		c.in.bo_size      = kIbSize;
 		c.in.alignment    = 64 * 1024;
 		c.in.domains      = AMDGPU_GEM_DOMAIN_GTT;
-		c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC; // write-combined, like Mesa's IBs
+		// Write-combined for the CPU, like Mesa's IBs, and uncached for the GPU: slots are reused, and
+		// the kernel's end-of-job flush writes L2 back without invalidating it, so with the default
+		// cached MTYPE the CP can fetch the previous IB from that slot out of L2 (seen on the board:
+		// tools/bc250-native-probe mem_probe gdsfull, and a ring hang from a stale mixture of two IBs).
+		// Always valid: kept valid with the VM, so it needs no BO list entry.
+		c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC | AMDGPU_GEM_CREATE_UNCACHED | AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
 		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) != 0) {
 			std::fprintf(stderr, "NativeSubmitter: IB GEM_CREATE failed: %s\n", std::strerror(errno));
 			return false;

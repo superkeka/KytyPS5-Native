@@ -107,7 +107,8 @@ public:
 		// mapping is GPU-mappable later at the same virtual address. Falls back to the memfd below.
 		if (const char* opt = getenv("KYTY_NATIVE_GPU_GEM");
 		    opt != nullptr && opt[0] != '\0' && opt[0] != '0') {
-			m_gem = Libs::Graphics::NativeGpu::GemBacking::Create(m_size);
+			m_gem = Libs::Graphics::NativeGpu::GemBacking::Create(
+			    m_size, "/dev/dri/renderD128", Libs::Graphics::NativeGpu::GemBacking::ModelFromEnv());
 			if (m_gem != nullptr) {
 				m_backing_base = m_gem->AliasBase();
 				return;
