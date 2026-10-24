@@ -345,12 +345,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		} else {
 			return;
 		}
-		auto lo = sh.find(lo_off);
-		auto hi = sh.find(lo_off + 1);
-		if (lo == sh.end() || hi == sh.end()) {
+		const uint32_t* lo = sh.Find(lo_off);
+		const uint32_t* hi = sh.Find(lo_off + 1);
+		if (lo == nullptr || hi == nullptr) {
 			return;
 		}
-		uint64_t va = (static_cast<uint64_t>(lo->second) << 8u) | (static_cast<uint64_t>(hi->second) << 40u);
+		uint64_t va = (static_cast<uint64_t>(*lo) << 8u) | (static_cast<uint64_t>(*hi) << 40u);
 		if (va != 0) {
 			shaders.push_back(va);
 		}
@@ -372,9 +372,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			rt_dirty = true;
 		}
 	};
-	auto reg = [](const std::map<uint32_t, uint32_t>& regs, uint32_t off) -> uint32_t {
-		auto it = regs.find(off);
-		return it == regs.end() ? 0u : it->second;
+	auto reg = [](const RegFile& regs, uint32_t off) -> uint32_t {
+		const uint32_t* v = regs.Find(off);
+		return v == nullptr ? 0u : *v;
 	};
 	// Compact refs: one bit per 16 MiB bucket of the two windows guest memory lives in, the low
 	// 1 TiB and Kyty's extended memory (512 GiB at 8 TiB). A "reference" anywhere else is a user-data
@@ -614,10 +614,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 
 	// Switches the context registers to `next` (a pop, a clear): the registers that change are set
 	// again, those `next` lacks go back to 0.
-	auto switch_context = [&](const std::map<uint32_t, uint32_t>& next) {
+	auto switch_context = [&](const RegFile& next) {
 		for (const auto& [off, value]: next) {
-			auto it = cx.find(off);
-			if (it == cx.end() || it->second != value) {
+			const uint32_t* cur = cx.Find(off);
+			if (cur == nullptr || *cur != value) {
 				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
 				mark_cx(off);
 			}

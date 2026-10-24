@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVEPM4_H_
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVEPM4_H_
 
+#include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -22,6 +24,98 @@
 // memory from the translator's point of view.
 
 namespace Libs::Graphics::NativeGpu {
+
+// Shadow of one register space: offset -> value, iterated in ascending offset order like the
+// std::map it replaces. Offsets below kDense (every context and SH register real packets write)
+// live in a flat array with a presence bitmap, so lookups are O(1) and the copies the translator
+// makes per DCB and per context push are a few KiB of memcpy instead of a tree; anything above
+// falls back to a map.
+class RegFile {
+public:
+	static constexpr uint32_t kDense = 0x400;
+
+	class Iterator {
+	public:
+		Iterator(const RegFile* f, uint32_t off, std::map<uint32_t, uint32_t>::const_iterator it)
+		    : m_f(f), m_off(off), m_it(it) {
+			SkipAbsent();
+		}
+		std::pair<uint32_t, uint32_t> operator*() const {
+			if (m_off < kDense) {
+				return {m_off, m_f->m_values[m_off]};
+			}
+			return {m_it->first, m_it->second};
+		}
+		Iterator& operator++() {
+			if (m_off < kDense) {
+				m_off++;
+				SkipAbsent();
+			} else {
+				++m_it;
+			}
+			return *this;
+		}
+		bool operator!=(const Iterator& o) const { return m_off != o.m_off || m_it != o.m_it; }
+
+	private:
+		void SkipAbsent() {
+			while (m_off < kDense) {
+				const uint64_t bits = m_f->m_present[m_off / 64] >> (m_off % 64);
+				if (bits != 0) {
+					m_off += static_cast<uint32_t>(std::countr_zero(bits));
+					return;
+				}
+				m_off = (m_off / 64 + 1) * 64;
+			}
+		}
+		const RegFile*                                m_f;
+		uint32_t                                      m_off;
+		std::map<uint32_t, uint32_t>::const_iterator m_it;
+	};
+
+	uint32_t& operator[](uint32_t off) {
+		if (off >= kDense) {
+			m_count += m_overflow.count(off) == 0 ? 1 : 0;
+			return m_overflow[off];
+		}
+		if (!Has(off)) {
+			m_present[off / 64] |= 1ull << (off % 64);
+			m_values[off] = 0;
+			m_count++;
+		}
+		return m_values[off];
+	}
+	// nullptr when the register was never written.
+	[[nodiscard]] const uint32_t* Find(uint32_t off) const {
+		if (off >= kDense) {
+			auto it = m_overflow.find(off);
+			return it == m_overflow.end() ? nullptr : &it->second;
+		}
+		return Has(off) ? &m_values[off] : nullptr;
+	}
+	[[nodiscard]] size_t count(uint32_t off) const { return Find(off) != nullptr ? 1 : 0; }
+	void                 emplace(uint32_t off, uint32_t value) {
+		if (count(off) == 0) {
+			(*this)[off] = value;
+		}
+	}
+	void clear() {
+		m_present.fill(0);
+		m_overflow.clear();
+		m_count = 0;
+	}
+	[[nodiscard]] size_t   size() const { return m_count; }
+	[[nodiscard]] Iterator begin() const { return {this, 0, m_overflow.begin()}; }
+	[[nodiscard]] Iterator end() const { return {this, kDense, m_overflow.end()}; }
+
+private:
+	[[nodiscard]] bool Has(uint32_t off) const { return ((m_present[off / 64] >> (off % 64)) & 1u) != 0; }
+
+	std::array<uint32_t, kDense>      m_values {};
+	std::array<uint64_t, kDense / 64> m_present {};
+	std::map<uint32_t, uint32_t>      m_overflow;
+	size_t                            m_count = 0;
+};
 
 struct Pm4TranslateStats {
 	uint32_t packets           = 0; // type-3 packets seen in the DCB
@@ -239,12 +333,12 @@ private:
 	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats) const;
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
 
-	std::map<uint32_t, uint32_t> m_cx; // context registers (SET_CONTEXT_REG space)
-	std::map<uint32_t, uint32_t> m_cx_defaults; // what a context clear restores (the seeded defaults)
-	std::map<uint32_t, uint32_t> m_saved_cx;    // context pushed by an Agc context-state push
+	RegFile                      m_cx; // context registers (SET_CONTEXT_REG space)
+	RegFile                      m_cx_defaults; // what a context clear restores (the seeded defaults)
+	RegFile                      m_saved_cx;    // context pushed by an Agc context-state push
 	bool                         m_cx_pushed = false;
-	std::map<uint32_t, uint32_t> m_sh; // SH registers (SET_SH_REG space)
-	std::map<uint32_t, uint32_t> m_uc; // whitelisted UCONFIG registers
+	RegFile                      m_sh; // SH registers (SET_SH_REG space)
+	RegFile                      m_uc; // whitelisted UCONFIG registers
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 	bool                         m_no_dcc     = false;
