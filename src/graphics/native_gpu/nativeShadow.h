@@ -15,7 +15,10 @@
 //
 // Diagnostics: KYTY_NATIVE_GPU_STATS=1 logs pipeline statistics (vertices, primitives, pixel shader
 // invocations) of the first frames with draws; KYTY_NATIVE_GPU_DUMP_REGS=<frame> writes the
-// shadowed register state of that frame to KYTY_NATIVE_GPU_DUMP_DIR.
+// shadowed register state of that frame to KYTY_NATIVE_GPU_DUMP_DIR. KYTY_NATIVE_GPU_CAPTURE_DIR with
+// KYTY_NATIVE_GPU_PROFILE_FLIPS / KYTY_NATIVE_GPU_PM4_DUMP_FLIPS captures GPU timestamps and the PM4
+// buffers of a window of flips, and KYTY_NATIVE_GPU_DRAW_MARKERS names the last draw on a hang, for
+// tools/bc250-pm4dbg (see its README).
 //
 // It never changes what the Vulkan path does, so default behaviour (either switch unset) is
 // byte-for-byte upstream.

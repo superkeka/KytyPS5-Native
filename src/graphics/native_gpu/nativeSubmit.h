@@ -87,6 +87,13 @@ public:
 			c.handle = h;
 			Ioctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &c);
 		}
+		if (m_prof_handle != 0) {
+			::munmap(m_prof_cpu, m_prof_size);
+			struct drm_gem_close c;
+			std::memset(&c, 0, sizeof(c));
+			c.handle = m_prof_handle;
+			Ioctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &c);
+		}
 		if (m_ib_va != 0) {
 			VaOp(AMDGPU_VA_OP_UNMAP, m_ib_handle, m_ib_va);
 		}
@@ -116,6 +123,72 @@ public:
 	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
 	[[nodiscard]] volatile uint8_t* ScratchCpu() const {
 		return static_cast<volatile uint8_t*>(m_ib_cpu) + kIbSize - kScratchSize;
+	}
+
+	// Profiling buffer (GPU timestamps, draw markers): cached GTT the IBs write and the CPU reads back,
+	// listed in every submission once created. Returns false when it cannot be created.
+	static constexpr uint64_t kProfileVa = kIbVa + 0x10000000ull;
+	bool CreateProfileBuffer(uint64_t bytes) {
+		if (m_prof_handle != 0) {
+			return true;
+		}
+		union drm_amdgpu_gem_create c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.bo_size   = bytes;
+		c.in.alignment = 64 * 1024;
+		c.in.domains   = AMDGPU_GEM_DOMAIN_GTT;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: profile GEM_CREATE failed: %s\n", std::strerror(errno));
+			return false;
+		}
+		union drm_amdgpu_gem_mmap m;
+		std::memset(&m, 0, sizeof(m));
+		m.in.handle = c.out.handle;
+		void* p     = MAP_FAILED;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_MMAP, &m) == 0) {
+			p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, m_drm_fd, static_cast<off_t>(m.out.addr_ptr));
+		}
+		struct drm_amdgpu_gem_va v;
+		std::memset(&v, 0, sizeof(v));
+		v.handle    = c.out.handle;
+		v.operation = AMDGPU_VA_OP_MAP;
+		v.flags     = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE;
+		v.va_address = kProfileVa;
+		v.map_size   = bytes;
+		if (p == MAP_FAILED || Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_VA, &v) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: profile buffer mmap/GEM_VA failed: %s\n", std::strerror(errno));
+			return false;
+		}
+		std::memset(p, 0, bytes);
+		m_prof_cpu    = p;
+		m_prof_handle = c.out.handle;
+		m_prof_size   = bytes;
+		return true;
+	}
+	[[nodiscard]] uint64_t                ProfileVa() const { return m_prof_handle != 0 ? kProfileVa : 0; }
+	[[nodiscard]] const volatile uint64_t* ProfileCpu() const { return static_cast<const volatile uint64_t*>(m_prof_cpu); }
+	[[nodiscard]] uint64_t                ProfileSize() const { return m_prof_size; }
+
+	// The GPU clock (the counter COPY_DATA and RELEASE_MEM timestamps sample), read now through the
+	// kernel; 0 on failure. CounterKhz is its frequency.
+	[[nodiscard]] uint64_t GpuClock() const {
+		uint64_t              ticks = 0;
+		struct drm_amdgpu_info request;
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer = reinterpret_cast<uintptr_t>(&ticks);
+		request.return_size    = sizeof(ticks);
+		request.query          = AMDGPU_INFO_TIMESTAMP;
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) == 0 ? ticks : 0;
+	}
+	[[nodiscard]] uint32_t CounterKhz() const {
+		struct drm_amdgpu_info_device dev;
+		std::memset(&dev, 0, sizeof(dev));
+		struct drm_amdgpu_info request;
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer = reinterpret_cast<uintptr_t>(&dev);
+		request.return_size    = sizeof(dev);
+		request.query          = AMDGPU_INFO_DEV_INFO;
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) == 0 ? static_cast<uint32_t>(dev.gpu_counter_freq) : 0;
 	}
 
 	NativeSubmitter(const NativeSubmitter&)            = delete;
@@ -166,6 +239,10 @@ public:
 		// A GDS, GWS or OA buffer in the list is what gives the job its GDS partition.
 		for (uint32_t h: m_gds_handles) {
 			e.bo_handle = h;
+			entries.push_back(e);
+		}
+		if (m_prof_handle != 0) {
+			e.bo_handle = m_prof_handle;
 			entries.push_back(e);
 		}
 		for (uint32_t h: bo_handles) {
@@ -421,6 +498,9 @@ private:
 	uint64_t m_slot_seq[kSlots] = {};
 	std::vector<uint32_t> m_gds_handles; // GDS, GWS and OA buffers listed in every submission
 	uint32_t              m_gds_size = 0;
+	uint32_t              m_prof_handle = 0; // CreateProfileBuffer
+	void*                 m_prof_cpu    = nullptr;
+	uint64_t              m_prof_size   = 0;
 };
 
 } // namespace Libs::Graphics::NativeGpu

@@ -219,6 +219,35 @@ struct FindHit {
 	bool     image    = false; // a T# base (address >> 8) rather than a 48-bit V#/pointer
 };
 
+// GPU timestamp slots (Pm4Translator::SetProfile): two 64-bit GPU clock values per slot, `issued`
+// when the CP reached the work (COPY_DATA, top of pipe) and `done` when it and everything before it
+// had finished (RELEASE_MEM, bottom of pipe). Slots are handed out round robin; the reader must take
+// them back before the ring wraps.
+struct ProfileRing {
+	uint64_t va       = 0; // slot i at va + 16 * i
+	uint32_t capacity = 0;
+	uint64_t next     = 0; // slots handed out so far
+
+	uint32_t Take() { return static_cast<uint32_t>(next++ % capacity); }
+	[[nodiscard]] uint64_t SlotVa(uint32_t slot) const { return va + 16ull * slot; }
+};
+
+// A draw or dispatch that got a profile slot.
+struct ProfiledItem {
+	uint32_t slot   = 0;
+	uint32_t index  = 0; // its number in the buffer, draws and dispatches counted together
+	uint32_t dw     = 0; // dword offset of its packet in the guest buffer
+	uint32_t op     = 0;
+	uint64_t shader = 0; // PS of a draw, CS of a dispatch
+	uint64_t es     = 0; // the NGG (ES/GS) shader of a draw
+	uint32_t args[3] = {}; // index count (draws), thread groups x, y, z (direct dispatches)
+};
+
+// COPY_DATA of the GPU clock to `va` (64 bit), when the CP gets to it.
+void EmitGpuClockCopy(std::vector<uint32_t>& ib, uint64_t va);
+// RELEASE_MEM writing the GPU clock to `va` (64 bit) once all earlier work is done.
+void EmitGpuClockEop(std::vector<uint32_t>& ib, uint64_t va);
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -246,6 +275,7 @@ struct Pm4TranslateResult {
 	std::vector<UnmetWait>        unmet_waits;    // WAIT_REG_MEM conditions not met at translation time
 	std::vector<std::pair<uint64_t, uint64_t>> label_writes; // (address, value) of this buffer's labels
 	std::vector<std::pair<uint32_t, uint32_t>> gds_dma;      // (GDS offset | 0x80000000 if written, bytes)
+	std::vector<ProfiledItem>     profiled;       // draws/dispatches with timestamps (SetProfile)
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -340,6 +370,17 @@ public:
 	// Draws with this pixel shader are reported in Pm4TranslateResult::inspected (0: none).
 	void SetInspectedPixelShader(uint64_t ps) { m_inspect_ps = ps; }
 
+	// Diagnostics: GPU timestamps around every draw and dispatch, in slots of `ring` (nullptr: off),
+	// reported in Pm4TranslateResult::profiled.
+	void SetProfile(ProfileRing* ring) { m_profile = ring; }
+	// Diagnostics: progress markers. Before each draw/dispatch a WRITE_DATA stores (tag << 32 | item)
+	// at `va`, and after it a bottom-of-pipe RELEASE_MEM stores the same value at va + 8, so after a
+	// hang they name the last item the CP started and the last one that finished. 0: off.
+	void SetDrawMarkers(uint64_t va, uint32_t tag) {
+		m_marker_va  = va;
+		m_marker_tag = tag;
+	}
+
 	// UCONFIG registers the backend is allowed to write. Everything else is dropped, because one
 	// experiment writing other UCONFIG registers froze the whole board (see the probe README).
 	static bool UconfigAllowed(uint32_t normalized_offset);
@@ -373,6 +414,9 @@ private:
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;
+	ProfileRing*                 m_profile    = nullptr;
+	uint64_t                     m_marker_va  = 0;
+	uint32_t                     m_marker_tag = 0;
 };
 
 } // namespace Libs::Graphics::NativeGpu

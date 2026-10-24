@@ -615,7 +615,8 @@ void TestGdsReleaseMem() {
 	dcb.push_back(0x55u);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.gds_releases == 1, "GDS release marker translated");
-	const Packet* rel = FindFirst(Decode(r.ib), 0x49u);
+	const auto    pkts = Decode(r.ib);
+	const Packet* rel  = FindFirst(pkts, 0x49u);
 	Check(rel != nullptr && rel->body.size() == 7 && ((rel->body[1] >> 24u) & 0x7u) == 0u &&
 	          ((rel->body[1] >> 29u) & 0x7u) == 5u && rel->body[4] == (0xc64u | (1u << 16u)) && rel->body[6] == 0u,
 	      "native RELEASE_MEM sends the GDS dword, without the interrupt");
@@ -685,7 +686,61 @@ void TestGpuRefs() {
 	Check(rt == 1, "carried-over render target reported once");
 }
 
+// SetProfile brackets every draw and dispatch with a GPU-clock COPY_DATA and a bottom-of-pipe
+// RELEASE_MEM into its slot; SetDrawMarkers adds a WRITE_DATA before and a RELEASE_MEM after.
+void TestProfileAndMarkers() {
+	constexpr uint32_t IT_COPY_DATA   = 0x40;
+	constexpr uint32_t IT_RELEASE_MEM = 0x49;
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x008u, 0x00123400u, 0x0u}, false); // PS at 0x12340000
+	Append(dcb, IT_SET_SH_REG, {0x20Cu, 0x00567800u, 0x0u}, true);  // CS at 0x56780000
+	Append(dcb, IT_DRAW_INDEX_2, {0x100u, 0x1000u, 0x0u, 36u, 0u}, false);
+	Append(dcb, IT_DISPATCH_DIRECT, {8u, 4u, 1u, 1u}, true);
+
+	Pm4Translator plain;
+	auto          r0 = plain.Translate(dcb);
+	Check(r0.ok && r0.profiled.empty(), "no profile slots by default");
+	const auto p0 = Decode(r0.ib);
+	Check(Count(p0, IT_COPY_DATA) == 0 && Count(p0, IT_RELEASE_MEM) == 0 && Count(p0, IT_WRITE_DATA) == 0,
+	      "no timestamps or markers by default");
+
+	Libs::Graphics::NativeGpu::ProfileRing ring;
+	ring.va       = 0x10000;
+	ring.capacity = 4;
+	ring.next     = 3; // the dispatch's slot wraps to 0
+	Pm4Translator t;
+	t.SetProfile(&ring);
+	t.SetDrawMarkers(0x20000, 7);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.profiled.size() == 2, "draw and dispatch profiled");
+	Check(r.profiled[0].slot == 3 && r.profiled[1].slot == 0 && ring.next == 5, "slots taken round robin");
+	Check(r.profiled[0].index == 0 && r.profiled[1].index == 1, "items numbered in order");
+	Check(r.profiled[0].shader == 0x12340000ull && r.profiled[0].args[0] == 36u, "draw shader and index count");
+	Check(r.profiled[1].shader == 0x56780000ull && r.profiled[1].args[0] == 8u && r.profiled[1].args[1] == 4u,
+	      "dispatch shader and groups");
+	const auto pkts = Decode(r.ib);
+	Check(Count(pkts, IT_COPY_DATA) == 2 && Count(pkts, IT_RELEASE_MEM) == 4 && Count(pkts, IT_WRITE_DATA) == 2,
+	      "two timestamps and two markers per item");
+	size_t draw = 0;
+	while (pkts[draw].op != IT_DRAW_INDEX_2) {
+		draw++;
+	}
+	Check(draw >= 2 && pkts[draw - 2].op == IT_WRITE_DATA && pkts[draw - 1].op == IT_COPY_DATA, "marker, timestamp, draw");
+	const auto& marker = pkts[draw - 2].body;
+	Check(marker[1] == 0x20000u && marker[3] == 0u && marker[4] == 7u, "issued marker (tag 7, item 0)");
+	const auto& issued = pkts[draw - 1].body;
+	Check((issued[0] & 0xfu) == 9u && issued[3] == 0x10000u + 16u * 3u, "issued timestamp: GPU clock into slot 3");
+	const auto& done = pkts[draw + 1].body;
+	Check(pkts[draw + 1].op == IT_RELEASE_MEM && (done[1] >> 29u) == 3u && done[2] == 0x10000u + 16u * 3u + 8u,
+	      "done timestamp: bottom-of-pipe GPU clock into slot 3 + 8");
+	const auto& finished = pkts[draw + 2].body;
+	Check(pkts[draw + 2].op == IT_RELEASE_MEM && finished[2] == 0x20008u && finished[4] == 0u && finished[5] == 7u,
+	      "finished marker (tag 7, item 0)");
+	Check(IbAligned(r.ib), "IB padded");
+}
+
 int main() {
+	TestProfileAndMarkers();
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
 	TestShaderDetection();

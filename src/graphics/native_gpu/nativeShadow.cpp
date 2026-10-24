@@ -58,6 +58,132 @@ bool PrimaryFeature(const char* name) {
 	return EnvOn("KYTY_NATIVE_GPU_PRIMARY");
 }
 
+uint64_t ToNs(double seconds) {
+	return static_cast<uint64_t>(seconds * 1e9);
+}
+
+// Capture files (KYTY_NATIVE_GPU_CAPTURE_DIR), read by tools/bc250-pm4dbg. Both are a sequence of
+// records: u32 type, u32 payload bytes, payload. Times are CLOCK_MONOTONIC nanoseconds, GPU values are
+// GPU clock ticks (TraceHeader::counter_khz); a GPU value of 0 was never written.
+//   trace.bin (KYTY_NATIVE_GPU_PROFILE_FLIPS): timing of every buffer, batch and flip in the window.
+//   pm4.bin   (KYTY_NATIVE_GPU_PM4_DUMP_FLIPS): every guest buffer and its IB, with guest memory that
+//             shader user data points at.
+enum TraceType : uint32_t {
+	kTraceHeader = 1, // TraceHeader
+	kTraceCalib  = 2, // TraceCalib: CPU time <-> GPU clock
+	kTraceFlip   = 3, // TraceFlip: a video-out flip reached the presenter
+	kTraceBatch  = 4, // TraceBatch: one CS; its TraceBuffer records follow it
+	kTraceBuffer = 5, // TraceBuffer: one guest DCB or ACB
+	kTraceItem   = 6, // TraceItem: one draw or dispatch (KYTY_NATIVE_GPU_PROFILE_DRAWS)
+	kTraceThen   = 7, // TraceThen: Kyty's command processor ran the buffer after the GPU finished it
+	kDumpBuffer  = 16, // DumpBuffer, then raw_dw guest dwords, then ib_dw IB dwords
+	kDumpMemory  = 17, // DumpMemory, then `bytes` bytes of guest memory
+};
+struct TraceHeader {
+	uint32_t version;
+	uint32_t counter_khz;
+	uint64_t cpu_ns;
+};
+struct TraceCalib {
+	uint64_t cpu_before_ns;
+	uint64_t gpu;
+	uint64_t cpu_after_ns;
+};
+struct TraceFlip {
+	uint64_t flip;
+	uint64_t cpu_ns;
+};
+struct TraceBatch {
+	uint64_t id;
+	uint64_t seq;
+	uint64_t cs_begin_ns; // the CS ioctl
+	uint64_t cs_end_ns;
+	uint64_t fence_ns; // the completion thread saw the fence
+	uint32_t buffers;
+	uint32_t handles;  // BOs in the list
+};
+struct TraceBuffer {
+	uint64_t batch;
+	uint64_t number; // frame / acb counter of the shadow log
+	uint64_t enqueue_ns; // the guest submitted it
+	uint64_t translated_ns; // translated and appended to the batch
+	uint64_t gpu_issued; // the CP started it
+	uint64_t gpu_done; // it had finished
+	uint32_t acb;
+	uint32_t draws;
+	uint32_t dispatches;
+	uint32_t flips; // flip markers in it
+	uint32_t ib_dw;
+	uint32_t wait_barriers;
+};
+struct TraceItem {
+	uint64_t number;
+	uint64_t shader;
+	uint64_t es;
+	uint64_t gpu_issued;
+	uint64_t gpu_done;
+	uint32_t acb;
+	uint32_t index;
+	uint32_t dw;
+	uint32_t op;
+	uint32_t args[3];
+	uint32_t pad;
+};
+struct TraceThen {
+	uint64_t number;
+	uint64_t start_ns;
+	uint64_t end_ns;
+	uint32_t acb;
+	uint32_t pad;
+};
+struct DumpBuffer {
+	uint64_t number;
+	uint64_t flip;
+	uint32_t acb;
+	uint32_t raw_dw;
+	uint32_t ib_dw;
+	uint32_t pad;
+};
+struct DumpMemory {
+	uint64_t addr;
+	uint32_t bytes;
+	uint32_t pad;
+};
+static_assert(sizeof(TraceBuffer) == 72 && sizeof(TraceItem) == 72 && sizeof(TraceBatch) == 48);
+
+void WriteRecord(std::FILE* f, uint32_t type, const void* payload, uint32_t bytes, const void* extra = nullptr,
+                 uint32_t extra_bytes = 0, const void* extra2 = nullptr, uint32_t extra2_bytes = 0) {
+	const uint32_t head[2] = {type, bytes + extra_bytes + extra2_bytes};
+	std::fwrite(head, sizeof(head), 1, f);
+	std::fwrite(payload, bytes, 1, f);
+	if (extra_bytes != 0) {
+		std::fwrite(extra, extra_bytes, 1, f);
+	}
+	if (extra2_bytes != 0) {
+		std::fwrite(extra2, extra2_bytes, 1, f);
+	}
+}
+
+// What the profiler keeps of a buffer until its batch has completed.
+struct BufferProfile {
+	uint64_t                  number = 0;
+	bool                      acb    = false;
+	uint32_t                  slot   = 0;
+	Pm4TranslateStats         stats;
+	uint32_t                  ib_dw      = 0;
+	double                    enqueued   = 0.0;
+	double                    translated = 0.0;
+	std::vector<ProfiledItem> items;
+};
+struct BatchProfile {
+	uint64_t                   id       = 0;
+	uint64_t                   seq      = 0;
+	double                     cs_begin = 0.0;
+	double                     cs_end   = 0.0;
+	uint32_t                   handles  = 0;
+	std::vector<BufferProfile> buffers;
+};
+
 // Shadow-mode state, built lazily on the first DCB so it sees the final env and the created GEM
 // backing. One instance for the process; submit_dcb is driven from the guest graphics thread, but
 // a mutex keeps it safe if that ever changes.
@@ -98,7 +224,9 @@ public:
 
 	// `acb`: an asynchronous compute buffer. ACBs go through their own translator (their own shadow
 	// of the compute registers) and run on the same gfx ring as the DCBs, in guest submission order.
-	void Submit(std::span<const uint32_t> dcb, bool acb = false) {
+	// `enqueued`: when the guest submitted it (pipeline mode), for the profile. `number` receives the
+	// buffer's frame / acb number.
+	void Submit(std::span<const uint32_t> dcb, bool acb = false, double enqueued = 0.0, uint64_t* number = nullptr) {
 		const double                t_enter = NowSecShadow();
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double                t_locked = NowSecShadow();
@@ -119,6 +247,15 @@ public:
 		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
 		const char* const  kind  = acb ? "acb" : "frame";
 		Pm4Translator&     tr    = acb ? m_acb_translator : m_translator;
+		if (number != nullptr) {
+			*number = frame;
+		}
+		const bool profiling = m_profiling.load(std::memory_order_relaxed);
+		tr.SetProfile(profiling && m_profile_items ? &m_ring : nullptr);
+		if (m_markers) {
+			tr.SetDrawMarkers(m_ring.va - kProfileRingOffset + kMarkerOffset,
+			                  (acb ? 0x80000000u : 0u) | static_cast<uint32_t>(frame & 0x7fffffffu));
+		}
 		SetStage(Stage::Translate, frame);
 		const double       t_translate = NowSecShadow();
 		Pm4TranslateResult result      = tr.Translate(dcb);
@@ -305,7 +442,18 @@ public:
 		// the rest. With KYTY_NATIVE_GPU_STATS=1 pipeline-statistics samples are added as well.
 		const uint64_t        sva = m_submitter->ScratchVa();
 		std::vector<uint32_t> wrapped;
-		wrapped.reserve(result.ib.size() + 32);
+		wrapped.reserve(result.ib.size() + 48);
+		// Profile window: the buffer's own slot brackets it (issued when the CP starts it, done when it
+		// has finished); its draws and dispatches have theirs inside the IB.
+		const bool     profiled_buffer = profiling && m_pipelined;
+		const uint32_t buffer_slot     = profiled_buffer ? m_ring.Take() : 0;
+		if (profiled_buffer) {
+			ClearSlot(buffer_slot);
+			for (const auto& it: result.profiled) {
+				ClearSlot(it.slot);
+			}
+			EmitGpuClockCopy(wrapped, m_ring.SlotVa(buffer_slot));
+		}
 		EmitTimestamp(wrapped, sva + kTimestampOffset);
 		if (m_stats) {
 			for (uint32_t i = 0; i < 2 * kStatSlots * 8; i++) {
@@ -320,11 +468,17 @@ public:
 			EmitSample(wrapped, sva + kStatSlots * 8);
 		}
 		EmitTimestamp(wrapped, sva + kTimestampOffset + 8);
+		if (profiled_buffer) {
+			EmitGpuClockEop(wrapped, m_ring.SlotVa(buffer_slot) + 8);
+		}
 		while ((wrapped.size() & 7u) != 0) {
 			wrapped.push_back(0xffff1000u);
 		}
 		if (!m_breadcrumbs.empty()) {
 			WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, wrapped);
+		}
+		if (m_dump != nullptr) {
+			DumpPm4(acb, frame, dcb, wrapped);
 		}
 		// Pipelined: the IB joins the batch the pipeline submits with one CS once it has taken every
 		// queued buffer (FlushBatch). One BO-list validation then covers them all.
@@ -333,6 +487,18 @@ public:
 				SubmitBatchLocked();
 			}
 			m_batch.insert(m_batch.end(), wrapped.begin(), wrapped.end());
+			if (profiled_buffer) {
+				BufferProfile p;
+				p.number     = frame;
+				p.acb        = acb;
+				p.slot       = buffer_slot;
+				p.stats      = result.stats;
+				p.ib_dw      = static_cast<uint32_t>(wrapped.size());
+				p.enqueued   = enqueued;
+				p.translated = NowSecShadow();
+				p.items      = std::move(result.profiled);
+				m_pending_buffers.push_back(std::move(p));
+			}
 			return;
 		}
 		std::span<const uint32_t> ib = wrapped;
@@ -612,8 +778,9 @@ private:
 			m_batch.clear();
 			return;
 		}
-		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
-		NativeSubmitter::Result r       = m_submitter->Submit(m_batch, handles, m_timeout_sec);
+		std::vector<uint32_t>   handles  = m_gem->CreatedHandles();
+		const double            cs_begin = NowSecShadow();
+		NativeSubmitter::Result r        = m_submitter->Submit(m_batch, handles, m_timeout_sec);
 		for (int retry = 0; !r.submitted && r.err == -ENOENT && retry < 3; retry++) {
 			handles = m_gem->CreatedHandles();
 			r       = m_submitter->Submit(m_batch, handles, m_timeout_sec);
@@ -622,13 +789,305 @@ private:
 		if (!r.submitted) {
 			std::fprintf(stderr, "native shadow: batch submit failed: %s (%zu BOs)\n", std::strerror(-r.err),
 			             handles.size());
+			m_pending_buffers.clear();
 			Disable("submit error");
 			return;
 		}
 		m_cs_ms_total += r.cs_seconds * 1e3;
 		m_last_seq = r.seq;
+		if (!m_pending_buffers.empty()) {
+			BatchProfile b;
+			b.id       = m_batch_ids++;
+			b.seq      = r.seq;
+			b.cs_begin = cs_begin;
+			b.cs_end   = NowSecShadow();
+			b.handles  = static_cast<uint32_t>(handles.size());
+			b.buffers  = std::move(m_pending_buffers);
+			m_pending_buffers.clear();
+			m_pending_batches.push_back(std::move(b));
+		}
 #endif
 	}
+
+public:
+	// The profiled batches submitted since the last call, for the completion thread to report once
+	// they have finished.
+	std::vector<BatchProfile> TakeBatchProfiles() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		return std::exchange(m_pending_batches, {});
+	}
+
+	// Called by the completion thread once `batches` have finished (`fence`: when it saw that).
+	void ProfileBatches(const std::vector<BatchProfile>& batches, double fence) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::lock_guard<std::mutex> lock(m_trace_mutex);
+		if (m_trace == nullptr) {
+			return;
+		}
+		const volatile uint64_t* slots = m_submitter->ProfileCpu() + kProfileRingOffset / 8;
+		for (const auto& b: batches) {
+			const TraceBatch tb {b.id, b.seq, ToNs(b.cs_begin), ToNs(b.cs_end), ToNs(fence),
+			                     static_cast<uint32_t>(b.buffers.size()), b.handles};
+			WriteRecord(m_trace, kTraceBatch, &tb, sizeof(tb));
+			for (const auto& p: b.buffers) {
+				TraceBuffer t {};
+				t.batch         = b.id;
+				t.number        = p.number;
+				t.enqueue_ns    = ToNs(p.enqueued);
+				t.translated_ns = ToNs(p.translated);
+				t.gpu_issued    = slots[2 * p.slot];
+				t.gpu_done      = slots[2 * p.slot + 1];
+				t.acb           = p.acb ? 1u : 0u;
+				t.draws         = p.stats.draws;
+				t.dispatches    = p.stats.dispatches;
+				t.flips         = p.stats.marker_flip;
+				t.ib_dw         = p.ib_dw;
+				t.wait_barriers = p.stats.wait_barriers;
+				WriteRecord(m_trace, kTraceBuffer, &t, sizeof(t));
+				// GPU busy time, buffers taken in ring order: the part of [issued, done] not already covered.
+				if (t.gpu_issued != 0 && t.gpu_done >= t.gpu_issued) {
+					const uint64_t from = std::max(t.gpu_issued, m_busy_until);
+					if (t.gpu_done > from) {
+						m_busy_ticks[t.acb] += t.gpu_done - from;
+					}
+					m_busy_until = std::max(m_busy_until, t.gpu_done);
+					m_span_first = m_span_first == 0 ? t.gpu_issued : m_span_first;
+					m_span_last  = std::max(m_span_last, t.gpu_done);
+				}
+				for (const auto& it: p.items) {
+					TraceItem ti {};
+					ti.number     = p.number;
+					ti.shader     = it.shader;
+					ti.es         = it.es;
+					ti.gpu_issued = slots[2 * it.slot];
+					ti.gpu_done   = slots[2 * it.slot + 1];
+					ti.acb        = t.acb;
+					ti.index      = it.index;
+					ti.dw         = it.dw;
+					ti.op         = it.op;
+					ti.args[0]    = it.args[0];
+					ti.args[1]    = it.args[1];
+					ti.args[2]    = it.args[2];
+					WriteRecord(m_trace, kTraceItem, &ti, sizeof(ti));
+				}
+			}
+		}
+#else
+		(void)batches;
+		(void)fence;
+#endif
+	}
+
+	// Kyty's command processor ran buffer `number` from `start` to `end` (pipeline mode).
+	void ProfileThen(bool acb, uint64_t number, double start, double end) {
+		std::lock_guard<std::mutex> lock(m_trace_mutex);
+		if (m_trace != nullptr) {
+			const TraceThen t {number, ToNs(start), ToNs(end), acb ? 1u : 0u, 0};
+			WriteRecord(m_trace, kTraceThen, &t, sizeof(t));
+		}
+	}
+
+	// Every video-out flip: opens the capture window KYTY_NATIVE_GPU_CAPTURE_AT seconds after the first
+	// submission, records the flip and closes the window again.
+	void NoteFlip(uint64_t flip) {
+		if (!m_capture_ready.load(std::memory_order_acquire)) {
+			return;
+		}
+		m_flip_no.store(flip, std::memory_order_relaxed);
+		std::lock_guard<std::mutex> lock(m_trace_mutex);
+		if (!m_capture_started) {
+			if (NowSecShadow() - m_capture_t0 < m_capture_at) {
+				return;
+			}
+			m_capture_started = true;
+			m_capture_flip0   = flip;
+			StartCapture();
+		}
+		const uint64_t k = flip - m_capture_flip0;
+		if (m_dumping.load(std::memory_order_relaxed) && k >= m_dump_flips) {
+			m_dumping.store(false, std::memory_order_relaxed); // Submit closes the file
+		}
+		if (m_trace == nullptr) {
+			return;
+		}
+		const TraceFlip f {flip, ToNs(NowSecShadow())};
+		WriteRecord(m_trace, kTraceFlip, &f, sizeof(f));
+		WriteCalib();
+		std::fflush(m_trace);
+		if (m_profiling.load(std::memory_order_relaxed) && k >= m_profile_flips) {
+			m_profiling.store(false, std::memory_order_relaxed);
+		}
+		// Batches still in flight when the window closed report a little later.
+		if (k >= m_profile_flips + 30) {
+			const double span = m_span_last > m_span_first ? static_cast<double>(m_span_last - m_span_first) : 0.0;
+			const double per  = 1e3 / (m_counter_khz * 1e3) / static_cast<double>(m_profile_flips);
+			std::fprintf(stderr,
+			             "native shadow: profile of %u flips: GPU span %.2f ms/flip, busy %.2f ms/flip (dcb %.2f, acb %.2f), "
+			             "idle %.2f ms/flip; trace in %s/trace.bin\n",
+			             m_profile_flips, span * per, static_cast<double>(m_busy_ticks[0] + m_busy_ticks[1]) * per,
+			             static_cast<double>(m_busy_ticks[0]) * per, static_cast<double>(m_busy_ticks[1]) * per,
+			             (span - static_cast<double>(m_busy_ticks[0] + m_busy_ticks[1])) * per, m_capture_dir.c_str());
+			std::fclose(m_trace);
+			m_trace = nullptr;
+		}
+	}
+
+	// KYTY_NATIVE_GPU_DRAW_MARKERS: the last draw/dispatch the CP started and the last that finished.
+	void ReportMarkers(const char* why) const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (!m_markers || m_submitter == nullptr) {
+			return;
+		}
+		const volatile uint64_t* m = m_submitter->ProfileCpu() + kMarkerOffset / 8;
+		auto describe = [](uint64_t v, char* out, size_t n) {
+			const auto tag = static_cast<uint32_t>(v >> 32u);
+			std::snprintf(out, n, "%s %u item %u", (tag & 0x80000000u) != 0 ? "acb" : "frame", tag & 0x7fffffffu,
+			              static_cast<uint32_t>(v));
+		};
+		char issued[64];
+		char done[64];
+		describe(m[0], issued, sizeof(issued));
+		describe(m[1], done, sizeof(done));
+		std::fprintf(stderr, "native shadow: MARKERS (%s): last draw/dispatch started: %s; last finished: %s\n", why, issued,
+		             done);
+#else
+		(void)why;
+#endif
+	}
+
+private:
+	// The profile buffer: markers first, then the timestamp ring.
+	static constexpr uint64_t kMarkerOffset      = 0;
+	static constexpr uint64_t kProfileRingOffset = 4096;
+	static constexpr uint64_t kProfileBytes      = 8ull << 20u;
+
+	void ClearSlot(uint32_t slot) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		auto* s = const_cast<volatile uint64_t*>(m_submitter->ProfileCpu() + kProfileRingOffset / 8);
+		s[2 * slot]     = 0;
+		s[2 * slot + 1] = 0;
+#else
+		(void)slot;
+#endif
+	}
+
+	// Under m_trace_mutex.
+	void WriteCalib() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		TraceCalib c {};
+		c.cpu_before_ns = ToNs(NowSecShadow());
+		c.gpu           = m_submitter->GpuClock();
+		c.cpu_after_ns  = ToNs(NowSecShadow());
+		WriteRecord(m_trace, kTraceCalib, &c, sizeof(c));
+#endif
+	}
+
+	// Under m_trace_mutex.
+	void StartCapture() {
+		if (m_profile_flips != 0) {
+			if (!m_pipelined) {
+				std::fprintf(stderr, "native shadow: the profile needs the pipeline (KYTY_NATIVE_GPU_THREAD); no trace\n");
+			} else if (std::FILE* f = std::fopen((m_capture_dir + "/trace.bin").c_str(), "wb"); f != nullptr) {
+				m_trace = f;
+				const TraceHeader h {1, m_counter_khz, ToNs(NowSecShadow())};
+				WriteRecord(m_trace, kTraceHeader, &h, sizeof(h));
+				WriteCalib();
+				m_profiling.store(true, std::memory_order_relaxed);
+			}
+		}
+		if (m_dump_flips != 0) {
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_dump = std::fopen((m_capture_dir + "/pm4.bin").c_str(), "wb");
+			m_dumping.store(m_dump != nullptr, std::memory_order_relaxed);
+		}
+		std::fprintf(stderr, "native shadow: capture started at flip %llu: profile %u flips%s, PM4 dump %u flips, in %s\n",
+		             static_cast<unsigned long long>(m_capture_flip0), m_trace != nullptr ? m_profile_flips : 0,
+		             m_profile_items ? " with every draw/dispatch" : "", m_dump != nullptr ? m_dump_flips : 0,
+		             m_capture_dir.c_str());
+	}
+
+	// KYTY_NATIVE_GPU_PM4_DUMP_FLIPS: the guest buffer, its IB and, for the decoder's V#/T#/S# tables,
+	// guest memory that the IB's shader user data points at (two levels deep), taken now, i.e. shortly
+	// before the GPU runs it. Under m_mutex.
+	void DumpPm4(bool acb, uint64_t number, std::span<const uint32_t> guest, std::span<const uint32_t> ib) {
+		if (!m_dumping.load(std::memory_order_relaxed)) {
+			std::fclose(m_dump);
+			m_dump = nullptr;
+			std::fprintf(stderr, "native shadow: PM4 dump done (%llu buffers, %llu MiB of guest memory) in %s/pm4.bin\n",
+			             static_cast<unsigned long long>(m_dumped_buffers),
+			             static_cast<unsigned long long>(m_dumped_bytes >> 20u), m_capture_dir.c_str());
+			return;
+		}
+		m_dumped_buffers++;
+		const DumpBuffer h {number, m_flip_no.load(std::memory_order_relaxed), acb ? 1u : 0u,
+		                    static_cast<uint32_t>(guest.size()), static_cast<uint32_t>(ib.size()), 0};
+		WriteRecord(m_dump, kDumpBuffer, &h, sizeof(h), guest.data(), static_cast<uint32_t>(guest.size_bytes()), ib.data(),
+		            static_cast<uint32_t>(ib.size_bytes()));
+#if KYTY_GEM_BACKING_SUPPORTED
+		// Shader user data (SPI_SHADER_USER_DATA_*, COMPUTE_USER_DATA_*) and SET_BASE addresses.
+		auto user_data = [](uint32_t off) {
+			return (off >= 0x240u && off < 0x250u) || (off < 0x180u && (off & 0x3fu) >= 0x0Cu && (off & 0x3fu) <= 0x2Bu);
+		};
+		auto plausible = [](uint64_t a) {
+			return a >= 0x100000000ull && a < 0x100000000000ull && (a & 3u) == 0;
+		};
+		std::vector<uint64_t> level;
+		std::vector<uint32_t> sh(0x400, 0);
+		for (size_t dw = 0; dw < ib.size();) {
+			const uint32_t header = ib[dw];
+			const uint32_t size   = (header & 0x3fffff00u) == 0x3fff1000u ? 1u : ((header >> 16u) & 0x3fffu) + 2u;
+			const uint32_t op     = (header >> 8u) & 0xffu;
+			if ((header >> 30u) != 3u || dw + size > ib.size()) {
+				break;
+			}
+			if (op == 0x76 && size >= 3) { // SET_SH_REG
+				const uint32_t base = ib[dw + 1] & 0xffffu;
+				// Every pair of user-data registers around a write (a pair whose other half is written
+				// next is taken again then, with both halves current).
+				for (uint32_t i = 0; i + 2 < size; i++) {
+					const uint32_t off = base + i;
+					if (off + 1 >= sh.size() || off == 0) {
+						continue;
+					}
+					sh[off] = ib[dw + 2 + i];
+					if (user_data(off) && user_data(off - 1)) {
+						level.push_back(sh[off - 1] | (static_cast<uint64_t>(sh[off] & 0xffffu) << 32u));
+					}
+					if (user_data(off) && user_data(off + 1)) {
+						level.push_back(sh[off] | (static_cast<uint64_t>(sh[off + 1] & 0xffffu) << 32u));
+					}
+				}
+			} else if (op == 0x11 && size >= 4) { // SET_BASE
+				level.push_back(ib[dw + 2] | (static_cast<uint64_t>(ib[dw + 3] & 0xffffu) << 32u));
+			}
+			dw += size;
+		}
+		// Each buffer gets its own copies (tables are rewritten every frame), up to 1 GiB in all.
+		constexpr uint32_t    kTableBytes = 512;
+		std::vector<uint32_t> data(kTableBytes / 4);
+		std::set<uint64_t>    taken;
+		for (int depth = 0; depth < 2 && !level.empty(); depth++) {
+			std::vector<uint64_t> next;
+			for (uint64_t a: level) {
+				if (!plausible(a) || m_dumped_bytes > (1ull << 30u) || !taken.insert(a).second) {
+					continue;
+				}
+				const auto got = static_cast<uint32_t>(m_gem->ReadGuest(a, data.data(), kTableBytes));
+				if (got == 0) {
+					continue;
+				}
+				const DumpMemory mh {a, got, 0};
+				WriteRecord(m_dump, kDumpMemory, &mh, sizeof(mh), data.data(), got);
+				m_dumped_bytes += got;
+				for (uint32_t i = 0; depth == 0 && i + 1 < got / 4; i++) {
+					next.push_back(data[i] | (static_cast<uint64_t>(data[i + 1] & 0xffffu) << 32u));
+				}
+			}
+			level = std::move(next);
+		}
+#endif
+	}
+
 
 	// KYTY_NATIVE_GPU_ACB: "1" runs async compute buffers natively (and Kyty skips their dispatches),
 	// "dry" only translates them and reports what the translator lacks.
@@ -1099,6 +1558,7 @@ private:
 			std::fprintf(stderr, "native shadow: submitter init failed; staying off.\n");
 			return;
 		}
+		InitCapture();
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetComputeQueue(true);
@@ -1169,7 +1629,56 @@ private:
 #endif
 	}
 
+#if KYTY_GEM_BACKING_SUPPORTED
+	// Diagnostics for the BC-250 native path, all off by default:
+	//   KYTY_NATIVE_GPU_CAPTURE_DIR=<dir>      where the capture files go (needed by the next three)
+	//   KYTY_NATIVE_GPU_CAPTURE_AT=<seconds>   start the window this long after the first submission
+	//   KYTY_NATIVE_GPU_PROFILE_FLIPS=<n>      trace.bin: GPU timestamps of every buffer for n flips
+	//   KYTY_NATIVE_GPU_PROFILE_DRAWS=1        ... and of every draw/dispatch in them
+	//   KYTY_NATIVE_GPU_PM4_DUMP_FLIPS=<n>     pm4.bin: guest buffers, IBs and tables for n flips
+	//   KYTY_NATIVE_GPU_DRAW_MARKERS=1         progress markers, logged when a submission times out
+	void InitCapture() {
+		m_markers = EnvOn("KYTY_NATIVE_GPU_DRAW_MARKERS");
+		auto count = [](const char* name) {
+			const char* v = std::getenv(name);
+			return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+		};
+		if (const char* dir = std::getenv("KYTY_NATIVE_GPU_CAPTURE_DIR"); dir != nullptr && dir[0] != '\0') {
+			m_capture_dir   = dir;
+			m_profile_flips = count("KYTY_NATIVE_GPU_PROFILE_FLIPS");
+			m_dump_flips    = count("KYTY_NATIVE_GPU_PM4_DUMP_FLIPS");
+			m_profile_items = EnvOn("KYTY_NATIVE_GPU_PROFILE_DRAWS");
+			const char* at  = std::getenv("KYTY_NATIVE_GPU_CAPTURE_AT");
+			m_capture_at    = at != nullptr ? std::strtod(at, nullptr) : 0.0;
+		}
+		const bool capture = !m_capture_dir.empty() && (m_profile_flips != 0 || m_dump_flips != 0);
+		if (!capture && !m_markers) {
+			return;
+		}
+		if (!m_submitter->CreateProfileBuffer(kProfileBytes)) {
+			m_markers = false;
+			return;
+		}
+		m_ring.va       = m_submitter->ProfileVa() + kProfileRingOffset;
+		m_ring.capacity = static_cast<uint32_t>((kProfileBytes - kProfileRingOffset) / 16);
+		m_counter_khz   = m_submitter->CounterKhz();
+		if (m_counter_khz == 0) {
+			m_counter_khz = static_cast<uint32_t>(kGpuClockHz / 1e3);
+		}
+		m_capture_t0 = NowSecShadow();
+		std::fprintf(stderr,
+		             "native shadow: diagnostics: markers %s, capture %s (at %.0f s: profile %u flips%s, PM4 dump %u flips), "
+		             "GPU clock %u kHz\n",
+		             m_markers ? "on" : "off", capture ? m_capture_dir.c_str() : "off", m_capture_at, m_profile_flips,
+		             m_profile_items ? " + draws" : "", m_dump_flips, m_counter_khz);
+		m_capture_ready.store(capture, std::memory_order_release);
+	}
+#else
+	void InitCapture() {}
+#endif
+
 	void Disable(const char* reason) {
+		ReportMarkers(reason);
 		m_disabled = true;
 		m_active.store(false, std::memory_order_release);
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -1229,6 +1738,36 @@ private:
 			}
 		}
 	}
+
+	// Capture and markers (InitCapture). m_trace and the busy counters are guarded by m_trace_mutex,
+	// m_dump and the dump counters by m_mutex.
+	std::string           m_capture_dir;
+	double                m_capture_at      = 0.0;
+	double                m_capture_t0      = 0.0;
+	uint32_t              m_profile_flips   = 0;
+	uint32_t              m_dump_flips      = 0;
+	bool                  m_profile_items   = false;
+	bool                  m_markers         = false;
+	uint32_t              m_counter_khz     = 0;
+	std::atomic<bool>     m_capture_ready {false};
+	std::atomic<bool>     m_profiling {false};
+	std::atomic<bool>     m_dumping {false};
+	std::atomic<uint64_t> m_flip_no {0};
+	bool                  m_capture_started = false;
+	uint64_t              m_capture_flip0   = 0;
+	ProfileRing           m_ring;
+	std::vector<BufferProfile> m_pending_buffers; // in the batch being built
+	std::vector<BatchProfile>  m_pending_batches; // submitted, not yet taken by the pipeline
+	uint64_t              m_batch_ids       = 0;
+	std::mutex            m_trace_mutex;
+	std::FILE*            m_trace           = nullptr;
+	uint64_t              m_busy_ticks[2]   = {}; // dcb, acb
+	uint64_t              m_busy_until      = 0;
+	uint64_t              m_span_first      = 0;
+	uint64_t              m_span_last       = 0;
+	std::FILE*            m_dump            = nullptr;
+	uint64_t              m_dumped_buffers  = 0;
+	uint64_t              m_dumped_bytes    = 0;
 
 	std::mutex    m_mutex;
 	bool          m_initialized = false;
@@ -1360,6 +1899,9 @@ private:
 		double                submitted; // when the batch went to the GPU
 		double                enqueued;
 		double                picked;    // when the worker took it
+		bool                  acb    = false;
+		uint64_t              number = ~0ull; // the shadow's frame / acb number, ~0 when not translated
+		std::vector<BatchProfile> profile;    // the profiled batches of this round (first job only)
 	};
 
 	Pipeline() {
@@ -1378,18 +1920,25 @@ private:
 				m_cv.wait(lock, [this] { return !m_jobs.empty(); });
 				jobs.swap(m_jobs);
 			}
-			const double picked = NowSecShadow();
-			for (auto& job: jobs) {
-				if (job.buffer != nullptr) { // nullptr: only keeps `then` in order
-					Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.acb);
+			const double          picked = NowSecShadow();
+			std::vector<uint64_t> numbers(jobs.size(), ~0ull);
+			for (size_t i = 0; i < jobs.size(); i++) {
+				if (jobs[i].buffer != nullptr) { // nullptr: only keeps `then` in order
+					Shadow::Instance().Submit(std::span<const uint32_t>(jobs[i].buffer, jobs[i].size_dw), jobs[i].acb,
+					                          jobs[i].enqueued, &numbers[i]);
 				}
 			}
 			Shadow::Instance().FlushBatch();
-			const uint64_t seq = Shadow::Instance().TakeLastSeq();
-			const double   now = NowSecShadow();
+			const uint64_t seq     = Shadow::Instance().TakeLastSeq();
+			auto           profile = Shadow::Instance().TakeBatchProfiles();
+			const double   now     = NowSecShadow();
 			std::lock_guard<std::mutex> lock(m_done_mutex);
-			for (auto& job: jobs) {
-				m_done.push_back(Done {seq, std::move(job.then), now, job.enqueued, picked});
+			for (size_t i = 0; i < jobs.size(); i++) {
+				Done d {seq, std::move(jobs[i].then), now, jobs[i].enqueued, picked, jobs[i].acb, numbers[i], {}};
+				if (i == 0) {
+					d.profile = std::move(profile);
+				}
+				m_done.push_back(std::move(d));
 			}
 			m_done_cv.notify_one();
 		}
@@ -1413,9 +1962,15 @@ private:
 				m_last_end   = end;
 				m_waited_seq = done.seq;
 			}
+			if (!done.profile.empty()) {
+				Shadow::Instance().ProfileBatches(done.profile, m_last_end);
+			}
 			const double then_start = NowSecShadow();
 			done.then();
 			const double then_end = NowSecShadow();
+			if (done.number != ~0ull) {
+				Shadow::Instance().ProfileThen(done.acb, done.number, then_start, then_end);
+			}
 			Shadow::Instance().AddChain(done.picked - done.enqueued, then_end - done.enqueued, then_end - then_start);
 		}
 	}
@@ -1614,6 +2169,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
                   const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
+	Shadow::Instance().NoteFlip(n);
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
 	}

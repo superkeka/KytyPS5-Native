@@ -195,7 +195,36 @@ bool WriteDataToMemory(uint32_t control) {
 	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
 }
 
+constexpr uint32_t IT_COPY_DATA           = 0x40;
+constexpr uint32_t kBottomOfPipeTs        = 0x28; // VGT_EVENT_TYPE BOTTOM_OF_PIPE_TS
+constexpr uint32_t kReleaseMemData64      = 2u;   // RELEASE_MEM DATA_SEL: 64-bit data
+constexpr uint32_t kReleaseMemGpuClock    = 3u;   // RELEASE_MEM DATA_SEL: 64-bit GPU clock
+
+void EmitEop64(std::vector<uint32_t>& ib, uint64_t va, uint32_t data_sel, uint64_t data) {
+	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+	ib.push_back(kBottomOfPipeTs | (5u << 8u)); // EVENT_INDEX 5: end of pipe
+	ib.push_back(data_sel << 29u);              // DST_SEL 0 memory, INT_SEL 0
+	ib.push_back(static_cast<uint32_t>(va));
+	ib.push_back(static_cast<uint32_t>(va >> 32u));
+	ib.push_back(static_cast<uint32_t>(data));
+	ib.push_back(static_cast<uint32_t>(data >> 32u));
+	ib.push_back(0u);
+}
+
 } // namespace
+
+void EmitGpuClockCopy(std::vector<uint32_t>& ib, uint64_t va) {
+	ib.push_back(Pkt3(IT_COPY_DATA, 5, false));
+	ib.push_back(9u | (5u << 8u) | (1u << 16u) | (1u << 20u)); // SRC GPU clock, DST memory, 64-bit, confirm
+	ib.push_back(0);
+	ib.push_back(0);
+	ib.push_back(static_cast<uint32_t>(va));
+	ib.push_back(static_cast<uint32_t>(va >> 32u));
+}
+
+void EmitGpuClockEop(std::vector<uint32_t>& ib, uint64_t va) {
+	EmitEop64(ib, va, kReleaseMemGpuClock, 0);
+}
 
 uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
 	// CB_COLORn_INFO.DCC_ENABLE (bit 28) off, for the no-DCC experiment.
@@ -686,6 +715,49 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 
+	// Diagnostics around each draw/dispatch packet that goes into the IB (SetProfile, SetDrawMarkers).
+	uint32_t items     = 0;
+	uint32_t item_slot = 0;
+	auto item_begin = [&](uint32_t op, uint32_t at_dw, uint32_t a0, uint32_t a1, uint32_t a2) {
+		const uint64_t marker = (static_cast<uint64_t>(m_marker_tag) << 32u) | items;
+		if (m_marker_va != 0) {
+			body.push_back(Pkt3(IT_WRITE_DATA, 5, false));
+			body.push_back((5u << 8u) | (1u << 20u)); // DST_SEL memory, WR_CONFIRM, ENGINE ME
+			body.push_back(static_cast<uint32_t>(m_marker_va));
+			body.push_back(static_cast<uint32_t>(m_marker_va >> 32u));
+			body.push_back(static_cast<uint32_t>(marker));
+			body.push_back(static_cast<uint32_t>(marker >> 32u));
+		}
+		if (m_profile != nullptr) {
+			const bool dispatch = op == IT_DISPATCH_DIRECT || op == IT_DISPATCH_INDIRECT;
+			auto       pgm      = [&](uint32_t lo_off) {
+				return (static_cast<uint64_t>(reg(sh, lo_off)) << 8u) | (static_cast<uint64_t>(reg(sh, lo_off + 1)) << 40u);
+			};
+			ProfiledItem it;
+			it.slot    = m_profile->Take();
+			it.index   = items;
+			it.dw      = at_dw;
+			it.op      = op;
+			it.shader  = dispatch ? pgm(0x20C) : pgm(0x008);
+			it.es      = dispatch ? 0 : pgm(0x0C8);
+			it.args[0] = a0;
+			it.args[1] = a1;
+			it.args[2] = a2;
+			item_slot  = it.slot;
+			r.profiled.push_back(it);
+			EmitGpuClockCopy(body, m_profile->SlotVa(it.slot));
+		}
+	};
+	auto item_end = [&]() {
+		if (m_profile != nullptr) {
+			EmitGpuClockEop(body, m_profile->SlotVa(item_slot) + 8);
+		}
+		if (m_marker_va != 0) {
+			EmitEop64(body, m_marker_va + 8, kReleaseMemData64, (static_cast<uint64_t>(m_marker_tag) << 32u) | items);
+		}
+		items++;
+	};
+
 	auto fail = [&](uint32_t op, uint32_t dw) {
 		r.ok         = false;
 		r.unknown_op = op;
@@ -998,7 +1070,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
+					item_begin(op, dw, body_count >= 4 ? bptr[3] : 0u, 0, 0);
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					item_end();
 				}
 				stats.draws++;
 				collect_refs();
@@ -1036,12 +1110,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint32_t index_type  = reg(uc, 0x243u) & 0x3u; // VGT_INDEX_TYPE: 0 16-bit, 1 32-bit, 2 8-bit
 					const uint64_t index_bytes = index_type == 1u ? 4u : (index_type == 2u ? 1u : 2u);
 					const uint64_t addr        = index_base + static_cast<uint64_t>(bptr[1]) * index_bytes;
+					item_begin(op, dw, bptr[2], 0, 0);
 					body.push_back(Pkt3(IT_DRAW_INDEX_2, 5, false));
 					body.push_back(bptr[0]);
 					body.push_back(static_cast<uint32_t>(addr));
 					body.push_back(static_cast<uint32_t>(addr >> 32u));
 					body.push_back(bptr[2]);
 					body.push_back(bptr[3]);
+					item_end();
 				}
 				stats.draws++;
 				collect_refs();
@@ -1053,8 +1129,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
+					item_begin(op, dw, body_count >= 1 ? bptr[0] : 0u, 0, 0);
 					pfp_sync_me();
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					item_end();
 				}
 				stats.draws++;
 				collect_refs();
@@ -1078,7 +1156,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
+					item_begin(op, dw, body_count >= 1 ? bptr[0] : 0u, 0, 0);
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					item_end();
 				}
 				stats.draws++;
 				collect_refs();
@@ -1093,14 +1173,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
+				if (m_compute_queue && body_count < 3) {
+					return fail(op, dw);
+				}
+				item_begin(op, dw, 0, 0, 0);
 				pfp_sync_me();
 				if (m_compute_queue) {
 					// A compute-queue buffer carries the argument address itself (ADDR_LO, ADDR_HI,
 					// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,
 					// so set the base to that address and dispatch at offset 0, as RADV does.
-					if (body_count < 3) {
-						return fail(op, dw);
-					}
 					const uint64_t args = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
 					body.push_back(Pkt3(IT_SET_BASE, 3, true));
 					body.push_back(1u); // BASE_INDEX: DISPATCH_INDIRECT / DRAW_INDIRECT base
@@ -1113,6 +1194,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				} else {
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				}
+				item_end();
 				stats.dispatches++;
 				collect_refs();
 				break;
@@ -1125,7 +1207,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.num_instances++;
 				break;
 			case IT_DISPATCH_DIRECT:
+				item_begin(op, dw, body_count >= 1 ? bptr[0] : 0u, body_count >= 2 ? bptr[1] : 0u, body_count >= 3 ? bptr[2] : 0u);
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				item_end();
 				stats.dispatches++;
 				collect_refs();
 				break;
