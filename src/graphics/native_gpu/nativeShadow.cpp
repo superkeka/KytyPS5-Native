@@ -1506,8 +1506,12 @@ private:
 		if (const char* acb = std::getenv("KYTY_NATIVE_GPU_ACB"); acb == nullptr ? EnvOn("KYTY_NATIVE_GPU_PRIMARY")
 		                                                                       : (acb[0] != '\0' && acb[0] != '0')) {
 			m_acb_mode = acb != nullptr && std::strcmp(acb, "dry") == 0 ? AcbMode::Dry : AcbMode::On;
+			const char* where = "run natively on the gfx ring";
+			if (m_acb_mode != AcbMode::Dry && EnvOn("KYTY_NATIVE_GPU_ACB_RINGS")) {
+				where = "run natively, on compute rings when native labels are on";
+			}
 			std::fprintf(stderr, "native shadow: async compute buffers %s\n",
-			             m_acb_mode == AcbMode::Dry ? "translated only (dry run)" : "run natively on the gfx ring");
+			             m_acb_mode == AcbMode::Dry ? "translated only (dry run)" : where);
 		}
 		if (const char* depth = std::getenv("KYTY_NATIVE_GPU_DEPTH"); depth != nullptr) {
 			const bool hiz_off  = std::strcmp(depth, "hiz_off") == 0;
