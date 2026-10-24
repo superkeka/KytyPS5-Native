@@ -156,6 +156,7 @@ struct Pm4TranslateStats {
 	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
 	uint32_t labels_native     = 0; // native labels: WRITE_DATA / RELEASE_MEM label writes run on the GPU
 	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU
+	uint32_t timestamps        = 0; // native labels: of those, timestamps (the reference clock)
 	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
 	uint32_t waits_native      = 0; // native labels: guest waits passed through (an earlier GPU write satisfies them)
 	uint32_t waits_split       = 0; // native labels: guest waits the IB is cut at (no known writer yet)
