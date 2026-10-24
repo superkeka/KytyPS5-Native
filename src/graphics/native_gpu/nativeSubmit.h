@@ -24,7 +24,7 @@ public:
 	// the extended-memory aperture is at 0x80000000000; the device's low VA range reaches
 	// 0x800000000000, so this sits clear of both).
 	static constexpr uint64_t kIbVa      = 0x400000000000ull;
-	static constexpr uint64_t kIbSize    = 2ull * 1024 * 1024;
+	static constexpr uint64_t kIbSize    = 8ull * 1024 * 1024; // 4 slots of ~2 MiB in async mode
 	static constexpr uint32_t kSlots     = 4;
 	// The last bytes of the IB buffer are a scratch area the IB itself may write into (pipeline
 	// statistics samples); IBs must stay below it.
