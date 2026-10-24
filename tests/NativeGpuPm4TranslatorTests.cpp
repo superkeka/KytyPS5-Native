@@ -13,7 +13,11 @@ using Libs::Graphics::NativeGpu::Pm4Segment;
 using Libs::Graphics::NativeGpu::TrackerPoint;
 using Libs::Graphics::NativeGpu::WaitCond;
 using Libs::Graphics::NativeGpu::Pm4TranslateResult;
+using Libs::Graphics::NativeGpu::ComputeRingForQueue;
+using Libs::Graphics::NativeGpu::NativeIbKind;
+using Libs::Graphics::NativeGpu::PlanRingWait;
 using Libs::Graphics::NativeGpu::Pm4Translator;
+using Libs::Graphics::NativeGpu::RingWaitRelease;
 
 namespace {
 
@@ -1090,6 +1094,87 @@ void TestValidateNativeIb() {
 	Check(ValidateNativeIb(gds, false), "a GDS release as always run passes");
 }
 
+void TestComputeRingPackets() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetComputeQueue(true);
+	t.SetComputeRing(true);
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	o.plan = LabelOracle::Plan::Native;
+	static uint32_t label = 0;
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	std::vector<uint32_t> acb;
+	Append(acb, IT_SET_SH_REG, {0x240u, 0x11u}, true);
+	Append(acb, 0x16u /* IT_DISPATCH_INDIRECT */, {0x074063c0u, 0x5u, 0x41u}, true);
+	Append(acb, IT_WRITE_DATA, {5u << 8u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u}, true);
+	AppendWait(acb, addr, 1);
+	auto r = t.Translate(acb);
+	Check(r.ok && r.stats.dispatches == 1, "compute-ring ACB translated");
+	const auto pkts = Decode(r.ib);
+	Check(FindFirst(pkts, IT_CONTEXT_CONTROL) == nullptr && FindFirst(pkts, IT_CLEAR_STATE) == nullptr,
+	      "a compute ring gets no graphics preamble");
+	Check(FindFirst(pkts, 0x42u) == nullptr, "no PFP_SYNC_ME on a compute ring");
+	Check(FindFirst(pkts, 0x11u) == nullptr, "DISPATCH_INDIRECT is not rewritten through SET_BASE");
+	const Packet* disp = FindFirst(pkts, 0x16u);
+	Check(disp != nullptr && disp->compute && disp->body.size() == 3 && disp->body[0] == 0x074063c0u && disp->body[1] == 0x5u &&
+	          disp->body[2] == 0x41u,
+	      "the guest DISPATCH_INDIRECT is kept, with the compute shader bit");
+	const Packet* sh = nullptr;
+	for (const auto& p: pkts) {
+		if (p.op == IT_SET_SH_REG && p.body.size() >= 2 && p.body[0] == 0x240u) {
+			sh = &p;
+		}
+	}
+	Check(sh != nullptr && sh->compute && sh->body[1] == 0x11u, "compute SH state is replayed with the shader bit");
+	bool release_cs = false;
+	bool wait_cs    = false;
+	for (const auto& p: pkts) {
+		release_cs = release_cs || (p.op == 0x49u && p.compute && p.body[0] == kFlushEvent);
+		wait_cs    = wait_cs || (p.op == 0x3Cu && p.compute && p.body[1] == static_cast<uint32_t>(addr));
+	}
+	Check(release_cs && wait_cs && r.stats.waits_native == 1, "label release and the guest wait use the compute shader bit");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "the IB passes the compute-ring check");
+	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a compute-bit release is not a gfx-ring packet");
+
+	std::vector<uint32_t> draw;
+	Append(draw, IT_DRAW_INDEX_2, {3u, 0x40000000u, 0x2u, 3u, 0u}, false);
+	Check(!t.Translate(draw).ok, "a draw in a compute-ring buffer is refused");
+}
+
+void TestPlanRingWait() {
+	// No pending write, label already in memory: a barrier. The GPU is not left waiting for a writer
+	// that no submitted buffer will produce.
+	Check(PlanRingWait(0, false, false, false, false, true, true) == RingWaitRelease::Barrier,
+	      "a label already in memory is a barrier");
+	Check(PlanRingWait(0, false, false, false, false, false, true) == RingWaitRelease::Hold,
+	      "nothing known about the label: hold the segment on the CPU");
+	// Same ring: the writer is already ahead in the batch, so the wait may go to the GPU before the CS.
+	Check(PlanRingWait(1, true, true, true, false, false, true) == RingWaitRelease::GpuWait,
+	      "same ring, writer ahead: real GPU wait");
+	// Other ring: only after that writer's ioctl has returned.
+	Check(PlanRingWait(1, true, true, false, false, false, true) == RingWaitRelease::Hold,
+	      "other ring, writer not submitted yet: hold");
+	Check(PlanRingWait(1, true, true, false, true, false, true) == RingWaitRelease::GpuWait,
+	      "other ring, writer submitted: real GPU wait");
+	// A pending write owns the address. Memory matching now is not enough: that write lands later.
+	Check(PlanRingWait(1, false, true, false, true, true, true) == RingWaitRelease::Hold,
+	      "a pending write that does not satisfy keeps the segment held");
+	Check(PlanRingWait(2, false, true, true, true, true, true) == RingWaitRelease::Hold,
+	      "a pending write of unknown value keeps the segment held");
+	Check(PlanRingWait(1, true, true, false, true, false, false) == RingWaitRelease::Hold,
+	      "no native wait form: do not tell the GPU to wait");
+}
+
+void TestComputeRingForQueue() {
+	Check(ComputeRingForQueue(0x20, 0x5u) == 0u && ComputeRingForQueue(0x21, 0x5u) == 2u &&
+	          ComputeRingForQueue(0x22, 0x5u) == 0u,
+	      "guest queues spread across the rings the kernel exposes");
+	Check(ComputeRingForQueue(0x27, 0x1u) == 0u, "one compute ring: every queue shares it");
+	Check(ComputeRingForQueue(0x20, 0u) == 0u, "no compute ring reported: ring 0");
+}
+
 int main() {
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
@@ -1124,6 +1209,9 @@ int main() {
 	TestLabelWriteCovers();
 	TestLabelsWait64();
 	TestValidateNativeIb();
+	TestComputeRingPackets();
+	TestPlanRingWait();
+	TestComputeRingForQueue();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

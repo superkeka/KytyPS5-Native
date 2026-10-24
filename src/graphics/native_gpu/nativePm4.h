@@ -297,11 +297,35 @@ struct Pm4Segment {
 // Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
 void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len);
 
+// Which ring an IB is about to be submitted to. Compute allows the same RELEASE_MEM / WAIT_REG_MEM
+// bodies as the gfx ring, with the shader-type bit set, and rejects graphics-only packets (a draw or
+// PFP_SYNC_ME on MEC is an illegal opcode).
+enum class NativeIbKind { Gfx, Compute };
+
 // The native-labels packet check: true when every packet of `ib` is one the translator has run on the
 // board before (in particular RELEASE_MEM and WAIT_REG_MEM only in the barrier's forms, NOPs only as
 // fillers, GET_LOD_STATS only with `lod_stats`), so an "Illegal opcode in command stream" cannot come
 // from a form never tried. On failure `bad_dw` is the offending packet.
-bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw = nullptr);
+bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw = nullptr,
+                      NativeIbKind kind = NativeIbKind::Gfx);
+
+// How a held guest wait may leave the CPU (KYTY_NATIVE_GPU_ACB_RINGS). The GPU is only given the
+// wait once a writer that satisfies it is guaranteed to run:
+//   same ring — the write is already ahead in that ring's batch, so the waiter is appended behind it;
+//   another ring — only after that writer's CS ioctl has returned, so a compute ring cannot block on
+// a label the gfx ring has not been asked to write (and the other way around).
+// Until then the segment stays on the CPU (Hold). A label already in memory, and no pending write
+// that will replace it, is a barrier: a wait whose writer will never be submitted does not block the
+// GPU. `cover` is LabelWrite::Covers (0 unrelated, 1 known value, 2 touched but unknown).
+enum class RingWaitRelease { Hold, GpuWait, Barrier };
+
+RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
+                             bool label_in_memory, bool native_wait);
+
+// Guest compute queues are 0x20 + n (7 pipes x 8 queues). `available_rings` is the
+// AMDGPU_INFO_HW_IP_INFO bitmask. Returns one of its set bits; queues spread across the rings the
+// kernel exposes. No bit set: 0.
+uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings);
 
 // What the backend knows about labels beyond the buffer being translated.
 class LabelOracle {
@@ -425,6 +449,10 @@ public:
 	// The buffers come from a compute queue (ACBs), whose packets differ from the gfx ring's
 	// (DISPATCH_INDIRECT carries its argument address); they are rewritten for the gfx ring.
 	void SetComputeQueue(bool compute_queue) { m_compute_queue = compute_queue; }
+	// Submit those buffers to an amdgpu compute ring (MEC) instead of rewriting them for the gfx
+	// ring: the guest DISPATCH_INDIRECT is kept, and RELEASE_MEM / WAIT_REG_MEM carry the compute
+	// shader bit. Graphics-only packets are refused.
+	void SetComputeRing(bool compute_ring) { m_compute_ring = compute_ring; }
 
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
@@ -487,6 +515,7 @@ private:
 	bool                         m_no_cmask_clear = false;
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
+	bool                         m_compute_ring   = false;
 	uint64_t                     m_fence_va       = 0;
 	LabelOracle*                 m_labels         = nullptr;
 	uint64_t                     m_tracker_va     = 0;

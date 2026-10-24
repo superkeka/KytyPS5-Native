@@ -210,8 +210,8 @@ constexpr uint32_t kWaitEqualMemMe = 3u | (1u << 4u);
 constexpr uint32_t kWaitPoll       = 4u;
 constexpr uint32_t kFiller         = 0xffff1000u; // the one-dword NOP IBs are padded with
 
-void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value) {
-	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value, bool compute) {
+	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, compute));
 	ib.push_back(kFlushEventCntl);
 	ib.push_back(kData32Cntl);
 	ib.push_back(static_cast<uint32_t>(addr));
@@ -221,8 +221,8 @@ void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value) {
 	ib.push_back(0u);
 }
 
-void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint32_t mask) {
-	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
+void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint32_t mask, bool compute) {
+	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, compute));
 	ib.push_back(kWaitEqualMemMe);
 	ib.push_back(static_cast<uint32_t>(addr));
 	ib.push_back(static_cast<uint32_t>(addr >> 32u));
@@ -234,12 +234,13 @@ void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint3
 // Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
 // on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
 // the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
-bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w) {
+bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) {
 	if (w.function != 3 || (w.wide && ((w.mask >> 32u) != 0 || (w.ref >> 32u) != 0))) {
 		return false;
 	}
-	EmitWaitEqual(ib, w.addr, static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.mask));
-	if (w.pfp) {
+	EmitWaitEqual(ib, w.addr, static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.mask), compute);
+	// MEC has no prefetch parser. PFP_SYNC_ME there is an illegal opcode; the ME wait is the whole sync.
+	if (w.pfp && !compute) {
 		ib.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
 		ib.push_back(0);
 	}
@@ -305,7 +306,8 @@ void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
 	}
 }
 
-bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw) {
+bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind) {
+	const bool compute = kind == NativeIbKind::Compute;
 	uint32_t dw = 0;
 	auto     bad = [&]() {
 		if (bad_dw != nullptr) {
@@ -331,8 +333,8 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				break;
 			case IT_RELEASE_MEM:
 				// The barrier's form (any address and data), or a GDS release as the translator has always
-				// run it: DATA_SEL 5, no interrupt.
-				if (header != Pkt3(IT_RELEASE_MEM, 7, false) ||
+				// run it: DATA_SEL 5, no interrupt. Compute rings use the same bodies with the shader bit.
+				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) ||
 				    !((b[0] == kFlushEventCntl && b[1] == kData32Cntl) ||
 				      (((b[1] >> 29u) & 0x7u) == 5u && ((b[1] >> 24u) & 0x7u) == 0u)) ||
 				    b[6] != 0u) {
@@ -340,21 +342,30 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				}
 				break;
 			case IT_WAIT_REG_MEM:
-				if (header != Pkt3(IT_WAIT_REG_MEM, 6, false) || b[0] != kWaitEqualMemMe || b[5] != kWaitPoll) {
+				if (header != Pkt3(IT_WAIT_REG_MEM, 6, compute) || b[0] != kWaitEqualMemMe || b[5] != kWaitPoll) {
 					return bad();
 				}
 				break;
 			case IT_GET_LOD_STATS:
-				if (!lod_stats) {
+				if (compute || !lod_stats) {
 					return bad();
 				}
 				break;
-			// What the translator has always passed through or built.
+			// Packets both rings run. On MEC the shader-type bit is set.
 			case IT_SET_BASE:
-			case IT_CLEAR_STATE:
-			case IT_INDEX_BUFFER_SIZE:
 			case IT_DISPATCH_DIRECT:
 			case IT_DISPATCH_INDIRECT:
+			case IT_EVENT_WRITE:
+			case IT_DMA_DATA:
+			case IT_ACQUIRE_MEM:
+			case IT_SET_SH_REG:
+				if (compute && (header & 2u) == 0) {
+					return bad();
+				}
+				break;
+			// Graphics-only. An illegal opcode on a compute ring.
+			case IT_CLEAR_STATE:
+			case IT_INDEX_BUFFER_SIZE:
 			case IT_DRAW_INDIRECT:
 			case IT_DRAW_INDEX_INDIRECT:
 			case IT_INDEX_BASE:
@@ -363,18 +374,48 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			case IT_DRAW_INDEX_AUTO:
 			case IT_NUM_INSTANCES:
 			case IT_PFP_SYNC_ME:
-			case IT_EVENT_WRITE:
-			case IT_DMA_DATA:
-			case IT_ACQUIRE_MEM:
 			case IT_SET_CONTEXT_REG:
-			case IT_SET_SH_REG:
 			case IT_SET_UCONFIG_REG:
-			case IT_SET_UCONFIG_REG_INDEX: break;
+			case IT_SET_UCONFIG_REG_INDEX:
+				if (compute) {
+					return bad();
+				}
+				break;
 			default: return bad();
 		}
 		dw += size;
 	}
 	return true;
+}
+
+RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
+                             bool label_in_memory, bool native_wait) {
+	if (cover != 0) {
+		// A write already emitted still owns the address. Matching memory is stale until it lands,
+		// and an unknown value cannot be proved to satisfy the wait, so the segment stays held.
+		const bool gpu_wait = cover == 1 && value_satisfies && gpu_write && native_wait &&
+		                      (same_ring || writer_submitted);
+		return gpu_wait ? RingWaitRelease::GpuWait : RingWaitRelease::Hold;
+	}
+	if (label_in_memory) {
+		return RingWaitRelease::Barrier;
+	}
+	return RingWaitRelease::Hold;
+}
+
+uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings) {
+	uint32_t rings[32];
+	uint32_t n = 0;
+	for (uint32_t bit = 0; bit < 32; bit++) {
+		if ((available_rings & (1u << bit)) != 0) {
+			rings[n++] = bit;
+		}
+	}
+	if (n == 0) {
+		return 0;
+	}
+	const uint32_t index = guest_queue >= 0x20u ? guest_queue - 0x20u : guest_queue;
+	return rings[index % n];
 }
 
 uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
@@ -474,6 +515,15 @@ void Pm4Translator::ResetShadow() {
 
 void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx,
                                  const RegFile& sh, const RegFile& uc) const {
+	if (m_compute_ring) {
+		// MEC has no graphics context. CONTEXT_CONTROL, CLEAR_STATE, context and UCONFIG writes are
+		// illegal opcodes on a compute ring. SH state is replayed: other jobs share the ring.
+		for (const auto& [offset, value]: sh) {
+			EmitSet(ib, IT_SET_SH_REG, offset, value, true);
+			stats.preamble_sh++;
+		}
+		return;
+	}
 	// RADV-style preamble: take back context ownership, clear to defaults, then replay the whole
 	// shadowed state. Other processes share the gfx ring between our submissions, so nothing from
 	// the previous DCB is assumed to survive on the hardware.
@@ -868,7 +918,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// WRITE_DATA). On the gfx ring the PFP fetches them ahead of the ME that performs those writes,
 	// which a compute queue (one engine) never does: sync the PFP to the ME first, as RADV does.
 	auto pfp_sync_me = [&]() {
-		if (m_pfp_sync_indirect) {
+		// A compute ring has one engine; the PFP race this closes exists only on the gfx ring, and
+		// PFP_SYNC_ME is illegal on MEC.
+		if (m_pfp_sync_indirect && !m_compute_ring) {
 			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
 			body.push_back(0);
 			stats.pfp_syncs_emitted++;
@@ -883,7 +935,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	auto emit_barrier = [&](bool pfp) {
 		if (m_fence_va != 0) {
 			const uint32_t seq = ++m_fence_seq;
-			body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+			body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
 			// EVENT_TYPE CACHE_FLUSH_AND_INV_TS_EVENT (0x14), EVENT_INDEX 5 (end of pipe), GCR_CNTL:
 			// GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB.
 			body.push_back(0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
@@ -894,7 +946,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			body.push_back(seq);
 			body.push_back(0u);
 			body.push_back(0u);
-			body.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
+			body.push_back(Pkt3(IT_WAIT_REG_MEM, 6, m_compute_ring));
 			body.push_back(3u | (1u << 4u)); // function EQUAL, memory space, ME engine
 			body.push_back(static_cast<uint32_t>(m_fence_va));
 			body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
@@ -903,7 +955,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			body.push_back(4u); // poll interval
 			stats.wait_barriers++;
 		}
-		if (pfp) {
+		if (pfp && !m_compute_ring) {
 			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u)); // PKT3 PFP_SYNC_ME, one body dword
 			body.push_back(0);
 			stats.pfp_syncs_emitted++;
@@ -935,7 +987,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			p.dw = segs.back().points.back().dw;
 		} else {
 			p.dw = static_cast<uint32_t>(body.size()) + 5u;
-			EmitRelease32(body, m_tracker_va, 0u);
+			EmitRelease32(body, m_tracker_va, 0u, m_compute_ring);
 			last_tracker_end = body.size();
 		}
 		for (auto& ts: pending_timestamps) {
@@ -980,7 +1032,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		s.wait_dw     = static_cast<uint32_t>(body.size());
 		// No native form (not EQUAL, or a 64-bit wait on both halves): only seeing the label in memory
 		// releases it.
-		s.wait_len  = EmitNativeWait(body, w) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
+		s.wait_len  = EmitNativeWait(body, w, m_compute_ring) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
 		seg_effects = true;
 		stats.waits_split++;
 	};
@@ -1014,6 +1066,36 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			stats.packets_skipped++;
 			dw += size;
 			continue;
+		}
+		if (m_compute_ring) {
+			// MEC has no graphics engine. These opcodes hang a compute ring ("Illegal opcode").
+			switch (op) {
+				case IT_DRAW_INDIRECT:
+				case IT_DRAW_INDEX_INDIRECT:
+				case IT_DRAW_INDEX_2:
+				case IT_DRAW_INDEX_OFFSET_2:
+				case IT_DRAW_INDEX_AUTO:
+				case IT_INDEX_BASE:
+				case IT_INDEX_BUFFER_SIZE:
+				case IT_CONTEXT_CONTROL:
+				case IT_CLEAR_STATE:
+				case IT_NUM_INSTANCES:
+				case IT_PFP_SYNC_ME:
+				case IT_SET_CONTEXT_REG:
+				case IT_SET_CONTEXT_REG_INDIRECT:
+				case IT_SET_UCONFIG_REG:
+				case IT_SET_UCONFIG_REG_INDEX:
+				case IT_SET_UCONFIG_REG_INDIRECT:
+				case IT_GET_LOD_STATS:
+					if (r.unknown_ops.empty()) {
+						r.unknown_op = op;
+						r.unknown_dw = dw;
+					}
+					r.unknown_ops.insert(op);
+					dw += size;
+					continue;
+				default: break;
+			}
 		}
 		switch (op) {
 			case IT_NOP: {
@@ -1080,19 +1162,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// flush) follows anyway.
 					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
 					if (sel == 1) {
-						EmitRelease32(body, dst, bptr[4]);
+						EmitRelease32(body, dst, bptr[4], m_compute_ring);
 					} else if (sel == 2) {
-						EmitRelease32(body, dst + 4, bptr[5]);
-						EmitRelease32(body, dst, bptr[4]);
+						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring);
+						EmitRelease32(body, dst, bptr[4], m_compute_ring);
 					} else if (sel == 5) {
-						body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
 						body.push_back(bptr[0]);
 						body.push_back(bptr[1] & ~(0x7u << 24u)); // INT_SEL 0
 						for (uint32_t i = 2; i < 7; i++) {
 							body.push_back(i == 6 ? 0u : bptr[i]);
 						}
 					} else if (!interrupt && !cpu_point && ((bptr[0] >> 12u) & 0x1fffu) != 0) {
-						EmitRelease32(body, m_tracker_va + 8, 0u);
+						EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring);
 					}
 					seg_effects = true;
 					if (sel != 0) {
@@ -1125,7 +1207,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// would copy its own, never written, GDS buffer instead. Without the interrupt, which
 					// Kyty still raises.
 					if (body_count >= 7 && ((bptr[1] >> 29u) & 0x7u) == 5u && m_gds) {
-						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_queue));
+						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
 						body.push_back(bptr[0]);
 						body.push_back(bptr[1] & ~(0x7u << 24u)); // INT_SEL 0
 						for (uint32_t i = 2; i < 7; i++) {
@@ -1170,6 +1252,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				stats.set_sh++;
 				break;
 			}
@@ -1324,7 +1409,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (plan == LabelOracle::Plan::Native && !m_native_waits) {
 						plan = LabelOracle::Plan::Met;
 					}
-					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, w)) {
+					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, w, m_compute_ring)) {
 						plan = LabelOracle::Plan::Split;
 					}
 					switch (plan) {
@@ -1365,10 +1450,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint32_t src_sel = (bptr[0] >> 29u) & 0x3u;
 					const uint32_t dst_sel = (bptr[0] >> 20u) & 0x3u;
 					if (m_gds_dma_sync && src_sel == 1u) {
-						body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // CS_PARTIAL_FLUSH (event 7, index 4)
+						body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u) | (m_compute_ring ? 2u : 0u)); // CS_PARTIAL_FLUSH
 						body.push_back((4u << 8u) | 7u);
 					}
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (m_compute_ring) {
+						body[body.size() - size] |= 2u;
+					}
 					if (m_gds_dma_sync && (src_sel == 1u || dst_sel == 1u)) {
 						body[body.size() - size + 1] |= 1u << 31u; // CP_SYNC
 						stats.gds_dma_synced++;
@@ -1422,7 +1510,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const bool gpu = engine <= 1 && n <= 16 && m_labels->GpuWritable(dst) && m_labels->GpuWritable(dst + bytes - 1);
 					if (gpu) {
 						for (uint32_t i = 0; i < n; i++) {
-							EmitRelease32(body, one_addr ? dst : dst + 4u * i, bptr[3 + i]);
+							EmitRelease32(body, one_addr ? dst : dst + 4u * i, bptr[3 + i], m_compute_ring);
 						}
 						add_ref(dst, bytes, false);
 						stats.labels_native++;
@@ -1559,30 +1647,45 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					return fail(op, dw);
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u),
 				        kMetadataSpan, false);
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
-				pfp_sync_me();
-				if (m_compute_queue) {
-					// A compute-queue buffer carries the argument address itself (ADDR_LO, ADDR_HI,
-					// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,
-					// so set the base to that address and dispatch at offset 0, as RADV does.
+				if (m_compute_ring) {
+					// The guest packet already carries ADDR_LO, ADDR_HI, DISPATCH_INITIATOR. MEC reads
+					// that form; the gfx-ring SET_BASE rewrite would be the wrong engine.
 					if (body_count < 3) {
 						return fail(op, dw);
 					}
-					const uint64_t args = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
-					body.push_back(Pkt3(IT_SET_BASE, 3, true));
-					body.push_back(1u); // BASE_INDEX: DISPATCH_INDIRECT / DRAW_INDIRECT base
-					body.push_back(static_cast<uint32_t>(args));
-					body.push_back(static_cast<uint32_t>(args >> 32u));
-					body.push_back(Pkt3(IT_DISPATCH_INDIRECT, 2, true));
-					body.push_back(0u);
-					body.push_back(bptr[2]);
-					add_ref(args, kMetadataSpan, false);
+					body.push_back(dcb[dw] | 2u);
+					body.insert(body.end(), dcb.begin() + dw + 1, dcb.begin() + dw + size);
+					add_ref(static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u), kMetadataSpan,
+					        false);
 				} else {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					pfp_sync_me();
+					if (m_compute_queue) {
+						// A compute-queue buffer carries the argument address itself (ADDR_LO, ADDR_HI,
+						// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,
+						// so set the base to that address and dispatch at offset 0, as RADV does.
+						if (body_count < 3) {
+							return fail(op, dw);
+						}
+						const uint64_t args = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
+						body.push_back(Pkt3(IT_SET_BASE, 3, true));
+						body.push_back(1u); // BASE_INDEX: DISPATCH_INDIRECT / DRAW_INDIRECT base
+						body.push_back(static_cast<uint32_t>(args));
+						body.push_back(static_cast<uint32_t>(args >> 32u));
+						body.push_back(Pkt3(IT_DISPATCH_INDIRECT, 2, true));
+						body.push_back(0u);
+						body.push_back(bptr[2]);
+						add_ref(args, kMetadataSpan, false);
+					} else {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
 				}
 				stats.dispatches++;
 				collect_refs();
@@ -1597,15 +1700,24 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			case IT_DISPATCH_DIRECT:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				stats.dispatches++;
 				collect_refs();
 				break;
 			case IT_ACQUIRE_MEM:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				stats.acquire_mem++;
 				break;
 			case IT_EVENT_WRITE:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				// Events with an address (ZPASS_DONE occlusion counters, 16 DBs x begin/end) write there.
 				if (body_count >= 3) {
 					add_ref((static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), 256, false);
