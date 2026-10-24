@@ -37,6 +37,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <ucontext.h>
 #include <unistd.h>
 #if defined(__linux__)
@@ -57,6 +59,99 @@ bool EnvOn(const char* name) {
 	const char* v = std::getenv(name);
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
+
+// GET_LOD_STATS the way the PS5 does it: the GPU's PRT LOD statistics reporter counts texture samples
+// per counter bank and writes the report itself. Its registers are privileged, so a root helper
+// (tools/bc250-lodhw/kyty-lodhw, the part the PS5 kernel and ME play) programs them; this is the
+// client. The helper finds this VM's current VMID by its PASID in the kernel's IH_VMID_n_LUT, so no
+// VMID is reserved (a reserved VMID makes gfx and compute jobs of one VM wait for each other before
+// a flush, which deadlocks against cross-ring waits). KYTY_LOD_HW_SOCK names the socket
+// (default /run/kyty-lodhw.sock); KYTY_LOD_STATS_MODE=usage or all keeps the CPU-side answers.
+class LodStatsHw {
+public:
+	static LodStatsHw& Instance() {
+		static LodStatsHw h;
+		return h;
+	}
+	// Connects to the helper; true when reports can go through it.
+	bool Connect() {
+		const char* path = std::getenv("KYTY_LOD_HW_SOCK");
+		path             = path != nullptr && path[0] != '\0' ? path : "/run/kyty-lodhw.sock";
+		const int fd     = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+		if (fd < 0) {
+			return false;
+		}
+		struct sockaddr_un a {};
+		a.sun_family = AF_UNIX;
+		std::snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+		if (::connect(fd, reinterpret_cast<struct sockaddr*>(&a), sizeof(a)) != 0) {
+			::close(fd);
+			return false;
+		}
+		m_fd = fd;
+		return true;
+	}
+	[[nodiscard]] bool On() const { return m_fd >= 0; }
+	void Disconnect() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_fd >= 0) {
+			::close(m_fd);
+			m_fd = -1;
+		}
+	}
+	// The PASID of the VM on `drm_fd` (its /proc fdinfo "pasid:" line); 0 when not found.
+	static uint32_t Pasid(int drm_fd) {
+		char path[64];
+		std::snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", drm_fd);
+		FILE*    f     = std::fopen(path, "re");
+		uint32_t pasid = 0;
+		char     line[128];
+		while (f != nullptr && std::fgets(line, sizeof(line), f) != nullptr) {
+			unsigned v = 0;
+			if (std::sscanf(line, "pasid: %u", &v) == 1) {
+				pasid = v;
+			}
+		}
+		if (f != nullptr) {
+			std::fclose(f);
+		}
+		return pasid;
+	}
+	void SetPasid(uint32_t pasid) { m_pasid = pasid; }
+	// One report of `size` bytes at `va` in whichever VMID serves this VM now, finished when this
+	// returns 0. -ESRCH: the VM holds no VMID at the moment (nothing of it on the GPU).
+	int Report(uint64_t va, uint32_t size) { return Call(3u | (m_pasid << 8u), size, va, nullptr); }
+
+private:
+	int Call(uint32_t op, uint32_t size, uint64_t va, uint32_t* value) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_fd < 0) {
+			return -ENOTCONN;
+		}
+		struct {
+			uint32_t op, size;
+			uint64_t va;
+		} q {op, size, va};
+		struct {
+			int32_t  status;
+			uint32_t value;
+		} r {};
+		if (::send(m_fd, &q, sizeof(q), MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(q)) ||
+		    ::recv(m_fd, &r, sizeof(r), 0) != static_cast<ssize_t>(sizeof(r))) {
+			::close(m_fd);
+			m_fd = -1;
+			return -EPIPE;
+		}
+		if (value != nullptr) {
+			*value = r.value;
+		}
+		return r.status;
+	}
+
+	std::mutex m_mutex;
+	int        m_fd    = -1;
+	uint32_t   m_pasid = 0;
+};
 
 // What native primary mode needs to run games correctly is on there by default; setting the switch
 // to 0 turns a feature off (and setting it turns it on outside primary mode).
@@ -991,6 +1086,32 @@ public:
 	}
 
 private:
+	// GET_LOD_STATS through the GPU's own reporter when the kyty-lodhw helper runs (and the mode is
+	// not a CPU-side one). The helper puts this VM's VMID into CNTL3, as the PS5 kernel does with the
+	// process VMID; it finds it by the VM's PASID.
+	void InitLodStatsHw() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		const char* mode = std::getenv("KYTY_LOD_STATS_MODE");
+		if (mode != nullptr && mode[0] != '\0' && std::strcmp(mode, "hw") != 0 && std::strcmp(mode, "usage") != 0) {
+			return;
+		}
+		if (!LodStatsHw::Instance().Connect()) {
+			if (mode != nullptr && std::strcmp(mode, "hw") == 0) {
+				std::fprintf(stderr, "native shadow: KYTY_LOD_STATS_MODE=hw but the kyty-lodhw helper is not running\n");
+			}
+			return;
+		}
+		const uint32_t pasid = LodStatsHw::Pasid(m_gem->DrmFd());
+		if (pasid == 0) {
+			std::fprintf(stderr, "native shadow: no PASID in the DRM fdinfo; not using the LOD statistics reporter\n");
+			LodStatsHw::Instance().Disconnect();
+			return;
+		}
+		LodStatsHw::Instance().SetPasid(pasid);
+		std::fprintf(stderr, "native shadow: GET_LOD_STATS by the GPU's LOD statistics reporter (kyty-lodhw helper, PASID %u)\n", pasid);
+#endif
+	}
+
 	// Deferred ACBs leave in order, once nothing they wait for is outstanding: a submitted DCB wrote
 	// the label, Kyty already did (the writer has run), or 64 DCBs went by (a writer the translator
 	// does not see; counted as unresolved). Labels Kyty has written stop counting as in flight.
@@ -1544,6 +1665,7 @@ private:
 			std::fprintf(stderr, "native shadow: submitter init failed; staying off.\n");
 			return;
 		}
+		InitLodStatsHw();
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetComputeQueue(true);
@@ -1581,7 +1703,7 @@ private:
 		// The LOD statistics banks of every draw and dispatch, for Kyty's GET_LOD_STATS
 		// (KYTY_LOD_STATS_MODE=usage, the default, or =banks; also when KYTY_LOD_STATS_LOG is set).
 		// KYTY_LOD_STATS_SCAN_DWORDS: how much of each first-level table is read.
-		if (LodBankScanOn()) {
+		if (LodBankScanOn() && !LodStatsHw::Instance().On()) {
 			const char*    v      = std::getenv("KYTY_LOD_STATS_SCAN_DWORDS");
 			const uint32_t dwords = v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 1024u;
 			m_translator.SetLodBankScan(true, dwords);
@@ -2406,6 +2528,19 @@ private:
 				}();
 				static uint64_t  reports  = 0;
 				static uint32_t  no_scan  = 0;
+				if (LodStatsHw::Instance().On()) {
+					// The reporter counted every sample since the previous report; it writes the header
+					// and the records itself and resets the counters, as the PS5's ME does for the packet.
+					static uint32_t failed = 0;
+					const int       r      = LodStatsHw::Instance().Report(p.addr, p.size);
+					if (r == 0) {
+						break;
+					}
+					if (failed++ < 8) {
+						std::fprintf(stderr, "LOD stats: hardware report at 0x%016llx failed: %s\n",
+						             static_cast<unsigned long long>(p.addr), std::strerror(-r));
+					}
+				}
 				std::bitset<256> banks;
 				if (mode == LodStatsMode::Usage && TakeLodStatsBanks(p.addr, banks)) {
 					const uint32_t used = WriteLodUsageReport(reinterpret_cast<void*>(p.addr), p.size, banks);

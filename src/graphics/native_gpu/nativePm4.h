@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <unordered_set>
 #include <span>
 #include <utility>
 #include <vector>
@@ -561,6 +562,7 @@ public:
 		LodBankScan out = std::move(m_lod_cur);
 		m_lod_cur       = {};
 		m_lod_tables.clear();
+		m_lod_stages.clear();
 		return out;
 	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
@@ -628,7 +630,8 @@ private:
 	LodGuestReadFn               m_lod_read          = nullptr;
 	void*                        m_lod_read_user     = nullptr;
 	LodBankScan                  m_lod_cur;          // SetLodBankScan: since the last GET_LOD_STATS
-	std::set<uint64_t>           m_lod_tables;       // tables already read for m_lod_cur
+	std::unordered_set<uint64_t> m_lod_tables;       // tables already read for m_lod_cur
+	std::unordered_set<uint64_t> m_lod_stages;       // user-data blocks already scanned for m_lod_cur (hashes)
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;

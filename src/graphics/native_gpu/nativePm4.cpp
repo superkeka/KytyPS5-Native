@@ -602,7 +602,7 @@ void LodBankScan::Merge(const LodBankScan& o) {
 }
 
 LodStatsMode ParseLodStatsMode(const char* mode) {
-	if (mode == nullptr || mode[0] == '\0' || std::strcmp(mode, "usage") == 0) {
+	if (mode == nullptr || mode[0] == '\0' || std::strcmp(mode, "usage") == 0 || std::strcmp(mode, "hw") == 0) {
 		return LodStatsMode::Usage;
 	}
 	if (std::strcmp(mode, "banks") == 0) {
@@ -993,6 +993,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					ud[i]   = *v;
 					have[i] = true;
 				}
+			}
+			// Draws mostly repeat a stage's user data; the same block reaches the same T#s and
+			// tables, which were read for this window already.
+			uint64_t h = 0xcbf29ce484222325ull ^ first;
+			for (uint32_t i = 0; i < count; i++) {
+				h = (h ^ (have[i] ? ud[i] : 0x9e3779b9u) ^ (static_cast<uint64_t>(have[i]) << 32u)) * 0x100000001b3ull;
+				h ^= h >> 29u;
+			}
+			if (m_lod_stages.size() >= 65536) {
+				m_lod_stages.clear();
+			}
+			if (!m_lod_stages.insert(h).second) {
+				return;
 			}
 			for (uint32_t i = 0; i + 8 <= count; i++) {
 				if (have[i] && have[i + 7]) {
