@@ -337,6 +337,12 @@ public:
 			             m_gpu_only_ms_total / n, m_gpu_ms_total / n,
 			             static_cast<unsigned long long>(m_gem->ResidentBytes() >> 20u), m_dummy_writes);
 			std::fprintf(stderr,
+			             "native shadow: blocks made resident by: cpu writes %llu, shaders %llu, user-data pointers %llu, "
+			             "direct refs %llu, table buffers %llu, table images %llu\n",
+			             static_cast<unsigned long long>(m_promoted_by[0]), static_cast<unsigned long long>(m_promoted_by[1]),
+			             static_cast<unsigned long long>(m_promoted_by[2]), static_cast<unsigned long long>(m_promoted_by[3]),
+			             static_cast<unsigned long long>(m_promoted_by[4]), static_cast<unsigned long long>(m_promoted_by[5]));
+			std::fprintf(stderr,
 			             "native shadow: %llu frames completed, avg gpu(submit->fence) %.2f ms, "
 			             "%u shaders scanned, %u v_dot2c_f32_f16 sites\n",
 			             static_cast<unsigned long long>(m_completed),
@@ -545,7 +551,7 @@ private:
 		constexpr uint64_t kBufferCap = 64ull << 20u;
 		constexpr size_t   kMaxTables = 2048;
 		constexpr uint32_t kBucketShift = 24; // 16 MiB guest-address buckets, the block size
-		m_gem->PromoteTouched();
+		m_promoted_by[0] += m_gem->PromoteTouched();
 
 		// Membership tests run thousands of times per frame: binary search over a cached copy of the
 		// view ranges, refreshed when the views change (which also forgets which buckets are known
@@ -560,17 +566,18 @@ private:
 			                           std::make_pair(addr, ~0ull));
 			return it != m_view_ranges.begin() && addr < std::prev(it)->second;
 		};
-		auto promote = [&](uint64_t addr, uint64_t size) {
+		// `kind` counts which reference made blocks resident (m_promoted_by, logged with the averages).
+		auto promote = [&](uint64_t addr, uint64_t size, int kind) {
 			for (uint64_t b = addr >> kBucketShift; b <= (addr + size - 1) >> kBucketShift; b++) {
 				if (m_resident_buckets.insert(b).second) {
-					m_gem->PromoteGuestRange(b << kBucketShift, 1ull << kBucketShift);
+					m_promoted_by[kind] += m_gem->PromoteGuestRange(b << kBucketShift, 1ull << kBucketShift);
 				}
 			}
 		};
 
 		for (uint64_t addr: result.shader_addrs) {
 			if (backed(addr)) {
-				promote(addr, 64u * 1024u);
+				promote(addr, 64u * 1024u, 1);
 			}
 		}
 		std::vector<uint64_t> tables;
@@ -584,11 +591,20 @@ private:
 				             static_cast<unsigned long long>(ref.addr), static_cast<unsigned long long>(ref.size));
 			}
 			if (backed(ref.addr)) {
-				promote(ref.addr, ref.size != 0 ? ref.size : kTableSpan);
+				promote(ref.addr, ref.size != 0 ? ref.size : kTableSpan, ref.pointer ? 2 : 3);
 				if (ref.pointer) {
 					tables.push_back(ref.addr);
 				}
 			}
+		}
+		// Following descriptor tables guesses: any dword pair that looks like a guest address makes its
+		// whole block resident. In ASTRO BOT that was 336 of 712 blocks (5.4 GB) and nothing needed them
+		// (what the GPU reads was already resident through CPU writes and direct references), so tables
+		// are only followed with KYTY_NATIVE_GPU_TABLE_PROMOTE=1. A GPU write into memory left out still
+		// shows as a dummy write in the log.
+		static const bool follow_tables = EnvOn("KYTY_NATIVE_GPU_TABLE_PROMOTE");
+		if (!follow_tables) {
+			tables.clear();
 		}
 		std::set<uint64_t> seen;
 		for (int depth = 0; depth < 2 && !tables.empty(); depth++) {
@@ -606,13 +622,13 @@ private:
 						const uint64_t stride  = (d[i + 1] >> 16u) & 0x3fffu;
 						const uint64_t records = i + 2 < n ? d[i + 2] : 0;
 						const uint64_t bytes   = stride != 0 ? stride * records : records;
-						promote(ptr, std::clamp<uint64_t>(bytes, kTableSpan, kBufferCap));
+						promote(ptr, std::clamp<uint64_t>(bytes, kTableSpan, kBufferCap), 4);
 						next.push_back(ptr);
 					}
 					const uint64_t image = (d[i] | (static_cast<uint64_t>(d[i + 1] & 0xffu) << 32u)) << 8u;
 					NoteUnmapped(image, "image", table);
 					if (image != 0 && backed(image)) {
-						promote(image, kImageSpan);
+						promote(image, kImageSpan, 5);
 					}
 				}
 			}
@@ -917,6 +933,7 @@ private:
 	uint64_t      m_acbs_refused   = 0;
 	std::set<uint32_t> m_unknown_acb_ops;
 	uint32_t      m_acb_dummy_writes = 0;
+	uint64_t      m_promoted_by[6]   = {};
 	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
 	std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> m_find_seen; // KYTY_NATIVE_GPU_FIND hits logged
