@@ -156,7 +156,8 @@ struct Pm4TranslateStats {
 	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
 	uint32_t labels_native     = 0; // native labels: WRITE_DATA / RELEASE_MEM label writes run on the GPU
 	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU
-	uint32_t timestamps        = 0; // native labels: of those, timestamps (the reference clock)
+	uint32_t timestamps        = 0; // native labels: timestamps the tracker still writes (CPU clock)
+	uint32_t timestamps_native = 0; // native labels: timestamps the GPU writes (DATA_SEL 3)
 	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
 	uint32_t waits_native      = 0; // native labels: guest waits passed through (an earlier GPU write satisfies them)
 	uint32_t waits_split       = 0; // native labels: guest waits the IB is cut at (no known writer yet)
@@ -445,6 +446,9 @@ public:
 	}
 	// With native labels: false turns the waits an earlier GPU write satisfies into barriers too.
 	void SetNativeWaits(bool on) { m_native_waits = on; }
+	// Timestamps stay on the tracker (Kyty's host TSC scaled to 100 MHz) instead of the GPU clock.
+	// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1. The two clocks have the same unit and different zeros.
+	void SetCpuTimestamps(bool on) { m_cpu_timestamps = on; }
 
 	// The buffers come from a compute queue (ACBs), whose packets differ from the gfx ring's
 	// (DISPATCH_INDIRECT carries its argument address); they are rewritten for the gfx ring.
@@ -520,6 +524,7 @@ private:
 	LabelOracle*                 m_labels         = nullptr;
 	uint64_t                     m_tracker_va     = 0;
 	bool                         m_native_waits   = true;
+	bool                         m_cpu_timestamps = false;
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;

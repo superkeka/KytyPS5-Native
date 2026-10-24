@@ -786,6 +786,18 @@ bool HasLabelRelease(const std::vector<Packet>& pkts, uint64_t addr, uint32_t va
 	return false;
 }
 
+// RELEASE_MEM DATA_SEL 3: the GPU clock, data dwords zero.
+bool HasGpuTimestamp(const std::vector<Packet>& pkts, uint64_t addr) {
+	for (const auto& p: pkts) {
+		if (p.op == 0x49u && p.body.size() >= 7 && p.body[0] == kFlushEvent && p.body[1] == (3u << 29u) &&
+		    p.body[2] == static_cast<uint32_t>(addr) && p.body[3] == static_cast<uint32_t>(addr >> 32u) && p.body[4] == 0u &&
+		    p.body[5] == 0u && p.body[6] == 0u) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // Kyty's R_RELEASE_MEM marker around a hardware RELEASE_MEM body.
 void AppendReleaseMarker(std::vector<uint32_t>& dcb, uint32_t data_sel, uint32_t int_sel, uint64_t dst, uint64_t value,
                          uint32_t ctx) {
@@ -870,16 +882,21 @@ void TestLabelsReleaseMem() {
 	Check(HasLabelRelease(wpkts, 0x202000324ull, 9u) && HasLabelRelease(wpkts, 0x202000320ull, 8u), "64-bit label as two halves");
 	Check(r.stats.interrupts == 2 && r.stats.labels_native == 1, "stats");
 
-	// A timestamp goes through the tracker (Kyty writes its reference clock).
+	// A timestamp the GPU can reach is a DATA_SEL 3 release, not a tracker write. The interrupt
+	// after it still shares the segment's one tracker packet with the end.
 	std::vector<uint32_t> ts;
 	AppendReleaseMarker(ts, 3, 0, 0x202000310ull, 0, 0);
 	Append(ts, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
 	AppendReleaseMarker(ts, 1, 2, 0x202000318ull, 1, 7);
 	auto        rt  = t.Translate(ts);
 	const auto& tsp = rt.segments[0].points;
-	Check(tsp.size() == 3 && tsp[0].kind == TrackerPoint::Kind::Timestamp && tsp[0].addr == 0x202000310ull &&
-	          tsp[1].kind == TrackerPoint::Kind::Interrupt && tsp[0].dw == tsp[1].dw && tsp[2].kind == TrackerPoint::Kind::End,
-	      "a timestamp is written by the tracker at the next point, without a packet of its own");
+	const auto  tpk = Decode(rt.ib);
+	Check(rt.ok && rt.stats.timestamps_native == 1 && rt.stats.timestamps == 0 && HasGpuTimestamp(tpk, 0x202000310ull),
+	      "a reachable timestamp is a GPU clock release");
+	Check(tsp.size() == 2 && tsp[0].kind == TrackerPoint::Kind::Interrupt && tsp[0].ctx == 7 &&
+	          tsp[1].kind == TrackerPoint::Kind::End && tsp[0].dw == tsp[1].dw,
+	      "the interrupt shares the segment's one tracker packet with the end");
+	Check(HasRef(rt.refs, 0x202000310ull, 8, false), "the timestamp address is made resident");
 }
 
 void TestLabelsLocalWait() {
@@ -1217,6 +1234,83 @@ void TestUnreachableLabel() {
 	      "an oracle native wait on an unreachable label stays on the CPU");
 }
 
+void TestGpuTimestamp() {
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+
+	std::vector<uint32_t> dcb;
+	AppendReleaseMarker(dcb, 3, 2, 0x202000400ull, 0, 0x42); // clock + an interrupt
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(dcb, 3, 2, 0x202000408ull, 0, 0x43);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.timestamps_native == 2 && r.stats.timestamps == 0 && r.stats.interrupts == 2, "two GPU timestamps");
+	const auto pkts = Decode(r.ib);
+	Check(HasGpuTimestamp(pkts, 0x202000400ull) && HasGpuTimestamp(pkts, 0x202000408ull), "both clocks are DATA_SEL 3");
+	bool gfx_bit = true;
+	uint32_t tracker = 0;
+	for (const auto& p: pkts) {
+		if (p.op == 0x49u && p.body[1] == (3u << 29u)) {
+			gfx_bit = gfx_bit && !p.compute;
+		}
+		tracker += (p.op == 0x49u && p.body[2] == static_cast<uint32_t>(kTrackerVa)) ? 1u : 0u;
+	}
+	Check(gfx_bit && tracker == 1, "gfx timestamp has no shader bit; both interrupts share one tracker packet");
+	Check(r.segments[0].points.size() == 3 && r.segments[0].points[0].dw == r.segments[0].points[2].dw &&
+	          r.segments[0].points[0].kind == TrackerPoint::Kind::Interrupt &&
+	          r.segments[0].points[1].kind == TrackerPoint::Kind::Interrupt,
+	      "interrupts with a dispatch between them still share the end packet");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a GPU timestamp passes the gfx check");
+
+	t.SetComputeRing(true);
+	std::vector<uint32_t> acb;
+	AppendReleaseMarker(acb, 3, 0, 0x202000410ull, 0, 0);
+	Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rc = t.Translate(acb);
+	Check(rc.ok && rc.stats.timestamps_native == 1, "compute-ring timestamp translated");
+	bool cs_bit = false;
+	for (const auto& p: Decode(rc.ib)) {
+		cs_bit = cs_bit || (p.op == 0x49u && p.body[1] == (3u << 29u) && p.compute);
+	}
+	Check(cs_bit && ValidateNativeIb(rc.ib, false, &bad, NativeIbKind::Compute), "compute timestamp carries the shader bit");
+	Check(!ValidateNativeIb(rc.ib, false, &bad, NativeIbKind::Gfx), "that shader bit is not a gfx packet");
+
+	// Not 8-byte aligned, or the GPU cannot reach it, or the CPU clock is requested: the tracker writes it.
+	t.SetComputeRing(false);
+	o.unwritable = 0x202000420ull;
+	std::vector<uint32_t> cpu;
+	AppendReleaseMarker(cpu, 3, 0, 0x202000420ull, 0, 0);
+	AppendReleaseMarker(cpu, 3, 0, 0x202000424ull, 0, 0); // not qword aligned
+	auto ru = t.Translate(cpu);
+	Check(ru.stats.timestamps == 2 && ru.stats.timestamps_native == 0 && !HasGpuTimestamp(Decode(ru.ib), 0x202000420ull),
+	      "an unreachable or unaligned timestamp stays on the tracker");
+	bool saw_ts = false;
+	for (const auto& p: ru.segments[0].points) {
+		saw_ts = saw_ts || p.kind == TrackerPoint::Kind::Timestamp;
+	}
+	Check(saw_ts, "the tracker point is still there");
+
+	o.unwritable = 0;
+	t.SetCpuTimestamps(true);
+	std::vector<uint32_t> host;
+	AppendReleaseMarker(host, 3, 0, 0x202000430ull, 0, 0);
+	auto rh = t.Translate(host);
+	Check(rh.stats.timestamps == 1 && rh.stats.timestamps_native == 0 && !HasGpuTimestamp(Decode(rh.ib), 0x202000430ull),
+	      "KYTY_NATIVE_GPU_CPU_TIMESTAMPS keeps the host clock on the tracker");
+
+	std::vector<uint32_t> bad_data = {0xc0064900u, kFlushEvent, 3u << 29u, 0x1000u, 0u, 1u, 0u, 0u,
+	                                  0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u,
+	                                  0xffff1000u, 0xffff1000u};
+	Check(!ValidateNativeIb(bad_data, false, &bad, NativeIbKind::Gfx), "a timestamp with a data dword is rejected");
+	std::vector<uint32_t> bad_align = {0xc0064900u, kFlushEvent, 3u << 29u, 0x1004u, 0u, 0u, 0u, 0u,
+	                                   0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u,
+	                                   0xffff1000u, 0xffff1000u};
+	Check(!ValidateNativeIb(bad_align, false, &bad, NativeIbKind::Gfx), "an unaligned GPU timestamp is rejected");
+}
+
 void TestPlanRingWait() {
 	// No pending write, label already in memory: a barrier. The GPU is not left waiting for a writer
 	// that no submitted buffer will produce.
@@ -1285,6 +1379,7 @@ int main() {
 	TestValidateNativeIb();
 	TestComputeRingPackets();
 	TestUnreachableLabel();
+	TestGpuTimestamp();
 	TestPlanRingWait();
 	TestComputeRingForQueue();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");

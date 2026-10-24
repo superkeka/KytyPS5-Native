@@ -338,6 +338,7 @@ public:
 			m_labels_stats[4] += result.stats.waits_split;
 			m_labels_stats[5] += result.stats.wait_barriers;
 			m_labels_stats[6] += result.stats.timestamps;
+			m_labels_stats[7] += result.stats.timestamps_native;
 			// The first labels the GPU may not write, and why (diagnostics for the tracker's share).
 			for (const auto& seg: result.segments) {
 				for (const auto& p: seg.points) {
@@ -603,6 +604,9 @@ public:
 			m_flip_t0 = now;
 			m_busy_s = m_wait_lock_s = m_present_s = 0.0;
 			m_flips  = 0;
+			for (uint32_t i = 0; i < 8; i++) {
+				m_labels_mark[i] = m_labels_stats[i];
+			}
 			return;
 		}
 		if (m_flips == 120) {
@@ -639,13 +643,21 @@ public:
 				             static_cast<unsigned long long>(m_acb_unresolved));
 			}
 			if (m_labels) {
+				const double irq_per = m_flips != 0 ? static_cast<double>(m_labels_stats[2] - m_labels_mark[2]) /
+				                                           static_cast<double>(m_flips)
+				                                     : 0.0;
 				std::fprintf(stderr,
-				             "native shadow: native labels so far: %llu GPU label writes, %llu by the tracker (%llu timestamps), %llu "
-				             "interrupts; waits: %llu native, %llu cut, %llu barriers\n",
+				             "native shadow: native labels so far: %llu GPU label writes, %llu by the tracker, "
+				             "timestamps %llu on the GPU / %llu by the tracker, %llu interrupts (%.1f per flip); "
+				             "waits: %llu native, %llu cut, %llu barriers\n",
 				             static_cast<unsigned long long>(m_labels_stats[0]), static_cast<unsigned long long>(m_labels_stats[1]),
-				             static_cast<unsigned long long>(m_labels_stats[6]),
-				             static_cast<unsigned long long>(m_labels_stats[2]), static_cast<unsigned long long>(m_labels_stats[3]),
-				             static_cast<unsigned long long>(m_labels_stats[4]), static_cast<unsigned long long>(m_labels_stats[5]));
+				             static_cast<unsigned long long>(m_labels_stats[7]), static_cast<unsigned long long>(m_labels_stats[6]),
+				             static_cast<unsigned long long>(m_labels_stats[2]), irq_per,
+				             static_cast<unsigned long long>(m_labels_stats[3]), static_cast<unsigned long long>(m_labels_stats[4]),
+				             static_cast<unsigned long long>(m_labels_stats[5]));
+				for (uint32_t i = 0; i < 8; i++) {
+					m_labels_mark[i] = m_labels_stats[i];
+				}
 			}
 			std::lock_guard<std::mutex> chain_lock(m_chain_mutex);
 			if (m_chain_n > 0) {
@@ -716,11 +728,14 @@ public:
 		const uint64_t va      = m_submitter->ScratchVa() + kTrackerOffset;
 		const char*    native  = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
 		const bool     waits   = native == nullptr || native[0] != '0';
+		const bool     cpu_ts  = EnvOn("KYTY_NATIVE_GPU_CPU_TIMESTAMPS");
 		m_label_oracle = oracle;
 		m_translator.SetNativeLabels(oracle, va);
 		m_acb_translator.SetNativeLabels(oracle, va);
 		m_translator.SetNativeWaits(waits);
 		m_acb_translator.SetNativeWaits(waits);
+		m_translator.SetCpuTimestamps(cpu_ts);
+		m_acb_translator.SetCpuTimestamps(cpu_ts);
 		if (m_acb_rings) {
 			// MEC packet forms. The gfx translator is unchanged.
 			m_acb_translator.SetComputeRing(true);
@@ -832,7 +847,7 @@ public:
 	}
 
 	// Waits for the last CS submitted to tracker `slot`. True when that ring is idle (or nothing was
-	// submitted there). Each ring has its own fence.
+	// submitted there). Each ring has its own fence. A timeout disables the native path.
 	bool WaitSlot(uint32_t slot) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		SlotFence fence;
@@ -860,6 +875,30 @@ public:
 		(void)slot;
 #endif
 		return false;
+	}
+
+	// Blocks until `slot`'s latest fence signals or `timeout_sec` passes. A timeout does not disable
+	// the path: the tracker uses this instead of polling the slot. True when the ring is idle or the
+	// fence signaled.
+	bool WaitSlotBrief(uint32_t slot, double timeout_sec) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		SlotFence fence;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			if (slot >= kTrackerSlots) {
+				return false;
+			}
+			fence = m_slot_fence[slot];
+		}
+		if (fence.seq == 0 || m_submitter == nullptr) {
+			return fence.seq == 0;
+		}
+		return m_submitter->WaitSeq(fence.seq, timeout_sec, {fence.ip_type, fence.ring});
+#else
+		(void)slot;
+		(void)timeout_sec;
+		return true;
+#endif
 	}
 
 	// The submission the last Submit queued in async mode (0: none), for the pipeline to wait on.
@@ -1618,7 +1657,8 @@ private:
 	bool          m_labels           = false;
 	bool          m_validate         = true;
 	uint32_t      m_validate_refused = 0;
-	uint64_t      m_labels_stats[7]  = {}; // GPU labels, tracker labels, interrupts, native/cut/barrier waits, timestamps
+	uint64_t      m_labels_stats[8] = {}; // GPU labels, tracker labels, interrupts, native/cut/barrier waits, CPU timestamps, GPU timestamps
+	uint64_t      m_labels_mark[8]  = {}; // m_labels_stats at the previous flip report (per-flip deltas)
 	uint32_t      m_cpu_labels_logged = 0;
 	std::set<uint64_t> m_cpu_label_pages;
 	std::vector<uint32_t> m_batch;
@@ -1990,8 +2030,10 @@ private:
 			{
 				std::unique_lock<std::mutex> lock(m_mutex);
 				if (m_held > 0) {
-					// Something waits for a label: look at memory again soon even without new buffers.
-					m_cv.wait_for(lock, std::chrono::microseconds(50), [this] { return !m_jobs.empty(); });
+					// A label with no GPU writer shows up in memory when the tracker writes it, or when
+					// the GPU does and the fence (or this timeout) says so. Not a 50 us poll.
+					m_cv.wait_for(lock, std::chrono::milliseconds(2), [this] { return !m_jobs.empty() || m_wake; });
+					m_wake = false;
 				} else {
 					m_cv.wait(lock, [this] { return !m_jobs.empty(); });
 				}
@@ -2172,7 +2214,7 @@ private:
 	void Track() {
 		t_pipeline_thread = true;
 #if defined(__linux__)
-		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul); // 50 us naps, not the default 50 us + slack
+		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul);
 #endif
 		double stuck_since = 0.0;
 		double busy_since  = 0.0; // GPU busy for the flip stats: while tracker points are outstanding
@@ -2197,6 +2239,11 @@ private:
 				for (auto& e: ready) {
 					Run(e);
 				}
+				{
+					std::lock_guard<std::mutex> lock(m_mutex);
+					m_wake = true;
+				}
+				m_cv.notify_one();
 				continue;
 			}
 			const double now = NowSecShadow();
@@ -2224,8 +2271,27 @@ private:
 				stuck_since = 0.0;
 				continue;
 			}
-			struct timespec nap = {0, 50000};
-			nanosleep(&nap, nullptr);
+			// Block on this ring's fence. The 2 ms cap covers a tracker dword written before the CS
+			// ends, and a point whose CS has not been submitted yet. A timeout does not disable the
+			// path. If the fence was already signaled, WaitSeq returns at once: sleep so that case
+			// does not spin.
+			uint32_t slot = 0;
+			{
+				std::lock_guard<std::mutex> lock(m_track_mutex);
+				if (!m_entries.empty()) {
+					slot = m_entries.front().slot;
+				}
+			}
+			Shadow::Instance().WaitSlotBrief(slot, 0.002);
+			bool pending = false;
+			{
+				std::lock_guard<std::mutex> lock(m_track_mutex);
+				pending = !m_entries.empty() && !Shadow::Instance().Reached(m_entries.front().seq, m_entries.front().slot);
+			}
+			if (pending) {
+				struct timespec nap = {0, 1000000};
+				nanosleep(&nap, nullptr);
+			}
 		}
 	}
 
@@ -2303,6 +2369,7 @@ private:
 	std::map<uint32_t, std::deque<Piece>>   m_pending; // by queue
 	uint32_t                                m_translating = 0;
 	uint64_t                                m_held        = 0;
+	bool                                    m_wake        = false; // the tracker moved; recheck held labels
 	uint64_t                                m_seq         = 0;
 	bool                                    m_appended    = false;
 	std::map<uint64_t, RingWrite>           m_ring; // label -> the latest write emitted into the ring

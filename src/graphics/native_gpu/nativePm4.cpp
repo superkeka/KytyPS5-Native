@@ -206,6 +206,11 @@ bool WriteDataToMemory(uint32_t control) {
 constexpr uint32_t kFlushEventCntl = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
                                      (1u << 20u) | (1u << 21u);
 constexpr uint32_t kData32Cntl     = 1u << 29u;
+// DATA_SEL 3: the 64-bit GPU clock counter. amdgpu's gfx_v10_0_ring_emit_fence stores a
+// sequence with DATA_SEL 1 or 2 in this same packet (CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX
+// 5); Mesa's write-timestamp uses DATA_SEL 3 and ignores the data dwords. The event dword stays
+// the one this board already runs. The data dwords are zero: the clock replaces them.
+constexpr uint32_t kDataTimestampCntl = 3u << 29u;
 constexpr uint32_t kWaitEqualMemMe = 3u | (1u << 4u);
 constexpr uint32_t kWaitPoll       = 4u;
 constexpr uint32_t kFiller         = 0xffff1000u; // the one-dword NOP IBs are padded with
@@ -217,6 +222,18 @@ void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value, boo
 	ib.push_back(static_cast<uint32_t>(addr));
 	ib.push_back(static_cast<uint32_t>(addr >> 32u));
 	ib.push_back(value);
+	ib.push_back(0u);
+	ib.push_back(0u);
+}
+
+// End-of-pipe GPU clock at `addr` (8-byte aligned). Same event as EmitRelease32, DATA_SEL 3.
+void EmitTimestampRelease(std::vector<uint32_t>& ib, uint64_t addr, bool compute) {
+	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, compute));
+	ib.push_back(kFlushEventCntl);
+	ib.push_back(kDataTimestampCntl);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+	ib.push_back(0u);
 	ib.push_back(0u);
 	ib.push_back(0u);
 }
@@ -332,15 +349,23 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				}
 				break;
 			case IT_RELEASE_MEM:
-				// The barrier's form (any address and data), or a GDS release as the translator has always
-				// run it: DATA_SEL 5, no interrupt. Compute rings use the same bodies with the shader bit.
-				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) ||
-				    !((b[0] == kFlushEventCntl && b[1] == kData32Cntl) ||
-				      (((b[1] >> 29u) & 0x7u) == 5u && ((b[1] >> 24u) & 0x7u) == 0u)) ||
-				    b[6] != 0u) {
+				// The barrier's form (any address and data), a GPU-clock timestamp (DATA_SEL 3, data
+				// dwords zero, 8-byte address), or a GDS release as the translator has always run it
+				// (DATA_SEL 5, no interrupt). Compute rings use the same bodies with the shader bit.
+				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || b[6] != 0u) {
 					return bad();
 				}
-				break;
+				if (b[0] == kFlushEventCntl && b[1] == kData32Cntl) {
+					break;
+				}
+				if (b[0] == kFlushEventCntl && b[1] == kDataTimestampCntl && b[4] == 0u && b[5] == 0u &&
+				    (b[2] & 7u) == 0u) {
+					break;
+				}
+				if (((b[1] >> 29u) & 0x7u) == 5u && ((b[1] >> 24u) & 0x7u) == 0u) {
+					break;
+				}
+				return bad();
 			case IT_WAIT_REG_MEM:
 				if (header != Pkt3(IT_WAIT_REG_MEM, 6, compute) || b[0] != kWaitEqualMemMe || b[5] != kWaitPoll) {
 					return bad();
@@ -986,30 +1011,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	std::vector<bool>                  seg_keep(1, true);
 	bool                               seg_effects = false;
 	std::vector<LabelWrite>            local_writes;
-	// A tracker point writes a 32-bit sequence number (patched by the backend) into the tracker slot.
-	// Points with nothing between them share one packet. Timestamps wait for the next point instead of
-	// taking a packet (a full cache flush) of their own: ASTRO BOT writes about 300 per frame, and a
-	// timing a few draws late is still a timing.
-	size_t                    last_tracker_end = ~size_t {0};
-	std::vector<TrackerPoint> pending_timestamps;
+	// CPU-side points of this segment (interrupts the guest asked for, labels the GPU cannot write,
+	// the end). They share one sequence packet, emitted when the segment closes, instead of a cache
+	// flush per point. A guest interrupt still runs, at the end of the segment, which is where the
+	// continuation runs too.
+	std::vector<TrackerPoint> queued_points;
 	auto                      tracker_point = [&](TrackerPoint p) {
-		if (p.kind == TrackerPoint::Kind::Timestamp) {
-			pending_timestamps.push_back(std::move(p));
-			return;
-		}
-		if (body.size() == last_tracker_end && !segs.back().points.empty()) {
-			p.dw = segs.back().points.back().dw;
-		} else {
-			p.dw = static_cast<uint32_t>(body.size()) + 5u;
-			EmitRelease32(body, m_tracker_va, 0u, m_compute_ring);
-			last_tracker_end = body.size();
-		}
-		for (auto& ts: pending_timestamps) {
-			ts.dw = p.dw;
-			segs.back().points.push_back(std::move(ts));
-		}
-		pending_timestamps.clear();
-		segs.back().points.push_back(std::move(p));
+		queued_points.push_back(std::move(p));
 		seg_effects = true;
 	};
 	auto note_write = [&](const LabelWrite& w) {
@@ -1019,10 +1027,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// Ends the current segment with its End point; a first segment that does nothing is dropped (the
 	// next segment's preamble holds its register writes).
 	auto close_segment = [&](bool last) {
-		if (seg_effects || last || segs.size() > 1) {
+		if (seg_effects || last || segs.size() > 1 || !queued_points.empty()) {
 			TrackerPoint end;
 			end.kind = TrackerPoint::Kind::End;
-			tracker_point(end);
+			queued_points.push_back(std::move(end));
+			const uint32_t dw = static_cast<uint32_t>(body.size()) + 5u;
+			EmitRelease32(body, m_tracker_va, 0u, m_compute_ring);
+			for (auto& p: queued_points) {
+				p.dw = dw;
+				segs.back().points.push_back(std::move(p));
+			}
+			queued_points.clear();
 		} else {
 			seg_keep.back() = false;
 		}
@@ -1159,12 +1174,27 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					TrackerPoint cpu;
 					bool         cpu_point = false;
 					if (sel == 3) {
-						stats.timestamps++;
-						cpu.kind  = TrackerPoint::Kind::Timestamp;
-						cpu.addr  = dst;
-						cpu.size  = 8;
-						cpu_point = true;
-						sel       = 0;
+						// Kyty's CPU timestamp is Sync::ReadReferenceClock(): the host TSC scaled to
+						// 100 MHz. DATA_SEL 3 writes the GPU clock counter, also 100 MHz on this board
+						// (gfx_v10_0's counter, the same kGpuClockHz the scratch samples use), but it
+						// is not the host TSC: the zeros differ, deltas match. A game that compares the
+						// value to a later ReadReferenceClock() needs the CPU clock, which
+						// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1 keeps on the tracker.
+						const bool gpu_clock = !m_cpu_timestamps && (dst & 7ull) == 0 && label_gpu(dst, 8);
+						if (gpu_clock) {
+							EmitTimestampRelease(body, dst, m_compute_ring);
+							note_write({dst, 0, false, true, true});
+							stats.timestamps_native++;
+							stats.labels_native++;
+							seg_effects = true;
+						} else {
+							stats.timestamps++;
+							cpu.kind  = TrackerPoint::Kind::Timestamp;
+							cpu.addr  = dst;
+							cpu.size  = 8;
+							cpu_point = true;
+						}
+						sel = 0;
 					} else if ((sel == 1 || sel == 2) && !label_gpu(dst, sel == 1 ? 4ull : 8ull)) {
 						cpu.kind  = TrackerPoint::Kind::CpuWrite;
 						cpu.addr  = dst;
