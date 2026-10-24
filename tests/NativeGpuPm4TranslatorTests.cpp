@@ -669,6 +669,32 @@ void TestContextDefaults() {
 	Check(r.stats.preamble_cx == 7, "five SeedPs5Defaults plus two library defaults in the preamble");
 }
 
+void TestPs5RegOverrides() {
+	auto shader_control = [](const std::vector<Packet>& pkts, uint32_t& value) {
+		bool found = false;
+		for (const auto& p: pkts) {
+			if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x310u) {
+				value = p.body[1];
+				found = true;
+			}
+		}
+		return found;
+	};
+	Pm4Translator t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x310u, 0x1u}, false);
+	uint32_t v = 0;
+	Check(shader_control(Decode(t.Translate(dcb).ib), v) && v == 0x1u, "PA_SC_SHADER_CONTROL as written by default");
+	t.SetPs5RegOverrides(true);
+	Check(shader_control(Decode(t.Translate(dcb).ib), v) && v == 0x5u, "LOAD_COLLISION_WAVEID forced like the PS5 CAM");
+	Pm4Translator fresh;
+	fresh.SetPs5RegOverrides(true);
+	std::vector<uint32_t> nops;
+	Append(nops, IT_NOP, {0x0u}, false);
+	Check(shader_control(Decode(fresh.Translate(nops).ib), v) && v == 0x4u,
+	      "the preamble sets LOAD_COLLISION_WAVEID before the game writes the register");
+}
+
 void TestGpuRefs() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
@@ -736,6 +762,7 @@ int main() {
 	TestWaitBarrier();
 	TestCompactRefs();
 	TestGdsReleaseMem();
+	TestPs5RegOverrides();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

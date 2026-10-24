@@ -1220,6 +1220,10 @@ private:
 			std::fprintf(stderr, "native shadow: GET_LOD_STATS runs on the GPU (experiment)\n");
 		}
 		m_acb_defer = EnvOn("KYTY_NATIVE_GPU_ACB_DEFER");
+		if (EnvOn("KYTY_NATIVE_GPU_PS5_REG_OVERRIDES")) {
+			m_translator.SetPs5RegOverrides(true);
+			std::fprintf(stderr, "native shadow: PS5 register overrides (PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID)\n");
+		}
 		if (EnvOn("KYTY_NATIVE_GPU_GDS_DMA_SYNC")) {
 			m_translator.SetGdsDmaSync(true);
 			m_acb_translator.SetGdsDmaSync(true);

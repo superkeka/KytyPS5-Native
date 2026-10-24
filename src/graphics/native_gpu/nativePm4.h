@@ -292,6 +292,8 @@ public:
 
 	// Experiment: render targets without DCC compression (CB_COLORn_INFO.DCC_ENABLE cleared).
 	void SetNoDcc(bool no_dcc) { m_no_dcc = no_dcc; }
+	// Context register overrides the PS5 kernel applies through the CP's RCIU CAM (see PatchContext).
+	void SetPs5RegOverrides(bool on) { m_ps5_reg_overrides = on; }
 
 	// Experiment: targets without DCC lose CB_COLORn_INFO.FAST_CLEAR (no CMASK fast clear).
 	// CMASK fast clear off on targets without DCC in the MRT slots of `slots` (bit n = slot n).
@@ -366,6 +368,7 @@ private:
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 	bool                         m_no_dcc     = false;
+	bool                         m_ps5_reg_overrides = false;
 	uint32_t                     m_target_mask = 0xffffffffu;
 	bool                         m_no_cmask_clear = false;
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;

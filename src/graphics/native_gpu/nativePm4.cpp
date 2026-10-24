@@ -84,6 +84,7 @@ constexpr uint32_t kCbColor0Attrib2  = 0x3B0;
 constexpr uint32_t kCbTargetMask     = 0x08E;
 constexpr uint32_t kDbDepthView      = 0x002;
 constexpr uint32_t kDbRenderOverride = 0x003;
+constexpr uint32_t kPaScShaderControl = 0x310;
 constexpr uint32_t kDbZInfo          = 0x010;
 constexpr uint32_t kDbStencilInfo    = 0x011;
 constexpr uint32_t kDbHtileDataBase  = 0x005;
@@ -213,6 +214,11 @@ uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
 	if (offset == kCbTargetMask) {
 		value &= m_target_mask;
 	}
+	// The PS5 kernel programs the CP's register-override CAM (RCIU) so PA_SC_SHADER_CONTROL always has
+	// LOAD_COLLISION_WAVEID (bit 2) set, whatever the game writes.
+	if (m_ps5_reg_overrides && offset == kPaScShaderControl) {
+		value |= 1u << 2u;
+	}
 	switch (m_depth_mode) {
 		case DepthDebugMode::None: return value;
 		case DepthDebugMode::HizOff:
@@ -301,6 +307,9 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	for (const auto& [offset, value]: m_cx) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
 		stats.preamble_cx++;
+	}
+	if (m_ps5_reg_overrides && m_cx.count(kPaScShaderControl) == 0) {
+		EmitSet(ib, IT_SET_CONTEXT_REG, kPaScShaderControl, PatchContext(kPaScShaderControl, 0), false);
 	}
 	if (m_depth_mode == DepthDebugMode::HizOff && m_cx.count(kDbRenderOverride) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
