@@ -650,6 +650,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 		}
 	};
+	// A label the GPU can actually touch. GpuWritable is a mapping (a GPU view, or a writable
+	// external range). A view's block stays the dummy page until MakeResident promotes it, and
+	// that only happens for addresses this buffer references, so a reachable label is added
+	// here. No mapping means it cannot be made resident: the wait stays on the CPU and the
+	// write stays on the tracker. A GPU wait or release on the dummy never sees the guest
+	// label, and the ring does not finish.
+	auto label_gpu = [&](uint64_t addr, uint64_t bytes) -> bool {
+		if (addr == 0 || bytes == 0 || m_labels == nullptr || !m_labels->GpuWritable(addr) ||
+		    !m_labels->GpuWritable(addr + bytes - 1)) {
+			return false;
+		}
+		add_ref(addr, bytes, false);
+		return true;
+	};
 	// A user-data dword pair can be a 48-bit pointer (V# and table pointers) or the 40-bit
 	// 256-byte-aligned base of a T# (dword 0 = address >> 8, low byte of dword 1 = address >> 40);
 	// a single dword can be address >> 8 (shader programs, inline image bases).
@@ -1030,9 +1044,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		emit_barrier(w.pfp);
 		s.barrier_len = static_cast<uint32_t>(body.size()) - s.barrier_dw;
 		s.wait_dw     = static_cast<uint32_t>(body.size());
-		// No native form (not EQUAL, or a 64-bit wait on both halves): only seeing the label in memory
-		// releases it.
-		s.wait_len  = EmitNativeWait(body, w, m_compute_ring) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
+		// No native form (not EQUAL, or a 64-bit wait on both halves), or an address the GPU cannot
+		// reach: only seeing the label in memory releases it. A WAIT_REG_MEM there reads the dummy.
+		s.wait_len = 0;
+		// The native form polls one dword. That dword has to be resident; the rest of a 64-bit
+		// wait is not what this packet reads.
+		if (label_gpu(w.addr, 4)) {
+			s.wait_len = EmitNativeWait(body, w, m_compute_ring) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
+		}
 		seg_effects = true;
 		stats.waits_split++;
 	};
@@ -1069,6 +1088,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		if (m_compute_ring) {
 			// MEC has no graphics engine. These opcodes hang a compute ring ("Illegal opcode").
+			// SET_UCONFIG_REG / INDEX / INDIRECT are handled below: profiler UCONFIG is dropped,
+			// geometry-engine UCONFIG still refuses the buffer.
 			switch (op) {
 				case IT_DRAW_INDIRECT:
 				case IT_DRAW_INDEX_INDIRECT:
@@ -1083,9 +1104,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				case IT_PFP_SYNC_ME:
 				case IT_SET_CONTEXT_REG:
 				case IT_SET_CONTEXT_REG_INDIRECT:
-				case IT_SET_UCONFIG_REG:
-				case IT_SET_UCONFIG_REG_INDEX:
-				case IT_SET_UCONFIG_REG_INDIRECT:
 				case IT_GET_LOD_STATS:
 					if (r.unknown_ops.empty()) {
 						r.unknown_op = op;
@@ -1147,7 +1165,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						cpu.size  = 8;
 						cpu_point = true;
 						sel       = 0;
-					} else if ((sel == 1 || sel == 2) && !m_labels->GpuWritable(dst)) {
+					} else if ((sel == 1 || sel == 2) && !label_gpu(dst, sel == 1 ? 4ull : 8ull)) {
 						cpu.kind  = TrackerPoint::Kind::CpuWrite;
 						cpu.addr  = dst;
 						cpu.data  = sel == 1 ? std::vector<uint32_t> {bptr[4]} : std::vector<uint32_t> {bptr[4], bptr[5]};
@@ -1178,7 +1196,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					seg_effects = true;
 					if (sel != 0) {
-						add_ref(dst, 8, false);
+						if (sel == 5) {
+							add_ref(dst, 8, false); // GDS data; a memory label is referenced in label_gpu
+						}
 						note_write({dst, sel == 1 ? (value & 0xffffffffull) : value, sel != 5, true, sel == 2});
 						stats.labels_native++;
 						stats.gds_releases += sel == 5 ? 1u : 0u;
@@ -1262,6 +1282,28 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_SET_UCONFIG_REG:
 			case IT_SET_UCONFIG_REG_INDEX: {
 				// Pass through only whitelisted UCONFIG registers; drop the rest for board safety.
+				// On a compute ring the whitelist is geometry-engine state (no GE on MEC), so it
+				// refuses the buffer. SQ_THREAD_TRACE_USERDATA_0..7 (0x340..0x347) and every other
+				// non-whitelisted offset are dropped, same as the gfx path. Refusing the opcode
+				// refused every ACB: they write 0x342 and 0x343 as profiler markers.
+				if (m_compute_ring && body_count >= 1) {
+					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
+					                                                        : Normalize(bptr[0]);
+					bool graphics = false;
+					for (uint32_t i = 1; i < body_count; i++) {
+						if (UconfigAllowed(base + (i - 1))) {
+							graphics = true;
+						}
+					}
+					if (graphics) {
+						if (r.unknown_ops.empty()) {
+							r.unknown_op = op;
+							r.unknown_dw = dw;
+						}
+						r.unknown_ops.insert(op);
+						break;
+					}
+				}
 				bool allowed = body_count >= 1;
 				if (allowed) {
 					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
@@ -1348,6 +1390,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							r.skipped_uconfig.insert(off);
 							continue;
 						}
+						if (m_compute_ring) {
+							if (r.unknown_ops.empty()) {
+								r.unknown_op = op;
+								r.unknown_dw = dw;
+							}
+							r.unknown_ops.insert(op);
+							continue;
+						}
 						uc[off] = value;
 						EmitSetUconfig(body, off, value);
 						stats.loaded_uc_regs++;
@@ -1408,6 +1458,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					if (plan == LabelOracle::Plan::Native && !m_native_waits) {
 						plan = LabelOracle::Plan::Met;
+					}
+					// A native wait reads whatever the GPU is mapped at. If that is not this label,
+					// hold the segment: the tracker (or a later CPU write) puts the value in guest
+					// memory, and the barrier is the only GPU wait.
+					if (plan == LabelOracle::Plan::Native && !label_gpu(addr, 4)) {
+						plan = LabelOracle::Plan::Split;
 					}
 					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, w, m_compute_ring)) {
 						plan = LabelOracle::Plan::Split;
@@ -1507,12 +1563,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// Not as WRITE_DATA (never run natively in this form): each dword as a label release in
 					// the barrier's form, at the end of the pipe instead of when the micro engine gets there,
 					// which only makes it later; Kyty used to write it later still.
-					const bool gpu = engine <= 1 && n <= 16 && m_labels->GpuWritable(dst) && m_labels->GpuWritable(dst + bytes - 1);
+					const bool gpu = engine <= 1 && n <= 16 && label_gpu(dst, bytes);
 					if (gpu) {
 						for (uint32_t i = 0; i < n; i++) {
 							EmitRelease32(body, one_addr ? dst : dst + 4u * i, bptr[3 + i], m_compute_ring);
 						}
-						add_ref(dst, bytes, false);
 						stats.labels_native++;
 						seg_effects = true;
 					}

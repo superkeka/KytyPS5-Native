@@ -900,6 +900,7 @@ void TestLabelsLocalWait() {
 	const Packet* wait = FindFirst(pkts, 0x3Cu);
 	Check(wait != nullptr && wait->body[1] == static_cast<uint32_t>(addr) && r.stats.waits_native == 1 && r.stats.wait_barriers == 0,
 	      "and passes through natively");
+	Check(HasRef(r.refs, addr, 4, false), "the GPU label is a residency reference, so its block is promoted");
 
 	// The same wait with the label reset to 0 after the release: nobody satisfies it, so the IB is cut.
 	std::vector<uint32_t> reset;
@@ -1141,6 +1142,79 @@ void TestComputeRingPackets() {
 	std::vector<uint32_t> draw;
 	Append(draw, IT_DRAW_INDEX_2, {3u, 0x40000000u, 0x2u, 3u, 0u}, false);
 	Check(!t.Translate(draw).ok, "a draw in a compute-ring buffer is refused");
+
+	// SQ_THREAD_TRACE_USERDATA_2/3 (dwords 0xc342/0xc343, offsets 0x342/0x343) and the rest of
+	// USERDATA_0..7. ASTRO BOT's ACBs write only these; refusing the opcode refused every ACB.
+	std::vector<uint32_t> trace;
+	Append(trace, IT_SET_UCONFIG_REG, {0x342u, 0x11u}, true);
+	Append(trace, IT_SET_UCONFIG_REG, {0x343u, 0x22u}, true);
+	Append(trace, IT_SET_UCONFIG_REG_INDEX, {0x340u, 0x1u}, true);
+	Append(trace, IT_SET_UCONFIG_REG, {0x347u, 0x3u}, true);
+	Append(trace, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rt = t.Translate(trace);
+	Check(rt.ok && rt.stats.dispatches == 1 && rt.stats.uconfig_skipped == 4 && rt.skipped_uconfig.count(0x342u) == 1 &&
+	          rt.skipped_uconfig.count(0x343u) == 1 && rt.skipped_uconfig.count(0x340u) == 1,
+	      "profiler UCONFIG is dropped and the ACB still translates");
+	const auto trace_pkts = Decode(rt.ib);
+	Check(FindFirst(trace_pkts, IT_SET_UCONFIG_REG) == nullptr && FindFirst(trace_pkts, IT_SET_UCONFIG_REG_INDEX) == nullptr,
+	      "dropped UCONFIG is not in the compute IB");
+	Check(ValidateNativeIb(rt.ib, false, &bad, NativeIbKind::Compute), "an ACB that only marked the profiler passes the check");
+
+	std::vector<uint32_t> ge;
+	Append(ge, IT_SET_UCONFIG_REG, {0x242u, 0x5u}, true); // VGT_PRIMITIVE_TYPE
+	Append(ge, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rg = t.Translate(ge);
+	Check(!rg.ok && rg.unknown_op == IT_SET_UCONFIG_REG, "geometry-engine UCONFIG still refuses a compute-ring buffer");
+	std::vector<uint32_t> ge_index;
+	Append(ge_index, IT_SET_UCONFIG_REG_INDEX, {0x20000243u, 0u}, true); // VGT_INDEX_TYPE, index 2
+	Check(!t.Translate(ge_index).ok, "indexed geometry-engine UCONFIG still refuses a compute-ring buffer");
+}
+
+// A label the GPU cannot reach must not become a WAIT_REG_MEM or a RELEASE_MEM. The oracle saying
+// "native" is not enough: that packet would read or write the dummy page.
+bool WaitsOn(const std::vector<Packet>& pkts, uint64_t addr) {
+	for (const auto& p: pkts) {
+		if (p.op == 0x3Cu && p.body.size() >= 3 && p.body[1] == static_cast<uint32_t>(addr) &&
+		    p.body[2] == static_cast<uint32_t>(addr >> 32u)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void TestUnreachableLabel() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	static uint32_t label = 0;
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	o.unwritable          = addr;
+	o.plan                = LabelOracle::Plan::Native;
+
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(dcb, IT_WRITE_DATA, {5u << 8u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u}, false);
+	AppendWait(dcb, addr, 1);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 2 && r.segments[1].held && r.segments[1].wait_len == 0 && o.asked == 0,
+	      "a wait on a label this buffer writes on the CPU is held, with no native wait");
+	const auto pkts = Decode(r.ib);
+	Check(!HasLabelRelease(pkts, addr, 1u) && !WaitsOn(pkts, addr), "no GPU release and no GPU wait on an unreachable label");
+	Check(!HasRef(r.refs, addr, 1, false), "an unreachable label is not added for residency");
+	bool cpu = false;
+	for (const auto& p: r.segments[0].points) {
+		cpu = cpu || (p.kind == TrackerPoint::Kind::CpuWrite && p.addr == addr && p.data.size() == 1 && p.data[0] == 1u);
+	}
+	Check(cpu && r.segments[0].writes.size() == 1 && !r.segments[0].writes[0].gpu, "the tracker writes it");
+
+	std::vector<uint32_t> bare;
+	Append(bare, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendWait(bare, addr, 1);
+	auto rb = t.Translate(bare);
+	Check(rb.ok && o.asked == 1 && rb.segments.size() == 2 && rb.segments[1].held && rb.segments[1].wait_len == 0 &&
+	          !WaitsOn(Decode(rb.ib), addr),
+	      "an oracle native wait on an unreachable label stays on the CPU");
 }
 
 void TestPlanRingWait() {
@@ -1210,6 +1284,7 @@ int main() {
 	TestLabelsWait64();
 	TestValidateNativeIb();
 	TestComputeRingPackets();
+	TestUnreachableLabel();
 	TestPlanRingWait();
 	TestComputeRingForQueue();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
