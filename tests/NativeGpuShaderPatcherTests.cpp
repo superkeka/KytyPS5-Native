@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <vector>
 
+using Libs::Graphics::NativeGpu::CountDot2c;
 using Libs::Graphics::NativeGpu::InstructionDwords;
 using Libs::Graphics::NativeGpu::PatchDot2c;
 
@@ -240,6 +241,17 @@ void TestDecodeErrorPatchesNothing() {
 
 } // namespace
 
+void TestCountsFlatAndApertures() {
+	// flat_load_dword v1, v[2:3] (FLAT seg 0), global_load_dword v1, v[2:3], off (seg 2),
+	// s_mov_b32 s0, src_shared_base, s_getreg_b32 s1, hwreg(HW_REG_SH_MEM_BASES), s_endpgm.
+	const std::vector<uint32_t> code = {0xdc300000u, 0x017d0002u, 0xdc308000u, 0x017d0002u,
+	                                    0xbe8003ebu, 0xb901f80fu, SEndpgm};
+	const auto scan = CountDot2c(code);
+	Check(scan.ended && !scan.decode_error, "flat/aperture sample decodes to s_endpgm");
+	Check(scan.flat_ops == 1, "one FLAT-segment access, the GLOBAL one does not count");
+	Check(scan.aperture_ops == 2, "src_shared_base and the SH_MEM_BASES getreg are aperture reads");
+}
+
 int main() {
 	TestInstructionLengths();
 	TestPatchesVgprAndSgprSites();
@@ -252,6 +264,7 @@ int main() {
 	TestUnsupportedWhenNoScratchRoom();
 	TestLiteralThatLooksLikeDot2c();
 	TestDecodeErrorPatchesNothing();
+	TestCountsFlatAndApertures();
 	std::puts("NativeGpuShaderPatcherTests: all cases passed");
 	return 0;
 }

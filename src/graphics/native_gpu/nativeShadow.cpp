@@ -1316,6 +1316,15 @@ private:
 				             static_cast<unsigned long long>(va), scan.sites, scan.instructions,
 				             scan.ended ? "s_endpgm" : (scan.decode_error ? "decode stop" : "capped"));
 			}
+			// The PS5 kernel gives the game VMID SH_MEM_BASES 0x80007000, Linux 0x20001000: a shader that
+			// reads the apertures adapts, one that hardcodes PS5 aperture addresses in FLAT accesses does not.
+			if (scan.flat_ops + scan.aperture_ops > 0) {
+				m_flat_shaders++;
+				if (m_flat_shaders <= 32) {
+					std::fprintf(stderr, "native shadow: shader 0x%llx has %u FLAT accesses, %u aperture reads (%u instrs)\n",
+					             static_cast<unsigned long long>(va), scan.flat_ops, scan.aperture_ops, scan.instructions);
+				}
+			}
 			if (scan.gds_ops + scan.ordered_ops + scan.gws_ops > 0) {
 				m_gds_shaders.insert(va);
 				std::fprintf(stderr,
@@ -1389,6 +1398,7 @@ private:
 	uint64_t      m_gds_dma_dcb[2]  = {}; // DMA_DATA to / from GDS in graphics buffers
 	uint64_t      m_gds_dma_acb[2]  = {}; // and in async compute buffers
 	unsigned long m_data_writes_logged = 0;
+	uint64_t      m_flat_shaders       = 0;
 	uint64_t      m_chain_n         = 0; // pipelined buffers finished since the last flip report
 	double        m_chain_queued_s  = 0.0;
 	double        m_chain_latency_s = 0.0;

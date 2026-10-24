@@ -284,6 +284,26 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 				scan.gds_ops++;
 			}
 		}
+		// FLAT (gfx10): bits 31:26 = 0x37, SEG in 15:14 (0 flat, 1 scratch, 2 global).
+		if ((w >> 26u) == 0x37u && ((w >> 14u) & 0x3u) == 0u) {
+			scan.flat_ops++;
+		}
+		// The aperture bases a shader can see: s_getreg_b32 of HW_REG_SH_MEM_BASES (SOPK op 0x12, hwreg
+		// id 15) and the inline sources src_shared_base/limit, src_private_base/limit (235..238).
+		const auto aperture_src = [](uint32_t src) { return src >= 235u && src <= 238u; };
+		const uint32_t enc9 = w >> 23u;
+		const bool     sopk = (w >> 28u) == 0xbu && enc9 < 0x17du; // SOP1/SOPC/SOPP share the 0xb nibble
+		if (sopk && (enc9 & 0x1fu) == 0x12u && (w & 0x3fu) == 15u) {
+			scan.aperture_ops++;
+		} else if ((w >> 30u) == 0x2u && !sopk && enc9 != 0x17fu && (aperture_src(w & 0xffu) || aperture_src((w >> 8u) & 0xffu))) {
+			scan.aperture_ops++; // SOP1/SOP2/SOPC sources
+		} else if ((w >> 31u) == 0u && aperture_src(w & 0x1ffu)) {
+			scan.aperture_ops++; // VOP2/VOP1/VOPC src0
+		} else if ((w >> 26u) == 0x35u && len >= 2 &&
+		           (aperture_src(code[dw + 1] & 0x1ffu) || aperture_src((code[dw + 1] >> 9u) & 0x1ffu) ||
+		            aperture_src((code[dw + 1] >> 18u) & 0x1ffu))) {
+			scan.aperture_ops++; // VOP3 sources
+		}
 		scan.instructions++;
 		dw += len;
 		scan.dwords = dw;

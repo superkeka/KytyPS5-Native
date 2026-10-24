@@ -48,6 +48,8 @@ struct Dot2cScan {
 	uint32_t gds_ops      = 0;     // DS instructions with the GDS bit (GDS memory, append/consume)
 	uint32_t ordered_ops  = 0;     // ds_ordered_count (ordered append; needs the GDS OA engine)
 	uint32_t gws_ops      = 0;     // ds_gws_* (global wave sync)
+	uint32_t flat_ops     = 0;     // FLAT-segment loads/stores: the address goes through the LDS/scratch apertures
+	uint32_t aperture_ops = 0;     // reads of SH_MEM_BASES (s_getreg) or src_{shared,private}_{base,limit}
 	uint32_t dwords       = 0;     // dwords swept, s_endpgm included
 	bool     ended        = false; // true if an s_endpgm terminated the sweep
 	bool     decode_error = false; // true if an instruction could not be decoded
