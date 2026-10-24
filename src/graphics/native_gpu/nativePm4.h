@@ -153,6 +153,7 @@ struct Pm4TranslateStats {
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
 	uint32_t write_data_dropped = 0; // IT_WRITE_DATA to memory, left to Kyty (see Translate)
 	uint32_t write_data_native  = 0; // IT_WRITE_DATA to memory also kept in the IB (SetWriteDataNative)
+	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
@@ -329,6 +330,9 @@ public:
 	void SetLodStats(bool on) { m_lod_stats = on; }
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
+	// DMA_DATA to or from GDS with CP_SYNC, and a CS_PARTIAL_FLUSH before a copy out of GDS, so the
+	// append counters are final and copied before an indirect dispatch reads them (experiment).
+	void SetGdsDmaSync(bool on) { m_gds_dma_sync = on; }
 	// WRITE_DATA to memory in the native IB as well (Kyty still performs it): 0 none (default), 1 the
 	// ones carrying more than one dword (data, not a label), 2 all.
 	void SetWriteDataNative(uint32_t mode) { m_write_data_native = mode; }
@@ -375,6 +379,7 @@ private:
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
 	bool                         m_pfp_sync_indirect = true;
+	bool                         m_gds_dma_sync      = false;
 	uint32_t                     m_write_data_native = 0;
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;

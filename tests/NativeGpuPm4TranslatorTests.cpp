@@ -355,6 +355,19 @@ void TestDmaData() {
 	t.SetGdsAvailable(true);
 	auto rg = t.Translate(gds);
 	Check(rg.ok && rg.stats.dma_data == 1, "DMA_DATA into GDS passed through with a GDS partition");
+	t.SetGdsDmaSync(true);
+	std::vector<uint32_t> from_gds;
+	Append(from_gds, 0x50u, {1u << 29u, 0x0u, 0x0u, 0x1000u, 0x2u, 4u}, false);
+	const auto ps = Decode(t.Translate(from_gds).ib);
+	const Packet* ev  = FindFirst(ps, 0x46u);
+	const Packet* dma = FindFirst(ps, 0x50u);
+	Check(ev != nullptr && ev->body.size() == 1 && ev->body[0] == ((4u << 8u) | 7u) && dma != nullptr &&
+	          (dma->body[0] >> 31u) == 1u,
+	      "a copy out of GDS gets CS_PARTIAL_FLUSH and CP_SYNC");
+	const auto pg = Decode(t.Translate(gds).ib);
+	Check(FindFirst(pg, 0x46u) == nullptr && (FindFirst(pg, 0x50u)->body[0] >> 31u) == 1u,
+	      "a copy into GDS gets CP_SYNC only");
+	t.SetGdsDmaSync(false);
 	for (const auto& ref: rg.refs) {
 		Check(ref.addr != 0x0u, "a GDS destination is not a memory reference");
 	}

@@ -960,7 +960,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					r.unknown_detail = {bptr[0], body_count >= 6 ? bptr[5] : 0u};
 					return fail(op, dw);
 				}
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				{
+					const uint32_t src_sel = (bptr[0] >> 29u) & 0x3u;
+					const uint32_t dst_sel = (bptr[0] >> 20u) & 0x3u;
+					if (m_gds_dma_sync && src_sel == 1u) {
+						body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // CS_PARTIAL_FLUSH (event 7, index 4)
+						body.push_back((4u << 8u) | 7u);
+					}
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (m_gds_dma_sync && (src_sel == 1u || dst_sel == 1u)) {
+						body[body.size() - size + 1] |= 1u << 31u; // CP_SYNC
+						stats.gds_dma_synced++;
+					}
+				}
 				stats.dma_data++;
 				{
 					const uint64_t bytes = bptr[5] & 0x1fffffu;

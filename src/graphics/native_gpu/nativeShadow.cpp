@@ -1220,6 +1220,11 @@ private:
 			std::fprintf(stderr, "native shadow: GET_LOD_STATS runs on the GPU (experiment)\n");
 		}
 		m_acb_defer = EnvOn("KYTY_NATIVE_GPU_ACB_DEFER");
+		if (EnvOn("KYTY_NATIVE_GPU_GDS_DMA_SYNC")) {
+			m_translator.SetGdsDmaSync(true);
+			m_acb_translator.SetGdsDmaSync(true);
+			std::fprintf(stderr, "native shadow: DMA_DATA with GDS gets CP_SYNC, copies out of GDS a CS_PARTIAL_FLUSH\n");
+		}
 		// KYTY_NATIVE_GPU_GUESS_SPAN_KIB: residency for each user-data value that may be an image base.
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_GUESS_SPAN_KIB"); v != nullptr) {
 			const uint64_t bytes = std::strtoull(v, nullptr, 0) << 10u;
