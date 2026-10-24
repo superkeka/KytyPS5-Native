@@ -415,7 +415,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// a single dword can be address >> 8 (shader programs, inline image bases).
 	auto add_pair = [&](uint32_t lo, uint32_t hi) {
 		add_ref(static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi & 0xffffu) << 32u), 0, true);
-		add_ref((static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi & 0xffu) << 32u)) << 8u, kTextureSpan, false);
+		add_ref((static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi & 0xffu) << 32u)) << 8u, m_guess_span, false);
 	};
 	// SetFindRange diagnostics. Guest VA == host VA, but a stale pointer must not crash the emulator,
 	// so tables are read with process_vm_readv on ourselves (EFAULT instead of SIGSEGV).
@@ -529,7 +529,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				continue; // shader programs come through shader_addrs, the rest is configuration
 			}
 			const uint32_t value = reg(sh, off);
-			add_ref(static_cast<uint64_t>(value) << 8u, kTextureSpan, false);
+			add_ref(static_cast<uint64_t>(value) << 8u, m_guess_span, false);
 			if (IsUserDataRegister(off + 1) && sh.count(off + 1) != 0) {
 				add_pair(value, reg(sh, off + 1));
 			}

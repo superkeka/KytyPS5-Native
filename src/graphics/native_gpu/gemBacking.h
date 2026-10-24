@@ -407,6 +407,12 @@ public:
 		std::lock_guard<std::mutex> lock(m_lock);
 		return m_resident_bytes;
 	}
+	// Of ResidentBytes, what the CPU had written before each block moved (the rest the GPU may still
+	// use: render targets and other GPU-only memory start out untouched).
+	[[nodiscard]] uint64_t TouchedBytes() const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		return m_touched_bytes;
+	}
 
 	// Binds a guest range that is NOT part of the memfd backing — flexible, program (code), runtime
 	// or stack memory: committed anonymous host pages at guest VA == host VA — into this device's GPU
@@ -802,6 +808,8 @@ private:
 		// Every CPU mapping of the block: (address, length, protection, offset in block), the alias slot
 		// first, then each guest view piece split at protection boundaries. Kept in a heap job: the
 		// move runs on the mover thread and must not write to this thread's stack (see MoveBlock).
+		uint64_t touched = 0; // bytes the CPU had written, the rest of the block is padding
+		ForEachDataExtent(index, [&](uint64_t, uint64_t len) { touched += len; });
 		auto job    = std::make_unique<MoveJob>();
 		job->index  = index;
 		job->start  = start;
@@ -842,8 +850,9 @@ private:
 		block.bo       = bo;
 		block.resident = true;
 		m_resident_bytes += block.size;
-		std::fprintf(stderr, "GemBacking: block %llu resident, %llu MiB of guest memory in GTT\n",
-		             static_cast<unsigned long long>(index),
+		m_touched_bytes += touched;
+		std::fprintf(stderr, "GemBacking: block %llu resident (%llu KiB written by the CPU), %llu MiB of guest memory in GTT\n",
+		             static_cast<unsigned long long>(index), static_cast<unsigned long long>(touched >> 10u),
 		             static_cast<unsigned long long>(m_resident_bytes / (1024 * 1024)));
 		return true;
 	}
@@ -955,6 +964,7 @@ private:
 	uint8_t*                      m_alias  = nullptr;
 	uint64_t                      m_size   = 0;
 	uint64_t                      m_resident_bytes = 0;
+	uint64_t                      m_touched_bytes  = 0;
 	std::vector<Block>            m_blocks;
 	std::map<uint64_t, View>      m_views;     // guest VA -> view of the backing
 	uint64_t                      m_views_generation = 0;

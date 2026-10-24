@@ -19,6 +19,9 @@
 #include <ctime>
 #include <map>
 #include <mutex>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <set>
 #include <tuple>
 #include <span>
@@ -425,6 +428,17 @@ public:
 		m_gpu_busy_s += seconds;
 	}
 
+	// One pipelined buffer finished: `queued` waiting for the worker, `latency` from the guest's
+	// submit to its continuation being done, `then` the continuation (Kyty's command processor).
+	void AddChain(double queued, double latency, double then) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_chain_n++;
+		m_chain_queued_s += queued;
+		m_chain_latency_s += latency;
+		m_chain_then_s += then;
+		m_chain_max_s = std::max(m_chain_max_s, latency);
+	}
+
 	void FlipStats(double present_s) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double now = NowSecShadow();
@@ -443,6 +457,27 @@ public:
 			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms; %llu MiB guest memory resident\n",
 			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per,
 			             m_gpu_busy_s * per, static_cast<unsigned long long>(ResidentMiB()));
+#if defined(__GLIBC__)
+			if (EnvOn("KYTY_NATIVE_GPU_MALLOC_STATS")) {
+				const struct mallinfo2 mi = mallinfo2();
+				std::fprintf(stderr, "native shadow: host malloc: %zu MiB in arenas, %zu MiB mmapped, %zu MiB in use\n",
+				             mi.arena >> 20u, mi.hblkhd >> 20u, (mi.uordblks + mi.hblkhd) >> 20u);
+			}
+#endif
+			if (m_dummy_writes > 0) {
+				std::fprintf(stderr, "native shadow: %u checks found GPU writes to non-resident guest memory\n",
+				             m_dummy_writes);
+			}
+			if (m_chain_n > 0) {
+				const double per_buf = 1e3 / static_cast<double>(m_chain_n);
+				std::fprintf(stderr,
+				             "native shadow: per buffer (%.1f per flip): queued %.2f ms, submit to done %.2f ms "
+				             "(max %.1f), continuation %.2f ms\n",
+				             static_cast<double>(m_chain_n) / static_cast<double>(m_flips), m_chain_queued_s * per_buf,
+				             m_chain_latency_s * per_buf, m_chain_max_s * 1e3, m_chain_then_s * per_buf);
+			}
+			m_chain_n = 0;
+			m_chain_queued_s = m_chain_latency_s = m_chain_then_s = m_chain_max_s = 0.0;
 			m_flip_t0 = now;
 			m_busy_s = m_wait_lock_s = m_present_s = m_gpu_busy_s = 0.0;
 			m_flips  = 0;
@@ -991,6 +1026,14 @@ private:
 			m_translator.SetCompactRefs(true);
 			m_acb_translator.SetCompactRefs(true);
 		}
+		// KYTY_NATIVE_GPU_GUESS_SPAN_KIB: residency for each user-data value that may be an image base.
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_GUESS_SPAN_KIB"); v != nullptr) {
+			const uint64_t bytes = std::strtoull(v, nullptr, 0) << 10u;
+			m_translator.SetGuessSpan(bytes);
+			m_acb_translator.SetGuessSpan(bytes);
+			std::fprintf(stderr, "native shadow: image-base guesses make %llu KiB resident\n",
+			             static_cast<unsigned long long>(bytes >> 10u));
+		}
 		// KYTY_NATIVE_GPU_ASYNC=1: submissions return without waiting for the GPU (experiment; the
 		// guest's labels are still written by Kyty's CPU command processor, possibly too early).
 		if (EnvOn("KYTY_NATIVE_GPU_ASYNC") || ShadowThreaded()) {
@@ -1119,6 +1162,11 @@ private:
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
 	double        m_gpu_busy_s  = 0.0;
+	uint64_t      m_chain_n         = 0; // pipelined buffers finished since the last flip report
+	double        m_chain_queued_s  = 0.0;
+	double        m_chain_latency_s = 0.0;
+	double        m_chain_then_s    = 0.0;
+	double        m_chain_max_s     = 0.0;
 	double        m_flip_t0     = 0.0;
 	uint32_t      m_flips       = 0;
 	std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> m_find_seen; // KYTY_NATIVE_GPU_FIND hits logged
@@ -1191,7 +1239,7 @@ public:
 
 	void Enqueue(const uint32_t* buffer, uint32_t size_dw, bool acb, std::function<void()> then) {
 		std::lock_guard<std::mutex> lock(m_mutex);
-		m_jobs.push_back(Job {buffer, size_dw, acb, std::move(then)});
+		m_jobs.push_back(Job {buffer, size_dw, acb, std::move(then), NowSecShadow()});
 		m_cv.notify_one();
 	}
 
@@ -1201,11 +1249,14 @@ private:
 		uint32_t              size_dw;
 		bool                  acb;
 		std::function<void()> then;
+		double                enqueued; // when the guest submitted it
 	};
 	struct Done {
 		uint64_t              seq;
 		std::function<void()> then;
 		double                submitted; // when the batch went to the GPU
+		double                enqueued;
+		double                picked;    // when the worker took it
 	};
 
 	Pipeline() {
@@ -1224,6 +1275,7 @@ private:
 				m_cv.wait(lock, [this] { return !m_jobs.empty(); });
 				jobs.swap(m_jobs);
 			}
+			const double picked = NowSecShadow();
 			for (auto& job: jobs) {
 				if (job.buffer != nullptr) { // nullptr: only keeps `then` in order
 					Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.acb);
@@ -1234,7 +1286,7 @@ private:
 			const double   now = NowSecShadow();
 			std::lock_guard<std::mutex> lock(m_done_mutex);
 			for (auto& job: jobs) {
-				m_done.push_back(Done {seq, std::move(job.then), now});
+				m_done.push_back(Done {seq, std::move(job.then), now, job.enqueued, picked});
 			}
 			m_done_cv.notify_one();
 		}
@@ -1258,7 +1310,10 @@ private:
 				m_last_end   = end;
 				m_waited_seq = done.seq;
 			}
+			const double then_start = NowSecShadow();
 			done.then();
+			const double then_end = NowSecShadow();
+			Shadow::Instance().AddChain(done.picked - done.enqueued, then_end - done.enqueued, then_end - then_start);
 		}
 	}
 
