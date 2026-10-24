@@ -2975,7 +2975,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	cmd[4] = static_cast<uint32_t>(vaddr >> 8u);
 	cmd[5] = static_cast<uint32_t>(vaddr >> 40u);
 	cmd[6] = std::min(poll_cycles >> 4u, 0xffffu);
-	cmd[7] = gcr_cntl & 0x7ffffu;
+	// libSceAgc never invalidates GL2 without writing it back: GL2_INV (bit 14) alone gets GL2_WB
+	// (bit 15) added, as AgcCbReleaseMem does for GLM.
+	auto packet_gcr_cntl = gcr_cntl;
+	if ((packet_gcr_cntl & 0xc000u) == 0x4000u) {
+		packet_gcr_cntl |= 0x8000u;
+	}
+	cmd[7] = packet_gcr_cntl & 0x7ffffu;
 
 	return cmd;
 }
