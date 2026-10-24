@@ -259,12 +259,13 @@ struct TrackerPoint {
 	enum class Kind : uint8_t {
 		End,       // the end of a segment (the last one: the buffer is done)
 		Interrupt, // RELEASE_MEM INT_SEL: raise the queue's EOP interrupt with `ctx`
+		           // (points with nothing between them share one packet, i.e. one `dw`)
 		CpuWrite,  // write `data` (dwords) at `addr`, all to one address when `one_addr`
 		Timestamp, // write the reference clock at `addr` (`size` bytes)
 		LodStats,  // fill `size` bytes at `addr` like Kyty's GET_LOD_STATS
 	};
 	Kind                  kind     = Kind::End;
-	uint32_t              dw       = 0; // the point's 64-bit sequence value in the IB (patched before submission)
+	uint32_t              dw       = 0; // the point's 32-bit sequence value in the IB (patched before submission)
 	uint32_t              ctx      = 0;
 	uint64_t              addr     = 0;
 	uint32_t              size     = 0;
@@ -290,8 +291,14 @@ struct Pm4Segment {
 	std::vector<LabelWrite>   writes;
 };
 
-// Rewrites `len` dwords at `ib[dw]` as one NOP packet (len >= 2).
+// Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
 void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len);
+
+// The native-labels packet check: true when every packet of `ib` is one the translator has run on the
+// board before (in particular RELEASE_MEM and WAIT_REG_MEM only in the barrier's forms, NOPs only as
+// fillers, GET_LOD_STATS only with `lod_stats`), so an "Illegal opcode in command stream" cannot come
+// from a form never tried. On failure `bad_dw` is the offending packet.
+bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw = nullptr);
 
 // What the backend knows about labels beyond the buffer being translated.
 class LabelOracle {
@@ -401,7 +408,7 @@ public:
 	// Native labels: label writes run on the GPU (or at tracker points that write `tracker_va`),
 	// waits pass through, become barriers or cut the IB as `oracle` decides; Kyty's command processor
 	// only gets Pm4TranslateResult::cpu_tail. nullptr turns it off. The fence (SetFenceAddress) is
-	// needed for the barriers of held segments.
+	// needed for the barriers of held segments. The dword at `tracker_va` + 8 takes flush-only releases.
 	void SetNativeLabels(LabelOracle* oracle, uint64_t tracker_va) {
 		m_labels     = oracle;
 		m_tracker_va = tracker_va;

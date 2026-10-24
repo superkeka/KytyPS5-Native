@@ -196,28 +196,52 @@ bool WriteDataToMemory(uint32_t control) {
 	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
 }
 
-// Emits a guest wait the gfx ring can run: WAIT_REG_MEM without the compute shader-type bit an ACB's
-// packet may carry; WAIT_REG_MEM_64, which the gfx ring's micro engine may not have, as the 32-bit
-// wait on the low dword when the high halves of mask and reference are 0 (the same condition).
-// Returns false when it cannot.
-bool EmitNativeWait(std::vector<uint32_t>& ib, std::span<const uint32_t> packet) {
-	const uint32_t op = (packet[0] >> 8u) & 0xffu;
-	if (op == IT_WAIT_REG_MEM) {
-		ib.insert(ib.end(), packet.begin(), packet.end());
-		ib[ib.size() - packet.size()] &= ~0x2u;
-		return true;
-	}
-	// WAIT_REG_MEM_64 body: control, addr lo, addr hi, ref lo, ref hi, mask lo, mask hi, poll.
-	if (packet.size() < 9 || packet[5] != 0 || packet[7] != 0) {
+// Native labels emit RELEASE_MEM and WAIT_REG_MEM only in the forms the barrier has run on the board
+// countless times (guest forms of them stopped the gfx ring with "Illegal opcode in command stream"):
+// RELEASE_MEM with CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX 5 (end of pipe), GCR_CNTL GLM_WB |
+// GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB, 32-bit data to memory and no interrupt; and
+// WAIT_REG_MEM EQUAL on memory by the micro engine, poll interval 4. ValidateNativeIb holds the IB to
+// that.
+constexpr uint32_t kFlushEventCntl = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
+                                     (1u << 20u) | (1u << 21u);
+constexpr uint32_t kData32Cntl     = 1u << 29u;
+constexpr uint32_t kWaitEqualMemMe = 3u | (1u << 4u);
+constexpr uint32_t kWaitPoll       = 4u;
+constexpr uint32_t kFiller         = 0xffff1000u; // the one-dword NOP IBs are padded with
+
+void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value) {
+	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+	ib.push_back(kFlushEventCntl);
+	ib.push_back(kData32Cntl);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+	ib.push_back(value);
+	ib.push_back(0u);
+	ib.push_back(0u);
+}
+
+void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint32_t mask) {
+	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
+	ib.push_back(kWaitEqualMemMe);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+	ib.push_back(ref);
+	ib.push_back(mask);
+	ib.push_back(kWaitPoll);
+}
+
+// Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
+// on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
+// the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
+bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w) {
+	if (w.function != 3 || (w.wide && ((w.mask >> 32u) != 0 || (w.ref >> 32u) != 0))) {
 		return false;
 	}
-	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
-	ib.push_back(packet[1]);
-	ib.push_back(packet[2]);
-	ib.push_back(packet[3]);
-	ib.push_back(packet[4]);
-	ib.push_back(packet[6]);
-	ib.push_back(packet[8]);
+	EmitWaitEqual(ib, w.addr, static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.mask));
+	if (w.pfp) {
+		ib.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
+		ib.push_back(0);
+	}
 	return true;
 }
 
@@ -272,13 +296,84 @@ int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out) const {
 }
 
 void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
-	if (len < 2 || dw + len > ib.size()) {
+	if (dw + len > ib.size()) {
 		return;
 	}
-	ib[dw] = Pkt3(IT_NOP, len - 1u, false);
-	for (uint32_t i = 1; i < len; i++) {
-		ib[dw + i] = 0;
+	for (uint32_t i = 0; i < len; i++) {
+		ib[dw + i] = kFiller;
 	}
+}
+
+bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw) {
+	uint32_t dw = 0;
+	auto     bad = [&]() {
+		if (bad_dw != nullptr) {
+			*bad_dw = dw;
+		}
+		return false;
+	};
+	while (dw < ib.size()) {
+		const uint32_t header = ib[dw];
+		if ((header >> 30u) != 3u) {
+			return bad();
+		}
+		const uint32_t size = PacketSizeDw(header);
+		if (dw + size > ib.size()) {
+			return bad();
+		}
+		const uint32_t* b = ib.data() + dw + 1;
+		switch ((header >> 8u) & 0xffu) {
+			case IT_NOP:
+				if (header != kFiller) {
+					return bad();
+				}
+				break;
+			case IT_RELEASE_MEM:
+				// The barrier's form (any address and data), or a GDS release as the translator has always
+				// run it: DATA_SEL 5, no interrupt.
+				if (header != Pkt3(IT_RELEASE_MEM, 7, false) ||
+				    !((b[0] == kFlushEventCntl && b[1] == kData32Cntl) ||
+				      (((b[1] >> 29u) & 0x7u) == 5u && ((b[1] >> 24u) & 0x7u) == 0u)) ||
+				    b[6] != 0u) {
+					return bad();
+				}
+				break;
+			case IT_WAIT_REG_MEM:
+				if (header != Pkt3(IT_WAIT_REG_MEM, 6, false) || b[0] != kWaitEqualMemMe || b[5] != kWaitPoll) {
+					return bad();
+				}
+				break;
+			case IT_GET_LOD_STATS:
+				if (!lod_stats) {
+					return bad();
+				}
+				break;
+			// What the translator has always passed through or built.
+			case IT_SET_BASE:
+			case IT_CLEAR_STATE:
+			case IT_INDEX_BUFFER_SIZE:
+			case IT_DISPATCH_DIRECT:
+			case IT_DISPATCH_INDIRECT:
+			case IT_DRAW_INDIRECT:
+			case IT_DRAW_INDEX_INDIRECT:
+			case IT_INDEX_BASE:
+			case IT_DRAW_INDEX_2:
+			case IT_CONTEXT_CONTROL:
+			case IT_DRAW_INDEX_AUTO:
+			case IT_NUM_INSTANCES:
+			case IT_PFP_SYNC_ME:
+			case IT_EVENT_WRITE:
+			case IT_DMA_DATA:
+			case IT_ACQUIRE_MEM:
+			case IT_SET_CONTEXT_REG:
+			case IT_SET_SH_REG:
+			case IT_SET_UCONFIG_REG:
+			case IT_SET_UCONFIG_REG_INDEX: break;
+			default: return bad();
+		}
+		dw += size;
+	}
+	return true;
 }
 
 uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
@@ -816,16 +911,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	std::vector<bool>                  seg_keep(1, true);
 	bool                               seg_effects = false;
 	std::vector<LabelWrite>            local_writes;
-	auto tracker_point = [&](TrackerPoint p) {
-		p.dw = static_cast<uint32_t>(body.size()) + 5u;
-		body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
-		body.push_back(0x28u | (5u << 8u)); // BOTTOM_OF_PIPE_TS, EVENT_INDEX 5: end of pipe, no cache action
-		body.push_back(2u << 29u);          // DATA_SEL 2: 64-bit data; DST_SEL 0 memory; no interrupt
-		body.push_back(static_cast<uint32_t>(m_tracker_va));
-		body.push_back(static_cast<uint32_t>(m_tracker_va >> 32u));
-		body.push_back(0u); // the sequence number, patched by the backend
-		body.push_back(0u);
-		body.push_back(0u);
+	// A tracker point writes a 32-bit sequence number (patched by the backend) into the tracker slot.
+	// Points with nothing between them share one packet.
+	size_t last_tracker_end = ~size_t {0};
+	auto   tracker_point    = [&](TrackerPoint p) {
+		if (body.size() == last_tracker_end && !segs.back().points.empty()) {
+			p.dw = segs.back().points.back().dw;
+		} else {
+			p.dw = static_cast<uint32_t>(body.size()) + 5u;
+			EmitRelease32(body, m_tracker_va, 0u);
+			last_tracker_end = body.size();
+		}
 		segs.back().points.push_back(std::move(p));
 		seg_effects = true;
 	};
@@ -847,7 +943,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	// Cuts the IB at a guest wait nobody known satisfies yet: the rest starts held, with its own
 	// preamble, a barrier block and the guest wait (the backend NOPs one of the two).
-	auto split_at_wait = [&](const WaitCond& w, uint32_t wait_at, uint32_t wait_size) {
+	auto split_at_wait = [&](const WaitCond& w) {
 		close_segment(false);
 		segs.emplace_back();
 		seg_body.push_back(static_cast<uint32_t>(body.size()));
@@ -861,8 +957,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		emit_barrier(w.pfp);
 		s.barrier_len = static_cast<uint32_t>(body.size()) - s.barrier_dw;
 		s.wait_dw     = static_cast<uint32_t>(body.size());
-		// No native form (a 64-bit wait on both halves): only seeing the label in memory releases it.
-		s.wait_len  = EmitNativeWait(body, dcb.subspan(wait_at, wait_size)) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
+		// No native form (not EQUAL, or a 64-bit wait on both halves): only seeing the label in memory
+		// releases it.
+		s.wait_len  = EmitNativeWait(body, w) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
 		seg_effects = true;
 		stats.waits_split++;
 	};
@@ -953,14 +1050,27 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						cpu_point = true;
 						sel       = 0;
 					}
-					// The guest's event and cache actions run as they are; the interrupt goes through the
-					// tracker instead. On the gfx ring, also for an ACB: an ACB's RELEASE_MEM with the compute
-					// shader-type bit stopped the gfx ring with "Illegal opcode in command stream".
-					body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
-					body.push_back(bptr[0]);
-					body.push_back((bptr[1] & ~((0x7u << 24u) | (0x7u << 29u))) | (sel << 29u));
-					for (uint32_t i = 2; i < 7; i++) {
-						body.push_back(i == 6 ? 0u : bptr[i]);
+					// Not the guest's packet: its event, cache actions and data forms stopped the gfx ring
+					// ("Illegal opcode in command stream"). The label is written in the barrier's form, which
+					// flushes more than any guest release asks for; a 64-bit one as two 32-bit writes, the
+					// high dword first. GDS data goes as the translator always ran it. A release that only
+					// flushes caches becomes a flush into our scratch dword, unless a tracker point (also a
+					// flush) follows anyway.
+					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
+					if (sel == 1) {
+						EmitRelease32(body, dst, bptr[4]);
+					} else if (sel == 2) {
+						EmitRelease32(body, dst + 4, bptr[5]);
+						EmitRelease32(body, dst, bptr[4]);
+					} else if (sel == 5) {
+						body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+						body.push_back(bptr[0]);
+						body.push_back(bptr[1] & ~(0x7u << 24u)); // INT_SEL 0
+						for (uint32_t i = 2; i < 7; i++) {
+							body.push_back(i == 6 ? 0u : bptr[i]);
+						}
+					} else if (!interrupt && !cpu_point && ((bptr[0] >> 12u) & 0x1fffu) != 0) {
+						EmitRelease32(body, m_tracker_va + 8, 0u);
 					}
 					seg_effects = true;
 					if (sel != 0) {
@@ -975,7 +1085,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						tracker_point(std::move(cpu));
 						stats.labels_cpu++;
 					}
-					if (int_sel == 1 || int_sel == 2 || int_sel == 4) {
+					if (interrupt) {
 						TrackerPoint irq;
 						irq.kind = TrackerPoint::Kind::Interrupt;
 						irq.ctx  = bptr[6] & 0x07ffffffu;
@@ -1192,7 +1302,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (plan == LabelOracle::Plan::Native && !m_native_waits) {
 						plan = LabelOracle::Plan::Met;
 					}
-					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, dcb.subspan(dw, size))) {
+					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, w)) {
 						plan = LabelOracle::Plan::Split;
 					}
 					switch (plan) {
@@ -1204,7 +1314,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							emit_barrier(pfp);
 							seg_effects = true;
 							break;
-						case LabelOracle::Plan::Split: split_at_wait(w, dw, size); break;
+						case LabelOracle::Plan::Split: split_at_wait(w); break;
 					}
 					break;
 				}
@@ -1272,9 +1382,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (n == 0 || dst == 0) {
 						break;
 					}
-					const bool gpu = engine <= 1 && m_labels->GpuWritable(dst) && m_labels->GpuWritable(dst + bytes - 1);
+					// Not as WRITE_DATA (never run natively in this form): each dword as a label release in
+					// the barrier's form, at the end of the pipe instead of when the micro engine gets there,
+					// which only makes it later; Kyty used to write it later still.
+					const bool gpu = engine <= 1 && n <= 16 && m_labels->GpuWritable(dst) && m_labels->GpuWritable(dst + bytes - 1);
 					if (gpu) {
-						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						for (uint32_t i = 0; i < n; i++) {
+							EmitRelease32(body, one_addr ? dst : dst + 4u * i, bptr[3 + i]);
+						}
 						add_ref(dst, bytes, false);
 						stats.labels_native++;
 						seg_effects = true;

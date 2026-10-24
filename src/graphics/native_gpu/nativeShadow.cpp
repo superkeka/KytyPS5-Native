@@ -300,6 +300,17 @@ public:
 		m_residency_ms_total += (NowSecShadow() - t_residency) * 1e3;
 		SetStage(Stage::Idle, frame);
 		if (out != nullptr) {
+			// Only packet forms that have run on the board before go to the GPU; anything else and the
+			// buffer is Kyty's.
+			if (uint32_t bad = 0; m_validate && !ValidateNativeIb(result.ib, NativeLodStats(), &bad)) {
+				if (m_validate_refused++ < 16) {
+					std::fprintf(stderr,
+					             "native shadow: %s %llu left to Kyty by the packet check: op 0x%02x (header 0x%08x) at dw %u\n",
+					             kind, static_cast<unsigned long long>(frame), (result.ib[bad] >> 8u) & 0xffu, result.ib[bad], bad);
+				}
+				m_refused++;
+				return false;
+			}
 			if (!m_breadcrumbs.empty()) {
 				WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, result.ib);
 			}
@@ -620,6 +631,10 @@ public:
 			return false;
 		}
 		*reinterpret_cast<volatile uint64_t*>(m_submitter->ScratchCpu() + kTrackerOffset) = 0;
+		m_validate = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_VALIDATE");
+			return v == nullptr || v[0] != '0';
+		}();
 		const uint64_t va      = m_submitter->ScratchVa() + kTrackerOffset;
 		const char*    native  = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
 		const bool     waits   = native == nullptr || native[0] != '0';
@@ -637,13 +652,25 @@ public:
 #endif
 	}
 
-	// The tracker slot: the sequence number of the last tracker point the GPU has passed.
-	uint64_t TrackerValue() const {
+	// The tracker slot: the (low 32 bits of the) sequence number of the last tracker point the GPU has
+	// passed.
+	uint32_t TrackerValue() const {
 #if KYTY_GEM_BACKING_SUPPORTED
-		return *reinterpret_cast<const volatile uint64_t*>(m_submitter->ScratchCpu() + kTrackerOffset);
+		return *reinterpret_cast<const volatile uint32_t*>(m_submitter->ScratchCpu() + kTrackerOffset);
 #else
 		return 0;
 #endif
+	}
+	// True once the GPU has passed tracker point `seq` (wrap-safe on the 32-bit slot).
+	bool Reached(uint64_t seq) const { return static_cast<int32_t>(TrackerValue() - static_cast<uint32_t>(seq)) >= 0; }
+
+	// KYTY_NATIVE_GPU_VALIDATE (on unless 0): whether native-labels IBs go through ValidateNativeIb.
+	bool Validating() const { return m_validate; }
+	void DisableNow(const char* reason) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (!m_disabled) {
+			Disable(reason);
+		}
 	}
 
 	// Whether the GPU may write a label at `addr`. Called while translating (the lock is held).
@@ -1020,7 +1047,8 @@ private:
 	// COPY_DATA SRC_SEL 9 (GPU clock, gpu_counter_freq = 100 MHz on BC-250) -> memory, 64 bit.
 	static constexpr uint32_t kItCopyData       = 0x40;
 	static constexpr uint32_t kTimestampOffset  = 512;
-	// Native labels: the 64-bit slot tracker points write (the fences are at 1024 and 1032).
+	// Native labels: the 32-bit slot tracker points write and, 8 bytes on, the dword flush-only releases
+	// write (the fences are at 1024 and 1032).
 	static constexpr uint32_t kTrackerOffset    = 1040;
 	static constexpr double   kGpuClockHz       = 100e6;
 
@@ -1348,6 +1376,8 @@ private:
 	uint64_t      m_last_seq         = 0;
 	bool          m_pipelined        = false;
 	bool          m_labels           = false;
+	bool          m_validate         = true;
+	uint32_t      m_validate_refused = 0;
 	uint64_t      m_labels_stats[6]  = {}; // GPU labels, tracker labels, interrupts, native/cut/barrier waits
 	std::vector<uint32_t> m_batch;
 	std::atomic<bool> m_active {false};
@@ -1658,7 +1688,7 @@ private:
 		if (it == m_ring.end()) {
 			return nullptr;
 		}
-		if (it->second.landed <= Shadow::Instance().TrackerValue()) {
+		if (Shadow::Instance().Reached(it->second.landed)) {
 			m_ring.erase(it);
 			return nullptr;
 		}
@@ -1778,12 +1808,14 @@ private:
 			}
 		}
 		std::vector<Entry> entries;
+		uint32_t           packet = ~0u;
 		for (auto& point: p.seg.points) {
-			const uint64_t seq = ++m_seq;
-			p.ib[point.dw]     = static_cast<uint32_t>(seq);
-			p.ib[point.dw + 1] = static_cast<uint32_t>(seq >> 32u);
-			const bool last    = &point == &p.seg.points.back();
-			entries.push_back(Entry {seq, queue, std::move(point), last ? p.done : nullptr});
+			if (point.dw != packet) { // points sharing a packet share its number
+				packet         = point.dw;
+				p.ib[point.dw] = static_cast<uint32_t>(++m_seq);
+			}
+			const bool last = &point == &p.seg.points.back();
+			entries.push_back(Entry {m_seq, queue, std::move(point), last ? p.done : nullptr});
 		}
 		if (p.ib.empty()) {
 			// No GPU work: done once everything ahead of it in the ring is.
@@ -1796,14 +1828,20 @@ private:
 			}
 		}
 		if (m_ring.size() > 16384) {
-			const uint64_t landed = Shadow::Instance().TrackerValue();
 			for (auto it = m_ring.begin(); it != m_ring.end();) {
-				it = it->second.landed <= landed ? m_ring.erase(it) : std::next(it);
+				it = Shadow::Instance().Reached(it->second.landed) ? m_ring.erase(it) : std::next(it);
 			}
 		}
 		if (!p.ib.empty()) {
-			Shadow::Instance().AppendBatch(p.ib);
-			m_appended = true;
+			// The translated IB passed the packet check; the patched one has to as well.
+			if (uint32_t bad = 0; Shadow::Instance().Validating() && !ValidateNativeIb(p.ib, NativeLodStats(), &bad)) {
+				std::fprintf(stderr, "native shadow: a patched segment fails the packet check at dw %u (0x%08x); disabling\n", bad,
+				             p.ib[bad]);
+				Shadow::Instance().DisableNow("packet check");
+			} else {
+				Shadow::Instance().AppendBatch(p.ib);
+				m_appended = true;
+			}
 		}
 		std::lock_guard<std::mutex> lock(m_track_mutex);
 		for (auto& e: entries) {
@@ -1823,8 +1861,7 @@ private:
 			{
 				std::unique_lock<std::mutex> lock(m_track_mutex);
 				m_track_cv.wait(lock, [this] { return !m_entries.empty(); });
-				const uint64_t value = m_native ? Shadow::Instance().TrackerValue() : ~0ull;
-				while (!m_entries.empty() && (m_entries.front().seq <= value || m_drain)) {
+				while (!m_entries.empty() && (!m_native || m_drain || Shadow::Instance().Reached(m_entries.front().seq))) {
 					ready.push_back(std::move(m_entries.front()));
 					m_entries.pop_front();
 				}
@@ -1843,12 +1880,11 @@ private:
 				// that completes, the point was lost (run it anyway); if not, the path disables itself
 				// and everything outstanding runs.
 				const bool idle = Shadow::Instance().WaitSubmission(m_last_cs.load(std::memory_order_acquire));
-				std::fprintf(stderr, "native shadow: tracker stuck at %llu for %.0f s; %s\n",
-				             static_cast<unsigned long long>(Shadow::Instance().TrackerValue()), now - stuck_since,
+				std::fprintf(stderr, "native shadow: tracker stuck at %u for %.0f s; %s\n", Shadow::Instance().TrackerValue(), now - stuck_since,
 				             idle ? "the GPU is idle, running the next point" : "draining");
 				std::lock_guard<std::mutex> lock(m_track_mutex);
 				if (idle && !m_entries.empty()) {
-					m_entries.front().seq = 0;
+					m_entries.front().seq = Shadow::Instance().TrackerValue();
 				} else {
 					m_drain = true;
 				}

@@ -710,10 +710,25 @@ public:
 constexpr uint64_t kTrackerVa = 0x400000fff410ull;
 constexpr uint64_t kFenceVa   = 0x400000fff400ull;
 
+// The barrier's RELEASE_MEM event (CACHE_FLUSH_AND_INV_TS, end of pipe, full GCR): the only form
+// native labels use.
+constexpr uint32_t kFlushEvent = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) | (1u << 20u) | (1u << 21u);
+
 // The tracker RELEASE_MEM a point's sequence value sits in.
 bool IsTrackerPacket(const std::vector<uint32_t>& ib, uint32_t dw) {
-	return dw >= 5 && dw + 2 < ib.size() && ((ib[dw - 5] >> 8u) & 0xffu) == 0x49u && ib[dw - 2] == static_cast<uint32_t>(kTrackerVa) &&
-	       ib[dw - 1] == static_cast<uint32_t>(kTrackerVa >> 32u) && ((ib[dw - 3] >> 29u) & 0x7u) == 2u;
+	return dw >= 5 && dw + 2 < ib.size() && ib[dw - 5] == 0xc0064900u && ib[dw - 4] == kFlushEvent && ib[dw - 3] == (1u << 29u) &&
+	       ib[dw - 2] == static_cast<uint32_t>(kTrackerVa) && ib[dw - 1] == static_cast<uint32_t>(kTrackerVa >> 32u);
+}
+
+// A label release in the barrier's form writing `value` at `addr`.
+bool HasLabelRelease(const std::vector<Packet>& pkts, uint64_t addr, uint32_t value) {
+	for (const auto& p: pkts) {
+		if (p.op == 0x49u && p.body[0] == kFlushEvent && p.body[1] == (1u << 29u) && p.body[2] == static_cast<uint32_t>(addr) &&
+		    p.body[3] == static_cast<uint32_t>(addr >> 32u) && p.body[4] == value) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // Kyty's R_RELEASE_MEM marker around a hardware RELEASE_MEM body.
@@ -744,8 +759,8 @@ void TestLabelsWriteData() {
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.segments.size() == 1 && !r.segments[0].held, "one segment, not held");
 	const auto pkts = Decode(r.ib);
-	const Packet* wd = FindFirst(pkts, IT_WRITE_DATA);
-	Check(wd != nullptr && wd->body[1] == 0x02000100u && wd->body[3] == 7u, "the label WRITE_DATA runs on the GPU");
+	Check(FindFirst(pkts, IT_WRITE_DATA) == nullptr && HasLabelRelease(pkts, 0x202000100ull, 7u),
+	      "the label WRITE_DATA runs on the GPU as a release in the barrier's form");
 	const auto& s = r.segments[0];
 	Check(s.points.size() == 1 && s.points[0].kind == TrackerPoint::Kind::End && IsTrackerPacket(r.ib, s.points[0].dw),
 	      "the segment ends with a tracker point");
@@ -762,8 +777,9 @@ void TestLabelsWriteData() {
 	Check(FindFirst(Decode(rc.ib), IT_WRITE_DATA) == nullptr, "an unwritable label is not written by the GPU");
 	const auto& sc = rc.segments[0];
 	Check(sc.points.size() == 2 && sc.points[0].kind == TrackerPoint::Kind::CpuWrite && sc.points[0].addr == 0x202000200ull &&
-	          sc.points[0].data.size() == 1 && sc.points[0].data[0] == 9u && IsTrackerPacket(rc.ib, sc.points[0].dw),
-	      "the tracker writes it at its point");
+	          sc.points[0].data.size() == 1 && sc.points[0].data[0] == 9u && IsTrackerPacket(rc.ib, sc.points[0].dw) &&
+	          sc.points[1].dw == sc.points[0].dw,
+	      "the tracker writes it at its point, which the end shares");
 	Check(sc.writes.size() == 1 && !sc.writes[0].gpu, "reported as a CPU write");
 }
 
@@ -783,15 +799,20 @@ void TestLabelsReleaseMem() {
 			rels.push_back(&p);
 		}
 	}
-	Check(rels.size() == 2, "both guest releases run natively");
-	Check(((rels[0]->body[1] >> 29u) & 7u) == 1u && ((rels[0]->body[1] >> 24u) & 7u) == 0u && rels[0]->body[4] == 5u &&
-	          rels[0]->body[6] == 0u,
-	      "the first writes its 32-bit label, without the hardware interrupt");
-	Check(((rels[1]->body[1] >> 29u) & 7u) == 0u, "INT_SEL 1 on the graphics queue writes nothing");
+	Check(rels.size() == 1 && HasLabelRelease(pkts, 0x202000300ull, 5u),
+	      "the first writes its 32-bit label in the barrier's form; INT_SEL 1 on the graphics queue writes nothing");
 	const auto& pts = r.segments[0].points;
 	Check(pts.size() == 3 && pts[0].kind == TrackerPoint::Kind::Interrupt && pts[0].ctx == 0x1234 &&
 	          pts[1].kind == TrackerPoint::Kind::Interrupt && pts[1].ctx == 0x55 && pts[2].kind == TrackerPoint::Kind::End,
 	      "each interrupt is a tracker point, in order, before the end");
+	Check(pts[1].dw == pts[0].dw && pts[2].dw == pts[0].dw, "points with nothing between them share one packet");
+
+	// A 64-bit label: two 32-bit releases, the high dword first.
+	std::vector<uint32_t> wide;
+	AppendReleaseMarker(wide, 2, 0, 0x202000320ull, 0x0000000900000008ull, 0);
+	auto       rw    = t.Translate(wide);
+	const auto wpkts = Decode(rw.ib);
+	Check(HasLabelRelease(wpkts, 0x202000324ull, 9u) && HasLabelRelease(wpkts, 0x202000320ull, 8u), "64-bit label as two halves");
 	Check(r.stats.interrupts == 2 && r.stats.labels_native == 1, "stats");
 
 	// A timestamp goes through the tracker (Kyty writes its reference clock).
@@ -869,9 +890,13 @@ void TestLabelsSplit() {
 	Check(Count(Decode(std::vector<uint32_t>(r.ib.begin() + b.wait_dw + b.wait_len, r.ib.begin() + b.end)), IT_DISPATCH_DIRECT) == 1,
 	      "and the rest of the buffer");
 
-	// NopOut turns either one into a NOP of the same length.
+	// NopOut turns either one into filler NOPs.
 	Libs::Graphics::NativeGpu::NopOut(r.ib, b.barrier_dw, b.barrier_len);
-	Check(PacketSizeDw(r.ib[b.barrier_dw]) == b.barrier_len && ((r.ib[b.barrier_dw] >> 8u) & 0xffu) == IT_NOP, "NOP of the same size");
+	bool filler = true;
+	for (uint32_t i = 0; i < b.barrier_len; i++) {
+		filler = filler && r.ib[b.barrier_dw + i] == 0xffff1000u;
+	}
+	Check(filler, "fillers in place of the barrier");
 
 	// A wait before any work: the empty first segment is left out.
 	std::vector<uint32_t> first;
@@ -956,6 +981,61 @@ void TestLabelsWait64() {
 	Check(rs.segments.size() == 2 && rs.segments[1].wait_len == 7, "a held 64-bit wait carries its 32-bit form");
 }
 
+void TestValidateNativeIb() {
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	// Everything the native-labels translator emits passes.
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	static uint64_t label = 0; // read as 64 bits by the WAIT_REG_MEM_64 too
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x240u, 0x11u}, true);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(dcb, IT_WRITE_DATA, {(2u << 8u) | (1u << 20u), 0x02000100u, 0x2u, 7u}, false);
+	AppendReleaseMarker(dcb, 1, 2, 0x202000300ull, 5, 0x1234);
+	AppendReleaseMarker(dcb, 2, 0, 0x202000308ull, 6, 0);
+	dcb.push_back((3u << 30u) | (6u << 16u) | (IT_NOP << 8u) | (0x18u << 2u)); // a cache flush alone
+	dcb.push_back(0x30e62fu);
+	dcb.push_back(1u << 16u);
+	for (int i = 0; i < 5; i++) {
+		dcb.push_back(0u);
+	}
+	AppendWait(dcb, addr, 1);
+	Append(dcb, 0x93u, {3u | (1u << 4u) | (1u << 8u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0u, 0xffffffffu, 0u, 0x19u},
+	       false);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	for (auto plan: {LabelOracle::Plan::Split, LabelOracle::Plan::Native, LabelOracle::Plan::Met}) {
+		o.plan = plan;
+		auto r = t.Translate(dcb);
+		Check(r.ok && ValidateNativeIb(r.ib, false), "the native-labels IB passes the packet check");
+		Check(FindFirst(Decode(r.ib), IT_WRITE_DATA) == nullptr && FindFirst(Decode(r.ib), 0x93u) == nullptr, "no guest forms in it");
+	}
+
+	auto rejects = [&](std::vector<uint32_t> ib, const char* what) {
+		while ((ib.size() & 7u) != 0) {
+			ib.push_back(0xffff1000u);
+		}
+		uint32_t bad = ~0u;
+		Check(!ValidateNativeIb(ib, false, &bad) && bad == 0u, what);
+	};
+	rejects({0xc0079300u, 0x13u, 0u, 0u, 1u, 0u, ~0u, 0u, 4u}, "WAIT_REG_MEM_64 rejected");
+	rejects({0xc0033700u, 0x100200u, 0x1000u, 0u, 1u}, "WRITE_DATA rejected");
+	rejects({0xc0064902u, kFlushEvent, 1u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "RELEASE_MEM with the compute bit rejected");
+	rejects({0xc0064900u, 0x528u, 2u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "a guest-form RELEASE_MEM rejected");
+	rejects({0xc0064900u, kFlushEvent, (1u << 29u) | (2u << 24u), 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM interrupt rejected");
+	rejects({0xc0053c00u, 0x4000013u, 0x1000u, 0u, 1u, ~0u, 0x19u}, "a guest-form WAIT_REG_MEM rejected");
+	rejects({0xc0053c02u, 0x13u, 0x1000u, 0u, 1u, ~0u, 4u}, "WAIT_REG_MEM with the compute bit rejected");
+	rejects({0xc0011000u, 0u, 0u}, "a NOP that is not a filler rejected");
+	rejects({0xc0028e00u, 64u, 0x1000u, 0u}, "GET_LOD_STATS rejected unless enabled");
+	rejects({0x12345678u}, "not a type-3 packet");
+	std::vector<uint32_t> lod = {0xc0028e00u, 64u, 0x1000u, 0u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u};
+	Check(ValidateNativeIb(lod, true), "GET_LOD_STATS passes when enabled");
+	std::vector<uint32_t> gds = {0xc0064900u, 0x2fu | (6u << 8u), 5u << 29u, 0x1000u, 2u, 0xc64u, 0u, 0u};
+	Check(ValidateNativeIb(gds, false), "a GDS release as always run passes");
+}
+
 int main() {
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
@@ -988,6 +1068,7 @@ int main() {
 	TestLabelsCpuTail();
 	TestLabelWriteCovers();
 	TestLabelsWait64();
+	TestValidateNativeIb();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
