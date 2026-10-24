@@ -321,6 +321,18 @@ public:
 			m_labels_stats[3] += result.stats.waits_native;
 			m_labels_stats[4] += result.stats.waits_split;
 			m_labels_stats[5] += result.stats.wait_barriers;
+			m_labels_stats[6] += result.stats.timestamps;
+			// The first labels the GPU may not write, and why (diagnostics for the tracker's share).
+			for (const auto& seg: result.segments) {
+				for (const auto& p: seg.points) {
+					if (p.kind == TrackerPoint::Kind::CpuWrite && m_cpu_labels_logged < 8 && m_cpu_label_pages.insert(p.addr >> 12u).second) {
+						m_cpu_labels_logged++;
+						std::fprintf(stderr, "native shadow: label 0x%llx written by the tracker: %s\n", static_cast<unsigned long long>(p.addr),
+						             m_gem->IsBacked(p.addr) ? "direct memory not mapped for the GPU"
+						                                     : (m_gem->IsGpuMapped(p.addr) ? "read-only for the GPU" : "not GPU memory"));
+					}
+				}
+			}
 			*out = std::move(result);
 			return true;
 		}
@@ -573,9 +585,10 @@ public:
 			}
 			if (m_labels) {
 				std::fprintf(stderr,
-				             "native shadow: native labels so far: %llu GPU label writes, %llu by the tracker, %llu interrupts; "
-				             "waits: %llu native, %llu cut, %llu barriers\n",
+				             "native shadow: native labels so far: %llu GPU label writes, %llu by the tracker (%llu timestamps), %llu "
+				             "interrupts; waits: %llu native, %llu cut, %llu barriers\n",
 				             static_cast<unsigned long long>(m_labels_stats[0]), static_cast<unsigned long long>(m_labels_stats[1]),
+				             static_cast<unsigned long long>(m_labels_stats[6]),
 				             static_cast<unsigned long long>(m_labels_stats[2]), static_cast<unsigned long long>(m_labels_stats[3]),
 				             static_cast<unsigned long long>(m_labels_stats[4]), static_cast<unsigned long long>(m_labels_stats[5]));
 			}
@@ -1378,7 +1391,9 @@ private:
 	bool          m_labels           = false;
 	bool          m_validate         = true;
 	uint32_t      m_validate_refused = 0;
-	uint64_t      m_labels_stats[6]  = {}; // GPU labels, tracker labels, interrupts, native/cut/barrier waits
+	uint64_t      m_labels_stats[7]  = {}; // GPU labels, tracker labels, interrupts, native/cut/barrier waits, timestamps
+	uint32_t      m_cpu_labels_logged = 0;
+	std::set<uint64_t> m_cpu_label_pages;
 	std::vector<uint32_t> m_batch;
 	std::atomic<bool> m_active {false};
 	unsigned long m_waits_logged     = 0;

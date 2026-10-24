@@ -818,10 +818,13 @@ void TestLabelsReleaseMem() {
 	// A timestamp goes through the tracker (Kyty writes its reference clock).
 	std::vector<uint32_t> ts;
 	AppendReleaseMarker(ts, 3, 0, 0x202000310ull, 0, 0);
-	auto rt = t.Translate(ts);
-	Check(rt.segments[0].points.size() == 2 && rt.segments[0].points[0].kind == TrackerPoint::Kind::Timestamp &&
-	          rt.segments[0].points[0].addr == 0x202000310ull,
-	      "timestamp written by the tracker");
+	Append(ts, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(ts, 1, 2, 0x202000318ull, 1, 7);
+	auto        rt  = t.Translate(ts);
+	const auto& tsp = rt.segments[0].points;
+	Check(tsp.size() == 3 && tsp[0].kind == TrackerPoint::Kind::Timestamp && tsp[0].addr == 0x202000310ull &&
+	          tsp[1].kind == TrackerPoint::Kind::Interrupt && tsp[0].dw == tsp[1].dw && tsp[2].kind == TrackerPoint::Kind::End,
+	      "a timestamp is written by the tracker at the next point, without a packet of its own");
 }
 
 void TestLabelsLocalWait() {

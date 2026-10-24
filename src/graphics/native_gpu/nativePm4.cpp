@@ -912,9 +912,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	bool                               seg_effects = false;
 	std::vector<LabelWrite>            local_writes;
 	// A tracker point writes a 32-bit sequence number (patched by the backend) into the tracker slot.
-	// Points with nothing between them share one packet.
-	size_t last_tracker_end = ~size_t {0};
-	auto   tracker_point    = [&](TrackerPoint p) {
+	// Points with nothing between them share one packet. Timestamps wait for the next point instead of
+	// taking a packet (a full cache flush) of their own: ASTRO BOT writes about 300 per frame, and a
+	// timing a few draws late is still a timing.
+	size_t                    last_tracker_end = ~size_t {0};
+	std::vector<TrackerPoint> pending_timestamps;
+	auto                      tracker_point = [&](TrackerPoint p) {
+		if (p.kind == TrackerPoint::Kind::Timestamp) {
+			pending_timestamps.push_back(std::move(p));
+			return;
+		}
 		if (body.size() == last_tracker_end && !segs.back().points.empty()) {
 			p.dw = segs.back().points.back().dw;
 		} else {
@@ -922,6 +929,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			EmitRelease32(body, m_tracker_va, 0u);
 			last_tracker_end = body.size();
 		}
+		for (auto& ts: pending_timestamps) {
+			ts.dw = p.dw;
+			segs.back().points.push_back(std::move(ts));
+		}
+		pending_timestamps.clear();
 		segs.back().points.push_back(std::move(p));
 		seg_effects = true;
 	};
@@ -1038,6 +1050,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					TrackerPoint cpu;
 					bool         cpu_point = false;
 					if (sel == 3) {
+						stats.timestamps++;
 						cpu.kind  = TrackerPoint::Kind::Timestamp;
 						cpu.addr  = dst;
 						cpu.size  = 8;
