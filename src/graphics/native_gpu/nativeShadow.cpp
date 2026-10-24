@@ -1741,7 +1741,8 @@ private:
 			uint64_t  v = 0;
 			const int c = w->Covers(wait.addr, wait.wide, &v);
 			if (c != 0) {
-				return c == 1 && wait.Met(v) && w->gpu ? Release::Native : Release::No;
+				// Without a native form of the wait (wait_len 0) only memory can release it.
+				return c == 1 && wait.Met(v) && w->gpu && p.seg.wait_len != 0 ? Release::Native : Release::No;
 			}
 		}
 		return wait.Met(ReadLabel(wait)) ? Release::Observed : Release::No;

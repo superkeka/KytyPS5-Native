@@ -196,6 +196,31 @@ bool WriteDataToMemory(uint32_t control) {
 	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
 }
 
+// Emits a guest wait the gfx ring can run: WAIT_REG_MEM without the compute shader-type bit an ACB's
+// packet may carry; WAIT_REG_MEM_64, which the gfx ring's micro engine may not have, as the 32-bit
+// wait on the low dword when the high halves of mask and reference are 0 (the same condition).
+// Returns false when it cannot.
+bool EmitNativeWait(std::vector<uint32_t>& ib, std::span<const uint32_t> packet) {
+	const uint32_t op = (packet[0] >> 8u) & 0xffu;
+	if (op == IT_WAIT_REG_MEM) {
+		ib.insert(ib.end(), packet.begin(), packet.end());
+		ib[ib.size() - packet.size()] &= ~0x2u;
+		return true;
+	}
+	// WAIT_REG_MEM_64 body: control, addr lo, addr hi, ref lo, ref hi, mask lo, mask hi, poll.
+	if (packet.size() < 9 || packet[5] != 0 || packet[7] != 0) {
+		return false;
+	}
+	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
+	ib.push_back(packet[1]);
+	ib.push_back(packet[2]);
+	ib.push_back(packet[3]);
+	ib.push_back(packet[4]);
+	ib.push_back(packet[6]);
+	ib.push_back(packet[8]);
+	return true;
+}
+
 // R_ZERO NOP payloads Kyty's command processor runs as flips (pm4Handlers.cpp CpOpMarker): a flip, a
 // flip that writes a label first, and one that also raises the EOP interrupt.
 bool IsFlipMarker(uint32_t tag) {
@@ -836,8 +861,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		emit_barrier(w.pfp);
 		s.barrier_len = static_cast<uint32_t>(body.size()) - s.barrier_dw;
 		s.wait_dw     = static_cast<uint32_t>(body.size());
-		body.insert(body.end(), dcb.begin() + wait_at, dcb.begin() + wait_at + wait_size);
-		s.wait_len  = wait_size;
+		// No native form (a 64-bit wait on both halves): only seeing the label in memory releases it.
+		s.wait_len  = EmitNativeWait(body, dcb.subspan(wait_at, wait_size)) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
 		seg_effects = true;
 		stats.waits_split++;
 	};
@@ -929,8 +954,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						sel       = 0;
 					}
 					// The guest's event and cache actions run as they are; the interrupt goes through the
-					// tracker instead.
-					body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_queue));
+					// tracker instead. On the gfx ring, also for an ACB: an ACB's RELEASE_MEM with the compute
+					// shader-type bit stopped the gfx ring with "Illegal opcode in command stream".
+					body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
 					body.push_back(bptr[0]);
 					body.push_back((bptr[1] & ~((0x7u << 24u) | (0x7u << 29u))) | (sel << 29u));
 					for (uint32_t i = 2; i < 7; i++) {
@@ -1166,9 +1192,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (plan == LabelOracle::Plan::Native && !m_native_waits) {
 						plan = LabelOracle::Plan::Met;
 					}
+					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, dcb.subspan(dw, size))) {
+						plan = LabelOracle::Plan::Split;
+					}
 					switch (plan) {
 						case LabelOracle::Plan::Native:
-							body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 							stats.waits_native++;
 							seg_effects = true;
 							break;

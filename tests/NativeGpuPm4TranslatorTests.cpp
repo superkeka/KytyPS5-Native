@@ -923,6 +923,39 @@ void TestLabelWriteCovers() {
 	Check(w32.Covers(0x1008, false, &v) == 0, "unrelated");
 }
 
+void TestLabelsWait64() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	static uint64_t label = 0;
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	auto wait64 = [&](std::vector<uint32_t>& dcb, uint32_t mask_hi) {
+		Append(dcb, 0x93u, {3u | (1u << 4u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0u, 0xffffffffu, mask_hi, 4u},
+		       false);
+	};
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	wait64(dcb, 0);
+	o.plan = LabelOracle::Plan::Native;
+	auto r = t.Translate(dcb);
+	const auto    pkts = Decode(r.ib);
+	const Packet* w32  = FindFirst(pkts, 0x3Cu);
+	Check(r.segments.size() == 1 && FindFirst(pkts, 0x93u) == nullptr && w32 != nullptr && w32->body[1] == static_cast<uint32_t>(addr) &&
+	          w32->body[3] == 1u && w32->body[4] == 0xffffffffu && w32->body[5] == 4u,
+	      "a native 64-bit wait with zero high halves becomes WAIT_REG_MEM (the gfx ring has no WAIT_REG_MEM_64)");
+
+	std::vector<uint32_t> both;
+	Append(both, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	wait64(both, 1);
+	auto rb = t.Translate(both);
+	Check(rb.segments.size() == 2 && rb.segments[1].held && rb.segments[1].wait_len == 0 && FindFirst(Decode(rb.ib), 0x93u) == nullptr,
+	      "one on both halves is cut and has no native form");
+	o.plan  = LabelOracle::Plan::Split;
+	auto rs = t.Translate(dcb);
+	Check(rs.segments.size() == 2 && rs.segments[1].wait_len == 7, "a held 64-bit wait carries its 32-bit form");
+}
+
 int main() {
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
@@ -954,6 +987,7 @@ int main() {
 	TestLabelsSplit();
 	TestLabelsCpuTail();
 	TestLabelWriteCovers();
+	TestLabelsWait64();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
