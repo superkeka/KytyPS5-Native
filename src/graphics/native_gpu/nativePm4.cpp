@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <atomic>
+#include <cstdio>
 #if defined(__linux__)
 #include <sys/uio.h>
 #include <unistd.h>
@@ -292,6 +294,33 @@ bool IsWork(uint32_t op) {
 }
 
 } // namespace
+
+// First time each guest side effect is handled. A board run then shows which forms the title uses.
+void NoteOnce(uint32_t id, const char* msg) {
+	static std::atomic<uint64_t> lo {0};
+	static std::atomic<uint64_t> hi {0};
+	if (id >= 128u) {
+		return;
+	}
+	auto&          word = id < 64u ? lo : hi;
+	const uint64_t bit  = 1ull << (id & 63u);
+	if ((word.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) {
+		return;
+	}
+	std::fprintf(stderr, "native labels: %s\n", msg);
+}
+
+void NoteEvent(uint32_t event_type) {
+	static std::atomic<uint64_t> seen {0};
+	if (event_type >= 64u) {
+		return;
+	}
+	const uint64_t bit = 1ull << event_type;
+	if ((seen.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) {
+		return;
+	}
+	std::fprintf(stderr, "native labels: EVENT_WRITE type 0x%02x\n", event_type);
+}
 
 bool WaitCond::Met(uint64_t value) const {
 	return WaitConditionMet(function, value & mask, ref);
@@ -1269,6 +1298,40 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		queued_points.push_back(std::move(p));
 		seg_effects = true;
 	};
+	// Kyty's command processor wrote this label with a CPU store after the buffer's GPU work. A guest
+	// that waits on the address (sync-on-address is a futex on that word) sees that store. A GPU
+	// RELEASE_MEM does not wake the futex, and on this path it is not what Dead Cells observes: the
+	// title never asks for an interrupt, and the level load sleeps until the label changes. The
+	// tracker writes the same bytes when the GPU reaches the end of this segment. `prior` is the
+	// dword at translate time, so a label the guest has already replaced is left alone, and a store
+	// the GPU made visible is not written again.
+	auto mirror_store = [&](uint64_t addr, std::vector<uint32_t> words, bool one_addr) {
+		if (words.empty() || addr == 0) {
+			return;
+		}
+		TrackerPoint cpu;
+		cpu.kind     = TrackerPoint::Kind::CpuWrite;
+		cpu.mirror   = true;
+		cpu.addr     = addr;
+		cpu.one_addr = one_addr;
+		cpu.data     = std::move(words);
+		const uint32_t samples = one_addr ? 1u : static_cast<uint32_t>(cpu.data.size());
+		cpu.prior.resize(samples);
+		bool sampled = m_labels != nullptr;
+		for (uint32_t i = 0; sampled && i < samples; i++) {
+			uint32_t v = 0;
+			if (!m_labels->SampleDword(addr + 4ull * i, &v)) {
+				sampled = false;
+			} else {
+				cpu.prior[i] = v;
+			}
+		}
+		if (!sampled) {
+			cpu.prior.clear();
+		}
+		tracker_point(std::move(cpu));
+		stats.labels_cpu++;
+	};
 	auto note_write = [&](const LabelWrite& w) {
 		segs.back().writes.push_back(w);
 		local_writes.push_back(w);
@@ -1436,12 +1499,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							stats.timestamps_native++;
 							stats.labels_native++;
 							seg_effects = true;
+							NoteOnce(2, "RELEASE_MEM timestamp written by the GPU clock");
 						} else {
 							stats.timestamps++;
 							cpu.kind  = TrackerPoint::Kind::Timestamp;
 							cpu.addr  = dst;
 							cpu.size  = 8;
 							cpu_point = true;
+							NoteOnce(3, "RELEASE_MEM timestamp written by the tracker (CPU clock)");
 						}
 						sel = 0;
 					} else if ((sel == 1 || sel == 2) && !label_gpu(dst, sel == 1 ? 4ull : 8ull)) {
@@ -1460,9 +1525,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
 					if (sel == 1) {
 						EmitRelease32(body, dst, bptr[4], m_compute_ring);
+						mirror_store(dst, {bptr[4]}, false);
+						NoteOnce(0, "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)");
 					} else if (sel == 2) {
 						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring);
 						EmitRelease32(body, dst, bptr[4], m_compute_ring);
+						mirror_store(dst, {bptr[4], bptr[5]}, false);
+						NoteOnce(1, "RELEASE_MEM 64-bit label (GPU store, mirrored to the CPU)");
 					} else if (sel == 5) {
 						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
 						body.push_back(bptr[0]);
@@ -1481,6 +1550,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						note_write({dst, sel == 1 ? (value & 0xffffffffull) : value, sel != 5, true, sel == 2});
 						stats.labels_native++;
 						stats.gds_releases += sel == 5 ? 1u : 0u;
+						if (sel == 5) {
+							NoteOnce(4, "RELEASE_MEM GDS data (GPU store, no CPU mirror)");
+						}
+					} else if (data_sel == 0 && !interrupt && !cpu_point) {
+						NoteOnce(5, "RELEASE_MEM with no data and no interrupt (cache action only)");
 					}
 					if (cpu_point) {
 						note_write({dst, cpu.data.size() == 1 ? (value & 0xffffffffull) : value, cpu.kind != TrackerPoint::Kind::Timestamp,
@@ -1494,6 +1568,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						irq.ctx  = bptr[6] & 0x07ffffffu;
 						tracker_point(irq);
 						stats.interrupts++;
+						NoteOnce(16u + int_sel, int_sel == 1 ? "RELEASE_MEM INT_SEL 1 (EOP interrupt)"
+						                                     : (int_sel == 2 ? "RELEASE_MEM INT_SEL 2 (EOP interrupt)"
+						                                                     : "RELEASE_MEM INT_SEL 4 (interrupt only)"));
 					}
 				} else if (marker == R_RELEASE_MEM) {
 					stats.marker_release++;
@@ -1751,12 +1828,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						case LabelOracle::Plan::Native:
 							stats.waits_native++;
 							seg_effects = true;
+							NoteOnce(8, "guest WAIT_REG_MEM passed through (a GPU write satisfies it)");
 							break;
 						case LabelOracle::Plan::Met:
 							emit_barrier(pfp);
 							seg_effects = true;
+							NoteOnce(10, "guest WAIT_REG_MEM already met (barrier)");
 							break;
-						case LabelOracle::Plan::Split: split_at_wait(w); break;
+						case LabelOracle::Plan::Split:
+							split_at_wait(w);
+							NoteOnce(9, "guest WAIT_REG_MEM held on the CPU (no known writer yet)");
+							break;
 					}
 					break;
 				}
@@ -1847,8 +1929,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						for (uint32_t i = 0; i < n; i++) {
 							EmitRelease32(body, one_addr ? dst : dst + 4u * i, bptr[3 + i], m_compute_ring);
 						}
+						mirror_store(dst, std::vector<uint32_t>(bptr + 3, bptr + 3 + n), one_addr);
 						stats.labels_native++;
 						seg_effects = true;
+						NoteOnce(6, "WRITE_DATA label (GPU store, mirrored to the CPU)");
 					}
 					for (uint32_t i = 0; i < std::min<uint32_t>(n, 64); i++) {
 						note_write({one_addr ? dst : dst + 4u * i, bptr[3 + i], true, gpu, false});
@@ -1861,6 +1945,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						cpu.data.assign(bptr + 3, bptr + 3 + n);
 						tracker_point(std::move(cpu));
 						stats.labels_cpu++;
+						NoteOnce(7, "WRITE_DATA label written by the tracker (GPU cannot reach it)");
 					}
 					r.label_writes.emplace_back(dst, bptr[3]);
 					break;
@@ -2064,6 +2149,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					add_ref((static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), 256, false);
 				}
 				stats.event_write++;
+				if (body_count >= 1) {
+					NoteEvent(bptr[0] & 0x3fu);
+				}
 				break;
 			case IT_CLEAR_STATE:
 				// The hardware resets the context to amdgpu's clear state, the PS5 CP to its own

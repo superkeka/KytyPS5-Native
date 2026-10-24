@@ -838,8 +838,10 @@ void TestLabelsWriteData() {
 	Check(FindFirst(pkts, IT_WRITE_DATA) == nullptr && HasLabelRelease(pkts, 0x202000100ull, 7u),
 	      "the label WRITE_DATA runs on the GPU as a release in the barrier's form");
 	const auto& s = r.segments[0];
-	Check(s.points.size() == 1 && s.points[0].kind == TrackerPoint::Kind::End && IsTrackerPacket(r.ib, s.points[0].dw),
-	      "the segment ends with a tracker point");
+	Check(s.points.size() == 2 && s.points[0].kind == TrackerPoint::Kind::CpuWrite && s.points[0].mirror &&
+	          s.points[0].data.size() == 1 && s.points[0].data[0] == 7u && s.points[1].kind == TrackerPoint::Kind::End &&
+	          s.points[0].dw == s.points[1].dw && IsTrackerPacket(r.ib, s.points[0].dw),
+	      "the GPU label is mirrored to the CPU at the segment's tracker point");
 	Check(s.writes.size() == 1 && s.writes[0].addr == 0x202000100ull && s.writes[0].value == 7u && s.writes[0].gpu,
 	      "the write is reported as a GPU label write");
 	Check(s.begin == 0 && s.end == r.ib.size() && IbAligned(r.ib), "the segment spans the aligned IB");
@@ -878,10 +880,12 @@ void TestLabelsReleaseMem() {
 	Check(rels.size() == 1 && HasLabelRelease(pkts, 0x202000300ull, 5u),
 	      "the first writes its 32-bit label in the barrier's form; INT_SEL 1 on the graphics queue writes nothing");
 	const auto& pts = r.segments[0].points;
-	Check(pts.size() == 3 && pts[0].kind == TrackerPoint::Kind::Interrupt && pts[0].ctx == 0x1234 &&
-	          pts[1].kind == TrackerPoint::Kind::Interrupt && pts[1].ctx == 0x55 && pts[2].kind == TrackerPoint::Kind::End,
-	      "each interrupt is a tracker point, in order, before the end");
-	Check(pts[1].dw == pts[0].dw && pts[2].dw == pts[0].dw, "points with nothing between them share one packet");
+	Check(pts.size() == 4 && pts[0].kind == TrackerPoint::Kind::CpuWrite && pts[0].mirror && pts[0].data.size() == 1 &&
+	          pts[0].data[0] == 5u && pts[1].kind == TrackerPoint::Kind::Interrupt && pts[1].ctx == 0x1234 &&
+	          pts[2].kind == TrackerPoint::Kind::Interrupt && pts[2].ctx == 0x55 && pts[3].kind == TrackerPoint::Kind::End,
+	      "the 32-bit label is mirrored, then each interrupt, then the end");
+	Check(pts[1].dw == pts[0].dw && pts[2].dw == pts[0].dw && pts[3].dw == pts[0].dw,
+	      "points with nothing between them share one packet");
 
 	// A 64-bit label: two 32-bit releases, the high dword first.
 	std::vector<uint32_t> wide;
@@ -889,6 +893,10 @@ void TestLabelsReleaseMem() {
 	auto       rw    = t.Translate(wide);
 	const auto wpkts = Decode(rw.ib);
 	Check(HasLabelRelease(wpkts, 0x202000324ull, 9u) && HasLabelRelease(wpkts, 0x202000320ull, 8u), "64-bit label as two halves");
+	const auto& wpts = rw.segments[0].points;
+	Check(!wpts.empty() && wpts[0].kind == TrackerPoint::Kind::CpuWrite && wpts[0].mirror && wpts[0].data.size() == 2 &&
+	          wpts[0].data[0] == 8u && wpts[0].data[1] == 9u,
+	      "the 64-bit label is mirrored as both halves");
 	Check(r.stats.interrupts == 2 && r.stats.labels_native == 1, "stats");
 
 	// A timestamp the GPU can reach is a DATA_SEL 3 release, not a tracker write. The interrupt
@@ -902,9 +910,10 @@ void TestLabelsReleaseMem() {
 	const auto  tpk = Decode(rt.ib);
 	Check(rt.ok && rt.stats.timestamps_native == 1 && rt.stats.timestamps == 0 && HasGpuTimestamp(tpk, 0x202000310ull),
 	      "a reachable timestamp is a GPU clock release");
-	Check(tsp.size() == 2 && tsp[0].kind == TrackerPoint::Kind::Interrupt && tsp[0].ctx == 7 &&
-	          tsp[1].kind == TrackerPoint::Kind::End && tsp[0].dw == tsp[1].dw,
-	      "the interrupt shares the segment's one tracker packet with the end");
+	Check(tsp.size() == 3 && tsp[0].kind == TrackerPoint::Kind::CpuWrite && tsp[0].mirror && tsp[0].addr == 0x202000318ull &&
+	          tsp[1].kind == TrackerPoint::Kind::Interrupt && tsp[1].ctx == 7 && tsp[2].kind == TrackerPoint::Kind::End &&
+	          tsp[0].dw == tsp[2].dw,
+	      "the label mirror and the interrupt share the segment's one tracker packet with the end");
 	Check(HasRef(rt.refs, 0x202000310ull, 8, false), "the timestamp address is made resident");
 }
 

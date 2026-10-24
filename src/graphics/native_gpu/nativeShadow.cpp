@@ -27,6 +27,11 @@
 #endif
 #include <set>
 #include <tuple>
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <unordered_map>
 #include <span>
 #include <string>
@@ -502,7 +507,8 @@ public:
 			// The first labels the GPU may not write, and why (diagnostics for the tracker's share).
 			for (const auto& seg: result.segments) {
 				for (const auto& p: seg.points) {
-					if (p.kind == TrackerPoint::Kind::CpuWrite && m_cpu_labels_logged < 8 && m_cpu_label_pages.insert(p.addr >> 12u).second) {
+					if (p.kind == TrackerPoint::Kind::CpuWrite && !p.mirror && m_cpu_labels_logged < 8 &&
+					    m_cpu_label_pages.insert(p.addr >> 12u).second) {
 						m_cpu_labels_logged++;
 						std::fprintf(stderr, "native shadow: label 0x%llx written by the tracker: %s\n", static_cast<unsigned long long>(p.addr),
 						             m_gem->IsBacked(p.addr) ? "direct memory not mapped for the GPU"
@@ -958,6 +964,18 @@ public:
 		if (!m_disabled) {
 			Disable(reason);
 		}
+	}
+
+	// The dword at `addr` through the guest alias, so a label mirror can tell a GPU store that
+	// already landed from one the guest has replaced. Called while translating.
+	bool SampleDword(uint64_t addr, uint32_t* out) const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return out != nullptr && m_gem != nullptr && m_gem->ReadGuest(addr, out, 4) == 4;
+#else
+		(void)addr;
+		(void)out;
+		return false;
+#endif
 	}
 
 	// Whether the GPU may write a label at `addr`. Called while translating (the lock is held).
@@ -2092,9 +2110,9 @@ Host& HostCallbacks() {
 // was never submitted. Each ring has its own tracker slot and its own fence; a buffer's continuation
 // runs when its ring passes the buffer's end point.
 //
-// A tracker thread polls the slot every tracker point writes its sequence number to (about every
-// 50 us while points are outstanding) and performs what each point stands for as soon as the GPU
-// passes it: EOP interrupts, labels the GPU cannot write, the end of a buffer (its continuation:
+// A tracker thread blocks on the ring fence and performs what each point stands for as soon as the
+// GPU passes it: EOP interrupts, labels the GPU cannot write (and a CPU mirror of the ones it can,
+// so a guest futex-waiting on the address observes the store), the end of a buffer (its continuation:
 // Kyty's command processor runs the few packets it still needs, flips and waits for flips, copied
 // out at translation; refused buffers whole).
 class LabelPipeline final: public LabelOracle {
@@ -2113,6 +2131,8 @@ public:
 	}
 
 	bool GpuWritable(uint64_t addr) override { return Shadow::Instance().GpuWritable(addr); }
+
+	bool SampleDword(uint64_t addr, uint32_t* out) override { return Shadow::Instance().SampleDword(addr, out); }
 
 	// A wait in a buffer of m_translating's queue that no earlier write of that buffer decides: the
 	// pieces of the same queue still held come before it, then writes ahead in the ring that have not
@@ -2503,8 +2523,45 @@ private:
 				break;
 			case TrackerPoint::Kind::CpuWrite: {
 				auto* dst = reinterpret_cast<volatile uint32_t*>(p.addr);
-				for (size_t i = 0; i < p.data.size(); i++) {
-					dst[p.one_addr ? 0 : i] = p.data[i];
+				// A mirror publishes only while the guest still holds the dword from translate time.
+				// The GPU store landing (the dword already equals `data`) and a later guest store both
+				// leave the word alone. An empty `prior` is a label the GPU cannot write: always store.
+				const bool conditional = p.mirror && !p.prior.empty();
+				bool       published   = !conditional && !p.data.empty();
+				if (!conditional) {
+					for (size_t i = 0; i < p.data.size(); i++) {
+						dst[p.one_addr ? 0 : i] = p.data[i];
+					}
+				} else if (p.one_addr) {
+					const uint32_t cur = dst[0];
+					if (cur == p.prior[0]) {
+						for (uint32_t word: p.data) {
+							dst[0] = word;
+						}
+						published = true;
+					} else {
+						published = !p.data.empty() && cur == p.data.back();
+					}
+				} else {
+					published = !p.data.empty();
+					for (size_t i = 0; i < p.data.size(); i++) {
+						const uint32_t cur = dst[i];
+						if (cur == p.data[i]) {
+							continue;
+						}
+						if (i < p.prior.size() && cur == p.prior[i]) {
+							dst[i] = p.data[i];
+							continue;
+						}
+						published = false;
+					}
+				}
+				// sync-on-address sleeps in FUTEX_WAIT on this word. The store alone does not wake it;
+				// the 10 ms poll would, but the waiter returns as soon as it is woken and then reads.
+				if (published) {
+#if defined(__linux__)
+					syscall(SYS_futex, reinterpret_cast<uint32_t*>(p.addr), FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#endif
 				}
 				break;
 			}

@@ -159,7 +159,7 @@ struct Pm4TranslateStats {
 	uint32_t write_data_native  = 0; // IT_WRITE_DATA to memory also kept in the IB (SetWriteDataNative)
 	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
 	uint32_t labels_native     = 0; // native labels: WRITE_DATA / RELEASE_MEM label writes run on the GPU
-	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU
+	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU (unreachable, or a mirror of a GPU store)
 	uint32_t timestamps        = 0; // native labels: timestamps the tracker still writes (CPU clock)
 	uint32_t timestamps_native = 0; // native labels: timestamps the GPU writes (DATA_SEL 3)
 	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
@@ -278,7 +278,9 @@ struct TrackerPoint {
 	uint64_t              addr     = 0;
 	uint32_t              size     = 0;
 	bool                  one_addr = false;
+	bool                  mirror   = false; // also stored by the GPU; publish on the CPU only if the guest has not replaced it
 	std::vector<uint32_t> data;
+	std::vector<uint32_t> prior; // dwords at `addr` when the buffer was translated; empty: write unconditionally
 };
 
 // One self-contained piece of a translated buffer, IB dwords [begin, end) of Pm4TranslateResult::ib.
@@ -343,6 +345,13 @@ public:
 	virtual ~LabelOracle() = default;
 	// True when the GPU may write `addr` (GPU-mapped, writable guest memory).
 	virtual bool GpuWritable(uint64_t addr) = 0;
+	// The dword currently at `addr`, when it can be read without faulting. False leaves the tracker's
+	// mirror of a GPU label store unconditional.
+	virtual bool SampleDword(uint64_t addr, uint32_t* out) {
+		(void)addr;
+		(void)out;
+		return false;
+	}
 	// Decides a wait no earlier write of the same buffer decides.
 	virtual Plan PlanWait(const WaitCond& wait) = 0;
 };
