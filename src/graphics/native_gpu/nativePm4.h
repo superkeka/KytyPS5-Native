@@ -3,9 +3,12 @@
 
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <set>
 #include <span>
 #include <utility>
@@ -343,6 +346,70 @@ public:
 	virtual Plan PlanWait(const WaitCond& wait) = 0;
 };
 
+// Texture LOD statistics (SetLodBankScan): the PS5 T#s that count into GET_LOD_STATS, seen by the
+// draws and dispatches since the previous GET_LOD_STATS packet. Gfx10 layout, as Kyty decodes it:
+// word5 bit 25 MIP_STATS_CNT_EN, word5[19:8] MIN_LOD_WARN, word6[7:0] the counter bank (one 8-byte
+// record per bank behind the packet's 64-byte header). The gfx9 layout (word6: MIN_LOD_WARN[11:0],
+// COUNTER_BANK_ID[19:12], LOD_HDW_CNT_EN[20]) is counted next to it to tell which one the game uses.
+struct LodBankScan {
+	uint64_t                             addr = 0; // the GET_LOD_STATS buffer this scan ends at
+	std::bitset<256>                     banks;     // banks of the counting T#s
+	uint32_t                             tsharps  = 0; // plausible T#s scanned (repeats included)
+	uint32_t                             counting = 0; // of those, with MIP_STATS_CNT_EN
+	uint32_t                             inline_ud = 0; // counting T#s found in user data
+	uint32_t                             depth1    = 0; // ... in a table a user-data pointer points at
+	uint32_t                             depth2    = 0; // ... in a table such a table points at
+	uint32_t                             tables    = 0; // tables read
+	uint32_t                             max_word  = 0; // furthest dword a counting T# sat at in a table
+	uint32_t                             alt_counting = 0; // gfx9 layout: word6 bit 20 set
+	std::bitset<256>                     alt_banks;        // gfx9 layout: word6[19:12] of those
+	std::map<uint32_t, uint32_t>         min_lod_warn;     // MIN_LOD_WARN of the counting T#s -> count
+	std::vector<std::array<uint32_t, 8>> samples;          // the first counting T#s, whole
+	void                                 Merge(const LodBankScan& o);
+};
+
+// What CpOpGetLodStats writes. Usage (the default, and KYTY_LOD_STATS_MODE=usage) is one record per
+// bank from the translator's window. all / fill is the old whole-buffer fill (KYTY_LOD_STATS_FILL,
+// 0xff unless overridden). banks / even / lo / hi are the earlier diagnostics.
+enum class LodStatsMode { Usage, All, Banks, Even, Lo, Hi };
+LodStatsMode ParseLodStatsMode(const char* mode);
+
+// GET_LOD_STATS record, as ASTRO BOT's reader (eboot 0x900479d40) decodes it. Bits 23:0 are the
+// sample count, bits 31:24 an id byte the streamer folds in (left 0), bits 59:56 the minimum mip
+// actually sampled (0 finest; 0xF means this bank has no data). A used bank is reported as sampled
+// at the finest mip; the exact mip comes later, from shader instrumentation.
+constexpr uint64_t kLodStatsUsed   = 1ull;
+constexpr uint64_t kLodStatsNoData = 0x0F00000000000000ull;
+constexpr uint32_t kLodStatsHeader = 64;
+
+// Writes a usage report: header dword 0 = 1 (after the records, so a reader that sees the label
+// sees the records too), record `kLodStatsUsed` for each set bank, `kLodStatsNoData` for the rest.
+// Returns how many used records were written. `size_bytes` is the packet's buffer size.
+uint32_t WriteLodUsageReport(void* dst, uint32_t size_bytes, const std::bitset<256>& banks);
+
+// "12-13,87" or "none". `dst` is NUL-terminated when `dst_size` > 0.
+void FormatLodBankRanges(const std::bitset<256>& banks, char* dst, uint32_t dst_size);
+
+// Banks published by the pipeline thread that translates DCBs and ACBs, taken by the command
+// processor when it runs the matching GET_LOD_STATS. The processor runs after that translation
+// (same thread when the pipeline is off; the completion thread when KYTY_NATIVE_GPU_THREAD is on),
+// so Take sees every buffer submitted before the packet.
+class LodStatsHandoff {
+public:
+	void Push(uint64_t addr, const std::bitset<256>& banks);
+	bool Take(uint64_t addr, std::bitset<256>& banks);
+
+private:
+	static constexpr size_t kCap = 1024;
+	std::mutex m_mutex;
+	std::deque<std::pair<uint64_t, std::bitset<256>>> m_queue;
+	uint32_t m_dropped = 0;
+};
+LodStatsHandoff& LodStatsReports();
+
+// Optional stand-in for the guest-memory read the bank scan uses (process_vm_readv on Linux).
+using LodGuestReadFn = size_t (*)(uint64_t addr, uint32_t* dst, size_t dwords, void* user);
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -358,6 +425,7 @@ struct Pm4TranslateResult {
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
+	std::vector<LodBankScan>      lod_scans;      // SetLodBankScan: one per GET_LOD_STATS packet
 	struct UnmetWait {
 		uint64_t addr;
 		uint64_t ref;
@@ -475,6 +543,26 @@ public:
 	void SetCompactRefs(bool compact) { m_compact_refs = compact; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
+	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
+	// scan every stage's user-data SGPRs (PS, VS, GS, ES, HS, LS) and USER_DATA_ADDR; dispatches
+	// scan COMPUTE_USER_DATA_0..15. Descriptor tables those pointers name are read two levels deep
+	// (`table_dwords` of each first-level table). A non-zero-size GET_LOD_STATS closes the window:
+	// Pm4TranslateResult::lod_scans gets one scan, and TakeLodScan returns what was seen since the
+	// previous report. A zero-size packet does not close it.
+	void SetLodBankScan(bool on, uint32_t table_dwords = 1024) {
+		m_lod_scan        = on;
+		m_lod_scan_dwords = table_dwords != 0 ? table_dwords : 1024;
+	}
+	void SetLodGuestRead(LodGuestReadFn fn, void* user) {
+		m_lod_read      = fn;
+		m_lod_read_user = user;
+	}
+	LodBankScan TakeLodScan() {
+		LodBankScan out = std::move(m_lod_cur);
+		m_lod_cur       = {};
+		m_lod_tables.clear();
+		return out;
+	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
 	// DMA_DATA to or from GDS with CP_SYNC, and a CS_PARTIAL_FLUSH before a copy out of GDS, so the
@@ -535,6 +623,12 @@ private:
 	bool                         m_pfp_sync_indirect = true;
 	bool                         m_gds_dma_sync      = false;
 	uint32_t                     m_write_data_native = 0;
+	bool                         m_lod_scan          = false;
+	uint32_t                     m_lod_scan_dwords   = 1024;
+	LodGuestReadFn               m_lod_read          = nullptr;
+	void*                        m_lod_read_user     = nullptr;
+	LodBankScan                  m_lod_cur;          // SetLodBankScan: since the last GET_LOD_STATS
+	std::set<uint64_t>           m_lod_tables;       // tables already read for m_lod_cur
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;

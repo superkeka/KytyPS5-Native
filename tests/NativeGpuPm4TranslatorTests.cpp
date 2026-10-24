@@ -1,10 +1,15 @@
 #include "graphics/native_gpu/nativePm4.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <bitset>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <span>
+#include <thread>
 #include <vector>
 
 using Libs::Graphics::NativeGpu::GpuRef;
@@ -12,12 +17,16 @@ using Libs::Graphics::NativeGpu::LabelOracle;
 using Libs::Graphics::NativeGpu::Pm4Segment;
 using Libs::Graphics::NativeGpu::TrackerPoint;
 using Libs::Graphics::NativeGpu::WaitCond;
+using Libs::Graphics::NativeGpu::LodStatsHandoff;
+using Libs::Graphics::NativeGpu::LodStatsMode;
+using Libs::Graphics::NativeGpu::ParseLodStatsMode;
 using Libs::Graphics::NativeGpu::Pm4TranslateResult;
 using Libs::Graphics::NativeGpu::ComputeRingForQueue;
 using Libs::Graphics::NativeGpu::NativeIbKind;
 using Libs::Graphics::NativeGpu::PlanRingWait;
 using Libs::Graphics::NativeGpu::Pm4Translator;
 using Libs::Graphics::NativeGpu::RingWaitRelease;
+using Libs::Graphics::NativeGpu::WriteLodUsageReport;
 
 namespace {
 
@@ -1343,6 +1352,223 @@ void TestComputeRingForQueue() {
 	Check(ComputeRingForQueue(0x20, 0u) == 0u, "no compute ring reported: ring 0");
 }
 
+// Gfx10 T# that counts into `bank` (word5 bit 25, word6[7:0]). The other words only have to pass
+// the translator's plausibility checks.
+std::array<uint32_t, 8> CountingT(uint32_t bank) {
+	return {0x01234567u, 0x00a00000u, 0u, 0x90000000u, 0u, 0x02000000u, bank, 0u};
+}
+
+void AppendImage(std::vector<uint32_t>& dcb, uint32_t sh_offset, uint32_t bank) {
+	const auto img = CountingT(bank);
+	Append(dcb, IT_SET_SH_REG,
+	       {sh_offset, img[0], img[1], img[2], img[3], img[4], img[5], img[6], img[7]}, false);
+}
+
+void TestLodUsageReport() {
+	Check(ParseLodStatsMode(nullptr) == LodStatsMode::Usage && ParseLodStatsMode("") == LodStatsMode::Usage &&
+	          ParseLodStatsMode("usage") == LodStatsMode::Usage,
+	      "usage is the default LOD stats mode");
+	Check(ParseLodStatsMode("all") == LodStatsMode::All && ParseLodStatsMode("fill") == LodStatsMode::All,
+	      "all and fill keep the old fill");
+	Check(ParseLodStatsMode("banks") == LodStatsMode::Banks && ParseLodStatsMode("even") == LodStatsMode::Even &&
+	          ParseLodStatsMode("lo") == LodStatsMode::Lo && ParseLodStatsMode("hi") == LodStatsMode::Hi,
+	      "the diagnostic modes stay selectable");
+
+	std::bitset<256> banks;
+	banks.set(0);
+	banks.set(7);
+	banks.set(255);
+	alignas(8) uint8_t buf[0x840];
+	std::memset(buf, 0xa5, sizeof(buf));
+	const uint32_t used = WriteLodUsageReport(buf, sizeof(buf), banks);
+	Check(used == 3, "three used records");
+	Check(*reinterpret_cast<uint32_t*>(buf) == 1u, "header dword 0 is the report-present label");
+	bool header_rest = true;
+	for (uint32_t i = 1; i < 16; i++) {
+		header_rest = header_rest && reinterpret_cast<uint32_t*>(buf)[i] == 0u;
+	}
+	Check(header_rest, "the rest of the 64-byte header is zero");
+	auto record = [&](uint32_t bank) {
+		uint64_t v = 0;
+		std::memcpy(&v, buf + 64 + bank * 8, 8);
+		return v;
+	};
+	Check(record(0) == 1ull && record(7) == 1ull && record(255) == 1ull, "a used bank is count 1, min mip 0");
+	const uint8_t* used_bytes = buf + 64 + 7 * 8;
+	Check(used_bytes[0] == 1 && used_bytes[1] == 0 && used_bytes[2] == 0 && used_bytes[3] == 0 && used_bytes[4] == 0 &&
+	          used_bytes[5] == 0 && used_bytes[6] == 0 && used_bytes[7] == 0,
+	      "a used record is the integer 1 (id byte and min-mip nibble clear)");
+	Check(record(1) == 0x0F00000000000000ull && record(254) == 0x0F00000000000000ull,
+	      "an unused bank is no-data with a zero sample count");
+	const uint8_t* none = buf + 64 + 8;
+	Check(none[0] == 0 && none[1] == 0 && none[2] == 0 && none[3] == 0 && none[4] == 0 && none[5] == 0 && none[6] == 0 &&
+	          none[7] == 0x0F,
+	      "no-data is nibble 59:56 = 0xF and nothing else");
+
+	// A short buffer still gets a label and must not be written past.
+	alignas(8) uint8_t tiny[64 + 16 + 4];
+	std::memset(tiny, 0xa5, sizeof(tiny));
+	std::bitset<256> one;
+	one.set(1);
+	Check(WriteLodUsageReport(tiny, 64 + 16, one) == 1, "one record fits in a two-record buffer");
+	Check(tiny[64 + 16] == 0xa5 && tiny[64 + 17] == 0xa5, "the report stops at the caller's size");
+	uint64_t first = 0;
+	uint64_t second = 0;
+	std::memcpy(&first, tiny + 64, 8);
+	std::memcpy(&second, tiny + 72, 8);
+	Check(first == 0x0F00000000000000ull && second == 1ull, "bank 1 is the second record");
+}
+
+void TestLodStatsHandoff() {
+	LodStatsHandoff  handoff;
+	std::bitset<256> banks;
+	banks.set(4);
+	handoff.Push(0x210000040ull, banks);
+	std::bitset<256> got;
+	Check(handoff.Take(0x210000040ull, got) && got.count() == 1 && got.test(4), "take returns the published banks");
+	Check(!handoff.Take(0x210000040ull, got), "a report is delivered once");
+	Check(!handoff.Take(0x210000080ull, got), "an unknown buffer has no report");
+
+	banks.set(5);
+	handoff.Push(0x1000, banks);
+	std::bitset<256> later;
+	later.set(9);
+	handoff.Push(0x1000, later);
+	Check(handoff.Take(0x1000, got) && got.test(4) && got.test(5) && !got.test(9), "the older report for an address is first");
+	Check(handoff.Take(0x1000, got) && got.test(9) && !got.test(4), "then the newer one");
+
+	// The translator publishes on the pipeline thread; the command processor takes on its own thread.
+	LodStatsHandoff        shared;
+	std::atomic<uint32_t>  matches {0};
+	std::thread            producer([&] {
+		for (uint32_t i = 0; i < 200; i++) {
+			std::bitset<256> b;
+			b.set(i % 256);
+			shared.Push(static_cast<uint64_t>(i + 1), b);
+		}
+	});
+	std::thread            consumer([&] {
+		for (uint32_t i = 0; i < 200; i++) {
+			std::bitset<256> b;
+			bool             got_one = false;
+			for (uint32_t spin = 0; spin < 10000000u && !got_one; spin++) {
+				got_one = shared.Take(static_cast<uint64_t>(i + 1), b);
+			}
+			matches += got_one && b.test(i % 256) ? 1u : 0u;
+		}
+	});
+	producer.join();
+	consumer.join();
+	Check(matches.load() == 200, "concurrent publish and take do not drop or tear a report");
+}
+
+void TestLodBankScan() {
+	Pm4Translator t;
+	t.SetLodBankScan(true);
+	// A 2D T# at 0x123456700 counting into bank 7 (word5 bit 25, MIN_LOD_WARN 0x100) in PS user data
+	// 0-7, and the same image without MIP_STATS_CNT_EN (bank 9) in GS user data 0-7.
+	const uint32_t counting[8] = {0x01234567u, 0x00a00000u, 0u, 0x90000000u, 0u, 0x02010000u, 0x7u, 0u};
+	const uint32_t silent[8]   = {0x01234567u, 0x00a00000u, 0u, 0x90000000u, 0u, 0x00010000u, 0x9u, 0u};
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x00Cu, counting[0], counting[1], counting[2], counting[3], counting[4], counting[5], counting[6], counting[7]}, false);
+	Append(dcb, IT_SET_SH_REG, {0x08Cu, silent[0], silent[1], silent[2], silent[3], silent[4], silent[5], silent[6], silent[7]}, false);
+	Append(dcb, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
+	Append(dcb, 0x8Eu /* IT_GET_LOD_STATS */, {0x840u, 0x10000040u, 0x2u, 0x80000u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.lod_scans.size() == 1, "one LOD bank scan per GET_LOD_STATS");
+	const auto& s = r.lod_scans[0];
+	Check(s.addr == 0x210000040ull, "scan names the packet's buffer");
+	Check(s.banks.count() == 1 && s.banks.test(7) && s.counting == 1 && s.inline_ud == 1, "only the counting T#'s bank");
+	Check(s.min_lod_warn.size() == 1 && s.min_lod_warn.count(0x100u) == 1, "MIN_LOD_WARN from word5[19:8]");
+	// Banks start over after the packet.
+	std::vector<uint32_t> next;
+	Append(next, 0x8Eu /* IT_GET_LOD_STATS */, {0x840u, 0x10000040u, 0x2u, 0x80000u}, false);
+	auto r2 = t.Translate(next);
+	Check(r2.lod_scans.size() == 1 && r2.lod_scans[0].banks.none(), "no draws, no banks");
+}
+
+void TestLodBankSources() {
+	Pm4Translator t;
+	t.SetLodBankScan(true);
+	// A zero-size GET_LOD_STATS is the per-frame disable. It is not a report the game reads, so the
+	// banks sampled before it stay in the window until the next real report.
+	std::vector<uint32_t> first;
+	AppendImage(first, 0x00Cu, 3);
+	Append(first, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
+	Append(first, 0x8Eu /* IT_GET_LOD_STATS */, {0u, 0u, 0u, 0u}, false);
+	auto r0 = t.Translate(first);
+	Check(r0.ok && r0.lod_scans.empty(), "a zero-size GET_LOD_STATS does not close the window");
+
+	// VS user data loaded indirectly, plus ES/HS/LS inline, plus a T# in a descriptor table and one
+	// in the table that table points at, plus the PS USER_DATA_ADDR spill table.
+	const auto vs = CountingT(21);
+	std::vector<uint32_t> pairs;
+	for (uint32_t i = 0; i < 8; i++) {
+		pairs.push_back(0x04Cu + i);
+		pairs.push_back(vs[i]);
+	}
+	const auto     nested = CountingT(28);
+	const uint32_t nested_words[8] = {nested[0], nested[1], nested[2], nested[3], nested[4], nested[5], nested[6], nested[7]};
+	const uint32_t table_words[8]  = {0x00000400u, 0x2u, 0u, 0u, 0u, 0u, 0u, 0u}; // -> 0x200000400
+	const auto     spill_img = CountingT(27);
+	const uint32_t spill_words[8] = {spill_img[0], spill_img[1], spill_img[2], spill_img[3],
+	                                 spill_img[4], spill_img[5], spill_img[6], spill_img[7]};
+	const uint32_t silent[8] = {0x01234567u, 0x00a00000u, 0u, 0x90000000u, 0u, 0x00010000u, 0x9u, 0u};
+
+	std::vector<uint32_t> dcb;
+	AppendIndirect(dcb, IT_SET_SH_REG_INDIRECT, pairs);
+	AppendImage(dcb, 0x0CCu, 22); // ES
+	AppendImage(dcb, 0x10Cu, 23); // HS
+	AppendImage(dcb, 0x14Cu, 24); // LS
+	// PS user data 0-1 is the descriptor table; user data 8-15 is an inline T#.
+	const auto inline_ps = CountingT(30);
+	Append(dcb, IT_SET_SH_REG,
+	       {0x00Cu, 0x00000100u, 0x2u, 0u, 0u, 0u, 0u, 0u, 0u, inline_ps[0], inline_ps[1], inline_ps[2], inline_ps[3],
+	        inline_ps[4], inline_ps[5], inline_ps[6], inline_ps[7]},
+	       false);
+	Append(dcb, IT_SET_SH_REG, {0x002u, 0x00010000u, 0x2u}, false); // USER_DATA_ADDR -> 0x200010000
+	Append(dcb, IT_SET_SH_REG, {0x08Cu, silent[0], silent[1], silent[2], silent[3], silent[4], silent[5], silent[6], silent[7]}, false);
+	Append(dcb, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
+	// Compute user data, sampled by the dispatch in the same window.
+	AppendImage(dcb, 0x240u, 25);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 0u}, true);
+	Append(dcb, 0x8Eu /* IT_GET_LOD_STATS */, {0x840u, 0x10000040u, 0x2u, 0x80000u}, false);
+
+	struct Tables {
+		uint64_t        addr[3];
+		const uint32_t* words[3];
+		size_t          count[3];
+	};
+	Tables tables {{0x200000100ull, 0x200000400ull, 0x200010000ull},
+	                     {table_words, nested_words, spill_words},
+	                     {8, 8, 8}};
+	t.SetLodGuestRead(
+	    [](uint64_t addr, uint32_t* dst, size_t dwords, void* user) -> size_t {
+		    const auto* tabs = static_cast<const Tables*>(user);
+		    for (int i = 0; i < 3; i++) {
+			    if (addr == tabs->addr[i]) {
+				    const size_t n = std::min(dwords, tabs->count[i]);
+				    std::memcpy(dst, tabs->words[i], n * sizeof(uint32_t));
+				    return n;
+			    }
+		    }
+		    return 0;
+	    },
+	    &tables);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.lod_scans.size() == 1, "the real report closes the window");
+	const auto& s = r.lod_scans[0];
+	Check(s.banks.test(3), "banks from the previous DCB are still in the window");
+	Check(s.banks.test(21), "a T# loaded into VS user data by SET_SH_REG_INDIRECT counts");
+	Check(s.banks.test(22) && s.banks.test(23) && s.banks.test(24), "ES, HS and LS user data count");
+	Check(s.banks.test(30), "an inline T# beside a table pointer counts");
+	Check(s.banks.test(28), "a T# in a table reached through another table counts");
+	Check(s.banks.test(27), "a T# in the USER_DATA_ADDR spill table counts");
+	Check(s.banks.test(25), "a dispatch's COMPUTE_USER_DATA T# counts");
+	Check(s.banks.count() == 9, "exactly the sampled banks");
+	Check(!s.banks.test(9), "a T# without MIP_STATS_CNT_EN is not a sampled bank");
+}
+
 int main() {
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
@@ -1382,6 +1608,10 @@ int main() {
 	TestGpuTimestamp();
 	TestPlanRingWait();
 	TestComputeRingForQueue();
+	TestLodBankScan();
+	TestLodUsageReport();
+	TestLodStatsHandoff();
+	TestLodBankSources();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
