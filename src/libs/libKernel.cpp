@@ -1065,7 +1065,8 @@ static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT co
 
 void KernelDispatchPendingSignalForCurrentThread() {
 	Pthread current = PthreadSelfOrNull();
-	if (current == nullptr) {
+	// Called on every sleep and yield: one plain load instead of a locked RMW per signal number.
+	if (!PthreadHasAnyPendingSignal(current)) {
 		return;
 	}
 
