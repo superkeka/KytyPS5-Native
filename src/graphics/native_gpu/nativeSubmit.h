@@ -312,7 +312,10 @@ private:
 		c.in.bo_size      = kIbSize;
 		c.in.alignment    = 64 * 1024;
 		c.in.domains      = AMDGPU_GEM_DOMAIN_GTT;
-		c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC; // write-combined, like Mesa's IBs
+		// Write-combined, like Mesa's IBs, and uncached on the GPU: the slots are rewritten in place, and
+		// the CP fetching a reused slot through GL2 can execute stale lines of the previous IB there
+		// (mem_probe on the BC-250: the third job from one IB address ran the second one's commands).
+		c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC | AMDGPU_GEM_CREATE_UNCACHED;
 		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) != 0) {
 			std::fprintf(stderr, "NativeSubmitter: IB GEM_CREATE failed: %s\n", std::strerror(errno));
 			return false;
