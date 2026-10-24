@@ -26,7 +26,7 @@ fi
 ssh -o BatchMode=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=5 $H 'journalctl -kf -n 0 --no-pager -o short-monotonic' > "$LOCAL/kernel.log" 2>&1 &
 KLOG=$!
 sleep 2
-ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS $CRUMBS\" --setenv=EXTRA_ARGS=\"$ARGS\" ${TRY_NO_OVERLAY:+--setenv=OVERLAY=} $RUNS/game-run.sh $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
+ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS $CRUMBS\" --setenv=EXTRA_ARGS=\"$ARGS\" ${TRY_NO_OVERLAY:+--setenv=OVERLAY=} ${TRY_EMU:+--setenv=KYTY_EMU=$TRY_EMU} $RUNS/game-run.sh $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
 result=TIMEOUT
 for i in $(seq 1 $(( (SECS + 60) / 5 ))); do
 	sleep 5

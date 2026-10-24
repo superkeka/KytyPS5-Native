@@ -6,7 +6,7 @@
 set -u
 TITLE=$1 MODE=$2 SECS=$3 TAG=$4 EVERY=${5:-15}
 OUT=/home/deck/dev/kyty-runs/$TAG
-EMU=/home/deck/dev/KytyPS5-bc250/_Build/linux-no-qt/kyty_emulator
+EMU=${KYTY_EMU:-/home/deck/dev/KytyPS5-bc250/_Build/linux-no-qt/kyty_emulator}
 mkdir -p "$OUT"
 case $MODE in
   vulkan)  ENVS="" ;;
