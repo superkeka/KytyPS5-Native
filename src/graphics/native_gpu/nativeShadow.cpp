@@ -1771,8 +1771,9 @@ private:
 			uint64_t  v = 0;
 			const int c = w->Covers(wait.addr, wait.wide, &v);
 			if (c != 0) {
-				// Without a native form of the wait (wait_len 0) only memory can release it.
-				return c == 1 && wait.Met(v) && w->gpu && p.seg.wait_len != 0 ? Release::Native : Release::No;
+				// Without a native form of the wait (wait_len 0), or with KYTY_NATIVE_GPU_NATIVE_WAITS=0 (the
+				// GPU then never waits for a guest label), only memory can release it.
+				return c == 1 && wait.Met(v) && w->gpu && p.seg.wait_len != 0 && m_native_waits ? Release::Native : Release::No;
 			}
 		}
 		return wait.Met(ReadLabel(wait)) ? Release::Observed : Release::No;
@@ -1959,6 +1960,10 @@ private:
 	std::condition_variable                 m_cv;
 	std::deque<Job>                         m_jobs;
 	bool                                    m_native  = false;
+	bool                                    m_native_waits = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
+		return v == nullptr || v[0] != '0';
+	}();
 	double                                  m_timeout = 12.0;
 	std::map<uint32_t, std::deque<Piece>>   m_pending; // by queue
 	uint32_t                                m_translating = 0;
