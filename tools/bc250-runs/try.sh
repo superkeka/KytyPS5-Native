@@ -23,6 +23,13 @@ else
 	until mkdir "$LOCK.d" 2>/dev/null; do sleep 5; done
 	trap 'rmdir "$LOCK.d" 2>/dev/null' EXIT
 fi
+# A build on the board next to a run skews its memory and frame-rate figures: wait for running builds
+# (TRY_BUILD_WAIT seconds at most, default 15 minutes; 0 skips the wait).
+for i in $(seq 1 $(( ${TRY_BUILD_WAIT:-900} / 5 ))); do
+	ssh -o BatchMode=yes $H 'pgrep -x ninja > /dev/null' || break
+	[ $i = 1 ] && echo "waiting for a build on the board to finish"
+	sleep 5
+done
 ssh -o BatchMode=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=5 $H 'journalctl -kf -n 0 --no-pager -o short-monotonic' > "$LOCAL/kernel.log" 2>&1 &
 KLOG=$!
 sleep 2
