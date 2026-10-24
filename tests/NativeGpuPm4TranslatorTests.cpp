@@ -369,6 +369,18 @@ void TestWriteData() {
 	const auto pkts = Decode(r.ib);
 	Check(FindFirst(pkts, IT_WRITE_DATA) == nullptr, "WRITE_DATA left to Kyty, not in the native IB");
 
+	std::vector<uint32_t> data;
+	Append(data, IT_WRITE_DATA, {(5u << 8u) | (1u << 20u), 0x1000u, 0x2u, 0x1u, 0x2u, 0x3u}, false);
+	auto rd = t.Translate(data);
+	Check(rd.ok && rd.data_writes.size() == 1 && rd.data_writes[0].second == 3, "a multi-dword WRITE_DATA reported");
+	Check(FindFirst(Decode(rd.ib), IT_WRITE_DATA) == nullptr, "multi-dword WRITE_DATA left to Kyty by default");
+	t.SetWriteDataNative(1);
+	Check(FindFirst(Decode(t.Translate(data).ib), IT_WRITE_DATA) != nullptr, "mode 1 keeps a multi-dword WRITE_DATA");
+	Check(FindFirst(Decode(t.Translate(dcb).ib), IT_WRITE_DATA) == nullptr, "mode 1 still leaves a label to Kyty");
+	t.SetWriteDataNative(2);
+	Check(FindFirst(Decode(t.Translate(dcb).ib), IT_WRITE_DATA) != nullptr, "mode 2 keeps every WRITE_DATA");
+	t.SetWriteDataNative(0);
+
 	std::vector<uint32_t> to_reg;
 	Append(to_reg, IT_WRITE_DATA, {0u, 0x2c00u, 0x0u, 0x1u}, false);
 	auto r2 = t.Translate(to_reg);
@@ -615,7 +627,8 @@ void TestGdsReleaseMem() {
 	dcb.push_back(0x55u);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.gds_releases == 1, "GDS release marker translated");
-	const Packet* rel = FindFirst(Decode(r.ib), 0x49u);
+	const auto    pkts = Decode(r.ib);
+	const Packet* rel  = FindFirst(pkts, 0x49u);
 	Check(rel != nullptr && rel->body.size() == 7 && ((rel->body[1] >> 24u) & 0x7u) == 0u &&
 	          ((rel->body[1] >> 29u) & 0x7u) == 5u && rel->body[4] == (0xc64u | (1u << 16u)) && rel->body[6] == 0u,
 	      "native RELEASE_MEM sends the GDS dword, without the interrupt");
