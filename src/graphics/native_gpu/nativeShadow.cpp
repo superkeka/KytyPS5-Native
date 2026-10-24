@@ -254,10 +254,19 @@ public:
 		while ((wrapped.size() & 7u) != 0) {
 			wrapped.push_back(0xffff1000u);
 		}
-		std::span<const uint32_t> ib = wrapped;
 		if (!m_breadcrumbs.empty()) {
-			WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, ib);
+			WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, wrapped);
 		}
+		// Pipelined: the IB joins the batch the pipeline submits with one CS once it has taken every
+		// queued buffer (FlushBatch). One BO-list validation then covers them all.
+		if (m_pipelined) {
+			if ((m_batch.size() + wrapped.size()) * 4 > NativeSubmitter::kSlotSize) {
+				SubmitBatchLocked();
+			}
+			m_batch.insert(m_batch.end(), wrapped.begin(), wrapped.end());
+			return;
+		}
+		std::span<const uint32_t> ib = wrapped;
 		SetStage(Stage::Gpu, frame);
 		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
 		// ENOENT: a buffer in the list was closed meanwhile (another guest thread unmapped an external
@@ -418,6 +427,16 @@ public:
 
 	bool NativeAcb() const { return Active() && m_acb_mode == AcbMode::On; }
 
+	// Pipeline mode: Submit batches IBs; FlushBatch submits them with one CS.
+	void SetPipelined() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_pipelined = true;
+	}
+	void FlushBatch() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		SubmitBatchLocked();
+	}
+
 	// The submission the last Submit queued in async mode (0: none), for the pipeline to wait on.
 	uint64_t TakeLastSeq() {
 		std::lock_guard<std::mutex> lock(m_mutex);
@@ -443,6 +462,30 @@ public:
 	}
 
 private:
+	void SubmitBatchLocked() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_batch.empty() || m_disabled || m_submitter == nullptr) {
+			m_batch.clear();
+			return;
+		}
+		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
+		NativeSubmitter::Result r       = m_submitter->Submit(m_batch, handles, m_timeout_sec);
+		for (int retry = 0; !r.submitted && r.err == -ENOENT && retry < 3; retry++) {
+			handles = m_gem->CreatedHandles();
+			r       = m_submitter->Submit(m_batch, handles, m_timeout_sec);
+		}
+		m_batch.clear();
+		if (!r.submitted) {
+			std::fprintf(stderr, "native shadow: batch submit failed: %s (%zu BOs)\n", std::strerror(-r.err),
+			             handles.size());
+			Disable("submit error");
+			return;
+		}
+		m_cs_ms_total += r.cs_seconds * 1e3;
+		m_last_seq = r.seq;
+#endif
+	}
+
 	// KYTY_NATIVE_GPU_ACB: "1" runs async compute buffers natively (and Kyty skips their dispatches),
 	// "dry" only translates them and reports what the translator lacks.
 	enum class AcbMode { Off, Dry, On };
@@ -645,6 +688,9 @@ private:
 			if (backed(addr)) {
 				promote(addr, 64u * 1024u, 1);
 			}
+		}
+		for (uint32_t b: result.ref_buckets) {
+			promote(static_cast<uint64_t>(b) << kBucketShift, 1ull << kBucketShift, 3);
 		}
 		std::vector<uint64_t> tables;
 		for (const auto& ref: result.refs) {
@@ -894,6 +940,12 @@ private:
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetComputeQueue(true);
+		// Residency only needs the 16 MiB buckets the GPU may touch, unless descriptor tables are
+		// followed or unmapped references logged: those need every reference.
+		if (!EnvOn("KYTY_NATIVE_GPU_TABLE_PROMOTE") && !m_log_unmapped) {
+			m_translator.SetCompactRefs(true);
+			m_acb_translator.SetCompactRefs(true);
+		}
 		// KYTY_NATIVE_GPU_ASYNC=1: submissions return without waiting for the GPU (experiment; the
 		// guest's labels are still written by Kyty's CPU command processor, possibly too early).
 		if (EnvOn("KYTY_NATIVE_GPU_ASYNC") || EnvOn("KYTY_NATIVE_GPU_THREAD")) {
@@ -1012,6 +1064,8 @@ private:
 	uint32_t      m_acb_dummy_writes = 0;
 	uint64_t      m_promoted_by[6]   = {};
 	uint64_t      m_last_seq         = 0;
+	bool          m_pipelined        = false;
+	std::vector<uint32_t> m_batch;
 	std::atomic<bool> m_active {false};
 	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
@@ -1107,26 +1161,32 @@ private:
 	};
 
 	Pipeline() {
+		Shadow::Instance().SetPipelined();
 		std::thread([this] { Work(); }).detach();
 		std::thread([this] { Complete(); }).detach();
 	}
 
+	// Takes every queued buffer, translates them into one batch and submits it with a single CS. Their
+	// continuations all wait for that last submission: the gfx ring runs submissions in order.
 	void Work() {
 		for (;;) {
-			Job job;
+			std::deque<Job> jobs;
 			{
 				std::unique_lock<std::mutex> lock(m_mutex);
 				m_cv.wait(lock, [this] { return !m_jobs.empty(); });
-				job = std::move(m_jobs.front());
-				m_jobs.pop_front();
+				jobs.swap(m_jobs);
 			}
-			uint64_t seq = 0;
-			if (job.buffer != nullptr) { // nullptr: only keeps `then` in order
-				Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.acb);
-				seq = Shadow::Instance().TakeLastSeq();
+			for (auto& job: jobs) {
+				if (job.buffer != nullptr) { // nullptr: only keeps `then` in order
+					Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.acb);
+				}
 			}
+			Shadow::Instance().FlushBatch();
+			const uint64_t seq = Shadow::Instance().TakeLastSeq();
 			std::lock_guard<std::mutex> lock(m_done_mutex);
-			m_done.push_back(Done {seq, std::move(job.then)});
+			for (auto& job: jobs) {
+				m_done.push_back(Done {seq, std::move(job.then)});
+			}
 			m_done_cv.notify_one();
 		}
 	}

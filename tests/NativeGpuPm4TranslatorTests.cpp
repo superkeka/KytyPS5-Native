@@ -583,6 +583,23 @@ void TestWaitBarrier() {
 	      "WAIT_REG_MEM waits for that fence");
 }
 
+void TestCompactRefs() {
+	Pm4Translator t;
+	t.SetCompactRefs(true);
+	std::vector<uint32_t> dcb;
+	// CB_COLOR0 at 0x2_0100_0000, 1920x1080: one 16 MiB bucket (0x201).
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x02010000u}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x3B0u, ((1920u - 1u) << 14u) | (1080u - 1u)}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x08Eu, 0xfu}, false);
+	Append(dcb, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
+	auto r = t.Translate(dcb);
+	bool found = false;
+	for (uint32_t b: r.ref_buckets) {
+		found = found || b == 0x201u;
+	}
+	Check(r.ok && found && r.refs.empty(), "compact refs report the render target's bucket, no GpuRef list");
+}
+
 void TestContextDefaults() {
 	Pm4Translator t;
 	t.SeedPs5Defaults();
@@ -670,6 +687,7 @@ int main() {
 	TestIndirectDraws();
 	TestContextStatePushPop();
 	TestWaitBarrier();
+	TestCompactRefs();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

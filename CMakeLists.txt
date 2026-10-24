@@ -830,7 +830,9 @@ elseif(WIN32 OR LINUX)
 	target_link_options(kyty_emulator PRIVATE "-Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
 endif()
 
-if(LINUX)
+# KYTY_KEEP_SYMBOLS=ON keeps the symbol table of Release builds, for profiling with perf.
+option(KYTY_KEEP_SYMBOLS "Do not strip Release builds" OFF)
+if(LINUX AND NOT KYTY_KEEP_SYMBOLS)
     target_link_options(kyty_emulator PRIVATE
         $<$<CONFIG:Release>:-Wl,--strip-all>
     )

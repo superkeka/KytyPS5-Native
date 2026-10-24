@@ -376,9 +376,38 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		auto it = regs.find(off);
 		return it == regs.end() ? 0u : it->second;
 	};
+	// Compact refs: one bit per 16 MiB bucket of the two windows guest memory lives in, the low
+	// 1 TiB and Kyty's extended memory (512 GiB at 8 TiB). A "reference" anywhere else is a user-data
+	// value that is no address at all.
+	constexpr uint32_t kBucketShift = 24;
+	constexpr uint64_t kLowBuckets  = 1ull << (40 - kBucketShift);
+	constexpr uint64_t kExtBase     = 0x080000000000ull;
+	constexpr uint64_t kExtBuckets  = (512ull << 30u) >> kBucketShift;
+	if (m_compact_refs) {
+		m_bucket_bits.assign((kLowBuckets + kExtBuckets) / 64, 0);
+	}
+	auto bucket_index = [&](uint64_t bucket) -> uint64_t {
+		if (bucket < kLowBuckets) {
+			return bucket;
+		}
+		const uint64_t ext = bucket - (kExtBase >> kBucketShift);
+		return bucket >= (kExtBase >> kBucketShift) && ext < kExtBuckets ? kLowBuckets + ext : ~0ull;
+	};
 	auto add_ref = [&](uint64_t addr, uint64_t size, bool pointer, bool index = false) {
-		if (addr != 0) {
+		if (addr == 0) {
+			return;
+		}
+		if (!m_compact_refs || index) {
 			refs.push_back(GpuRef {addr, size, pointer, index});
+			return;
+		}
+		const uint64_t first = addr >> kBucketShift;
+		const uint64_t last  = (addr + (size != 0 ? size : 1) - 1) >> kBucketShift;
+		for (uint64_t b = first; b <= last; b++) {
+			const uint64_t i = bucket_index(b);
+			if (i != ~0ull) {
+				m_bucket_bits[i / 64] |= 1ull << (i % 64);
+			}
 		}
 	};
 	// A user-data dword pair can be a 48-bit pointer (V# and table pointers) or the 40-bit
@@ -1114,6 +1143,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	std::sort(refs.begin(), refs.end());
 	refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
 	r.refs = std::move(refs);
+	if (m_compact_refs) {
+		for (size_t w = 0; w < m_bucket_bits.size(); w++) {
+			for (uint64_t bits = m_bucket_bits[w]; bits != 0; bits &= bits - 1) {
+				const uint64_t i = w * 64 + static_cast<uint64_t>(__builtin_ctzll(bits));
+				r.ref_buckets.push_back(static_cast<uint32_t>(i < kLowBuckets ? i : (kExtBase >> kBucketShift) + i - kLowBuckets));
+			}
+		}
+	}
 	for (auto& [addr, t]: targets) {
 		r.render_targets.push_back(t);
 	}

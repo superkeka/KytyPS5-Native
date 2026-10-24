@@ -132,6 +132,7 @@ struct Pm4TranslateResult {
 	std::vector<uint64_t> shader_addrs;       // shader base VAs from PGM_LO writes this DCB
 	std::set<uint32_t>    skipped_uconfig;    // non-whitelisted UCONFIG offsets dropped this DCB
 	std::vector<GpuRef>   refs;               // guest memory the DCB's draws/dispatches may touch
+	std::vector<uint32_t> ref_buckets;        // compact mode: the 16 MiB buckets (addr >> 24) of those refs
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
@@ -214,6 +215,11 @@ public:
 	// Packets of these opcodes are left out of the IB (bisecting a hang down to a packet type).
 	void SetSkippedOpcodes(std::set<uint32_t> ops) { m_skip_ops = std::move(ops); }
 
+	// Compact references (default off): instead of every GpuRef, only the 16 MiB buckets they touch
+	// (ref_buckets); refs then keeps just the index buffers. What residency needs, without sorting a
+	// list that grows with every draw.
+	void SetCompactRefs(bool compact) { m_compact_refs = compact; }
+
 	// Diagnostics: report every draw/dispatch whose resources reach [addr, addr + size) in
 	// Pm4TranslateResult::find_hits (user data, then tables two levels deep). 0 size: off.
 	void SetFindRange(uint64_t addr, uint64_t size) {
@@ -249,6 +255,8 @@ private:
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;
 	uint64_t                     m_inspect_ps = 0;
+	bool                         m_compact_refs = false;
+	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;
 };
