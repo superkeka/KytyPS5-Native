@@ -352,6 +352,18 @@ public:
 		return it != m_external.begin() && vaddr < std::prev(it)->second.end;
 	}
 
+	// True when the GPU may write `vaddr`: a view mapped into the GPU VM (its block must be made
+	// resident before the write lands, or it goes to the dummy) or a writable external range. CPU
+	// stacks and read-only ranges are not.
+	[[nodiscard]] bool IsGpuWritable(uint64_t vaddr) const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		if (auto v = FindViewUnlocked(vaddr); v != m_views.end()) {
+			return v->second.gpu;
+		}
+		auto it = m_external.upper_bound(vaddr);
+		return it != m_external.begin() && vaddr < std::prev(it)->second.end && std::prev(it)->second.writable;
+	}
+
 	// Copies up to `size` bytes of guest memory at `vaddr` (clipped to the view holding it) through
 	// the alias, which is always readable whatever the guest's own protection. Returns the bytes
 	// copied, 0 when `vaddr` is not backed.
