@@ -475,6 +475,50 @@ public:
 		return handles;
 	}
 
+	// For frame capture (nativeCaptureWriter.h): every GPU mapping this backing made, in VA order. A
+	// mapping targets a resident block's buffer (`index` = block, `offset` into it), the dummy (offset
+	// into it) or an external range (`index` = its guest VA, `offset` 0, `size` its length).
+	enum class GpuTarget { Block, Dummy, External };
+	struct GpuMapping {
+		uint64_t  vaddr    = 0;
+		uint64_t  size     = 0;
+		GpuTarget target   = GpuTarget::Dummy;
+		uint64_t  index    = 0;
+		uint64_t  offset   = 0;
+		bool      writable = true;
+	};
+	[[nodiscard]] std::vector<GpuMapping> GpuMappings() const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		std::vector<GpuMapping>     out;
+		for (const auto& [vaddr, view]: m_views) {
+			if (!view.gpu) {
+				continue;
+			}
+			ForEachBlockPiece(view.offset, view.size, [&](uint64_t index, uint64_t inner, uint64_t done, uint64_t part) {
+				const bool resident = m_blocks[index].resident;
+				out.push_back(GpuMapping {vaddr + done, part, resident ? GpuTarget::Block : GpuTarget::Dummy, index, inner, true});
+				return true;
+			});
+		}
+		for (const auto& [vaddr, ext]: m_external) {
+			out.push_back(GpuMapping {vaddr, ext.end - vaddr, GpuTarget::External, vaddr, 0, ext.writable});
+		}
+		std::sort(out.begin(), out.end(), [](const GpuMapping& a, const GpuMapping& b) { return a.vaddr < b.vaddr; });
+		return out;
+	}
+
+	// CPU bytes of a resident block (through the alias) and of the dummy, for frame capture. Stable
+	// while the block stays resident (blocks are never demoted). nullptr for a non-resident block.
+	[[nodiscard]] const uint8_t* ResidentBlockCpu(uint64_t index, uint64_t* size) const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		if (index >= m_blocks.size() || !m_blocks[index].resident) {
+			return nullptr;
+		}
+		*size = m_blocks[index].size;
+		return m_alias + index * kBlockSize;
+	}
+	[[nodiscard]] const uint8_t* DummyCpu() const { return m_dummy_cpu; }
+
 	// Looks up the GEM buffer backing `offset`. Returns false if `offset` is out of range or its
 	// block is not resident.
 	bool Lookup(uint64_t offset, uint32_t* handle, uint64_t* offset_in_block) const {

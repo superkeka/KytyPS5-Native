@@ -36,3 +36,25 @@ if(BUILD_TESTING)
 	add_test(NAME native_gpu_pm4_translator COMMAND $<TARGET_FILE:native_gpu_pm4_translator_tests>)
 	add_dependencies(kyty_tests native_gpu_pm4_translator_tests)
 endif()
+
+# Frame capture format and PM4 helpers (nativeCapture.h): portable, runs everywhere.
+add_executable(native_gpu_capture_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuCaptureTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+)
+target_include_directories(native_gpu_capture_tests PRIVATE ${inc_headers})
+
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_capture COMMAND $<TARGET_FILE:native_gpu_capture_tests>)
+	add_dependencies(kyty_tests native_gpu_capture_tests)
+endif()
+
+# Replays a KYTY_NATIVE_GPU_CAPTURE frame capture on the BC-250 (tools/bc250-replay).
+if(LINUX)
+	add_executable(bc250_replay
+		"${CMAKE_CURRENT_SOURCE_DIR}/tools/bc250-replay/replay.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	)
+	target_include_directories(bc250_replay PRIVATE ${inc_headers} "${CMAKE_CURRENT_SOURCE_DIR}/tools/bc250-replay")
+	target_link_libraries(bc250_replay PRIVATE Threads::Threads)
+endif()

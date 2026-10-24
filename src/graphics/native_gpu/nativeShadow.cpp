@@ -1,5 +1,6 @@
 #include "graphics/native_gpu/nativeShadow.h"
 
+#include "graphics/native_gpu/nativeCaptureWriter.h"
 #include "graphics/native_gpu/nativePm4.h"
 #include "graphics/native_gpu/nativeSubmit.h" // KYTY_GEM_BACKING_SUPPORTED + NativeSubmitter
 #include "graphics/native_gpu/shaderPatcher.h"
@@ -332,17 +333,26 @@ public:
 			if ((m_batch.size() + wrapped.size()) * 4 > NativeSubmitter::kSlotSize) {
 				SubmitBatchLocked();
 			}
+			m_batch_parts.push_back(Capture::Part {static_cast<uint32_t>(m_batch.size()), static_cast<uint32_t>(wrapped.size()), acb, frame});
 			m_batch.insert(m_batch.end(), wrapped.begin(), wrapped.end());
 			return;
 		}
 		std::span<const uint32_t> ib = wrapped;
 		SetStage(Stage::Gpu, frame);
+		const bool capturing = m_capture.Active();
+		if (capturing) {
+			WaitIdle();
+			m_capture.BeforeCs(m_gem, m_submitter, ib, {Capture::Part {0, static_cast<uint32_t>(ib.size()), acb, frame}});
+		}
 		NativeSubmitter::Result r = m_submitter->Submit(ib, handles, m_timeout_sec);
 		// ENOENT: a buffer in the list was closed meanwhile (another guest thread unmapped an external
 		// range between CreatedHandles and the ioctl). Take a fresh list and try again.
 		for (int retry = 0; !r.submitted && r.err == -ENOENT && retry < 3; retry++) {
 			handles = m_gem->CreatedHandles();
 			r       = m_submitter->Submit(ib, handles, m_timeout_sec);
+		}
+		if (capturing && r.submitted) {
+			WaitIdle();
 		}
 		SetStage(Stage::Idle, frame);
 
@@ -457,6 +467,22 @@ public:
 #else
 		(void)addr;
 		(void)size;
+#endif
+	}
+
+	// KYTY_NATIVE_GPU_CAPTURE: every presented flip, for the frame capture (nativeCaptureWriter.h).
+	void CaptureFlip(const Capture::Flip& flip) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_submitter == nullptr || m_disabled) {
+			return;
+		}
+		if (m_capture.Active()) {
+			WaitIdle();
+		}
+		m_capture.OnFlip(m_gem, m_submitter, flip);
+#else
+		(void)flip;
 #endif
 	}
 
@@ -610,7 +636,13 @@ private:
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_batch.empty() || m_disabled || m_submitter == nullptr) {
 			m_batch.clear();
+			m_batch_parts.clear();
 			return;
+		}
+		const bool capturing = m_capture.Active();
+		if (capturing) {
+			WaitIdle();
+			m_capture.BeforeCs(m_gem, m_submitter, m_batch, m_batch_parts);
 		}
 		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
 		NativeSubmitter::Result r       = m_submitter->Submit(m_batch, handles, m_timeout_sec);
@@ -618,7 +650,11 @@ private:
 			handles = m_gem->CreatedHandles();
 			r       = m_submitter->Submit(m_batch, handles, m_timeout_sec);
 		}
+		if (capturing && r.submitted) {
+			WaitIdle();
+		}
 		m_batch.clear();
+		m_batch_parts.clear();
 		if (!r.submitted) {
 			std::fprintf(stderr, "native shadow: batch submit failed: %s (%zu BOs)\n", std::strerror(-r.err),
 			             handles.size());
@@ -1160,6 +1196,7 @@ private:
 			                                                   : Pm4Translator::DepthDebugMode::None));
 			std::fprintf(stderr, "native shadow: depth experiment %s\n", depth);
 		}
+		m_capture.Configure(m_submitter);
 		m_enabled = true;
 		m_active.store(true, std::memory_order_release);
 		std::fprintf(stderr, "native shadow: enabled (gfx-ring shadow submission, %.1f s timeout)\n",
@@ -1246,6 +1283,7 @@ private:
 	uint64_t      m_last_seq         = 0;
 	bool          m_pipelined        = false;
 	std::vector<uint32_t> m_batch;
+	std::vector<Capture::Part> m_batch_parts; // the guest buffers in m_batch, for the frame capture
 	std::atomic<bool> m_active {false};
 	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
@@ -1313,6 +1351,7 @@ private:
 #if KYTY_GEM_BACKING_SUPPORTED
 	GemBacking*      m_gem       = nullptr;
 	NativeSubmitter* m_submitter = nullptr;
+	FrameCaptureWriter m_capture;
 #endif
 };
 
@@ -1616,6 +1655,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
+		Shadow::Instance().CaptureFlip(Capture::Flip {n, 0, address, size, width, height, bytes_per_pixel, pixel_format, tile_mode});
 	}
 	const char*                  list = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS");
 	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active()) {
