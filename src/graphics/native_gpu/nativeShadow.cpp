@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,9 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 namespace Libs::Graphics::NativeGpu {
@@ -56,6 +60,88 @@ bool PrimaryFeature(const char* name) {
 		return v[0] != '0';
 	}
 	return EnvOn("KYTY_NATIVE_GPU_PRIMARY");
+}
+
+// GET_LOD_STATS: the counter banks the translator saw before each packet, by buffer address, until
+// Kyty's command processor runs that packet (TakeLodStatsBanks). The pipeline translates ahead of
+// the command processor, so several frames can be queued.
+class LodBankQueue {
+public:
+	static LodBankQueue& Instance() {
+		static LodBankQueue q;
+		return q;
+	}
+	void Push(uint64_t addr, const std::bitset<256>& banks) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_queue.size() >= 64) {
+			m_queue.pop_front();
+		}
+		m_queue.emplace_back(addr, banks);
+	}
+	bool Take(uint64_t addr, std::bitset<256>& banks) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		for (auto it = m_queue.begin(); it != m_queue.end(); ++it) {
+			if (it->first == addr) {
+				banks = it->second;
+				m_queue.erase(it);
+				return true;
+			}
+		}
+		return false;
+	}
+
+private:
+	std::mutex                                        m_mutex;
+	std::deque<std::pair<uint64_t, std::bitset<256>>> m_queue;
+};
+
+// KYTY_LOD_STATS_LOG=N: every Nth scan of the LOD statistics banks (one per GET_LOD_STATS).
+void LogLodScan(const LodBankScan& scan) {
+	static const unsigned long every = [] {
+		const char* v = std::getenv("KYTY_LOD_STATS_LOG");
+		return v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
+	}();
+	static uint64_t scans  = 0;
+	static uint32_t logged = 0;
+	if (every == 0 || scans++ % every != 0) {
+		return;
+	}
+	auto ranges = [](const std::bitset<256>& b) {
+		std::string out;
+		for (uint32_t i = 0; i < 256; i++) {
+			if (!b.test(i)) {
+				continue;
+			}
+			uint32_t j = i;
+			while (j + 1 < 256 && b.test(j + 1)) {
+				j++;
+			}
+			out += (out.empty() ? "" : ",") + std::to_string(i) + (j != i ? "-" + std::to_string(j) : "");
+			i = j;
+		}
+		return out.empty() ? std::string("none") : out;
+	};
+	std::string warn;
+	for (const auto& [w, n]: scan.min_lod_warn) {
+		char b[32];
+		std::snprintf(b, sizeof(b), " 0x%03x:%u", w, n);
+		warn += b;
+	}
+	std::fprintf(stderr,
+	             "native shadow: LOD scan %llu buf 0x%llx: %u T#s, %u counting (ud %u, table %u, table-in-table %u) in %u "
+	             "tables, furthest at dword %u; %zu banks: %s; gfx9 layout: %u counting, banks %s; MIN_LOD_WARN:%s\n",
+	             static_cast<unsigned long long>(scans - 1), static_cast<unsigned long long>(scan.addr), scan.tsharps,
+	             scan.counting, scan.inline_ud, scan.depth1, scan.depth2, scan.tables, scan.max_word, scan.banks.count(),
+	             ranges(scan.banks).c_str(), scan.alt_counting, ranges(scan.alt_banks).c_str(), warn.c_str());
+	if (logged++ < 3) {
+		for (const auto& t: scan.samples) {
+			std::fprintf(stderr,
+			             "native shadow:   T# %08x %08x %08x %08x | w4 %08x w5 %08x w6 %08x w7 %08x (warn 0x%03x bank %u; "
+			             "gfx9: warn 0x%03x bank %u en %u)\n",
+			             t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], (t[5] >> 8u) & 0xfffu, t[6] & 0xffu, t[6] & 0xfffu,
+			             (t[6] >> 12u) & 0xffu, (t[6] >> 20u) & 1u);
+		}
+	}
 }
 
 // Shadow-mode state, built lazily on the first DCB so it sees the final env and the created GEM
@@ -133,6 +219,14 @@ public:
 				             static_cast<unsigned long long>(h.shader), static_cast<unsigned long long>(h.es), h.user_reg,
 				             h.depth, static_cast<unsigned long long>(h.table), h.word, h.image ? "T#" : "ptr",
 				             static_cast<unsigned long long>(h.target));
+			}
+		}
+		if (!acb) {
+			for (auto& scan: result.lod_scans) {
+				// The async compute buffers sample textures too: whatever they saw since the last packet.
+				scan.Merge(m_acb_translator.TakeLodScan());
+				LogLodScan(scan);
+				LodBankQueue::Instance().Push(scan.addr, scan.banks);
 			}
 		}
 		// KYTY_NATIVE_GPU_LOG_WAITS=N: report the waits of the first N buffers that were not met when
@@ -1117,6 +1211,15 @@ private:
 			m_acb_translator.SetLodStats(true);
 			std::fprintf(stderr, "native shadow: GET_LOD_STATS runs on the GPU (experiment)\n");
 		}
+		// The LOD statistics banks of every draw's T#s, for Kyty's GET_LOD_STATS (KYTY_LOD_STATS_MODE=banks,
+		// KYTY_LOD_STATS_LOG). KYTY_LOD_STATS_SCAN_DWORDS: how much of each first-level table is read.
+		if (LodBankScanOn()) {
+			const char*    v      = std::getenv("KYTY_LOD_STATS_SCAN_DWORDS");
+			const uint32_t dwords = v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 1024u;
+			m_translator.SetLodBankScan(true, dwords);
+			m_acb_translator.SetLodBankScan(true, dwords);
+			std::fprintf(stderr, "native shadow: scanning T#s for LOD statistics banks (%u dwords per table)\n", dwords);
+		}
 		// KYTY_NATIVE_GPU_GUESS_SPAN_KIB: residency for each user-data value that may be an image base.
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_GUESS_SPAN_KIB"); v != nullptr) {
 			const uint64_t bytes = std::strtoull(v, nullptr, 0) << 10u;
@@ -1480,6 +1583,159 @@ std::atomic<bool>& ShowNative() {
 bool NativeLodStats() {
 	static const bool on = EnvOn("KYTY_NATIVE_GPU_LOD_STATS");
 	return on;
+}
+
+bool LodBankScanOn() {
+	static const bool on = [] {
+		const char* mode = std::getenv("KYTY_LOD_STATS_MODE");
+		return (mode != nullptr && std::strcmp(mode, "banks") == 0) || EnvOn("KYTY_LOD_STATS_LOG");
+	}();
+	return on;
+}
+
+bool TakeLodStatsBanks(uint64_t addr, std::bitset<256>& banks) {
+	return LodBankScanOn() && Shadow::Instance().Active() && LodBankQueue::Instance().Take(addr, banks);
+}
+
+namespace {
+
+// KYTY_LOD_STATS_TRAP: pages of LOD statistics buffers made inaccessible. Each CPU access is logged
+// and single-stepped (EFLAGS.TF) with the page open, then the page is closed again, for up to
+// kLodTrapAccesses accesses per armed buffer. The code around each new PC goes to
+// lodstats-code-<pc>.bin (pc - 0x400 .. pc + 0x400) in the working directory.
+constexpr uint32_t kLodTrapAccesses = 48;
+struct LodTrap {
+	std::atomic<uint64_t> page {0};
+	std::atomic<uint64_t> bytes {0};
+	std::atomic<uint64_t> buffer {0};
+	std::atomic<uint64_t> size {0};
+	std::atomic<uint32_t> left {0};
+};
+LodTrap                g_lod_traps[4];
+thread_local LodTrap*  t_lod_stepping = nullptr;
+std::atomic<uint32_t>  g_lod_trap_outside {0};
+std::atomic<uint32_t>  g_lod_trap_lines {0};
+uint64_t               g_lod_code_pcs[16] = {};
+std::atomic<uint32_t>  g_lod_code_count {0};
+struct sigaction       g_lod_prev_trap {};
+
+void LodTrapStep(int sig, siginfo_t* info, void* native_context) {
+	auto* uc = static_cast<ucontext_t*>(native_context);
+	if (LodTrap* t = t_lod_stepping; t != nullptr) {
+		t_lod_stepping = nullptr;
+		uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
+		if (t->left.load() > 0) {
+			::mprotect(reinterpret_cast<void*>(t->page.load()), t->bytes.load(), PROT_NONE);
+		} else {
+			t->page.store(0);
+		}
+		return;
+	}
+	if ((g_lod_prev_trap.sa_flags & SA_SIGINFO) != 0 && g_lod_prev_trap.sa_sigaction != nullptr) {
+		g_lod_prev_trap.sa_sigaction(sig, info, native_context);
+	} else if (g_lod_prev_trap.sa_handler != SIG_DFL && g_lod_prev_trap.sa_handler != SIG_IGN && g_lod_prev_trap.sa_handler != nullptr) {
+		g_lod_prev_trap.sa_handler(sig);
+	}
+}
+
+void LodTrapDumpCode(uint64_t pc) {
+	const uint32_t n = g_lod_code_count.load();
+	for (uint32_t i = 0; i < n && i < 16; i++) {
+		if (g_lod_code_pcs[i] == pc) {
+			return;
+		}
+	}
+	if (n >= 16) {
+		return;
+	}
+	g_lod_code_pcs[n] = pc;
+	g_lod_code_count.store(n + 1);
+	char name[64];
+	std::snprintf(name, sizeof(name), "lodstats-code-%llx.bin", static_cast<unsigned long long>(pc));
+	const int fd = ::open(name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd >= 0) {
+		// Code pages are readable; a page that is not would fault here, so stay inside pc's own page
+		// and the neighbours the instruction stream needs anyway.
+		(void)::write(fd, reinterpret_cast<const void*>(pc - 0x400), 0x800);
+		::close(fd);
+	}
+}
+
+} // namespace
+
+void LodStatsTrapArm(uint64_t addr, uint64_t size) {
+	static const bool installed = [] {
+		struct sigaction sa {};
+		sa.sa_sigaction = LodTrapStep;
+		sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+		sigemptyset(&sa.sa_mask);
+		return ::sigaction(SIGTRAP, &sa, &g_lod_prev_trap) == 0;
+	}();
+	if (!installed) {
+		return;
+	}
+	const uint64_t page_size = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
+	const uint64_t page      = addr & ~(page_size - 1);
+	const uint64_t bytes     = ((addr + size + page_size - 1) & ~(page_size - 1)) - page;
+	for (auto& t: g_lod_traps) {
+		uint64_t expected = 0;
+		if (t.page.compare_exchange_strong(expected, page)) {
+			t.bytes.store(bytes);
+			t.buffer.store(addr);
+			t.size.store(size);
+			t.left.store(kLodTrapAccesses);
+			if (::mprotect(reinterpret_cast<void*>(page), bytes, PROT_NONE) != 0) {
+				t.page.store(0);
+			}
+			return;
+		}
+	}
+}
+
+bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context) {
+	for (auto& t: g_lod_traps) {
+		const uint64_t page  = t.page.load();
+		const uint64_t bytes = t.bytes.load();
+		if (page == 0 || vaddr < page || vaddr >= page + bytes) {
+			continue;
+		}
+		::mprotect(reinterpret_cast<void*>(page), bytes, PROT_READ | PROT_WRITE);
+		const uint64_t buffer = t.buffer.load();
+		// Other data sharing the pages is only stepped over (up to a limit), not counted or logged.
+		const bool inside = vaddr >= buffer && vaddr < buffer + t.size.load();
+		if (!inside) {
+			if (native_context != nullptr && g_lod_trap_outside.fetch_add(1) < 200000) {
+				t_lod_stepping = &t;
+				static_cast<ucontext_t*>(native_context)->uc_mcontext.gregs[REG_EFL] |= 0x100ll;
+			} else {
+				t.left.store(0);
+				t.page.store(0);
+			}
+			return true;
+		}
+		if (g_lod_trap_lines.fetch_add(1) < 400) {
+			char      line[192];
+			const int n = std::snprintf(line, sizeof(line),
+			                            "native shadow: LOD stats TRAP %s at 0x%llx (buffer 0x%llx +%lld) by pc 0x%llx\n",
+			                            write ? "write" : "read", static_cast<unsigned long long>(vaddr),
+			                            static_cast<unsigned long long>(buffer), static_cast<long long>(vaddr - buffer),
+			                            static_cast<unsigned long long>(pc));
+			if (n > 0) {
+				(void)::write(2, line, static_cast<size_t>(n));
+			}
+		}
+		LodTrapDumpCode(pc);
+		// Step over the access with the page open, then close it again (LodTrapStep).
+		if (t.left.fetch_sub(1) > 1 && native_context != nullptr) {
+			t_lod_stepping = &t;
+			static_cast<ucontext_t*>(native_context)->uc_mcontext.gregs[REG_EFL] |= 0x100ll;
+		} else {
+			t.left.store(0);
+			t.page.store(0);
+		}
+		return true;
+	}
+	return false;
 }
 
 bool PrimaryRendering() {

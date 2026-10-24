@@ -3,6 +3,7 @@
 
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -219,6 +220,28 @@ struct FindHit {
 	bool     image    = false; // a T# base (address >> 8) rather than a 48-bit V#/pointer
 };
 
+// Texture LOD statistics (SetLodBankScan): the PS5 T#s that count into GET_LOD_STATS, seen by the
+// draws and dispatches since the previous GET_LOD_STATS packet. Gfx10 layout, as Kyty decodes it:
+// word5 bit 25 MIP_STATS_CNT_EN, word5[19:8] MIN_LOD_WARN, word6[7:0] the counter bank (one 8-byte
+// record per bank behind the packet's 64-byte header). The gfx9 layout (word6: MIN_LOD_WARN[11:0],
+// COUNTER_BANK_ID[19:12], LOD_HDW_CNT_EN[20]) is counted next to it to tell which one the game uses.
+struct LodBankScan {
+	uint64_t                             addr = 0; // the GET_LOD_STATS buffer this scan ends at
+	std::bitset<256>                     banks;     // banks of the counting T#s
+	uint32_t                             tsharps  = 0; // plausible T#s scanned (repeats included)
+	uint32_t                             counting = 0; // of those, with MIP_STATS_CNT_EN
+	uint32_t                             inline_ud = 0; // counting T#s found in user data
+	uint32_t                             depth1    = 0; // ... in a table a user-data pointer points at
+	uint32_t                             depth2    = 0; // ... in a table such a table points at
+	uint32_t                             tables    = 0; // tables read
+	uint32_t                             max_word  = 0; // furthest dword a counting T# sat at in a table
+	uint32_t                             alt_counting = 0; // gfx9 layout: word6 bit 20 set
+	std::bitset<256>                     alt_banks;        // gfx9 layout: word6[19:12] of those
+	std::map<uint32_t, uint32_t>         min_lod_warn;     // MIN_LOD_WARN of the counting T#s -> count
+	std::vector<std::array<uint32_t, 8>> samples;          // the first counting T#s, whole
+	void                                 Merge(const LodBankScan& o);
+};
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -234,6 +257,7 @@ struct Pm4TranslateResult {
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
+	std::vector<LodBankScan>      lod_scans;      // SetLodBankScan: one per GET_LOD_STATS packet
 	struct UnmetWait {
 		uint64_t addr;
 		uint64_t ref;
@@ -325,6 +349,19 @@ public:
 	void SetCompactRefs(bool compact) { m_compact_refs = compact; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
+	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches (user data, and
+	// tables two levels deep, `table_dwords` of each first-level table): Pm4TranslateResult::lod_scans
+	// gets one scan per GET_LOD_STATS packet; TakeLodScan returns what was seen since the last one.
+	void SetLodBankScan(bool on, uint32_t table_dwords = 1024) {
+		m_lod_scan        = on;
+		m_lod_scan_dwords = table_dwords != 0 ? table_dwords : 1024;
+	}
+	LodBankScan TakeLodScan() {
+		LodBankScan out = std::move(m_lod_cur);
+		m_lod_cur       = {};
+		m_lod_tables.clear();
+		return out;
+	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
 	// How much memory a user-data value that may be an image base (address >> 8) makes resident.
@@ -370,6 +407,10 @@ private:
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
 	bool                         m_pfp_sync_indirect = true;
+	bool                         m_lod_scan          = false;
+	uint32_t                     m_lod_scan_dwords   = 1024;
+	LodBankScan                  m_lod_cur;          // SetLodBankScan: since the last GET_LOD_STATS
+	std::set<uint64_t>           m_lod_tables;       // tables already read for m_lod_cur
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;

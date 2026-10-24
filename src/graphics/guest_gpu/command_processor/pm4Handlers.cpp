@@ -19,10 +19,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cinttypes>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -1320,21 +1323,98 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	if (NativeGpu::NativeLodStats() && NativeGpu::PrimaryRendering()) {
 		return 4;
 	}
-	// Games stream texture mips by these statistics. All zeros reads as "never sampled": ASTRO BOT then
-	// keeps only the smallest mips (flat, overexposed terrain). All ones keeps every texture at full
-	// detail. KYTY_LOD_STATS_FILL=<byte> overrides the fill.
+	// Games stream texture mips by these statistics: a 64-byte header, then one 8-byte record per
+	// counter bank (T# word6[7:0], 256 banks). All zeros reads as "never sampled": ASTRO BOT then keeps
+	// only the smallest mips (flat, overexposed terrain). All ones keeps every texture at full detail.
+	// KYTY_LOD_STATS_FILL=<byte> overrides the fill; KYTY_LOD_STATS_MODE picks the records it goes to:
+	//   all (default) every record; banks: only the banks of the T#s the native translator saw this
+	//   frame (the rest zero); even: even banks only; lo / hi: only the low / high dword of each record.
+	// KYTY_LOD_STATS_LOG=N logs every Nth packet with what the buffer held before the fill;
+	// KYTY_LOD_STATS_TRAP=N[@P] makes the buffer's pages fault on the next CPU access after each of N
+	// fills (from packet P on), to log who reads it.
+	enum class Mode { All, Banks, Even, Lo, Hi };
 	static const int fill = [] {
 		const char* v = std::getenv("KYTY_LOD_STATS_FILL");
 		return v != nullptr ? static_cast<int>(std::strtol(v, nullptr, 0)) : 0xff;
 	}();
+	static const Mode mode = [] {
+		const char* v = std::getenv("KYTY_LOD_STATS_MODE");
+		const std::string m = v != nullptr ? v : "";
+		return m == "banks" ? Mode::Banks : m == "even" ? Mode::Even : m == "lo" ? Mode::Lo : m == "hi" ? Mode::Hi : Mode::All;
+	}();
+	static const unsigned long log_every = [] {
+		const char* v = std::getenv("KYTY_LOD_STATS_LOG");
+		return v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
+	}();
+	static unsigned long trap_from = 0;
+	static unsigned long traps     = [] {
+		const char* v   = std::getenv("KYTY_LOD_STATS_TRAP");
+		char*       end = nullptr;
+		const auto  n   = v != nullptr ? std::strtoul(v, &end, 0) : 0ul;
+		if (end != nullptr && *end == '@') {
+			trap_from = std::strtoul(end + 1, nullptr, 0);
+		}
+		return n;
+	}();
+	static uint64_t packets = 0;
+	static uint64_t no_scan = 0;
+	constexpr uint32_t kHeader = 64;
+	static uint64_t filled = 0; // packets with a buffer
+	if (log_every != 0 && (packets < 16 || packets % log_every == 0)) {
+		std::fprintf(stderr, "LOD stats %" PRIu64 " (%" PRIu64 " with a buffer): packet %08x %08x %08x %08x\n", packets, filled,
+		             buffer[0], buffer[1], buffer[2], buffer[3]);
+	}
+	const bool log_fill = log_every != 0 && dst != nullptr && buffer_size != 0 && (filled < 16 || filled % log_every == 0);
 	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, fill, buffer_size);
+		filled++;
+		auto* bytes = static_cast<uint8_t*>(dst);
+		if (log_fill) {
+			const auto* d = static_cast<const uint32_t*>(dst);
+			uint32_t    nonzero = 0;
+			for (uint32_t i = kHeader / 4; i < buffer_size / 4; i++) {
+				nonzero += d[i] != 0 ? 1u : 0u;
+			}
+			std::fprintf(stderr, "LOD stats %" PRIu64 ": buffer 0x%016" PRIx64 " size 0x%x control 0x%08x; before fill: header %08x %08x %08x %08x "
+			       "%08x %08x %08x %08x, %u nonzero record dwords, records 0-1 %08x %08x %08x %08x\n",
+			       packets, reinterpret_cast<uint64_t>(dst), buffer_size, buffer[3], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+			       nonzero, buffer_size >= kHeader + 16 ? d[16] : 0u, buffer_size >= kHeader + 16 ? d[17] : 0u,
+			       buffer_size >= kHeader + 16 ? d[18] : 0u, buffer_size >= kHeader + 16 ? d[19] : 0u);
+		}
+		std::bitset<256> banks;
+		bool             have_banks = mode == Mode::Banks && NativeGpu::TakeLodStatsBanks(reinterpret_cast<uint64_t>(dst), banks);
+		if (mode == Mode::Banks && !have_banks && no_scan++ < 8) {
+			std::fprintf(stderr, "LOD stats %" PRIu64 ": no bank scan for buffer 0x%016" PRIx64 ", filling every record\n", packets,
+			       reinterpret_cast<uint64_t>(dst));
+		}
+		if (mode == Mode::All || (mode == Mode::Banks && !have_banks)) {
+			memset(dst, fill, buffer_size);
+		} else {
+			memset(dst, fill, std::min(buffer_size, kHeader));
+			for (uint32_t bank = 0; kHeader + bank * 8u + 8u <= buffer_size; bank++) {
+				uint8_t* rec = bytes + kHeader + bank * 8u;
+				switch (mode) {
+					case Mode::Banks: memset(rec, banks.test(bank % 256u) ? fill : 0, 8); break;
+					case Mode::Even: memset(rec, bank % 2u == 0 ? fill : 0, 8); break;
+					case Mode::Lo: memset(rec, fill, 4); memset(rec + 4, 0, 4); break;
+					case Mode::Hi: memset(rec, 0, 4); memset(rec + 4, fill, 4); break;
+					default: break;
+				}
+			}
+		}
 		// Hack?
 		if (buffer_size >= sizeof(uint32_t)) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
+		if (log_fill && have_banks) {
+			std::fprintf(stderr, "LOD stats %" PRIu64 ": %zu banks filled\n", packets, banks.count());
+		}
+		if (traps != 0 && packets >= trap_from) {
+			traps--;
+			NativeGpu::LodStatsTrapArm(reinterpret_cast<uint64_t>(dst), buffer_size);
+		}
 	}
+	packets++;
 
 	return 4;
 }

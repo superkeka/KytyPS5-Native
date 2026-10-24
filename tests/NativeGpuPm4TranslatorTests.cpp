@@ -685,6 +685,31 @@ void TestGpuRefs() {
 	Check(rt == 1, "carried-over render target reported once");
 }
 
+void TestLodBankScan() {
+	Pm4Translator t;
+	t.SetLodBankScan(true);
+	// A 2D T# at 0x123456700 counting into bank 7 (word5 bit 25, MIN_LOD_WARN 0x100) in PS user data
+	// 0-7, and the same image without MIP_STATS_CNT_EN (bank 9) in GS user data 0-7.
+	const uint32_t counting[8] = {0x01234567u, 0x00a00000u, 0u, 0x90000000u, 0u, 0x02010000u, 0x7u, 0u};
+	const uint32_t silent[8]   = {0x01234567u, 0x00a00000u, 0u, 0x90000000u, 0u, 0x00010000u, 0x9u, 0u};
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x00Cu, counting[0], counting[1], counting[2], counting[3], counting[4], counting[5], counting[6], counting[7]}, false);
+	Append(dcb, IT_SET_SH_REG, {0x08Cu, silent[0], silent[1], silent[2], silent[3], silent[4], silent[5], silent[6], silent[7]}, false);
+	Append(dcb, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
+	Append(dcb, 0x8Eu /* IT_GET_LOD_STATS */, {0x840u, 0x10000040u, 0x2u, 0x80000u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.lod_scans.size() == 1, "one LOD bank scan per GET_LOD_STATS");
+	const auto& s = r.lod_scans[0];
+	Check(s.addr == 0x210000040ull, "scan names the packet's buffer");
+	Check(s.banks.count() == 1 && s.banks.test(7) && s.counting == 1 && s.inline_ud == 1, "only the counting T#'s bank");
+	Check(s.min_lod_warn.size() == 1 && s.min_lod_warn.count(0x100u) == 1, "MIN_LOD_WARN from word5[19:8]");
+	// Banks start over after the packet.
+	std::vector<uint32_t> next;
+	Append(next, 0x8Eu /* IT_GET_LOD_STATS */, {0x840u, 0x10000040u, 0x2u, 0x80000u}, false);
+	auto r2 = t.Translate(next);
+	Check(r2.lod_scans.size() == 1 && r2.lod_scans[0].banks.none(), "no draws, no banks");
+}
+
 int main() {
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
@@ -710,6 +735,7 @@ int main() {
 	TestWaitBarrier();
 	TestCompactRefs();
 	TestGdsReleaseMem();
+	TestLodBankScan();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

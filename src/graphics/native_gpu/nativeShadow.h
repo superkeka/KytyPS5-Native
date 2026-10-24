@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESHADOW_H_
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESHADOW_H_
 
+#include <bitset>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -72,6 +73,17 @@ void ShadowToggleNativeFrames();
 bool PrimaryRendering();
 // KYTY_NATIVE_GPU_LOD_STATS=1: the native path runs GET_LOD_STATS, so Kyty must not fill the buffer.
 bool NativeLodStats();
+// KYTY_LOD_STATS_MODE=banks or KYTY_LOD_STATS_LOG=N: the translator collects the counter banks of
+// the T#s each draw and dispatch reaches (MIP_STATS_CNT_EN, word6[7:0]).
+bool LodBankScanOn();
+// The banks seen before the GET_LOD_STATS packet that writes `addr`, once per packet; false when the
+// scan is off or recorded nothing for it.
+bool TakeLodStatsBanks(uint64_t addr, std::bitset<256>& banks);
+// KYTY_LOD_STATS_TRAP: makes the pages of [addr, addr + size) inaccessible; LodStatsTrapFault
+// (called from the host fault handler with the faulting thread's ucontext_t) logs each CPU access with
+// its PC and single-steps it before closing the pages again.
+void LodStatsTrapArm(uint64_t addr, uint64_t size);
+bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context);
 
 // Called at every video-out flip with the guest surface about to be presented. For the flips
 // listed in KYTY_NATIVE_GPU_DUMP_FLIPS ("300,600" or a range "300-2000/10"), writes to

@@ -315,6 +315,27 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	}
 }
 
+void LodBankScan::Merge(const LodBankScan& o) {
+	banks |= o.banks;
+	tsharps += o.tsharps;
+	counting += o.counting;
+	inline_ud += o.inline_ud;
+	depth1 += o.depth1;
+	depth2 += o.depth2;
+	tables += o.tables;
+	max_word = std::max(max_word, o.max_word);
+	alt_counting += o.alt_counting;
+	alt_banks |= o.alt_banks;
+	for (const auto& [warn, n]: o.min_lod_warn) {
+		min_lod_warn[warn] += n;
+	}
+	for (const auto& t: o.samples) {
+		if (samples.size() < 8) {
+			samples.push_back(t);
+		}
+	}
+}
+
 Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	Pm4TranslateResult r;
 
@@ -513,7 +534,98 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 		}
 	};
+	// SetLodBankScan: the counter banks of the T#s this draw or dispatch can sample. A T# is 8 dwords
+	// inline in user data or in a descriptor table (read like find_refs, two levels deep); tables are
+	// read once per GET_LOD_STATS interval.
+	auto scan_lod_banks = [&]() {
+		const bool dispatch = cur_op == IT_DISPATCH_DIRECT || cur_op == IT_DISPATCH_INDIRECT;
+		LodBankScan& s = m_lod_cur;
+		auto guest = [](uint64_t a) {
+			return (a >= 0x100000000ull && a < 0x10000000000ull) || (a >= 0x080000000000ull && a < 0x088000000000ull);
+		};
+		// where: 0 user data, 1/2 table depth.
+		auto tsharp = [&](const uint32_t* t, uint32_t where, uint32_t word) {
+			const uint64_t base = (static_cast<uint64_t>(t[0]) | (static_cast<uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+			if ((t[3] >> 28u) < 8u || ((t[1] >> 20u) & 0x1ffu) == 0 || ((t[3] >> 12u) & 0xfu) > ((t[3] >> 16u) & 0xfu) ||
+			    !guest(base)) {
+				return;
+			}
+			s.tsharps++;
+			if (((t[6] >> 20u) & 1u) != 0) {
+				s.alt_counting++;
+				s.alt_banks.set((t[6] >> 12u) & 0xffu);
+			}
+			if (((t[5] >> 25u) & 1u) == 0) {
+				return;
+			}
+			s.counting++;
+			s.banks.set(t[6] & 0xffu);
+			s.min_lod_warn[(t[5] >> 8u) & 0xfffu]++;
+			(where == 0 ? s.inline_ud : where == 1 ? s.depth1 : s.depth2)++;
+			if (where != 0) {
+				s.max_word = std::max(s.max_word, word);
+			}
+			if (s.samples.size() < 8) {
+				std::array<uint32_t, 8> a {};
+				std::copy(t, t + 8, a.begin());
+				s.samples.push_back(a);
+			}
+		};
+		auto plausible = [&](uint64_t p) { return guest(p) && (p & 3u) == 0; };
+		auto scan_table = [&](uint64_t table, uint32_t depth, std::vector<uint64_t>* next) {
+			if (m_lod_tables.size() >= 16384 || !m_lod_tables.insert(table).second) {
+				return;
+			}
+			static thread_local std::vector<uint32_t> d;
+			d.resize(depth == 1 ? m_lod_scan_dwords : 256);
+			const size_t n = read_safe(table, d.data(), d.size());
+			s.tables++;
+			for (size_t k = 0; k + 8 <= n; k += 4) {
+				tsharp(&d[k], depth, static_cast<uint32_t>(k));
+			}
+			for (size_t j = 0; next != nullptr && j + 1 < n && next->size() < 64; j++) {
+				const uint64_t p = static_cast<uint64_t>(d[j]) | (static_cast<uint64_t>(d[j + 1] & 0xffffu) << 32u);
+				if (plausible(p)) {
+					next->push_back(p);
+				}
+			}
+		};
+		auto stage = [&](uint32_t first, uint32_t count) {
+			uint32_t ud[32] = {};
+			bool     have[32] = {};
+			for (uint32_t i = 0; i < count; i++) {
+				if (const uint32_t* v = sh.Find(first + i); v != nullptr) {
+					ud[i]   = *v;
+					have[i] = true;
+				}
+			}
+			for (uint32_t i = 0; i + 8 <= count; i++) {
+				if (have[i] && have[i + 7]) {
+					tsharp(&ud[i], 0, i);
+				}
+			}
+			std::vector<uint64_t> next;
+			for (uint32_t i = 0; i + 1 < count; i++) {
+				const uint64_t p = static_cast<uint64_t>(ud[i]) | (static_cast<uint64_t>(ud[i + 1] & 0xffffu) << 32u);
+				if (have[i] && have[i + 1] && plausible(p)) {
+					scan_table(p, 1, &next);
+				}
+			}
+			for (uint64_t p: next) {
+				scan_table(p, 2, nullptr);
+			}
+		};
+		if (dispatch) {
+			stage(0x240, 16);
+		} else {
+			stage(0x00C, 32); // SPI_SHADER_USER_DATA_PS_0..31
+			stage(0x08C, 32); // SPI_SHADER_USER_DATA_GS_0..31 (NGG)
+		}
+	};
 	auto collect_refs = [&]() {
+		if (m_lod_scan) {
+			scan_lod_banks();
+		}
 		if (m_find_hi > m_find_lo) {
 			find_refs();
 		}
@@ -1063,6 +1175,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			case IT_GET_LOD_STATS: // texture LOD statistics, which the game's texture streaming reads
+				if (m_lod_scan && body_count >= 3) {
+					LodBankScan scan = TakeLodScan();
+					scan.addr        = (static_cast<uint64_t>(bptr[1]) & ~0x3full) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					r.lod_scans.push_back(std::move(scan));
+				}
 				if (m_lod_stats && body_count >= 4) {
 					// A gfx10 packet (PAL: GET_LOD_STATS): BU_SIZE, BASE_LO (64-byte aligned), BASE_HI, and
 					// the interval / reset control word.
