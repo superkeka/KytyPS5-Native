@@ -1,6 +1,9 @@
 #include "libs/controller.h"
 
 #include <SDL3/SDL.h>
+#include <chrono>
+#include <cstdlib>
+#include <vector>
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -218,6 +221,51 @@ static GameController* PlayerForHandle(int handle) {
 	return PadVrHand(handle) >= 0 ? g_players[0].get() : nullptr;
 }
 
+// KYTY_PAD_SHAKE_AT=<s>[:<len>][,...]: shake the controller (accelerometer and gyro swinging back and
+// forth) for <len> seconds (default 4) starting <s> seconds after the first pad read, for automated
+// runs that must get past a "shake the controller" prompt without a real gamepad.
+static void PadDebugShake(PadData* data) {
+	struct Window {
+		double start;
+		double len;
+	};
+	static const std::vector<Window> windows = [] {
+		std::vector<Window> w;
+		const char*         v = std::getenv("KYTY_PAD_SHAKE_AT");
+		for (const char* p = v; p != nullptr && *p != '\0';) {
+			char*        end   = nullptr;
+			const double start = std::strtod(p, &end);
+			if (end == p) {
+				break;
+			}
+			double len = 4.0;
+			if (*end == ':') {
+				len = std::strtod(end + 1, &end);
+			}
+			w.push_back({start, len});
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return w;
+	}();
+	if (windows.empty()) {
+		return;
+	}
+	static const auto t0 = std::chrono::steady_clock::now();
+	const double      t  = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+	for (const auto& w: windows) {
+		if (t >= w.start && t < w.start + w.len) {
+			const float sign         = (static_cast<int>(t * 16.0) & 1) != 0 ? 1.0f : -1.0f;
+			data->acceleration_x     = 3.0f * sign;
+			data->acceleration_y     = 1.0f + 2.0f * sign;
+			data->acceleration_z     = 3.0f * sign;
+			data->angular_velocity_x = 12.0f * sign;
+			data->angular_velocity_y = 12.0f * sign;
+			data->angular_velocity_z = 12.0f * sign;
+			return;
+		}
+	}
+}
+
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
                           int connected_count) {
 	EXIT_IF(data == nullptr);
@@ -241,6 +289,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->orientation_y      = state.orientation[1];
 	data->orientation_z      = state.orientation[2];
 	data->orientation_w      = state.orientation[3];
+	PadDebugShake(data);
 	for (const auto& touch: state.touch) {
 		if (touch.down) {
 			auto& output = data->touch_data.touch[data->touch_data.touch_num++];
