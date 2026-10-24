@@ -33,6 +33,13 @@ public:
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;
 
+	// Which amdgpu ring a submission runs on. The default is the gfx ring; compute rings are
+	// AMDGPU_HW_IP_COMPUTE, ip_instance 0, ring index a bit set in ComputeRingMask().
+	struct RingTarget {
+		uint32_t ip_type = AMDGPU_HW_IP_GFX;
+		uint32_t ring    = 0;
+	};
+
 	struct Result {
 		bool   submitted = false; // the CS ioctl was accepted
 		bool   completed = false; // the fence signalled before the timeout
@@ -63,6 +70,7 @@ public:
 			delete self;
 			return nullptr;
 		}
+		self->QueryComputeRings();
 		// Opt-in: with the whole GDS, GWS and OA partitions in every submission (so amdgpu reprograms
 		// them for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even when
 		// no packet or shader used GDS. KYTY_NATIVE_GPU_GDS=1 asks for the whole partitions,
@@ -113,6 +121,8 @@ public:
 	// True when every submission owns the GFX partition of GDS (and its GWS and OA), so guest
 	// packets and shaders that use GDS can run natively.
 	[[nodiscard]] bool HasGds() const { return m_gds_size != 0; }
+	// AMDGPU_INFO_HW_IP_INFO available_rings for compute, ip_instance 0. 0 when the kernel has none.
+	[[nodiscard]] uint32_t ComputeRingMask() const { return m_compute_rings; }
 	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
 	[[nodiscard]] volatile uint8_t* ScratchCpu() const {
 		return static_cast<volatile uint8_t*>(m_ib_cpu) + kIbSize - kScratchSize;
@@ -130,29 +140,29 @@ public:
 
 	// Waits until every async submission so far has completed. Returns false on a timeout.
 	bool WaitIdle(double timeout_sec) {
-		for (uint64_t& seq: m_slot_seq) {
-			if (seq != 0 && !WaitSeq(seq, timeout_sec)) {
+		for (SlotUse& slot: m_slot) {
+			if (slot.seq != 0 && !WaitSeq(slot.seq, timeout_sec, slot.target)) {
 				return false;
 			}
-			seq = 0;
+			slot.seq = 0;
 		}
 		return true;
 	}
 
 	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
-	              double timeout_sec) {
+	              double timeout_sec, RingTarget target = {}) {
 		Result res;
 		const uint32_t slot = m_async ? m_next_slot : 0;
 		if (ib.size() * 4 > (m_async ? kSlotSize : kIbSize - kScratchSize)) {
 			res.err = -E2BIG;
 			return res;
 		}
-		if (m_async && m_slot_seq[slot] != 0) {
-			if (!WaitSeq(m_slot_seq[slot], timeout_sec)) {
+		if (m_async && m_slot[slot].seq != 0) {
+			if (!WaitSeq(m_slot[slot].seq, timeout_sec, m_slot[slot].target)) {
 				res.timed_out = true;
 				return res;
 			}
-			m_slot_seq[slot] = 0;
+			m_slot[slot].seq = 0;
 		}
 		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
 		__sync_synchronize();
@@ -163,7 +173,8 @@ public:
 		std::memset(&e, 0, sizeof(e));
 		e.bo_handle = m_ib_handle;
 		entries.push_back(e);
-		// A GDS, GWS or OA buffer in the list is what gives the job its GDS partition.
+		// A GDS, GWS or OA buffer in the list is what gives the job its GDS partition. Gfx and compute
+		// jobs list the same buffers, so they share one partition at base 0 (the PS5 VMID partition).
 		for (uint32_t h: m_gds_handles) {
 			e.bo_handle = h;
 			entries.push_back(e);
@@ -185,8 +196,9 @@ public:
 		std::memset(&ib_info, 0, sizeof(ib_info));
 		ib_info.va_start = m_ib_va + slot * kSlotSize;
 		ib_info.ib_bytes = static_cast<uint32_t>(ib.size() * 4);
-		ib_info.ip_type  = AMDGPU_HW_IP_GFX;
-		ib_info.ring     = 0;
+		ib_info.ip_type     = target.ip_type;
+		ib_info.ip_instance = 0;
+		ib_info.ring        = target.ring;
 
 		struct drm_amdgpu_cs_chunk chunks[2];
 		std::memset(chunks, 0, sizeof(chunks));
@@ -228,8 +240,9 @@ public:
 		res.submitted      = true;
 		const uint64_t seq = cs.out.handle;
 		if (m_async) {
-			m_slot_seq[slot] = seq;
-			m_next_slot      = (slot + 1) % kSlots;
+			m_slot[slot].seq    = seq;
+			m_slot[slot].target = target;
+			m_next_slot         = (slot + 1) % kSlots;
 			res.completed    = true;
 			res.seq          = seq;
 			res.seconds      = NowSec() - t0;
@@ -243,8 +256,8 @@ public:
 		w.in.handle  = seq;
 		w.in.timeout = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
 		               static_cast<uint64_t>(ts.tv_nsec) + static_cast<uint64_t>(timeout_sec * 1e9);
-		w.in.ip_type = AMDGPU_HW_IP_GFX;
-		w.in.ring    = 0;
+		w.in.ip_type = target.ip_type;
+		w.in.ring    = target.ring;
 		w.in.ctx_id  = m_ctx;
 		r            = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w);
 		res.seconds  = NowSec() - t0;
@@ -263,7 +276,7 @@ public:
 
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
 
-	bool WaitSeq(uint64_t seq, double timeout_sec) {
+	bool WaitSeq(uint64_t seq, double timeout_sec, RingTarget target = {}) {
 		union drm_amdgpu_wait_cs w;
 		std::memset(&w, 0, sizeof(w));
 		struct timespec ts;
@@ -271,8 +284,8 @@ public:
 		w.in.handle  = seq;
 		w.in.timeout = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec) +
 		               static_cast<uint64_t>(timeout_sec * 1e9);
-		w.in.ip_type = AMDGPU_HW_IP_GFX;
-		w.in.ring    = 0;
+		w.in.ip_type = target.ip_type;
+		w.in.ring    = target.ring;
 		w.in.ctx_id  = m_ctx;
 		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w) == 0 && w.out.status == 0;
 	}
@@ -304,6 +317,24 @@ private:
 		v.offset_in_bo = 0;
 		v.map_size     = kIbSize;
 		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_VA, &v);
+	}
+
+	void QueryComputeRings() {
+		struct drm_amdgpu_info_hw_ip ip;
+		std::memset(&ip, 0, sizeof(ip));
+		struct drm_amdgpu_info request;
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer          = reinterpret_cast<uintptr_t>(&ip);
+		request.return_size             = sizeof(ip);
+		request.query                   = AMDGPU_INFO_HW_IP_INFO;
+		request.query_hw_ip.type        = AMDGPU_HW_IP_COMPUTE;
+		request.query_hw_ip.ip_instance = 0;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: AMDGPU_INFO_HW_IP_INFO(compute) failed: %s\n", std::strerror(errno));
+			return;
+		}
+		m_compute_rings = ip.available_rings;
+		std::fprintf(stderr, "NativeSubmitter: compute rings mask 0x%x\n", m_compute_rings);
 	}
 
 	bool CreateIb() {
@@ -419,9 +450,14 @@ private:
 	uint32_t m_ib_handle = 0;
 	void*    m_ib_cpu    = nullptr;
 	uint64_t m_ib_va     = 0;
+	struct SlotUse {
+		uint64_t   seq = 0;
+		RingTarget target;
+	};
 	bool     m_async     = false;
 	uint32_t m_next_slot = 0;
-	uint64_t m_slot_seq[kSlots] = {};
+	SlotUse  m_slot[kSlots];
+	uint32_t m_compute_rings = 0; // bitmask from AMDGPU_INFO_HW_IP_INFO
 	std::vector<uint32_t> m_gds_handles; // GDS, GWS and OA buffers listed in every submission
 	uint32_t              m_gds_size = 0;
 };

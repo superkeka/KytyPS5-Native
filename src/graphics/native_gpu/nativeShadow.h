@@ -28,7 +28,9 @@ namespace Libs::Graphics::NativeGpu {
 void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
 
 // The same for an asynchronous compute buffer (KYTY_NATIVE_GPU_ACB=1, or "dry" to only translate
-// and report). ACBs run on the gfx ring in guest submission order with the DCBs.
+// and report). ACBs run on the gfx ring in guest submission order with the DCBs, unless
+// KYTY_NATIVE_GPU_ACB_RINGS=1 (with native labels): then each guest compute queue is a compute
+// ring and waits between the rings are real GPU waits.
 void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords);
 
 // KYTY_NATIVE_GPU_THREAD=1: submissions go through a pipeline (ShadowEnqueue) instead of running on the
