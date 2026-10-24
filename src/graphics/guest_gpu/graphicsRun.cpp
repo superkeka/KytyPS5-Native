@@ -1316,6 +1316,11 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			// The BC-250 native path ran this ZPASS_DONE on the GPU, which wrote the real counters;
+			// a synthetic result written now would replace half of each begin/end pair.
+			if (IsAsyncComputeQueue() ? NativeGpu::NativeAsyncCompute() : NativeGpu::PrimaryRendering()) {
+				break;
+			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
 				std::printf("Warning: game uses occlusion queries, which are currently treated as "
