@@ -335,6 +335,10 @@ public:
 	// DMA_DATA to or from GDS with CP_SYNC, and a CS_PARTIAL_FLUSH before a copy out of GDS, so the
 	// append counters are final and copied before an indirect dispatch reads them (experiment).
 	void SetGdsDmaSync(bool on) { m_gds_dma_sync = on; }
+	// Every guest ACQUIRE_MEM becomes a full-range writeback and invalidate of all cache levels
+	// (GL2, GLM metadata, GLK, GLV, GL1, GLI), preceded on the gfx ring by CB/DB metadata flushes
+	// (experiment: the PS5 ME's ACQUIRE_MEM handler is several times longer than AMD's).
+	void SetAcquireFull(bool on) { m_acquire_full = on; }
 	// WRITE_DATA to memory in the native IB as well (Kyty still performs it): 0 none (default), 1 the
 	// ones carrying more than one dword (data, not a label), 2 all.
 	void SetWriteDataNative(uint32_t mode) { m_write_data_native = mode; }
@@ -383,6 +387,7 @@ private:
 	bool                         m_lod_stats    = false;
 	bool                         m_pfp_sync_indirect = true;
 	bool                         m_gds_dma_sync      = false;
+	bool                         m_acquire_full      = false;
 	uint32_t                     m_write_data_native = 0;
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;

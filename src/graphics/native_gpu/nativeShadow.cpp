@@ -1224,6 +1224,11 @@ private:
 			m_translator.SetPs5RegOverrides(true);
 			std::fprintf(stderr, "native shadow: PS5 register overrides (PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID)\n");
 		}
+		if (EnvOn("KYTY_NATIVE_GPU_ACQUIRE_FULL")) {
+			m_translator.SetAcquireFull(true);
+			m_acb_translator.SetAcquireFull(true);
+			std::fprintf(stderr, "native shadow: every ACQUIRE_MEM is a full cache writeback and invalidate\n");
+		}
 		if (EnvOn("KYTY_NATIVE_GPU_GDS_DMA_SYNC")) {
 			m_translator.SetGdsDmaSync(true);
 			m_acb_translator.SetGdsDmaSync(true);

@@ -1159,7 +1159,23 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				collect_refs();
 				break;
 			case IT_ACQUIRE_MEM:
+				if (m_acquire_full && !m_compute_queue) {
+					body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // FLUSH_AND_INV_CB_META, index 0
+					body.push_back(0x2eu);
+					body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // FLUSH_AND_INV_DB_META, index 0
+					body.push_back(0x2cu);
+				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_acquire_full && body_count >= 7) {
+					uint32_t* a = &body[body.size() - size + 1];
+					a[1] = 0xffffffffu; // COHER_SIZE: everything
+					a[2] = 0xffu;       // COHER_SIZE_HI
+					a[3] = 0u;          // COHER_BASE
+					a[4] = 0u;          // COHER_BASE_HI
+					// GCR_CNTL: GLI_INV=1, GLM_WB, GLM_INV, GLK_WB, GLK_INV, GLV_INV, GL1_INV, GL2_INV, GL2_WB.
+					a[6] |= 0x1u | 0x10u | 0x20u | 0x40u | 0x80u | 0x100u | 0x200u | 0x4000u | 0x8000u;
+					a[6] &= ~((0x3u << 2u) | (0x3u << 11u)); // GL1_RANGE, GL2_RANGE = all
+				}
 				stats.acquire_mem++;
 				break;
 			case IT_EVENT_WRITE:

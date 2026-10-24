@@ -695,6 +695,28 @@ void TestPs5RegOverrides() {
 	      "the preamble sets LOAD_COLLISION_WAVEID before the game writes the register");
 }
 
+void TestAcquireFull() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, 0x58u, {0x0u, 0x1000u, 0x0u, 0x40000u, 0x0u, 0xau, 0x4000u}, false);
+	const Packet* a = nullptr;
+	auto          p0 = Decode(t.Translate(dcb).ib);
+	a                = FindFirst(p0, 0x58u);
+	Check(a != nullptr && a->body[6] == 0x4000u && a->body[1] == 0x1000u, "ACQUIRE_MEM passes through by default");
+	t.SetAcquireFull(true);
+	auto p1 = Decode(t.Translate(dcb).ib);
+	a       = FindFirst(p1, 0x58u);
+	Check(a != nullptr && a->body[1] == 0xffffffffu && a->body[2] == 0xffu && a->body[3] == 0u &&
+	          (a->body[6] & 0xc3f1u) == 0xc3f1u,
+	      "full ACQUIRE_MEM covers all memory and every cache level");
+	bool cb = false, db = false;
+	for (const auto& p: p1) {
+		cb = cb || (p.op == 0x46u && p.body.size() == 1 && p.body[0] == 0x2eu);
+		db = db || (p.op == 0x46u && p.body.size() == 1 && p.body[0] == 0x2cu);
+	}
+	Check(cb && db, "the gfx ring flushes CB and DB metadata before a full ACQUIRE_MEM");
+}
+
 void TestGpuRefs() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
@@ -763,6 +785,7 @@ int main() {
 	TestCompactRefs();
 	TestGdsReleaseMem();
 	TestPs5RegOverrides();
+	TestAcquireFull();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
