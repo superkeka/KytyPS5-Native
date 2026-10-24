@@ -402,6 +402,11 @@ public:
 
 	// Per-flip timing (KYTY_NATIVE_GPU_FLIP_STATS=1): native time spent in Submit and waiting for its
 	// lock between flips, with the presenter's share passed in.
+	void AddGpuBusy(double seconds) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_gpu_busy_s += seconds;
+	}
+
 	void FlipStats(double present_s) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double now = NowSecShadow();
@@ -417,10 +422,11 @@ public:
 			const double per = 1e3 / static_cast<double>(m_flips);
 			std::fprintf(stderr,
 			             "native shadow: per flip: interval %.1f ms, native submit %.1f ms, waiting for the native "
-			             "lock %.1f ms, presenter %.1f ms\n",
-			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per);
+			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms\n",
+			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per,
+			             m_gpu_busy_s * per);
 			m_flip_t0 = now;
-			m_busy_s = m_wait_lock_s = m_present_s = 0.0;
+			m_busy_s = m_wait_lock_s = m_present_s = m_gpu_busy_s = 0.0;
 			m_flips  = 0;
 		}
 	}
@@ -1072,6 +1078,7 @@ private:
 	double        m_busy_s      = 0.0;
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
+	double        m_gpu_busy_s  = 0.0;
 	double        m_flip_t0     = 0.0;
 	uint32_t      m_flips       = 0;
 	std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> m_find_seen; // KYTY_NATIVE_GPU_FIND hits logged
@@ -1158,6 +1165,7 @@ private:
 	struct Done {
 		uint64_t              seq;
 		std::function<void()> then;
+		double                submitted; // when the batch went to the GPU
 	};
 
 	Pipeline() {
@@ -1183,9 +1191,10 @@ private:
 			}
 			Shadow::Instance().FlushBatch();
 			const uint64_t seq = Shadow::Instance().TakeLastSeq();
+			const double   now = NowSecShadow();
 			std::lock_guard<std::mutex> lock(m_done_mutex);
 			for (auto& job: jobs) {
-				m_done.push_back(Done {seq, std::move(job.then)});
+				m_done.push_back(Done {seq, std::move(job.then), now});
 			}
 			m_done_cv.notify_one();
 		}
@@ -1201,8 +1210,13 @@ private:
 				done = std::move(m_done.front());
 				m_done.pop_front();
 			}
-			if (done.seq != 0) {
+			if (done.seq != 0 && done.seq != m_waited_seq) {
 				(void)Shadow::Instance().WaitSubmission(done.seq);
+				// GPU busy time: from the batch's submission (or the previous batch's end) to its fence.
+				const double end = NowSecShadow();
+				Shadow::Instance().AddGpuBusy(end - std::max(done.submitted, m_last_end));
+				m_last_end   = end;
+				m_waited_seq = done.seq;
 			}
 			done.then();
 		}
@@ -1214,6 +1228,8 @@ private:
 	std::mutex              m_done_mutex;
 	std::condition_variable m_done_cv;
 	std::deque<Done>        m_done;
+	uint64_t                m_waited_seq = 0;
+	double                  m_last_end   = 0.0;
 };
 
 } // namespace
