@@ -152,6 +152,20 @@ public:
 				             static_cast<unsigned long long>(w.ref));
 			}
 		}
+		// KYTY_NATIVE_GPU_LOG_DATA_WRITES=N: report the first N WRITE_DATA carrying more than one dword,
+		// which Kyty performs only after the whole batch (data, not labels).
+		static const unsigned long log_data_writes = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_LOG_DATA_WRITES");
+			return v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
+		}();
+		for (const auto& [a, n]: result.data_writes) {
+			if (m_data_writes_logged >= log_data_writes) {
+				break;
+			}
+			m_data_writes_logged++;
+			std::fprintf(stderr, "native shadow: DATA WRITE %s %llu: 0x%llx, %u dwords\n", kind,
+			             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(a), n);
+		}
 		if (acb && SkipAcb(frame, result)) {
 			return;
 		}
@@ -329,10 +343,41 @@ public:
 		// Pipelined: the IB joins the batch the pipeline submits with one CS once it has taken every
 		// queued buffer (FlushBatch). One BO-list validation then covers them all.
 		if (m_pipelined) {
-			if ((m_batch.size() + wrapped.size()) * 4 > NativeSubmitter::kSlotSize) {
-				SubmitBatchLocked();
+			// KYTY_NATIVE_GPU_ACB_DEFER=1: an ACB that waits for labels a DCB has not written yet goes into
+			// the batch after the DCB that writes them (on the ring its waits are barriers, so in guest
+			// submission order it would read what the previous frame left there). Only within one batch:
+			// FlushBatch appends whatever is still waiting.
+			if (acb && m_acb_defer && !result.unmet_waits.empty()) {
+				std::set<uint64_t> needs;
+				for (const auto& w: result.unmet_waits) {
+					if (m_batch_labels.count(w.addr) == 0) {
+						needs.insert(w.addr);
+					}
+				}
+				if (!needs.empty()) {
+					m_deferred_acbs.push_back(DeferredAcb {std::move(wrapped), std::move(needs)});
+					m_acb_deferred++;
+					return;
+				}
 			}
-			m_batch.insert(m_batch.end(), wrapped.begin(), wrapped.end());
+			AppendToBatchLocked(wrapped);
+			if (!acb && m_acb_defer) {
+				for (const auto& [a, v]: result.label_writes) {
+					m_batch_labels.insert(a);
+				}
+				for (auto it = m_deferred_acbs.begin(); it != m_deferred_acbs.end();) {
+					for (const auto& [a, v]: result.label_writes) {
+						it->needs.erase(a);
+					}
+					if (it->needs.empty()) {
+						AppendToBatchLocked(it->ib);
+						m_acb_resolved++;
+						it = m_deferred_acbs.erase(it);
+					} else {
+						++it;
+					}
+				}
+			}
 			return;
 		}
 		std::span<const uint32_t> ib = wrapped;
@@ -534,6 +579,11 @@ public:
 				             static_cast<unsigned long long>(m_gds_dma_dcb[0]), static_cast<unsigned long long>(m_gds_dma_dcb[1]),
 				             static_cast<unsigned long long>(m_gds_dma_acb[0]), static_cast<unsigned long long>(m_gds_dma_acb[1]));
 			}
+			if (m_acb_deferred > 0) {
+				std::fprintf(stderr, "native shadow: ACBs deferred behind their label writers: %llu, %llu placed, %llu not\n",
+				             static_cast<unsigned long long>(m_acb_deferred), static_cast<unsigned long long>(m_acb_resolved),
+				             static_cast<unsigned long long>(m_acb_unresolved));
+			}
 			if (m_chain_n > 0) {
 				const double per_buf = 1e3 / static_cast<double>(m_chain_n);
 				std::fprintf(stderr,
@@ -578,6 +628,12 @@ public:
 	}
 	void FlushBatch() {
 		std::lock_guard<std::mutex> lock(m_mutex);
+		for (const auto& d: m_deferred_acbs) {
+			AppendToBatchLocked(d.ib);
+			m_acb_unresolved++;
+		}
+		m_deferred_acbs.clear();
+		m_batch_labels.clear();
 		SubmitBatchLocked();
 	}
 
@@ -606,6 +662,13 @@ public:
 	}
 
 private:
+	void AppendToBatchLocked(const std::vector<uint32_t>& ib) {
+		if ((m_batch.size() + ib.size()) * 4 > NativeSubmitter::kSlotSize) {
+			SubmitBatchLocked();
+		}
+		m_batch.insert(m_batch.end(), ib.begin(), ib.end());
+	}
+
 	void SubmitBatchLocked() {
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_batch.empty() || m_disabled || m_submitter == nullptr) {
@@ -1112,11 +1175,18 @@ private:
 			m_translator.SetPfpSyncIndirect(false);
 			m_acb_translator.SetPfpSyncIndirect(false);
 		}
+		// KYTY_NATIVE_GPU_WRITE_DATA_NATIVE=1|2: WRITE_DATA also runs in the native IB (see SetWriteDataNative).
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_WRITE_DATA_NATIVE"); v != nullptr && v[0] != '0') {
+			m_translator.SetWriteDataNative(static_cast<uint32_t>(std::strtoul(v, nullptr, 0)));
+			m_acb_translator.SetWriteDataNative(static_cast<uint32_t>(std::strtoul(v, nullptr, 0)));
+			std::fprintf(stderr, "native shadow: WRITE_DATA runs natively too (mode %s)\n", v);
+		}
 		if (NativeLodStats()) {
 			m_translator.SetLodStats(true);
 			m_acb_translator.SetLodStats(true);
 			std::fprintf(stderr, "native shadow: GET_LOD_STATS runs on the GPU (experiment)\n");
 		}
+		m_acb_defer = EnvOn("KYTY_NATIVE_GPU_ACB_DEFER");
 		// KYTY_NATIVE_GPU_GUESS_SPAN_KIB: residency for each user-data value that may be an image base.
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_GUESS_SPAN_KIB"); v != nullptr) {
 			const uint64_t bytes = std::strtoull(v, nullptr, 0) << 10u;
@@ -1246,6 +1316,16 @@ private:
 	uint64_t      m_last_seq         = 0;
 	bool          m_pipelined        = false;
 	std::vector<uint32_t> m_batch;
+	struct DeferredAcb {
+		std::vector<uint32_t> ib;
+		std::set<uint64_t>    needs; // labels still to be written by a DCB
+	};
+	bool                     m_acb_defer = false;
+	std::vector<DeferredAcb> m_deferred_acbs;
+	std::set<uint64_t>       m_batch_labels; // labels written by the DCBs in this batch
+	uint64_t                 m_acb_deferred   = 0;
+	uint64_t                 m_acb_resolved   = 0;
+	uint64_t                 m_acb_unresolved = 0;
 	std::atomic<bool> m_active {false};
 	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
@@ -1265,6 +1345,7 @@ private:
 	std::set<uint64_t> m_gds_seen; // distinct (queue, direction, offset, size) of GDS DMA, for the log
 	uint64_t      m_gds_dma_dcb[2]  = {}; // DMA_DATA to / from GDS in graphics buffers
 	uint64_t      m_gds_dma_acb[2]  = {}; // and in async compute buffers
+	unsigned long m_data_writes_logged = 0;
 	uint64_t      m_chain_n         = 0; // pipelined buffers finished since the last flip report
 	double        m_chain_queued_s  = 0.0;
 	double        m_chain_latency_s = 0.0;

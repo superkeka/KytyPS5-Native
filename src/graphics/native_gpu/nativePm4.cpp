@@ -993,6 +993,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				stats.write_data_dropped++;
 				r.label_writes.emplace_back(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bptr[3]);
+				if (body_count > 4) {
+					r.data_writes.emplace_back(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u),
+					                           body_count - 3);
+				}
+				if (m_write_data_native == 2 || (m_write_data_native == 1 && body_count > 4)) {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					stats.write_data_native++;
+				}
 				break;
 			case IT_DRAW_INDEX_2:
 				if (skip_draw()) {
