@@ -527,10 +527,8 @@ public:
 #endif
 	}
 
-	void AddGpuBusy(double seconds) {
-		std::lock_guard<std::mutex> lock(m_mutex);
-		m_gpu_busy_s += seconds;
-	}
+	// Lock-free: the native labels tracker calls this, and m_mutex is held for whole translations.
+	void AddGpuBusy(double seconds) { m_gpu_busy_s.fetch_add(seconds, std::memory_order_relaxed); }
 
 	// One pipelined buffer finished: `queued` waiting for the worker, `latency` from the guest's
 	// submit to its continuation being done, `then` the continuation (Kyty's command processor).
@@ -561,7 +559,7 @@ public:
 			             "native shadow: per flip: interval %.1f ms, native submit %.1f ms, waiting for the native "
 			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms; %llu MiB guest memory resident\n",
 			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per,
-			             m_gpu_busy_s * per, static_cast<unsigned long long>(ResidentMiB()));
+			             m_gpu_busy_s.load(std::memory_order_relaxed) * per, static_cast<unsigned long long>(ResidentMiB()));
 #if defined(__GLIBC__)
 			if (EnvOn("KYTY_NATIVE_GPU_MALLOC_STATS")) {
 				const struct mallinfo2 mi = mallinfo2();
@@ -604,7 +602,8 @@ public:
 			m_chain_n = 0;
 			m_chain_queued_s = m_chain_latency_s = m_chain_then_s = m_chain_max_s = 0.0;
 			m_flip_t0 = now;
-			m_busy_s = m_wait_lock_s = m_present_s = m_gpu_busy_s = 0.0;
+			m_busy_s = m_wait_lock_s = m_present_s = 0.0;
+			m_gpu_busy_s.store(0.0, std::memory_order_relaxed);
 			m_flips  = 0;
 		}
 	}
@@ -1401,7 +1400,7 @@ private:
 	double        m_busy_s      = 0.0;
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
-	double        m_gpu_busy_s  = 0.0;
+	std::atomic<double> m_gpu_busy_s {0.0};
 	bool          m_check_order = EnvOn("KYTY_NATIVE_GPU_CHECK_ORDER");
 	struct PendingWait {
 		Pm4TranslateResult::UnmetWait wait;
@@ -1872,11 +1871,17 @@ private:
 		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul); // 50 us naps, not the default 50 us + slack
 #endif
 		double stuck_since = 0.0;
+		double busy_since  = 0.0; // GPU busy for the flip stats: while tracker points are outstanding
 		for (;;) {
 			std::vector<Entry> ready;
 			{
 				std::unique_lock<std::mutex> lock(m_track_mutex);
+				if (m_entries.empty() && busy_since != 0.0) {
+					Shadow::Instance().AddGpuBusy(NowSecShadow() - busy_since);
+					busy_since = 0.0;
+				}
 				m_track_cv.wait(lock, [this] { return !m_entries.empty(); });
+				busy_since = busy_since == 0.0 ? NowSecShadow() : busy_since;
 				while (!m_entries.empty() && (!m_native || m_drain || Shadow::Instance().Reached(m_entries.front().seq))) {
 					ready.push_back(std::move(m_entries.front()));
 					m_entries.pop_front();
