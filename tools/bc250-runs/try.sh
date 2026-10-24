@@ -13,6 +13,16 @@ H=${BC250_HOST:-deck@bc250.local}
 RUNS=/home/deck/dev/kyty-runs
 LOCAL=${TRY_OUT:-/tmp/bc250-try}/$TAG
 mkdir -p "$LOCAL"
+# One GPU experiment at a time on the board, across sessions: hold a lock on the Mac side for the
+# whole run (TRY_LOCK overrides the path; several sessions share it).
+LOCK=${TRY_LOCK:-/tmp/bc250-gpu.lock}
+exec 9>"$LOCK"
+if command -v flock >/dev/null 2>&1; then
+	flock 9
+else
+	until mkdir "$LOCK.d" 2>/dev/null; do sleep 5; done
+	trap 'rmdir "$LOCK.d" 2>/dev/null' EXIT
+fi
 ssh -o BatchMode=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=5 $H 'journalctl -kf -n 0 --no-pager -o short-monotonic' > "$LOCAL/kernel.log" 2>&1 &
 KLOG=$!
 sleep 2
