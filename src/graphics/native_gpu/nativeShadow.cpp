@@ -2392,12 +2392,37 @@ private:
 				break;
 			}
 			case TrackerPoint::Kind::LodStats: {
-				// As Kyty's command processor fills it (CpOpGetLodStats): every texture fully used, and
-				// the first dword 1.
+				// As Kyty's command processor fills it (CpOpGetLodStats): in usage mode the banks the
+				// translator published for this buffer, otherwise (or with no report) every texture fully
+				// used; the first dword 1.
 				static const int fill = [] {
 					const char* v = std::getenv("KYTY_LOD_STATS_FILL");
 					return v != nullptr ? static_cast<int>(std::strtol(v, nullptr, 0)) : 0xff;
 				}();
+				static const LodStatsMode   mode      = ParseLodStatsMode(std::getenv("KYTY_LOD_STATS_MODE"));
+				static const unsigned long log_every = [] {
+					const char* v = std::getenv("KYTY_LOD_STATS_LOG");
+					return v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
+				}();
+				static uint64_t  reports  = 0;
+				static uint32_t  no_scan  = 0;
+				std::bitset<256> banks;
+				if (mode == LodStatsMode::Usage && TakeLodStatsBanks(p.addr, banks)) {
+					const uint32_t used = WriteLodUsageReport(reinterpret_cast<void*>(p.addr), p.size, banks);
+					if (log_every != 0 && reports % log_every == 0) {
+						char ranges[2048];
+						FormatLodBankRanges(banks, ranges, sizeof(ranges));
+						std::fprintf(stderr, "LOD usage %llu (tracker): buffer 0x%016llx %zu banks used (%s); %u records used, the rest no-data\n",
+						             static_cast<unsigned long long>(reports), static_cast<unsigned long long>(p.addr), banks.count(),
+						             ranges, used);
+					}
+					reports++;
+					break;
+				}
+				if (mode == LodStatsMode::Usage && no_scan++ < 8) {
+					std::fprintf(stderr, "LOD stats (tracker): no bank scan for buffer 0x%016llx, filling every record\n",
+					             static_cast<unsigned long long>(p.addr));
+				}
 				std::memset(reinterpret_cast<void*>(p.addr), fill, p.size);
 				if (p.size >= 4) {
 					*reinterpret_cast<volatile uint32_t*>(p.addr) = 1;
