@@ -433,6 +433,25 @@ public:
 
 	bool NativeAcb() const { return Active() && m_acb_mode == AcbMode::On; }
 
+	bool DmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::vector<GemBacking::DmabufPiece> pieces;
+		if (m_gem == nullptr || !m_gem->DmabufPieces(vaddr, size, pieces)) {
+			return false;
+		}
+		out.clear();
+		for (const auto& p: pieces) {
+			out.push_back(NativeDmabufPiece {p.fd, p.bo_size, p.bo_offset, p.len});
+		}
+		return true;
+#else
+		(void)vaddr;
+		(void)size;
+		(void)out;
+		return false;
+#endif
+	}
+
 	// Pipeline mode: Submit batches IBs; FlushBatch submits them with one CS.
 	void SetPipelined() {
 		std::lock_guard<std::mutex> lock(m_mutex);
@@ -1245,6 +1264,11 @@ bool ShadowThreaded() {
 
 void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, bool acb, std::function<void()> then) {
 	Pipeline::Instance().Enqueue(buffer, size_in_dwords, acb, std::move(then));
+}
+
+bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out) {
+	static const bool on = !EnvOn("KYTY_NATIVE_GPU_NO_ZERO_COPY");
+	return on && PrimaryRendering() && Shadow::Instance().DmabufPieces(vaddr, size, out);
 }
 
 void ShadowFlipStats(double present_seconds) {

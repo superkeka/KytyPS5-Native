@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -95,6 +96,16 @@ public:
 	void               RunGarbageCollector();
 
 private:
+	// BC-250 native primary mode: a natively rendered image source copied on the GPU from the native
+	// path's exported buffers (dma-bufs, imported once each) into a mirror, instead of being read and
+	// uploaded by the CPU. nullptr when that is not possible.
+	Buffer* ObtainNativeImageSource(uint64_t vaddr, uint64_t size);
+	struct ImportedDmabuf {
+		vk::Buffer       buffer;
+		vk::DeviceMemory memory;
+	};
+	std::map<uint64_t, ImportedDmabuf> m_imported_dmabufs; // by the dma-buf's inode
+	std::unique_ptr<Buffer>            m_native_mirror;
 	friend struct BufferCacheTestAccess;
 
 	bool IsBufferInvalid(BufferId id) const {

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 // Shadow-mode native GPU submission for the BC-250. Called from Kyty's DCB submit path, it reads
 // the guest draw command buffer, translates it to a native amdgpu IB and submits it to the gfx
@@ -36,6 +37,17 @@ bool ShadowThreaded();
 // True on the pipeline thread that hands finished buffers to Kyty.
 bool ShadowOnPipelineThread();
 void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, bool acb, std::function<void()> then);
+
+// Guest memory rendered natively, as pieces of exported GPU buffers (dma-buf fd, buffer size, offset,
+// length), so Kyty's presenter can copy a surface on the GPU instead of reading it on the CPU. False
+// when not in primary mode, when any byte is not resident, or with KYTY_NATIVE_GPU_NO_ZERO_COPY=1.
+struct NativeDmabufPiece {
+	int      fd;
+	uint64_t bo_size;
+	uint64_t bo_offset;
+	uint64_t len;
+};
+bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out);
 
 // KYTY_NATIVE_GPU_FLIP_STATS=1: called at each flip with the time the presenter spent preparing it;
 // logs per-flip averages (flip interval, native submission time, presenter time).

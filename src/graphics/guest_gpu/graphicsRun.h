@@ -92,8 +92,11 @@ private:
 	bool                                           m_wake_pending      = false;
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
-	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
-	    std::make_shared<std::binary_semaphore>(1);
+	// How many suspend points (frames) the guest may run ahead of Kyty's command processor: 1, or
+	// KYTY_NATIVE_GPU_FRAMES_AHEAD in native primary mode.
+	static std::ptrdiff_t SuspendPointsAhead();
+	std::shared_ptr<std::counting_semaphore<8>> m_suspend_point_ready =
+	    std::make_shared<std::counting_semaphore<8>>(SuspendPointsAhead());
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

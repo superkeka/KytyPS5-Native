@@ -2,7 +2,12 @@
 
 #include "common/alignment.h"
 
+#include <bit>
 #include <cstdlib>
+#if defined(__linux__)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
@@ -14,6 +19,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -551,9 +557,120 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+Buffer* BufferCache::ObtainNativeImageSource(uint64_t vaddr, uint64_t size) {
+#if defined(__linux__)
+	std::vector<NativeGpu::NativeDmabufPiece> pieces;
+	if (!m_graphics.dma_buf_import_enabled || !NativeGpu::ShadowDmabufPieces(vaddr, size, pieces)) {
+		return nullptr;
+	}
+	const auto& device = m_graphics.device;
+	std::vector<vk::Buffer> sources;
+	for (const auto& piece: pieces) {
+		struct stat st {};
+		if (::fstat(piece.fd, &st) != 0) {
+			return nullptr;
+		}
+		auto found = m_imported_dmabufs.find(st.st_ino);
+		if (found == m_imported_dmabufs.end()) {
+			vk::ExternalMemoryBufferCreateInfo external {};
+			external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+			vk::BufferCreateInfo info {};
+			info.pNext       = &external;
+			info.size        = piece.bo_size;
+			info.usage       = vk::BufferUsageFlagBits::eTransferSrc;
+			info.sharingMode = vk::SharingMode::eExclusive;
+			const auto created = device.createBuffer(info);
+			if (created.result != vk::Result::eSuccess) {
+				return nullptr;
+			}
+			const vk::Buffer buffer       = created.value;
+			const auto       requirements = device.getBufferMemoryRequirements(buffer);
+			const auto       properties =
+			    device.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, piece.fd);
+			const uint32_t types = properties.result == vk::Result::eSuccess
+			                           ? properties.value.memoryTypeBits & requirements.memoryTypeBits
+			                           : 0u;
+			const int fd = types != 0 ? ::dup(piece.fd) : -1; // the import takes ownership
+			if (fd < 0) {
+				device.destroyBuffer(buffer);
+				LOGF("BufferCache: cannot import native dma-buf (memory types 0x%x)\n", types);
+				return nullptr;
+			}
+			vk::ImportMemoryFdInfoKHR import {};
+			import.handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
+			import.fd         = fd;
+			vk::MemoryAllocateInfo allocate {};
+			allocate.pNext           = &import;
+			allocate.allocationSize  = requirements.size;
+			allocate.memoryTypeIndex = static_cast<uint32_t>(std::countr_zero(types));
+			const auto allocated     = device.allocateMemory(allocate);
+			if (allocated.result != vk::Result::eSuccess) {
+				::close(fd);
+				device.destroyBuffer(buffer);
+				return nullptr;
+			}
+			const vk::DeviceMemory memory = allocated.value;
+			if (device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) {
+				device.freeMemory(memory);
+				device.destroyBuffer(buffer);
+				return nullptr;
+			}
+			found = m_imported_dmabufs.emplace(st.st_ino, ImportedDmabuf {buffer, memory}).first;
+		}
+		sources.push_back(found->second.buffer);
+	}
+	if (m_native_mirror == nullptr || m_native_mirror->Size() < size) {
+		if (m_native_mirror != nullptr) {
+			m_scheduler.DeferOperation([owner = std::move(m_native_mirror)]() mutable { owner.reset(); });
+		}
+		m_native_mirror = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+		                                           Common::AlignUp(size, 1024 * 1024));
+	}
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().Handle();
+	vk::BufferMemoryBarrier2 before {};
+	before.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	before.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	before.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	before.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = m_native_mirror->Handle();
+	before.offset              = 0;
+	before.size                = size;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &before;
+	command.pipelineBarrier2(dependency);
+	uint64_t at = 0;
+	for (size_t i = 0; i < pieces.size(); i++) {
+		const vk::BufferCopy copy {pieces[i].bo_offset, at, pieces[i].len};
+		command.copyBuffer(sources[i], m_native_mirror->Handle(), 1, &copy);
+		at += pieces[i].len;
+	}
+	auto after          = before;
+	after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead;
+	dependency.pBufferMemoryBarriers = &after;
+	command.pipelineBarrier2(dependency);
+	return m_native_mirror.get();
+#else
+	(void)vaddr;
+	(void)size;
+	return nullptr;
+#endif
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
+	}
+	if (LeanCaches()) {
+		if (auto* native = ObtainNativeImageSource(vaddr, size); native != nullptr) {
+			return {native, 0};
+		}
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {

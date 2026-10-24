@@ -23,6 +23,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -160,6 +161,15 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	submission.queue_id        = 0;
 	submission.flip_request_id = request_id;
 	Enqueue(std::move(submission));
+}
+
+std::ptrdiff_t GuestGpu::SuspendPointsAhead() {
+	const char* primary = std::getenv("KYTY_NATIVE_GPU_PRIMARY");
+	const char* ahead   = std::getenv("KYTY_NATIVE_GPU_FRAMES_AHEAD");
+	if (primary == nullptr || primary[0] == '\0' || primary[0] == '0' || ahead == nullptr) {
+		return 1;
+	}
+	return std::clamp<std::ptrdiff_t>(std::strtol(ahead, nullptr, 10), 1, 8);
 }
 
 void GuestGpu::SuspendPoint() {
@@ -615,8 +625,14 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			if (NativeGpu::PrimaryRendering()) {
+				// The native pipeline handed this point over only after the frame's GPU work had
+				// completed, and Kyty's own queue holds nothing to wait for.
+				m_suspend_point_ready->release();
+			} else {
+				m_renderer.GetCommandScheduler().DeferPriorityOperation(
+				    [ready = m_suspend_point_ready] { ready->release(); });
+			}
 			cp.BufferFlush();
 			cp.Reset();
 			break;

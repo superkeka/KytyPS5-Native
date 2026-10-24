@@ -283,6 +283,44 @@ public:
 		return promoted;
 	}
 
+	// [vaddr, vaddr + size) as pieces of resident block buffers, in guest order, for consumers that
+	// import the buffers' dma-bufs (zero-copy presentation). False unless every byte is resident.
+	struct DmabufPiece {
+		int      fd;        // the block buffer's dma-buf
+		uint64_t bo_size;   // its size
+		uint64_t bo_offset; // where the piece starts in it
+		uint64_t len;
+	};
+	bool DmabufPieces(uint64_t vaddr, uint64_t size, std::vector<DmabufPiece>& out) const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		out.clear();
+		uint64_t covered = 0;
+		uint64_t next    = vaddr;
+		bool     ok      = true;
+		ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t guest, uint64_t backing, uint64_t len) {
+			if (!ok || guest != next) {
+				ok = false;
+				return;
+			}
+			while (len > 0) {
+				const uint64_t index = backing / kBlockSize;
+				const uint64_t inner = backing % kBlockSize;
+				const Block&   block = m_blocks[index];
+				const uint64_t piece = std::min(len, block.size - inner);
+				if (!block.resident || block.bo.dmabuf_fd < 0) {
+					ok = false;
+					return;
+				}
+				out.push_back(DmabufPiece {block.bo.dmabuf_fd, block.size, inner, piece});
+				backing += piece;
+				len -= piece;
+				covered += piece;
+				next += piece;
+			}
+		});
+		return ok && covered == size;
+	}
+
 	// Makes the blocks behind guest addresses [vaddr, vaddr + size) resident, through whichever views
 	// cover them; addresses outside every view are ignored. Returns how many blocks were promoted.
 	uint32_t PromoteGuestRange(uint64_t vaddr, uint64_t size) {
