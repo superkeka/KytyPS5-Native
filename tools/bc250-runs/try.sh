@@ -6,6 +6,9 @@
 # until SSH answers again.
 set -u
 TAG=$1 SECS=$2 ENVS=$3 TITLE=${4:-PPSA21567} ARGS=${5:-}
+# TRY_CRUMBS=0 runs without breadcrumbs (they sync every submission to disk: slow).
+CRUMBS='KYTY_NATIVE_GPU_BREADCRUMBS=$C'
+[ "${TRY_CRUMBS:-1}" = 0 ] && CRUMBS=""
 H=${BC250_HOST:-deck@bc250.local}
 RUNS=/home/deck/dev/kyty-runs
 LOCAL=${TRY_OUT:-/tmp/bc250-try}/$TAG
@@ -13,7 +16,7 @@ mkdir -p "$LOCAL"
 ssh -o BatchMode=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=5 $H 'journalctl -kf -n 0 --no-pager -o short-monotonic' > "$LOCAL/kernel.log" 2>&1 &
 KLOG=$!
 sleep 2
-ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS KYTY_NATIVE_GPU_BREADCRUMBS=\$C\" --setenv=EXTRA_ARGS=\"$ARGS\" $RUNS/game-run.sh $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
+ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS $CRUMBS\" --setenv=EXTRA_ARGS=\"$ARGS\" $RUNS/game-run.sh $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
 result=TIMEOUT
 for i in $(seq 1 $(( (SECS + 60) / 5 ))); do
 	sleep 5
@@ -21,8 +24,8 @@ for i in $(seq 1 $(( (SECS + 60) / 5 ))); do
 	if ssh -o ConnectTimeout=5 $H "grep -q '^exit=' $RUNS/$TAG/run.log" 2>/dev/null; then result=DONE; break; fi
 done
 sleep 3
-scp -q -r $H:$RUNS/crumbs-$TAG "$LOCAL/" 2>/dev/null
-scp -q $H:$RUNS/$TAG/run.log "$LOCAL/" 2>/dev/null
+scp -q -o ConnectTimeout=5 -o ServerAliveInterval=3 -o ServerAliveCountMax=3 -r $H:$RUNS/crumbs-$TAG "$LOCAL/" 2>/dev/null
+scp -q -o ConnectTimeout=5 -o ServerAliveInterval=3 -o ServerAliveCountMax=3 $H:$RUNS/$TAG/run.log "$LOCAL/" 2>/dev/null
 kill $KLOG 2>/dev/null
 echo "$result $(cat "$LOCAL/crumbs-$TAG/last.txt" 2>/dev/null)"
 if [ $result != DONE ]; then

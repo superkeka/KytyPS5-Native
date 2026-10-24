@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
+
+#include <cstdlib>
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
@@ -27,6 +29,18 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// BC-250 native primary mode (KYTY_NATIVE_GPU_PRIMARY): the GPU work runs natively, so Kyty's Vulkan
+// renderer draws nothing and these caches stay nearly unused. Their upfront allocations (a 768 MiB
+// BDA page table for the whole guest address space, 768 MiB of staging and stream buffers) then only
+// take memory the guest needs: keep them small.
+bool LeanCaches() {
+	static const bool lean = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_PRIMARY");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	return lean;
+}
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -125,8 +139,11 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		// A lean page table (native primary mode) covers no guest pages: nothing Kyty runs reads it.
+		if (table_offset + addresses.size() * sizeof(vk::DeviceAddress) <= m_bda_pagetable_buffer.Size()) {
+			WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
+			                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		}
 		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -135,8 +152,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		if (table_offset + size_pages * sizeof(vk::DeviceAddress) <= m_bda_pagetable_buffer.Size()) {
+			m_bda_pagetable_buffer.Fill(table_offset, size_pages * sizeof(vk::DeviceAddress), 0);
+		}
 		buffer.is_deleted = true;
 	}
 }
@@ -246,12 +264,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+                             LeanCaches() ? 64 * 1024 : BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
-      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, (LeanCaches() ? 64 : 512) * MiB),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, (LeanCaches() ? 16 : 64) * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, (LeanCaches() ? 16 : 64) * MiB),
+      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, (LeanCaches() ? 32 : 128) * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());

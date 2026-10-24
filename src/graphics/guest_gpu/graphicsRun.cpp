@@ -379,6 +379,10 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
 		return;
 	}
+	// The BC-250 native path already performed this transfer with its DCB or ACB.
+	if (IsAsyncComputeQueue() ? NativeGpu::NativeAsyncCompute() : NativeGpu::PrimaryRendering()) {
+		return;
+	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
 		switch (selector) {
 			case 0:
