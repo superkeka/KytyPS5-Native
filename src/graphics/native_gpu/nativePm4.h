@@ -288,7 +288,11 @@ public:
 	void SetNoDcc(bool no_dcc) { m_no_dcc = no_dcc; }
 
 	// Experiment: targets without DCC lose CB_COLORn_INFO.FAST_CLEAR (no CMASK fast clear).
-	void SetNoCmaskClear(bool on) { m_no_cmask_clear = on; }
+	// CMASK fast clear off on targets without DCC in the MRT slots of `slots` (bit n = slot n).
+	void SetNoCmaskClear(bool on, uint32_t slots = 0xffu) {
+		m_no_cmask_clear       = on;
+		m_no_cmask_clear_slots = slots;
+	}
 
 	// Experiment: CB_TARGET_MASK is ANDed with `mask`, e.g. 0xf keeps only MRT0 writable.
 	void SetTargetMask(uint32_t mask) { m_target_mask = mask; }
@@ -350,6 +354,7 @@ private:
 	bool                         m_no_dcc     = false;
 	uint32_t                     m_target_mask = 0xffffffffu;
 	bool                         m_no_cmask_clear = false;
+	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
 	uint64_t                     m_fence_va       = 0;
 	uint32_t                     m_fence_seq      = 0;

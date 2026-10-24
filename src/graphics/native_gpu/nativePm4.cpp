@@ -206,7 +206,8 @@ uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
 	// CB_COLORn_INFO.FAST_CLEAR (bit 13) off on targets without DCC: CMASK-only fast clear, for the
 	// no-CMASK-clear experiment.
 	if (m_no_cmask_clear && offset >= kCbColor0Info && offset < kCbColor0Info + 8 * kCbColorStride &&
-	    (offset - kCbColor0Info) % kCbColorStride == 0 && (value & (1u << 28u)) == 0) {
+	    (offset - kCbColor0Info) % kCbColorStride == 0 && (value & (1u << 28u)) == 0 &&
+	    ((m_no_cmask_clear_slots >> ((offset - kCbColor0Info) / kCbColorStride)) & 1u) != 0) {
 		value &= ~(1u << 13u);
 	}
 	if (offset == kCbTargetMask) {
