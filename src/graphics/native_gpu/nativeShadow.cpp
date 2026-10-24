@@ -24,6 +24,7 @@
 #endif
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <span>
 #include <string>
 #include <thread>
@@ -343,40 +344,45 @@ public:
 		// Pipelined: the IB joins the batch the pipeline submits with one CS once it has taken every
 		// queued buffer (FlushBatch). One BO-list validation then covers them all.
 		if (m_pipelined) {
-			// KYTY_NATIVE_GPU_ACB_DEFER=1: an ACB that waits for labels a DCB has not written yet goes into
-			// the batch after the DCB that writes them (on the ring its waits are barriers, so in guest
-			// submission order it would read what the previous frame left there). Only within one batch:
-			// FlushBatch appends whatever is still waiting.
-			if (acb && m_acb_defer && !result.unmet_waits.empty()) {
-				std::set<uint64_t> needs;
+			// KYTY_NATIVE_GPU_ACB_DEFER=1: an ACB that waits for labels no submitted DCB has written yet
+			// goes into the batch after the DCB that writes them: on the ring its waits are barriers, so
+			// in guest submission order it would read what the previous frame left there. Kyty's compute
+			// queue only completes the ACB after those labels, i.e. after the writer ran, so the ACB may
+			// wait across batches. ACBs keep their order among themselves.
+			if (m_acb_defer) {
+				ReleaseDeferredAcbsLocked();
+			}
+			if (acb && m_acb_defer && (!m_deferred_acbs.empty() || !result.unmet_waits.empty())) {
+				DeferredAcb d;
+				d.ib = std::move(wrapped);
 				for (const auto& w: result.unmet_waits) {
-					if (m_batch_labels.count(w.addr) == 0) {
-						needs.insert(w.addr);
+					// A DCB already submitted writes it: that one runs first on the ring.
+					if (w.addr != 0 && m_inflight_labels.count(w.addr) == 0) {
+						d.needs.push_back(w);
 					}
 				}
-				if (!needs.empty()) {
-					m_deferred_acbs.push_back(DeferredAcb {std::move(wrapped), std::move(needs)});
+				if (!d.needs.empty() || !m_deferred_acbs.empty()) {
+					m_deferred_acbs.push_back(std::move(d));
 					m_acb_deferred++;
 					return;
 				}
+				wrapped = std::move(d.ib);
 			}
 			AppendToBatchLocked(wrapped);
 			if (!acb && m_acb_defer) {
 				for (const auto& [a, v]: result.label_writes) {
-					m_batch_labels.insert(a);
-				}
-				for (auto it = m_deferred_acbs.begin(); it != m_deferred_acbs.end();) {
-					for (const auto& [a, v]: result.label_writes) {
-						it->needs.erase(a);
-					}
-					if (it->needs.empty()) {
-						AppendToBatchLocked(it->ib);
-						m_acb_resolved++;
-						it = m_deferred_acbs.erase(it);
-					} else {
-						++it;
+					if (a != 0) {
+						m_inflight_labels[a] = static_cast<uint32_t>(v);
 					}
 				}
+				for (auto& d: m_deferred_acbs) {
+					std::erase_if(d.needs, [&](const Pm4TranslateResult::UnmetWait& w) {
+						return std::any_of(result.label_writes.begin(), result.label_writes.end(),
+						                   [&](const auto& lw) { return lw.first == w.addr; });
+					});
+					d.dcbs_since++;
+				}
+				ReleaseDeferredAcbsLocked();
 			}
 			return;
 		}
@@ -628,12 +634,6 @@ public:
 	}
 	void FlushBatch() {
 		std::lock_guard<std::mutex> lock(m_mutex);
-		for (const auto& d: m_deferred_acbs) {
-			AppendToBatchLocked(d.ib);
-			m_acb_unresolved++;
-		}
-		m_deferred_acbs.clear();
-		m_batch_labels.clear();
 		SubmitBatchLocked();
 	}
 
@@ -662,6 +662,39 @@ public:
 	}
 
 private:
+	// Deferred ACBs leave in order, once nothing they wait for is outstanding: a submitted DCB wrote
+	// the label, Kyty already did (the writer has run), or 64 DCBs went by (a writer the translator
+	// does not see; counted as unresolved). Labels Kyty has written stop counting as in flight.
+	void ReleaseDeferredAcbsLocked() {
+		std::erase_if(m_inflight_labels, [](const auto& e) {
+			return *reinterpret_cast<const volatile uint32_t*>(e.first) == e.second;
+		});
+		while (!m_deferred_acbs.empty()) {
+			DeferredAcb& d = m_deferred_acbs.front();
+			std::erase_if(d.needs, [](const Pm4TranslateResult::UnmetWait& w) {
+				const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(w.addr);
+				return WaitMet(w, v);
+			});
+			if (!d.needs.empty() && d.dcbs_since < 64) {
+				break;
+			}
+			(d.needs.empty() ? m_acb_resolved : m_acb_unresolved)++;
+			AppendToBatchLocked(d.ib);
+			m_deferred_acbs.pop_front();
+		}
+	}
+
+	static bool WaitMet(const Pm4TranslateResult::UnmetWait& w, uint64_t v) {
+		switch (w.function) {
+			case 1: return v < w.ref;
+			case 2: return v <= w.ref;
+			case 4: return v != w.ref;
+			case 5: return v >= w.ref;
+			case 6: return v > w.ref;
+			default: return v == w.ref;
+		}
+	}
+
 	void AppendToBatchLocked(const std::vector<uint32_t>& ib) {
 		if ((m_batch.size() + ib.size()) * 4 > NativeSubmitter::kSlotSize) {
 			SubmitBatchLocked();
@@ -1317,12 +1350,13 @@ private:
 	bool          m_pipelined        = false;
 	std::vector<uint32_t> m_batch;
 	struct DeferredAcb {
-		std::vector<uint32_t> ib;
-		std::set<uint64_t>    needs; // labels still to be written by a DCB
+		std::vector<uint32_t>                       ib;
+		std::vector<Pm4TranslateResult::UnmetWait> needs;      // waits no submitted DCB satisfies yet
+		uint32_t                                    dcbs_since = 0;
 	};
-	bool                     m_acb_defer = false;
-	std::vector<DeferredAcb> m_deferred_acbs;
-	std::set<uint64_t>       m_batch_labels; // labels written by the DCBs in this batch
+	bool                                   m_acb_defer = false;
+	std::deque<DeferredAcb>                m_deferred_acbs;
+	std::unordered_map<uint64_t, uint32_t> m_inflight_labels; // label -> value a submitted DCB writes, until Kyty has written it
 	uint64_t                 m_acb_deferred   = 0;
 	uint64_t                 m_acb_resolved   = 0;
 	uint64_t                 m_acb_unresolved = 0;
