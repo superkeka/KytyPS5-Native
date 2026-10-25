@@ -960,6 +960,169 @@ Libs::Graphics::NativeGpu::GemBacking* GetGemBacking() {
 #endif
 }
 
+// With the GEM backing, runtime memory (not code or stacks) lives in a region of the backing past
+// the physical memory, mapped like direct memory. The GPU then reaches them through ordinary
+// blocks: as anonymous pages they needed userptr buffers, whose pages every submission revalidates
+// (ASTRO BOT: 92 buffers, 268 MiB, about a quarter of a millisecond per CS).
+class ProgramBacking {
+public:
+	static constexpr uint64_t kSize = 1024ull * 1024 * 1024;
+
+	struct Piece {
+		uint64_t vaddr;
+		uint64_t size;
+		uint64_t offset;
+	};
+
+	void Init(uint64_t base) {
+		m_free.clear();
+		m_free[base] = kSize;
+		m_maps.clear();
+		m_fresh = base;
+		m_on    = true;
+	}
+	// The backing past every offset handed out so far is still the untouched (zero) memfd.
+	[[nodiscard]] bool WasFresh(uint64_t offset) const { return offset >= m_fresh_before; }
+	[[nodiscard]] bool On() const { return m_on; }
+
+	// First fit; 0 when the region is full.
+	uint64_t Alloc(uint64_t size) {
+		for (auto it = m_free.begin(); it != m_free.end(); ++it) {
+			if (it->second < size) {
+				continue;
+			}
+			const uint64_t offset = it->first;
+			const uint64_t left   = it->second - size;
+			m_free.erase(it);
+			if (left != 0) {
+				m_free[offset + size] = left;
+			}
+			m_fresh_before = m_fresh;
+			m_fresh        = std::max(m_fresh, offset + size);
+			return offset;
+		}
+		return 0;
+	}
+	// Takes [offset, offset + size) back out of the free list (a piece being restored).
+	bool AllocAt(uint64_t offset, uint64_t size) {
+		auto it = m_free.upper_bound(offset);
+		if (it == m_free.begin()) {
+			return false;
+		}
+		--it;
+		const uint64_t start = it->first;
+		const uint64_t end   = start + it->second;
+		if (offset < start || offset + size > end) {
+			return false;
+		}
+		m_free.erase(it);
+		if (start < offset) {
+			m_free[start] = offset - start;
+		}
+		if (offset + size < end) {
+			m_free[offset + size] = end - offset - size;
+		}
+		return true;
+	}
+	void Free(uint64_t offset, uint64_t size) {
+		auto [it, inserted] = m_free.emplace(offset, size);
+		EXIT_IF(!inserted);
+		if (auto next = std::next(it); next != m_free.end() && it->first + it->second == next->first) {
+			it->second += next->second;
+			m_free.erase(next);
+		}
+		if (it != m_free.begin()) {
+			auto prev = std::prev(it);
+			if (prev->first + prev->second == it->first) {
+				prev->second += it->second;
+				m_free.erase(it);
+			}
+		}
+	}
+
+	void Record(uint64_t vaddr, uint64_t size, uint64_t offset) { m_maps[vaddr] = {size, offset}; }
+
+	// The recorded pieces of [vaddr, vaddr + size), splitting records at the edges, and forgets them.
+	// False (nothing changed) unless the whole range is recorded.
+	bool Take(uint64_t vaddr, uint64_t size, std::vector<Piece>* out) {
+		const uint64_t end     = vaddr + size;
+		uint64_t       covered = 0;
+		for (auto it = FirstAt(vaddr); it != m_maps.end() && it->first < end; ++it) {
+			covered += std::min(end, it->first + it->second.first) - std::max(vaddr, it->first);
+		}
+		if (covered != size) {
+			return false;
+		}
+		for (auto it = FirstAt(vaddr); it != m_maps.end() && it->first < end;) {
+			const uint64_t s = it->first;
+			const uint64_t e = s + it->second.first;
+			const uint64_t o = it->second.second;
+			it               = m_maps.erase(it);
+			if (s < vaddr) {
+				m_maps[s] = {vaddr - s, o};
+			}
+			if (end < e) {
+				m_maps[end] = {e - end, o + (end - s)};
+			}
+			const uint64_t ps = std::max(vaddr, s);
+			out->push_back(Piece {ps, std::min(end, e) - ps, o + (ps - s)});
+		}
+		return true;
+	}
+
+private:
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>>::iterator FirstAt(uint64_t vaddr) {
+		auto it = m_maps.upper_bound(vaddr);
+		if (it != m_maps.begin() && std::prev(it)->first + std::prev(it)->second.first > vaddr) {
+			--it;
+		}
+		return it;
+	}
+
+	bool                                              m_on           = false;
+	uint64_t                                          m_fresh        = 0; // offsets from here on were never handed out
+	uint64_t                                          m_fresh_before = 0; // m_fresh before the last Alloc
+	std::map<uint64_t, uint64_t>                      m_free; // backing offset -> size
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_maps; // guest address -> (size, backing offset)
+};
+
+static ProgramBacking g_program_backing;
+
+// Unmaps committed program, runtime or stack memory, whichever way it is mapped. Pieces mapped from
+// the backing go to `pieces` (their backing freed) so a failed transaction can put them back.
+static bool ReleaseRuntimeMemory(uint64_t vaddr, uint64_t size, std::vector<ProgramBacking::Piece>* pieces) {
+	std::vector<ProgramBacking::Piece> taken;
+	if (g_program_backing.On() && g_program_backing.Take(vaddr, size, &taken)) {
+		for (const auto& p: taken) {
+			EXIT_IF(!g_guest_address_space->UnmapBacking(p.vaddr, p.size));
+			g_program_backing.Free(p.offset, p.size);
+		}
+		if (pieces != nullptr) {
+			pieces->insert(pieces->end(), taken.begin(), taken.end());
+		}
+		return true;
+	}
+	return g_guest_address_space->ReleaseCommitted(vaddr, size);
+}
+
+// Undoes ReleaseRuntimeMemory: the backing pieces map their old data again, anything else is
+// committed anew.
+static bool RestoreRuntimeMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
+                                 const std::vector<ProgramBacking::Piece>& pieces) {
+	bool from_backing = false;
+	for (const auto& p: pieces) {
+		if (p.vaddr >= vaddr && p.vaddr + p.size <= vaddr + size) {
+			from_backing = true;
+			if (!g_program_backing.AllocAt(p.offset, p.size) ||
+			    !g_guest_address_space->MapBacking(p.vaddr, p.size, p.offset, mode)) {
+				return false;
+			}
+			g_program_backing.Record(p.vaddr, p.size, p.offset);
+		}
+	}
+	return from_backing || g_guest_address_space->Commit(vaddr, size, mode);
+}
+
 #if KYTY_GEM_BACKING_SUPPORTED
 // Bind a GPU-visible guest range into the native GPU VM. Direct and pooled memory are backed by the
 // GemBacking chunks and already bound into that VM by GuestBackingStore::BindView, so only the anon-committed ranges
@@ -1119,7 +1282,13 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
-	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	// The GEM backing also holds program and runtime memory, past the physical memory (ProgramBacking).
+	const char* gem_env = std::getenv("KYTY_NATIVE_GPU_GEM");
+	const bool  gem     = KYTY_GEM_BACKING_SUPPORTED && gem_env != nullptr && gem_env[0] != '\0' && gem_env[0] != '0';
+	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize() + (gem ? ProgramBacking::kSize : 0));
+	if (gem && GetGemBacking() != nullptr) {
+		g_program_backing.Init(PhysicalMemory::TotalSize());
+	}
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();
@@ -2628,8 +2797,7 @@ int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len) {
 }
 
 static bool FreeGuestMemoryOwner(uint64_t vaddr, uint64_t size) {
-	return g_guest_address_space->ReleaseCommitted(vaddr, size) &&
-	       g_virtual_ranges->Remove(vaddr, size);
+	return ReleaseRuntimeMemory(vaddr, size, nullptr) && g_virtual_ranges->Remove(vaddr, size);
 }
 
 static int UnmapMemoryOwner(const VirtualRanges::Range& range, uint64_t vaddr, size_t len) {
@@ -3436,6 +3604,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		VirtualMemory::Mode                         mode     = VirtualMemory::Mode::NoAccess;
 		GpuAccessMode                               gpu_mode = GpuAccessMode::NoAccess;
 		std::vector<FlexibleMemory::AllocatedBlock> flexible_blocks;
+		std::vector<ProgramBacking::Piece>          program_pieces;
 		bool                                        host_unmapped    = false;
 		bool                                        backend_unmapped = false;
 	};
@@ -3509,7 +3678,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 				    g_flexible_memory->Restore(chunk.flexible_blocks);
 			} else if (IsPrivateCommittedRangeType(chunk.range.type) && chunk.host_unmapped) {
 				host_restored =
-				    g_guest_address_space->Commit(chunk.range.start, chunk.range.size, chunk.mode);
+				    RestoreRuntimeMemory(chunk.range.start, chunk.range.size, chunk.mode, chunk.program_pieces);
 			}
 			ok = host_restored && backend_restored && ok;
 		}
@@ -3555,7 +3724,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			chunk.backend_unmapped = unmapped;
 			chunk.gpu_mode         = gpu_mode;
 		} else if (IsPrivateCommittedRangeType(chunk.range.type)) {
-			unmapped = g_guest_address_space->ReleaseCommitted(chunk.range.start, chunk.range.size);
+			unmapped = ReleaseRuntimeMemory(chunk.range.start, chunk.range.size, &chunk.program_pieces);
 			chunk.host_unmapped    = unmapped;
 			chunk.backend_unmapped = unmapped;
 		} else if (IsReservedRangeType(chunk.range.type)) {
@@ -3937,11 +4106,28 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		return 0;
 	}
 	UnmapGpuRange(vaddr, mapped_size);
-	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
+	bool from_backing = false;
+	// Only runtime data: the GPU buffer a block moves into can be mapped for the CPU through its
+	// dma-buf only, and dma-buf mappings cannot be executable, so code stays in anonymous memory.
+	if (g_program_backing.On() && type == VirtualRangeType::Runtime && !VirtualMemory::IsExecute(mode)) {
+		if (const uint64_t offset = g_program_backing.Alloc(mapped_size); offset != 0) {
+			// Freed program memory keeps its old bytes in the backing; committed memory starts zeroed.
+			// Never-used backing is still zero, and zeroing it would commit every page of a large
+			// sparse reservation.
+			if ((g_program_backing.WasFresh(offset) || g_guest_address_space->ZeroBacking(offset, mapped_size)) &&
+			    g_guest_address_space->MapBacking(vaddr, mapped_size, offset, mode)) {
+				g_program_backing.Record(vaddr, mapped_size, offset);
+				from_backing = true;
+			} else {
+				g_program_backing.Free(offset, mapped_size);
+			}
+		}
+	}
+	if (!from_backing && !g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
 		return 0;
 	}
 	if (!g_virtual_ranges->Add(vaddr, mapped_size, 0, ProgramProtection(mode), 0, type, name)) {
-		EXIT_IF(!g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
+		EXIT_IF(!ReleaseRuntimeMemory(vaddr, mapped_size, nullptr));
 		return 0;
 	}
 	MapGpuRange(vaddr, mapped_size);
