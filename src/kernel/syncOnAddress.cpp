@@ -4,6 +4,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -81,12 +82,30 @@ void PollSignals(signal_poll_func_t signal_poll) {
 	}
 }
 
+// Sleepers per address bucket, for HasWaiters. 8-byte granules so a 64-bit wait and the store to
+// either of its words share a bucket.
+std::atomic<uint32_t> g_waiters[1024];
+
+std::atomic<uint32_t>& WaiterCount(volatile void* address) {
+	const auto granule = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(address) >> 3u);
+	return g_waiters[(granule * 0x9e3779b1u) >> 22u];
+}
+
+struct CountedWaiter {
+	std::atomic<uint32_t>& count;
+	explicit CountedWaiter(volatile void* address): count(WaiterCount(address)) { count.fetch_add(1, std::memory_order_seq_cst); }
+	~CountedWaiter() { count.fetch_sub(1, std::memory_order_release); }
+	CountedWaiter(const CountedWaiter&)            = delete;
+	CountedWaiter& operator=(const CountedWaiter&) = delete;
+};
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 
 template <typename T>
 int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
               signal_poll_func_t signal_poll) {
-	bool       first_wait = true;
+	const CountedWaiter counted(address);
+	bool                first_wait = true;
 
 	for (;;) {
 		if (ReadWord(address) != expected) {
@@ -285,6 +304,11 @@ int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeou
 int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout,
            signal_poll_func_t signal_poll) {
 	return WaitImpl(address, expected, MakeDeadline(timeout), signal_poll);
+}
+
+bool HasWaiters(volatile void* address) {
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	return WaiterCount(address).load(std::memory_order_relaxed) != 0;
 }
 
 int Wake(volatile void* address, int32_t count) {
