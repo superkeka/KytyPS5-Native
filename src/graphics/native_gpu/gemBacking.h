@@ -298,7 +298,7 @@ public:
 				break;
 			}
 			const uint64_t index = static_cast<uint64_t>(data) / BlockSize();
-			if (!m_blocks[index].resident && PromoteBlockUnlocked(index)) {
+			if (!m_blocks[index].resident && !m_blocks[index].code && PromoteBlockUnlocked(index)) {
 				promoted++;
 			}
 			pos = (index + 1) * BlockSize();
@@ -351,7 +351,7 @@ public:
 		uint32_t promoted = 0;
 		ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t, uint64_t backing, uint64_t len) {
 			for (uint64_t index = backing / BlockSize(); index <= (backing + len - 1) / BlockSize(); index++) {
-				if (!m_blocks[index].resident && PromoteBlockUnlocked(index)) {
+				if (!m_blocks[index].resident && !m_blocks[index].code && PromoteBlockUnlocked(index)) {
 					promoted++;
 				}
 			}
@@ -480,8 +480,18 @@ public:
 		// (seen in program memory: the shader is a readable slice, with an execute-only tail). A
 		// userptr cannot fault in an unreadable page, which fails the whole submission, so register one
 		// buffer per readable slice and skip the holes.
+		// Executable slices are CPU instructions; shaders live in data. Each registered byte costs every
+		// submission a page walk (ASTRO BOT's program text is most of its 267 MiB of userptr), so
+		// they are left out unless KYTY_NATIVE_GPU_BIND_CODE=1.
+		static const bool bind_code = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_BIND_CODE");
+			return v != nullptr && v[0] == '1';
+		}();
 		bool any = false;
-		ForEachReadableSubrange(vaddr, size, [&](uint64_t s, uint64_t sz, bool writable) {
+		ForEachReadableSubrange(vaddr, size, [&](uint64_t s, uint64_t sz, bool writable, bool executable) {
+			if (executable && !bind_code) {
+				return;
+			}
 			any = RegisterExternalUnlocked(s, sz, gpu_write && writable) || any;
 		});
 		return any;
@@ -550,6 +560,7 @@ private:
 		Bo       bo;
 		uint64_t size     = 0;
 		bool     resident = false;
+		bool     code     = false; // holds executable views: stays in the memfd (see PromoteBlockUnlocked)
 	};
 	// A guest view: `size` bytes of the backing from `offset`, mapped at the key address; `gpu` when
 	// it is also mapped into the GPU VM.
@@ -865,6 +876,7 @@ private:
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_pieces; // (guest address, offset in block)
 		std::vector<uint64_t>                      gpu_lengths;
 		job->pieces.push_back(MovePiece {reinterpret_cast<uint64_t>(m_alias + start), block.size, PROT_READ | PROT_WRITE, 0});
+		bool executable = false;
 		for (const auto& [view_addr, view]: m_views) {
 			const uint64_t vs = std::max(view.offset, start);
 			const uint64_t ve = std::min(view.offset + view.size, start + block.size);
@@ -874,11 +886,21 @@ private:
 			const uint64_t guest = view_addr + (vs - view.offset);
 			ForEachHostProtection(guest, ve - vs, [&](uint64_t s, uint64_t len, int prot) {
 				job->pieces.push_back(MovePiece {s, len, prot, vs - start + (s - guest)});
+				executable = executable || (prot & PROT_EXEC) != 0;
 			});
 			if (view.gpu) {
 				gpu_pieces.emplace_back(guest, vs - start);
 				gpu_lengths.push_back(ve - vs);
 			}
+		}
+		// A dma-buf cannot be mapped executable: a block the guest runs code from stays in the memfd.
+		if (executable) {
+			std::fprintf(stderr, "GemBacking: block %llu holds executable views, not made resident\n",
+			             static_cast<unsigned long long>(index));
+			::munmap(bo_cpu, block.size);
+			CloseBo(bo);
+			block.code = true;
+			return false;
 		}
 		RunOnMover(job.get());
 		const bool moved = job->moved;
@@ -903,7 +925,7 @@ private:
 		return true;
 	}
 
-	// Calls cb(start, size, writable) for each readable host VMA slice overlapping [vaddr, vaddr+size),
+	// Calls cb(start, size, writable, executable) for each readable host VMA slice overlapping [vaddr, vaddr+size),
 	// read from /proc/self/maps. Guest memory is mapped at host VA == guest VA; `writable` is the
 	// slice's host write permission. Unreadable slices (no-access or execute-only) are skipped, since a
 	// userptr cannot fault them in. If maps cannot be read, the whole range is offered once as writable
@@ -913,7 +935,7 @@ private:
 		const uint64_t end  = vaddr + size;
 		FILE*          maps = ::fopen("/proc/self/maps", "re");
 		if (maps == nullptr) {
-			cb(vaddr, size, true);
+			cb(vaddr, size, true, false);
 			return;
 		}
 		char line[512];
@@ -929,7 +951,7 @@ private:
 			const uint64_t cs = std::max<uint64_t>(s, vaddr);
 			const uint64_t ce = std::min<uint64_t>(e, end);
 			if (cs < ce) {
-				cb(cs, ce - cs, perms[1] == 'w');
+				cb(cs, ce - cs, perms[1] == 'w', perms[2] == 'x');
 			}
 		}
 		::fclose(maps);
