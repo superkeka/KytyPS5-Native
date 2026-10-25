@@ -38,7 +38,10 @@ public:
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
-	[[nodiscard]] bool IsSafeForRendering(int handle, int index);
+	// `before`: only flip requests older than this id count (NextFlipRequestId() when the command
+	// buffer that waits was submitted).
+	[[nodiscard]] bool     IsSafeForRendering(int handle, int index, uint64_t before = UINT64_MAX);
+	[[nodiscard]] uint64_t NextFlipRequestId();
 
 	[[nodiscard]] Impl& State() noexcept;
 

@@ -35,8 +35,10 @@ public:
 	void               Wake();
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
-	void Submit(std::span<const uint32_t> draw_commands,
-	            std::span<const uint32_t> constant_commands);
+	// `flip_watermark`: NextFlipRequestId() when the guest submitted the buffer (default: now), for
+	// its waits for a flip (CommandProcessor::WaitFlipDone).
+	void Submit(std::span<const uint32_t> draw_commands, std::span<const uint32_t> constant_commands,
+	            uint64_t flip_watermark = UINT64_MAX);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
@@ -68,6 +70,7 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  flip_watermark    = UINT64_MAX; // NextFlipRequestId() at submission
 	};
 
 	void              Enqueue(Submission submission);

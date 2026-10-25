@@ -254,6 +254,46 @@ void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint3
 // Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
 // on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
 // the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
+struct NotedWait {
+	std::atomic<uint64_t> addr {0}; // written last: 0 while the entry is being filled
+	WaitCond              wait;
+};
+std::array<NotedWait, 512> g_noted_waits;
+std::atomic<uint32_t>      g_noted_next {0};
+
+void NoteGpuWait(const WaitCond& w) {
+	auto& e = g_noted_waits[g_noted_next.fetch_add(1, std::memory_order_relaxed) % g_noted_waits.size()];
+	e.addr.store(0, std::memory_order_relaxed);
+	e.wait = w;
+	e.addr.store(w.addr, std::memory_order_release);
+}
+} // namespace
+
+std::vector<WaitCond> RecentGpuWaits() {
+	std::vector<WaitCond> out;
+	for (const auto& e: g_noted_waits) {
+		const uint64_t addr = e.addr.load(std::memory_order_acquire);
+		if (addr != 0 && e.wait.addr == addr) {
+			out.push_back(e.wait);
+		}
+	}
+	return out;
+}
+
+uint64_t SatisfyingValue(const WaitCond& w, uint64_t current) {
+	const uint64_t ref = w.ref & w.mask;
+	uint64_t       want = ref;
+	switch (w.function) {
+		case 1: want = ref != 0 ? ref - 1 : 0; break;                // <
+		case 4: want = (~ref) & w.mask; break;                        // !=
+		case 6: want = (ref + 1) & w.mask; break;                     // >
+		default: break;                                               // ==, <=, >=, always
+	}
+	return (current & ~w.mask) | (want & w.mask);
+}
+
+namespace {
+
 bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) {
 	if (w.function != 3) {
 		return false;
@@ -271,6 +311,7 @@ bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) 
 		ib.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
 		ib.push_back(0);
 	}
+	NoteGpuWait(w);
 	return true;
 }
 
@@ -468,6 +509,92 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 		return RingWaitRelease::Barrier;
 	}
 	return RingWaitRelease::Hold;
+}
+
+namespace {
+// 1: inlined something, 0: nothing to inline, -1: cannot.
+int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int depth, std::string* why) {
+	auto stop = [&](const char* what, size_t dw) {
+		if (why != nullptr && why->empty()) {
+			char text[160];
+			std::snprintf(text, sizeof(text), "%s at dw %zu of %zu, depth %d, buffer %p", what, dw, in.size(), depth,
+			              static_cast<const void*>(in.data()));
+			*why = text;
+		}
+		return -1;
+	};
+	constexpr uint32_t kRewind = 0x59, kIndirect = 0x3f;
+	constexpr size_t   kMaxDwords = 4u << 20u;
+	int                changed    = 0;
+	uint32_t           hops       = 0; // chains taken: a chain replaces the buffer, it does not nest
+	for (size_t dw = 0; dw < in.size();) {
+		const uint32_t header = in[dw];
+		const uint32_t len    = (header >> 30u) == 3u ? ((header >> 16u) & 0x3fffu) + 2u : 1u;
+		if (dw + len > in.size()) {
+			return stop("packet past the end", dw);
+		}
+		const uint32_t op = (header >> 8u) & 0xffu;
+		if ((header >> 30u) == 3u && op == kRewind && len == 2) {
+			if ((in[dw + 1] & 0x80000000u) == 0) {
+				return stop("REWIND not valid yet", dw);
+			}
+			changed = 1;
+			dw += len;
+			continue;
+		}
+		if ((header >> 30u) == 3u && op == kIndirect) {
+			if (len != 4) {
+				return stop("INDIRECT_BUFFER of another form", dw);
+			}
+			const uint32_t control = in[dw + 3];
+			const auto*    target  = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[dw + 2]) << 32u) | (in[dw + 1] & ~3u));
+			const uint32_t size    = control & 0xfffffu;
+			const bool     chain   = (control & (1u << 20u)) != 0;
+			changed                = 1;
+			if (size == 0) {
+				if (chain) {
+					return changed;
+				}
+				dw += len;
+				continue;
+			}
+			if (target == nullptr || out->size() + size > kMaxDwords) {
+				return stop("IB target null or too large", dw);
+			}
+			if (chain) {
+				if (++hops > 65536u) {
+					return stop("chain too long", dw);
+				}
+				in = {target, size};
+				dw = 0;
+				continue;
+			}
+			if (depth >= 16) {
+				return stop("calls nested too deep", dw);
+			}
+			if (FlattenInto({target, size}, out, depth + 1, why) < 0) {
+				return -1;
+			}
+			dw += len;
+			continue;
+		}
+		if (out->size() + len > kMaxDwords) {
+			return stop("too large", dw);
+		}
+		out->insert(out->end(), in.begin() + static_cast<std::ptrdiff_t>(dw), in.begin() + static_cast<std::ptrdiff_t>(dw + len));
+		dw += len;
+	}
+	return changed;
+}
+} // namespace
+
+bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why) {
+	out->clear();
+	if (FlattenInto(in, out, 0, why) <= 0) {
+		out->clear();
+		return false;
+	}
+	return true;
 }
 
 uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings) {
@@ -1357,8 +1484,40 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		r.draw_log.push_back(d);
 	};
+	// Color targets in a video-out buffer are drawn without DCC (AddDisplayRange). The shadow holds
+	// the value sent, so preambles agree; a slot that moves elsewhere gets the guest's value back.
+	auto fix_display_dcc = [&]() {
+		if (m_display_ranges.empty()) {
+			return;
+		}
+		constexpr uint32_t kDccEnable = 1u << 28u;
+		for (uint32_t i = 0; i < 8; i++) {
+			const uint32_t step = i * kCbColorStride;
+			const uint32_t off  = kCbColor0Info + step;
+			const uint32_t info = reg(cx, off);
+			const uint64_t addr = (static_cast<uint64_t>(reg(cx, kCbColor0Base + step)) << 8u) |
+			                      (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt + i) & 0xffu) << 40u);
+			const bool display = addr != 0 && std::any_of(m_display_ranges.begin(), m_display_ranges.end(), [&](const auto& d) {
+				return addr >= d.first && addr < d.first + d.second;
+			});
+			if (display && (info & kDccEnable) != 0) {
+				m_display_dcc_info[i] = info;
+				m_display_dcc_off |= 1u << i;
+				cx[off] = info & ~kDccEnable;
+				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, cx[off]), false);
+				NoteOnce(17, "render target in a video-out buffer drawn without DCC");
+			} else if (!display && ((m_display_dcc_off >> i) & 1u) != 0) {
+				if (info == (m_display_dcc_info[i] & ~kDccEnable)) {
+					cx[off] = m_display_dcc_info[i];
+					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, cx[off]), false);
+				}
+				m_display_dcc_off &= ~(1u << i);
+			}
+		}
+	};
 	auto skip_draw = [&]() {
 		fix_fmask();
+		fix_display_dcc();
 		const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
 		if (m_inspect_ps != 0 && ps == m_inspect_ps && r.inspected.size() < 4) {
 			DrawSnapshot snap;
@@ -2435,6 +2594,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (r.unknown_ops.empty()) {
 					r.unknown_op = op;
 					r.unknown_dw = dw;
+					if (op == 0x59u && body_count >= 1) { // REWIND: its state dword, what follows
+						r.unknown_detail = {bptr[0], static_cast<uint32_t>(dcb.size() - dw)};
+						for (uint32_t i = 2; i < 8 && dw + i < dcb.size(); i++) {
+							r.unknown_detail.push_back(dcb[dw + i]);
+						}
+					}
 				}
 				r.unknown_ops.insert(op);
 				break;

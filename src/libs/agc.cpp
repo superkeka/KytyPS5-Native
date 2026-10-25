@@ -4844,9 +4844,12 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
-		// With native labels the continuation gets only what Kyty's command processor still runs.
-		Libs::Graphics::NativeGpu::ShadowEnqueue(dcb, size_in_dwords, 0, [](std::span<const uint32_t> commands) {
-			g_renderer->GetGpu().Submit(commands, {});
+		// With native labels the continuation gets only what Kyty's command processor still runs. It
+		// runs after the DCB's GPU work, when the title may already have requested the next flips: its
+		// waits for a flip count only the requests made before this submission.
+		const uint64_t flip_watermark = g_renderer->GetVideoOut().NextFlipRequestId();
+		Libs::Graphics::NativeGpu::ShadowEnqueue(dcb, size_in_dwords, 0, [flip_watermark](std::span<const uint32_t> commands) {
+			g_renderer->GetGpu().Submit(commands, {}, flip_watermark);
 		});
 		return;
 	}

@@ -22,6 +22,7 @@ using Libs::Graphics::NativeGpu::LodStatsMode;
 using Libs::Graphics::NativeGpu::ParseLodStatsMode;
 using Libs::Graphics::NativeGpu::Pm4TranslateResult;
 using Libs::Graphics::NativeGpu::ComputeRingForQueue;
+using Libs::Graphics::NativeGpu::FlattenIndirectBuffers;
 using Libs::Graphics::NativeGpu::NativeIbKind;
 using Libs::Graphics::NativeGpu::PlanRingWait;
 using Libs::Graphics::NativeGpu::Pm4Translator;
@@ -1396,6 +1397,53 @@ void TestComputeRingForQueue() {
 	Check(ComputeRingForQueue(0x20, 0u) == 0u, "no compute ring reported: ring 0");
 }
 
+void TestFlattenIndirectBuffers() {
+	auto ib = [](const std::vector<uint32_t>& target, bool chain) {
+		const auto va = reinterpret_cast<uint64_t>(target.data());
+		return std::vector<uint32_t> {0xc0023f00u, static_cast<uint32_t>(va), static_cast<uint32_t>(va >> 32u),
+		                              static_cast<uint32_t>(target.size()) | (chain ? (1u << 20u) : 0u) | 0x0f200000u};
+	};
+	const std::vector<uint32_t> nop_a = {0xc0001000u, 0xaaaau};
+	const std::vector<uint32_t> nop_b = {0xc0001000u, 0xbbbbu};
+	std::vector<uint32_t>       out;
+
+	Check(!FlattenIndirectBuffers(nop_a, &out) && out.empty(), "no IB, no rewind: nothing to inline");
+
+	std::vector<uint32_t> called = {0xc0001000u, 0x1111u};
+	std::vector<uint32_t> buf    = ib(called, false);
+	buf.insert(buf.end(), nop_b.begin(), nop_b.end());
+	Check(FlattenIndirectBuffers(buf, &out) && out == std::vector<uint32_t>({0xc0001000u, 0x1111u, 0xc0001000u, 0xbbbbu}),
+	      "a call runs the target, then the rest");
+
+	// The chunked layout titles use: a valid REWIND, then a chain to the next chunk; nothing after
+	// the chain runs.
+	std::vector<uint32_t> next = nop_b;
+	buf                        = nop_a;
+	buf.insert(buf.end(), {0xc0005900u, 0x80000000u});
+	const auto chain = ib(next, true);
+	buf.insert(buf.end(), chain.begin(), chain.end());
+	buf.insert(buf.end(), {0xc0001000u, 0xdeadu});
+	Check(FlattenIndirectBuffers(buf, &out) && out == std::vector<uint32_t>({0xc0001000u, 0xaaaau, 0xc0001000u, 0xbbbbu}),
+	      "a valid REWIND is dropped and a chain replaces the rest");
+
+	buf = nop_a;
+	buf.insert(buf.end(), {0xc0005900u, 0x00000000u});
+	Check(!FlattenIndirectBuffers(buf, &out) && out.empty(), "a REWIND still waiting for the CPU is not inlined");
+
+	// A command buffer of many chunks, each ending in a valid REWIND and a chain to the next.
+	std::vector<std::vector<uint32_t>> chunks(20);
+	for (size_t i = chunks.size(); i-- > 0;) {
+		chunks[i] = {0xc0001000u, static_cast<uint32_t>(i)};
+		if (i + 1 < chunks.size()) {
+			chunks[i].insert(chunks[i].end(), {0xc0005900u, 0x80000000u});
+			const auto next_chain = ib(chunks[i + 1], true);
+			chunks[i].insert(chunks[i].end(), next_chain.begin(), next_chain.end());
+		}
+	}
+	Check(FlattenIndirectBuffers(chunks[0], &out) && out.size() == 40 && out[1] == 0u && out[39] == 19u,
+	      "a chain of 20 chunks is followed to its end");
+}
+
 // Gfx10 T# that counts into `bank` (word5 bit 25, word6[7:0]). The other words only have to pass
 // the translator's plausibility checks.
 std::array<uint32_t, 8> CountingT(uint32_t bank) {
@@ -1614,6 +1662,10 @@ void TestLodBankSources() {
 }
 
 int main() {
+	// The cases count the packets a DCB turns into; the preamble's start values (PIXEL_PIPE_STAT_CONTROL,
+	// the CP draw state) are board settings with their own switches, left out here.
+	setenv("KYTY_NATIVE_GPU_PIXEL_PIPE_STAT", "0", 0);
+	setenv("KYTY_NATIVE_GPU_CP_STATE", "0", 0);
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
 	TestShaderDetection();
@@ -1653,6 +1705,7 @@ int main() {
 	TestGpuTimestamp();
 	TestPlanRingWait();
 	TestComputeRingForQueue();
+	TestFlattenIndirectBuffers();
 	TestLodBankScan();
 	TestLodUsageReport();
 	TestLodStatsHandoff();

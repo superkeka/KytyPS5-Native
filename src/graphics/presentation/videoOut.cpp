@@ -223,7 +223,11 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	bool IsSafeForRendering(VideoOutConfig& cfg, int index);
+	bool     IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t before);
+	uint64_t NextRequestId() {
+		Common::LockGuard lock(m_mutex);
+		return m_next_request_id;
+	}
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -559,7 +563,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 }
 
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
-	const auto compression = Graphics::ClassifyVideoOutCompression(
+	auto compression = Graphics::ClassifyVideoOutCompression(
 	    category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, buffer.metadata_address,
 	    attribute.dcc_control, attribute.dcc_cb_register_clear_color);
 	if (attribute.reserved0 != 0 || attribute.aspect_ratio != 0 || attribute.width == 0 ||
@@ -592,6 +596,11 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	if (info.data.size == 0 || info.tiling.block.block_size != 65536 ||
 	    (buffer.data_address & 65535u) != 0) {
 		EXIT("invalid video-out surface footprint or alignment\n");
+	}
+	// Natively rendered display buffers hold plain pixels (ShadowDisplayWithoutDcc).
+	if (compression != Graphics::VideoOutCompression::Uncompressed &&
+	    Graphics::NativeGpu::ShadowDisplayWithoutDcc(buffer.data_address, info.data.size)) {
+		compression = Graphics::VideoOutCompression::Uncompressed;
 	}
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {
 		Graphics::TileSizeAlign dcc_size {};
@@ -934,6 +943,16 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	}
 }
 
+// KYTY_LOG_FLIPS=1: every flip request through the queue (reserve, prepare, complete, present) and
+// each refusal of IsSafeForRendering, to find what holds a display buffer.
+static bool LogFlips() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_LOG_FLIPS");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
 bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
                         uint64_t& request_id) {
 	Common::LockGuard lock(m_mutex);
@@ -988,6 +1007,11 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	if (LogFlips()) {
+		LOGF("flip %" PRIu64 ": reserved buffer %d from the %s (pending %d, current %d)\n", r.id, index,
+		     source == FlipRequestSource::GpuEop ? "GPU" : "CPU", cfg.flip_status.flipPendingNum + 1,
+		     cfg.flip_status.currentBuffer);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 
 	cfg.flip_status.flipPendingNum++;
@@ -1050,6 +1074,9 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 }
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+	if (LogFlips()) {
+		LOGF("flip %" PRIu64 ": prepare\n", request_id);
+	}
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
@@ -1187,6 +1214,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
+	if (LogFlips()) {
+		LOGF("flip %" PRIu64 ": recording complete\n", request_id);
+	}
 	m_mutex.Lock();
 	auto request = std::find_if(m_requests.begin(), m_requests.end(),
 	                            [request_id](const auto& r) { return r.id == request_id; });
@@ -1237,14 +1267,32 @@ void FlipQueue::SignalDoneLocked() {
 	}
 }
 
-// A display buffer is safe for rendering once it is neither displayed nor waiting to be.
-bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index) {
+// A display buffer is safe for rendering once it is neither displayed nor waiting to be. Only flips
+// requested before `before` count: on the PS5 the GPU checks this before the frame's end-of-pipe
+// event lets the title request the next flip, so a later request of the same buffer (possible here,
+// where the check runs after the frame's GPU work, or behind it) cannot hold the wait forever.
+bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t before) {
 	Common::LockGuard lock(m_mutex);
-	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	auto matches = [&cfg, index, before](const auto& r) { return r.cfg == &cfg && r.index == index && r.id < before; };
 	const bool safe = cfg.flip_status.currentBuffer != index &&
 	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
 	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	m_gpu_waiting = !safe;
+	if (!safe && LogFlips()) {
+		static int last_index = -1;
+		static int last_current = -2;
+		if (last_index != index || last_current != cfg.flip_status.currentBuffer) {
+			last_index   = index;
+			last_current = cfg.flip_status.currentBuffer;
+			LOGF("flip: buffer %d not safe for rendering (current %d)\n", index, cfg.flip_status.currentBuffer);
+			for (const auto* queue: {&m_requests, &m_cpu_requests}) {
+				for (const auto& r: *queue) {
+					LOGF("\t %s request %" PRIu64 ": buffer %d, state %d\n", queue == &m_requests ? "GPU-side" : "CPU",
+					     r.id, r.index, static_cast<int>(r.state));
+				}
+			}
+		}
+	}
 	return safe;
 }
 
@@ -1335,6 +1383,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
 		r.cfg->flip_status.flipArg                  = r.flip_arg;
 		r.cfg->flip_status.currentBuffer            = r.index;
+		if (LogFlips()) {
+			LOGF("flip %" PRIu64 ": buffer %d displayed\n", r.id, r.index);
+		}
 		r.cfg->flip_status.flipPendingNum--;
 		r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
 		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
@@ -1724,12 +1775,16 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
-bool VideoOutDriver::IsSafeForRendering(int handle, int index) {
+uint64_t VideoOutDriver::NextFlipRequestId() {
+	return m_impl->GetFlipQueue().NextRequestId();
+}
+
+bool VideoOutDriver::IsSafeForRendering(int handle, int index, uint64_t before) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, index);
+	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, index, before);
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {

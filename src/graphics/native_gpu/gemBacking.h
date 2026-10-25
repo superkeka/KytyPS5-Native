@@ -18,6 +18,8 @@
 #include <cerrno>
 #include <cstdio>
 #include <algorithm>
+#include <optional>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -405,6 +407,20 @@ public:
 		const uint64_t skip = vaddr - it->first;
 		const uint64_t n    = std::min(size, it->second.size - skip);
 		std::memcpy(dst, m_alias + it->second.offset + skip, n);
+		return n;
+	}
+
+	// Copies `size` bytes to guest memory at `vaddr` (clipped to the view holding it) through the
+	// alias, which is always writable whatever the guest's own protection. Returns the bytes copied.
+	uint64_t WriteGuest(uint64_t vaddr, const void* src, uint64_t size) {
+		std::lock_guard<std::mutex> lock(m_lock);
+		auto it = FindViewUnlocked(vaddr);
+		if (it == m_views.end()) {
+			return 0;
+		}
+		const uint64_t skip = vaddr - it->first;
+		const uint64_t n    = std::min(size, it->second.size - skip);
+		std::memcpy(m_alias + it->second.offset + skip, src, n);
 		return n;
 	}
 
@@ -848,31 +864,72 @@ private:
 		}
 	}
 
+	// The host mappings (/proc/self/maps) at one moment, sorted, for asking about many ranges: a
+	// title maps guest memory in many pieces (My First Gran Turismo: 17,000 mappings), and reading the
+	// file once per guest view made promoting a block take a second or more.
+	class HostMaps {
+	public:
+		HostMaps() {
+			const int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+			if (fd < 0) {
+				return;
+			}
+			std::string text;
+			char        chunk[65536];
+			for (ssize_t n = 0; (n = ::read(fd, chunk, sizeof(chunk))) > 0;) {
+				text.append(chunk, static_cast<size_t>(n));
+			}
+			::close(fd);
+			m_read = true;
+			for (size_t pos = 0; pos < text.size();) {
+				const size_t eol  = text.find('\n', pos);
+				const char*  line = text.c_str() + pos;
+				char*        next = nullptr;
+				Entry        e;
+				e.start = std::strtoull(line, &next, 16);
+				if (next != nullptr && *next == '-') {
+					e.end = std::strtoull(next + 1, &next, 16);
+					if (next != nullptr && *next == ' ' && next[1] != '\0' && next[2] != '\0' && next[3] != '\0') {
+						e.prot = (next[1] == 'r' ? PROT_READ : 0) | (next[2] == 'w' ? PROT_WRITE : 0) | (next[3] == 'x' ? PROT_EXEC : 0);
+						m_entries.push_back(e);
+					}
+				}
+				pos = eol == std::string::npos ? text.size() : eol + 1;
+			}
+		}
+		// Calls cb(start, size, prot) for each host mapping overlapping [vaddr, vaddr + size). If maps
+		// could not be read the whole range is reported read-write.
+		template <typename Cb>
+		void ForEach(uint64_t vaddr, uint64_t size, Cb&& cb) const {
+			if (!m_read) {
+				cb(vaddr, size, PROT_READ | PROT_WRITE);
+				return;
+			}
+			const uint64_t end = vaddr + size;
+			auto it = std::upper_bound(m_entries.begin(), m_entries.end(), vaddr, [](uint64_t v, const Entry& e) { return v < e.end; });
+			for (; it != m_entries.end() && it->start < end; ++it) {
+				const uint64_t cs = std::max<uint64_t>(it->start, vaddr);
+				const uint64_t ce = std::min<uint64_t>(it->end, end);
+				cb(cs, ce - cs, it->prot);
+			}
+		}
+
+	private:
+		struct Entry {
+			uint64_t start = 0;
+			uint64_t end   = 0;
+			int      prot  = 0;
+		};
+		std::vector<Entry> m_entries; // /proc/self/maps lists them by address
+		bool               m_read = false;
+	};
+
 	// Calls cb(start, size, prot) for each host mapping overlapping [vaddr, vaddr + size), from
 	// /proc/self/maps, so a remap can keep the protection the guest (or Kyty's write tracking) set.
 	// If maps cannot be read the whole range is reported read-write.
 	template <typename Cb>
 	static void ForEachHostProtection(uint64_t vaddr, uint64_t size, Cb&& cb) {
-		const uint64_t end  = vaddr + size;
-		FILE*          maps = ::fopen("/proc/self/maps", "re");
-		if (maps == nullptr) {
-			cb(vaddr, size, PROT_READ | PROT_WRITE);
-			return;
-		}
-		char line[512];
-		while (std::fgets(line, sizeof(line), maps) != nullptr) {
-			unsigned long long s = 0, e = 0;
-			char               perms[8] = {0};
-			if (std::sscanf(line, "%llx-%llx %7s", &s, &e, perms) != 3 || e <= vaddr || s >= end) {
-				continue;
-			}
-			const int prot = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) |
-			                 (perms[2] == 'x' ? PROT_EXEC : 0);
-			const uint64_t cs = std::max<uint64_t>(s, vaddr);
-			const uint64_t ce = std::min<uint64_t>(e, end);
-			cb(cs, ce - cs, prot);
-		}
-		::fclose(maps);
+		HostMaps().ForEach(vaddr, size, std::forward<Cb>(cb));
 	}
 
 	// Calls cb(offset in block, length) for each data extent of block `index` in the memfd.
@@ -1003,7 +1060,8 @@ private:
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_pieces; // (guest address, offset in block)
 		std::vector<uint64_t>                      gpu_lengths;
 		job->pieces.push_back(MovePiece {reinterpret_cast<uint64_t>(m_alias + start), block.size, PROT_READ | PROT_WRITE, 0});
-		bool executable = false;
+		bool                  executable = false;
+		std::optional<HostMaps> maps; // read once, at the first view of the block
 		for (const auto& [view_addr, view]: m_views) {
 			const uint64_t vs = std::max(view.offset, start);
 			const uint64_t ve = std::min(view.offset + view.size, start + block.size);
@@ -1011,7 +1069,10 @@ private:
 				continue;
 			}
 			const uint64_t guest = view_addr + (vs - view.offset);
-			ForEachHostProtection(guest, ve - vs, [&](uint64_t s, uint64_t len, int prot) {
+			if (!maps) {
+				maps.emplace();
+			}
+			maps->ForEach(guest, ve - vs, [&](uint64_t s, uint64_t len, int prot) {
 				job->pieces.push_back(MovePiece {s, len, prot, vs - start + (s - guest)});
 				executable = executable || (prot & PROT_EXEC) != 0;
 			});

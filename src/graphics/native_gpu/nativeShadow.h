@@ -66,6 +66,11 @@ struct NativeDmabufPiece {
 };
 bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out);
 
+// A video-out buffer registered with DCC: in native primary mode (KYTY_NATIVE_GPU_GEM and
+// KYTY_NATIVE_GPU_PRIMARY, unless KYTY_NATIVE_GPU_DISPLAY_DCC=1) the translator draws it without DCC,
+// so the presenter can take it as uncompressed; true then.
+bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size);
+
 // KYTY_NATIVE_GPU_FLIP_STATS=1: called at each flip with the time the presenter spent preparing it;
 // logs per-flip averages (flip interval, native submission time, presenter time).
 void ShadowFlipStats(double present_seconds);

@@ -447,6 +447,21 @@ public:
 		}
 		SetStage(Stage::Translate, frame);
 		const double       t_translate = NowSecShadow();
+		// Command buffers written in chunks (INDIRECT_BUFFER chains, REWIND) are translated as the CP
+		// fetches them.
+		std::vector<uint32_t> flat;
+		std::string           flat_why;
+		if (!FlattenIndirectBuffers(dcb, &flat, &flat_why) && !flat_why.empty() && m_flatten_failed++ < 8) {
+			std::fprintf(stderr, "native shadow: %s %llu not inlined: %s\n", kind, static_cast<unsigned long long>(frame),
+			             flat_why.c_str());
+		}
+		if (!flat.empty()) {
+			dcb = flat;
+			if (m_flattened++ == 0) {
+				std::fprintf(stderr, "native shadow: INDIRECT_BUFFER chains and calls inlined (first in %s %llu)\n", kind,
+				             static_cast<unsigned long long>(frame));
+			}
+		}
 		Pm4TranslateResult result      = tr.Translate(dcb);
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
 		for (uint32_t i = 0; i < result.stats.event_type.size(); i++) {
@@ -912,6 +927,15 @@ public:
 		return true;
 	}
 
+	void AddDisplayRange(uint64_t addr, uint64_t size) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (!m_translator.AddDisplayRange(addr, size)) {
+			return;
+		}
+		std::fprintf(stderr, "native shadow: video-out buffer 0x%llx (%llu MiB) drawn without DCC\n", static_cast<unsigned long long>(addr),
+		             static_cast<unsigned long long>(size >> 20u));
+	}
+
 	// Display buffers are written by the GPU (often by compute through a descriptor the translator
 	// cannot see), so whatever is flipped is made resident; until then such writes land in the dummy.
 	void KeepResident(uint64_t addr, uint64_t size) {
@@ -1338,6 +1362,61 @@ public:
 	}
 
 private:
+	// SIGTERM, SIGINT, SIGHUP: the GPU's pending waits are released before the process goes. Killed
+	// with jobs on the rings, the jobs not yet scheduled are dropped, and a submitted one waiting for
+	// a label they would have written spins forever: amdgpu cannot preempt a WAIT_REG_MEM on its own
+	// rings, and with GPU recovery off the board hangs. A thread does it (the handler only wakes it):
+	// it writes each recent native wait a value that satisfies it until the rings are idle, then exits.
+	void InstallStopDrain() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		static int fds[2] = {-1, -1};
+		if (fds[0] >= 0 || ::pipe2(fds, O_CLOEXEC) != 0) {
+			return;
+		}
+		struct sigaction sa {};
+		sa.sa_handler = [](int sig) {
+			const char c = static_cast<char>(sig);
+			(void)!::write(fds[1], &c, 1);
+		};
+		sigemptyset(&sa.sa_mask);
+		for (int sig: {SIGTERM, SIGINT, SIGHUP}) {
+			::sigaction(sig, &sa, nullptr);
+		}
+		std::thread([this] {
+			char sig = 0;
+			while (::read(fds[0], &sig, 1) != 1) {
+			}
+			DrainAndExit(sig);
+		}).detach();
+#endif
+	}
+
+	[[noreturn]] void DrainAndExit(int sig) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_disabled = true; // nothing more is submitted
+		}
+		uint32_t released = 0;
+		bool     idle     = m_submitter == nullptr;
+		for (int round = 0; round < 40 && !idle; round++) {
+			for (const WaitCond& w: RecentGpuWaits()) {
+				uint64_t cur = 0;
+				if (m_gem->ReadGuest(w.addr, &cur, w.wide ? 8 : 4) == 0 || w.Met(cur)) {
+					continue;
+				}
+				const uint64_t v = SatisfyingValue(w, cur);
+				m_gem->WriteGuest(w.addr, &v, w.wide ? 8 : 4);
+				released++;
+			}
+			idle = m_submitter->WaitIdle(0.05);
+		}
+		std::fprintf(stderr, "native shadow: signal %d: %u pending GPU waits released, rings %s; exiting\n", sig, released,
+		             idle ? "idle" : "STILL BUSY");
+#endif
+		::_exit(128 + sig);
+	}
+
 	// GET_LOD_STATS through the GPU's own reporter when the kyty-lodhw helper runs (and the mode is
 	// not a CPU-side one). The helper puts this VM's VMID into CNTL3, as the PS5 kernel does with the
 	// process VMID; it finds it by the VM's PASID.
@@ -1954,6 +2033,7 @@ private:
 			return;
 		}
 		InitLodStatsHw();
+		InstallStopDrain();
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetComputeQueue(true);
@@ -2237,6 +2317,8 @@ private:
 	uint64_t      m_frames         = 0;
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
+	uint64_t      m_flattened      = 0; // buffers FlattenIndirectBuffers inlined
+	uint64_t      m_flatten_failed = 0; // and could not
 	double        m_gpu_ms_total   = 0.0;
 	double        m_cs_ms_total    = 0.0;
 	double        m_gpu_only_ms_total = 0.0;
@@ -3060,6 +3142,15 @@ void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, uint32_t que
 bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out) {
 	static const bool on = !EnvOn("KYTY_NATIVE_GPU_NO_ZERO_COPY");
 	return on && PrimaryRendering() && Shadow::Instance().DmabufPieces(vaddr, size, out);
+}
+
+bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size) {
+	static const bool on = EnvOn("KYTY_NATIVE_GPU_GEM") && EnvOn("KYTY_NATIVE_GPU_PRIMARY") && !EnvOn("KYTY_NATIVE_GPU_DISPLAY_DCC");
+	if (!on) {
+		return false;
+	}
+	Shadow::Instance().AddDisplayRange(addr, size);
+	return true;
 }
 
 void ShadowFlipStats(double present_seconds) {

@@ -2532,6 +2532,11 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	if (cmd_offset == Pm4::UC_NOP) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
+	// SQ_THREAD_TRACE_USERDATA_0..7: profiler markers (titles write 0x342 and 0x343 around passes);
+	// without a thread trace running they do nothing.
+	if (cmd_offset >= 0x340u && cmd_offset + (KYTY_PM4_LEN(cmd_id) - 2u) <= 0x348u) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 	if (cmd_offset >= Pm4::UC_NUM) {
 		EXIT("unsupported UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
 		     "), cmd_id = 0x%08" PRIx32 "\n",

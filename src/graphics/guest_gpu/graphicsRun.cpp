@@ -130,7 +130,7 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
-                      std::span<const uint32_t> constant_commands) {
+                      std::span<const uint32_t> constant_commands, uint64_t flip_watermark) {
 	if (draw_commands.empty()) {
 		return;
 	}
@@ -139,6 +139,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
+	submission.flip_watermark    = flip_watermark != UINT64_MAX ? flip_watermark : m_renderer.GetVideoOut().NextFlipRequestId();
 	Enqueue(std::move(submission));
 }
 
@@ -563,6 +564,7 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		cp.SetFlipWatermark(submission.flip_watermark);
 	}
 
 	cp.BufferInit();
@@ -766,6 +768,23 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
+			// KYTY_LOG_CP_SUSPEND=1: each packet a queue stops on (once per position), so a stalled
+			// queue names the wait that holds it.
+			static const bool log_suspend = [] {
+				const char* v = std::getenv("KYTY_LOG_CP_SUSPEND");
+				return v != nullptr && v[0] == '1';
+			}();
+			static thread_local const uint32_t* last_suspend = nullptr;
+			if (log_suspend && packet != last_suspend) {
+				last_suspend = packet;
+				LOGF("CP suspended: queue 0x%x op=0x%02" PRIx32 " r=0x%02" PRIx32 " at 0x%016" PRIx64
+				     " dw %" PRIu32 "/%" PRIu32 ": %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+				     " %08" PRIx32 "\n",
+				     static_cast<unsigned>(m_interrupt_event_id), opcode, KYTY_PM4_R(packet_header), reinterpret_cast<uint64_t>(packet),
+				     total_dw - remaining_dw, total_dw, packet[1], remaining_dw > 2 ? packet[2] : 0u,
+				     remaining_dw > 3 ? packet[3] : 0u, remaining_dw > 4 ? packet[4] : 0u,
+				     remaining_dw > 5 ? packet[5] : 0u);
+			}
 			return;
 		}
 		cursor.offset_dw += packet_dw;
@@ -1050,7 +1069,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	// Stall only this command processor, not the host command lane or other queues.
 	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
-	                                                 static_cast<int>(display_buffer_index))) {
+	                                                 static_cast<int>(display_buffer_index), m_flip_watermark)) {
 		SuspendPm4();
 	}
 }

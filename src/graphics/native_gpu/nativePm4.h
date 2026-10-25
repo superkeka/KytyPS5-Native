@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVEPM4_H_
 
 #include <array>
+#include <string>
 #include <bit>
 #include <bitset>
 #include <cstdint>
@@ -356,6 +357,22 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 // kernel exposes. No bit set: 0.
 uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings);
 
+// The native GPU waits put into IBs most recently (EmitNativeWait), for draining the rings when the
+// process is told to stop: a ring stuck on a WAIT_REG_MEM whose writer will never be submitted cannot be
+// preempted by amdgpu, and with GPU recovery off that hangs the board.
+std::vector<WaitCond> RecentGpuWaits();
+// A value that satisfies `w`, given the label's `current` value (only the masked bits change).
+uint64_t SatisfyingValue(const WaitCond& w, uint64_t current);
+
+// A guest command buffer with its INDIRECT_BUFFER calls and chains inlined, as the CP would fetch it:
+// a call runs the target and comes back, a chain (CHAIN bit) runs the target instead of the rest.
+// REWIND packets already valid are dropped: they only make the CP refetch, and the translator copies
+// the commands anyway. Titles write their command buffers in chunks linked this way. Returns false
+// (`out` cleared) when there is nothing to inline, or something it cannot: a REWIND still waiting for
+// the CPU, another IB form, or a chain deeper than 16 or longer than 4M dwords.
+// `why`, when given, says what stopped it (empty when there was nothing to inline).
+bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr);
+
 // What the backend knows about labels beyond the buffer being translated.
 class LabelOracle {
 public:
@@ -537,6 +554,19 @@ public:
 
 	// Experiment: render targets without DCC compression (CB_COLORn_INFO.DCC_ENABLE cleared).
 	void SetNoDcc(bool no_dcc) { m_no_dcc = no_dcc; }
+	// The registered video-out buffers: color targets there are drawn without DCC (DCC_ENABLE cleared
+	// before each draw, the guest's value back once the slot points elsewhere). The PS5 display engine
+	// scans DCC out; Kyty's presenter copies the buffer as plain memory, so it has to hold plain pixels.
+	// False when the range was already known.
+	bool AddDisplayRange(uint64_t addr, uint64_t size) {
+		for (const auto& [a, s]: m_display_ranges) {
+			if (a == addr && s == size) {
+				return false;
+			}
+		}
+		m_display_ranges.emplace_back(addr, size);
+		return true;
+	}
 	// Context register overrides the PS5 kernel applies through the CP's RCIU CAM (see PatchContext).
 	void SetPs5RegOverrides(bool on) { m_ps5_reg_overrides = on; }
 
@@ -662,6 +692,9 @@ private:
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 	bool                         m_no_dcc     = false;
+	std::vector<std::pair<uint64_t, uint64_t>> m_display_ranges; // AddDisplayRange
+	uint32_t                     m_display_dcc_off = 0;           // MRT slots drawn with DCC cleared
+	std::array<uint32_t, 8>      m_display_dcc_info {};           // their guest CB_COLORn_INFO
 	bool                         m_ps5_reg_overrides = false;
 	uint32_t                     m_target_mask = 0xffffffffu;
 	bool                         m_no_cmask_clear = false;

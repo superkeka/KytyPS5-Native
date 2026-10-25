@@ -189,7 +189,7 @@ int main() {
 	}
 	::close(probe);
 
-	const uint64_t chunk = GemBacking::kBlockSize;
+	const uint64_t chunk = GemBacking::BlockSize();
 	// 2.5 blocks: two full blocks plus a half-size tail block, so the last block is partial.
 	const uint64_t size = chunk * 2 + chunk / 2;
 
@@ -395,14 +395,14 @@ int main() {
 		Check(gem->CreatedHandles().size() == handles_before,
 		      "UnbindExternal must release every external buffer it added");
 
-		// Read-only external range: shader code is mapped r-x, and amdgpu rejects a writable userptr
-		// whose host pages are not writable (the submission fails with EPERM), so the read-only
-		// registration path must work on its own. Put the shader in the range, drop host write
-		// permission to mirror code memory, bind it read-only, and have the GPU fetch and execute it
-		// to write a separate read-write output.
+		// Read-only external range: shaders sit in read-only program data, and amdgpu rejects a
+		// writable userptr whose host pages are not writable (the submission fails with EPERM), so the
+		// read-only registration path must work on its own. Put the shader in the range, drop host
+		// write permission, bind it read-only, and have the GPU fetch and execute it to write a
+		// separate read-write output. (Executable slices are CPU code: BindExternal leaves them out.)
 		{
 			std::memcpy(host, kStoreShader, sizeof(kStoreShader));
-			Check(::mprotect(host, third, PROT_READ | PROT_EXEC) == 0, "mprotect of code to r-x failed");
+			Check(::mprotect(host, third, PROT_READ) == 0, "mprotect of the shader to read-only failed");
 			Check(gem->BindExternal(va, third, false), "read-only BindExternal failed");
 
 			auto*          rw    = static_cast<uint32_t*>(ReserveGuest(third));
