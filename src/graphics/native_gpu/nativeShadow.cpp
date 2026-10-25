@@ -3349,12 +3349,16 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 				const auto& d = fd.draw;
 				uint32_t    args[5] = {};
 				if (d.op == 0x46u && d.indirect != 0) {
-					// An occlusion dump: 16 RBs x 64-bit counters (bit 63 = written). args: RBs written,
-					// their counter sum (low 32 bits), and the first counter's low and high dwords.
-					uint64_t c[16] = {};
+					// An occlusion dump: 16 RBs x 64-bit counters 16 bytes apart (bit 63 = written). args: RBs
+					// written, their counter sum (low 32 bits), and the first counter's low and high dwords.
+					uint64_t c[32] = {};
 					Shadow::Instance().ReadGuest(d.indirect, c, sizeof(c));
+					for (int rb = 1; rb < 16; rb++) {
+						c[rb] = c[rb * 2];
+					}
 					uint64_t sum = 0;
-					for (uint64_t v: c) {
+					for (int rb = 0; rb < 16; rb++) {
+						const uint64_t v = c[rb];
 						args[0] += static_cast<uint32_t>(v >> 63u);
 						sum += v & 0x7fffffffffffffffull;
 					}

@@ -596,6 +596,20 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
 	ib.push_back(0u);
 
+	// libSceAgc puts PIXEL_PIPE_STAT_CONTROL (event 0x38, EVENT_INDEX 1) into the context start state
+	// once; the title then only sends PIXEL_PIPE_STAT_DUMP (0x39). The control word enables all 16 RB
+	// instances, and without it the DB writes nothing for a dump. KYTY_NATIVE_GPU_PIXEL_PIPE_STAT=0 skips it.
+	if (static const bool pixel_pipe_stat = [] {
+		    const char* e = std::getenv("KYTY_NATIVE_GPU_PIXEL_PIPE_STAT");
+		    return e == nullptr || e[0] != '0';
+	    }();
+	    pixel_pipe_stat) {
+		ib.push_back(Pkt3(IT_EVENT_WRITE, 3, false));
+		ib.push_back(0x38u | (1u << 8u));
+		ib.push_back(0x07fffc00u);
+		ib.push_back(0u);
+	}
+
 	for (const auto& [offset, value]: cx) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
 		stats.preamble_cx++;
@@ -2252,6 +2266,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (static const bool zpass_sync = std::getenv("KYTY_NATIVE_GPU_ZPASS_SYNC") != nullptr;
 				    zpass_sync && !m_compute_ring && body_count >= 1 && ((bptr[0] & 0x3fu) == 0x39u || (bptr[0] & 0x3fu) == 0x15u)) {
 					emit_barrier(true);
+				}
+				// PIXEL_PIPE_STAT_DUMP (0x39) leaves memory untouched on the BC-250 DB. ZPASS_DONE (0x15) writes the
+				// same thing: one 64-bit counter per RB, 16 bytes apart (STRIDE 2 of PS5's PIXEL_PIPE_STAT_CONTROL),
+				// bit 63 set. KYTY_NATIVE_GPU_ZPASS_DUMP=0 sends 0x39 as the title wrote it.
+				if (static const bool zpass_dump = [] {
+					    const char* e = std::getenv("KYTY_NATIVE_GPU_ZPASS_DUMP");
+					    return e == nullptr || e[0] != '0';
+				    }();
+				    zpass_dump && !m_compute_ring && body_count >= 3 && (bptr[0] & 0x3fu) == 0x39u) {
+					body[body.size() - size + 1] = (bptr[0] & ~0x3fu) | 0x15u;
 				}
 				// The draw log keeps occlusion dumps with their address, so a flip dump can show the counters.
 				if (body_count >= 3 && ((bptr[0] & 0x3fu) == 0x39u || (bptr[0] & 0x3fu) == 0x15u)) {
