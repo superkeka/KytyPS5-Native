@@ -1426,6 +1426,9 @@ private:
 		constexpr uint64_t kBufferCap = 64ull << 20u;
 		constexpr size_t   kMaxTables = 2048;
 		constexpr uint32_t kBucketShift = 24; // 16 MiB guest-address buckets, the block size
+		if (GemBacking::ResidencyAtMap()) {
+			return; // mappings with GPU access were made resident when the guest mapped them
+		}
 		m_promoted_by[0] += m_gem->PromoteTouched();
 
 		// Membership tests run thousands of times per frame: binary search over a cached copy of the
@@ -1724,6 +1727,11 @@ private:
 		if (!EnvOn("KYTY_NATIVE_GPU_TABLE_PROMOTE") && !m_log_unmapped) {
 			m_translator.SetCompactRefs(true);
 			m_acb_translator.SetCompactRefs(true);
+		}
+		if (GemBacking::ResidencyAtMap()) {
+			m_translator.SetCollectRefs(false);
+			m_acb_translator.SetCollectRefs(false);
+			std::fprintf(stderr, "native shadow: residency at map time (PS5): no per-draw references, no CPU-write scan\n");
 		}
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT"); v != nullptr && v[0] == '0') {
 			m_translator.SetPfpSyncIndirect(false);

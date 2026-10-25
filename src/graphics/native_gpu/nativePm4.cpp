@@ -830,7 +830,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		return bucket >= (kExtBase >> kBucketShift) && ext < kExtBuckets ? kLowBuckets + ext : ~0ull;
 	};
 	auto add_ref = [&](uint64_t addr, uint64_t size, bool pointer, bool index = false) {
-		if (addr == 0) {
+		if (addr == 0 || !m_collect_refs) {
 			return;
 		}
 		if (!m_compact_refs || index) {
@@ -1085,6 +1085,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				dirty_sh.push_back(off);
 			}
 			all_sh_dirty = false;
+		}
+		if (!m_collect_refs) {
+			dirty_sh.clear(); // user data only matters for residency references
 		}
 		std::sort(dirty_sh.begin(), dirty_sh.end());
 		dirty_sh.erase(std::unique(dirty_sh.begin(), dirty_sh.end()), dirty_sh.end());

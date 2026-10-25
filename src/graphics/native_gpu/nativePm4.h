@@ -555,6 +555,8 @@ public:
 	// (ref_buckets); refs then keeps just the index buffers. What residency needs, without sorting a
 	// list that grows with every draw.
 	void SetCompactRefs(bool compact) { m_compact_refs = compact; }
+	// Residency at map time (GemBacking::ResidencyAtMap): no per-draw references are collected.
+	void SetCollectRefs(bool on) { m_collect_refs = on; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
 	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
@@ -643,6 +645,7 @@ private:
 	bool                         m_gds_dma_sync      = false;
 	bool                         m_acquire_full      = false;
 	uint32_t                     m_write_data_native = 0;
+	bool                         m_collect_refs      = true;
 	bool                         m_lod_scan          = false;
 	uint32_t                     m_lod_scan_dwords   = 1024;
 	LodGuestReadFn               m_lod_read          = nullptr;

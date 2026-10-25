@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <memory>
@@ -85,6 +86,18 @@ public:
 	// that is in place costs about a microsecond), so smaller blocks waste less memory but make
 	// longer lists. 16 MiB divides the 13.5 GiB backing evenly.
 	static constexpr uint64_t kBlockSize = 16ull * 1024 * 1024;
+
+	// KYTY_NATIVE_GPU_RESIDENCY=map: residency as the PS5 kernel does it. A guest mapping of direct
+	// memory with GPU access (or an mprotect that adds it) makes its blocks resident at once, the way
+	// the PS5 writes the GPU page table entries at map time, and command buffers carry no residency
+	// work (no per-draw references, no CPU-write scan before each submission).
+	static bool ResidencyAtMap() {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_RESIDENCY");
+			return v != nullptr && std::strcmp(v, "map") == 0;
+		}();
+		return on;
+	}
 
 	// Creates the backing for `size` bytes: opens the device, creates the memfd, its contiguous
 	// alias and the dummy GPU buffer. Returns nullptr on failure. No block is resident yet.

@@ -16,6 +16,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -522,6 +523,22 @@ private:
 			m_gpu_page_table_entries =
 			    add ? m_gpu_page_table_entries + entries : m_gpu_page_table_entries - entries;
 		}
+		// KYTY_MEM_GPU_STATS=1: bytes mapped for the GPU by kind (direct/pooled vs the rest) and
+		// access (GPU write vs GPU read only), each time a total crosses another 256 MiB.
+		static const bool gpu_stats = std::getenv("KYTY_MEM_GPU_STATS") != nullptr;
+		if (gpu_stats && (range.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+			const bool direct = range.type == VirtualRangeType::Direct || range.type == VirtualRangeType::Pooled;
+			const bool write  = (range.protection & PROT_GPU_WRITE) != 0;
+			int64_t&   total  = m_gpu_bytes[(direct ? 0 : 2) + (write ? 0 : 1)];
+			const auto before = total >> 28u;
+			total += add ? static_cast<int64_t>(range.size) : -static_cast<int64_t>(range.size);
+			if ((total >> 28u) != before) {
+				std::fprintf(stderr,
+				             "mem gpu: direct %lld MiB GPU-write, %lld MiB GPU-read only; other %lld MiB GPU-write, %lld MiB GPU-read only\n",
+				             static_cast<long long>(m_gpu_bytes[0] >> 20u), static_cast<long long>(m_gpu_bytes[1] >> 20u),
+				             static_cast<long long>(m_gpu_bytes[2] >> 20u), static_cast<long long>(m_gpu_bytes[3] >> 20u));
+			}
+		}
 	}
 
 	Iterator EraseUnlocked(Iterator position) {
@@ -644,6 +661,7 @@ private:
 	Common::Mutex m_mutex;
 	uint64_t      m_cpu_page_table_entries = 0;
 	uint64_t      m_gpu_page_table_entries = 0;
+	int64_t       m_gpu_bytes[4]           = {}; // KYTY_MEM_GPU_STATS: direct write/read-only, other write/read-only
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -953,6 +971,12 @@ static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	if (g_guest_address_space != nullptr && g_guest_address_space->BackingContains(vaddr, size)) {
+		// PS5 residency: the GPU page tables of a mapping with GPU access are written at map time.
+		VirtualRanges::Range range {};
+		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtMap() && g_virtual_ranges != nullptr &&
+		    g_virtual_ranges->Query(vaddr, 0, &range) && (range.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+			gem->PromoteGuestRange(vaddr, size);
+		}
 		return;
 	}
 	// The caller publishes the range before mapping it to the GPU, so its protection tells us whether
@@ -991,6 +1015,13 @@ static void NativeGpuRebindGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	for (const auto& r: ranges) {
+		// PS5 residency: an mprotect that gives direct memory GPU access maps it for the GPU now.
+		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtMap() && IsCommittedRangeType(r.type) &&
+		    (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0 && g_guest_address_space != nullptr &&
+		    g_guest_address_space->BackingContains(r.start, r.size)) {
+			gem->PromoteGuestRange(r.start, r.size);
+			continue;
+		}
 		if (r.type == VirtualRangeType::Stack || !IsCommittedRangeType(r.type) ||
 		    !IsGpuAddressRange(r.start, r.size) ||
 		    (g_guest_address_space != nullptr &&
