@@ -2453,7 +2453,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_c
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	cmd[0] = KYTY_PM4(2, Pm4::IT_INDEX_BUFFER_SIZE, 0u);
-	cmd[1] = index_count;
+	cmd[1] = index_count != 0 ? index_count : 1u; // libSceAgc never writes a size of 0 (agc diff)
 
 	return cmd;
 }
@@ -2544,8 +2544,12 @@ static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG            = 0xc8000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW           = 4u;
 static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
 
+// libSceAgc writes these with the header's bit 2 set in DCBs and clear in ACBs (agc diff against
+// the real library).
+static thread_local bool g_agc_internal_data_in_acb = false;
+
 static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
-	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, g_agc_internal_data_in_acb ? 0u : 1u);
 	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = tag;
 }
@@ -3140,8 +3144,10 @@ uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, 
 uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
-	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
-	                        poll_cycles);
+	g_agc_internal_data_in_acb = true;
+	auto* cmd = AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask, poll_cycles);
+	g_agc_internal_data_in_acb = false;
+	return cmd;
 }
 
 uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
@@ -3986,7 +3992,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 		return nullptr;
 	}
 
-	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, g_agc_internal_data_in_acb ? 0u : 1u);
 	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = (wait32 ? AGC_WAIT_USER_DATA_BEGIN_32_TAG : AGC_WAIT_USER_DATA_BEGIN_64_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
