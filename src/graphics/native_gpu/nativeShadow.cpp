@@ -65,6 +65,64 @@ bool EnvOn(const char* name) {
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// KYTY_NATIVE_GPU_CTL=1: a debugging control socket, /tmp/kyty-ctl.sock (KYTY_NATIVE_GPU_CTL_SOCK
+// overrides it). One command per line, one reply line each:
+//   dump [N]  dump the next N flips (default 8) into KYTY_NATIVE_GPU_DUMP_DIR, render targets included
+//   ping      "pong"
+std::atomic<uint32_t>& DemandedDumps() {
+	static std::atomic<uint32_t> n {0};
+	return n;
+}
+
+void StartControlSocket() {
+	const char* path = std::getenv("KYTY_NATIVE_GPU_CTL_SOCK");
+	path             = path != nullptr && path[0] != '\0' ? path : "/tmp/kyty-ctl.sock";
+	const int fd     = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_un a {};
+	a.sun_family = AF_UNIX;
+	std::snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+	::unlink(path);
+	if (fd < 0 || ::bind(fd, reinterpret_cast<struct sockaddr*>(&a), sizeof(a)) != 0 || ::listen(fd, 4) != 0) {
+		std::fprintf(stderr, "native shadow: control socket %s failed: %s\n", path, std::strerror(errno));
+		return;
+	}
+	std::fprintf(stderr, "native shadow: control socket %s (dump [N], ping)\n", path);
+	std::thread([fd] {
+		for (;;) {
+			const int c = ::accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
+			if (c < 0) {
+				continue;
+			}
+			std::string line;
+			char        ch = 0;
+			for (;;) {
+				const ssize_t got = ::recv(c, &ch, 1, 0);
+				if (got <= 0) {
+					break;
+				}
+				if (ch != '\n') {
+					line.push_back(ch);
+					continue;
+				}
+				char     reply[128];
+				unsigned count = 0;
+				if (line == "ping") {
+					std::snprintf(reply, sizeof(reply), "pong\n");
+				} else if (line == "dump" || std::sscanf(line.c_str(), "dump %u", &count) == 1) {
+					count = count != 0 ? count : 8u;
+					DemandedDumps().store(count);
+					std::snprintf(reply, sizeof(reply), "ok dumping the next %u flips\n", count);
+				} else {
+					std::snprintf(reply, sizeof(reply), "unknown command; try: dump [N], ping\n");
+				}
+				::send(c, reply, std::strlen(reply), MSG_NOSIGNAL);
+				line.clear();
+			}
+			::close(c);
+		}
+	}).detach();
+}
+
 // GET_LOD_STATS the way the PS5 does it: the GPU's PRT LOD statistics reporter counts texture samples
 // per counter bank and writes the report itself. Its registers are privileged, so a root helper
 // (tools/bc250-lodhw/kyty-lodhw, the part the PS5 kernel and ME play) programs them; this is the
@@ -1683,7 +1741,10 @@ private:
 		} else {
 			m_allow_gds_shaders = EnvOn("KYTY_NATIVE_GPU_PRIMARY"); // primary mode has the GDS partition
 		}
-		m_collect_targets = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr;
+		m_collect_targets = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr || EnvOn("KYTY_NATIVE_GPU_CTL");
+		if (EnvOn("KYTY_NATIVE_GPU_CTL")) {
+			StartControlSocket();
+		}
 		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
 			StartWatchdog();
 		}
@@ -3112,13 +3173,28 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
 	}
-	const char*                  list = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS");
-	if (list == nullptr || address == 0 || size == 0 || !Shadow::Instance().Active()) {
+	// KYTY_NATIVE_GPU_CTL=1: "dump N" on the control socket dumps the next N flips, render targets
+	// included (see ControlSocket).
+	static const bool on_demand   = EnvOn("KYTY_NATIVE_GPU_CTL");
+	static uint32_t   demand_left = 0;
+	if (on_demand && demand_left == 0) {
+		if (const uint32_t count = DemandedDumps().exchange(0); count != 0) {
+			demand_left = std::min(count, 120u);
+			std::fprintf(stderr, "native shadow: on-demand dump of %u flips from flip %llu\n", demand_left,
+			             static_cast<unsigned long long>(n));
+		}
+	}
+	const char* list   = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS");
+	const bool  wanted = demand_left > 0 || (list != nullptr && FlipWanted(list, n));
+	if ((list == nullptr && !on_demand) || address == 0 || size == 0 || !Shadow::Instance().Active()) {
 		return;
 	}
-	if (!FlipWanted(list, n)) {
+	if (!wanted) {
 		(void)Shadow::Instance().TakeFrameTargets(); // keep only the dumped frame's targets
 		return;
+	}
+	if (demand_left > 0) {
+		demand_left--;
 	}
 	const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
 	if (dir == nullptr || dir[0] == '\0') {
@@ -3138,7 +3214,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			WriteFile(path, reinterpret_cast<const void*>(address), size);
 		}
 		DumpRenderTargets(dir, flip, download_region);
-	} else if (PrimaryRendering() && EnvOn("KYTY_NATIVE_GPU_DUMP_RTS")) {
+	} else if (PrimaryRendering() && (EnvOn("KYTY_NATIVE_GPU_DUMP_RTS") || on_demand)) {
 		DumpRenderTargets(dir, flip, nullptr);
 	}
 	// KYTY_NATIVE_GPU_DUMP_RANGES=0xADDR:0xSIZE[,...]: guest ranges saved next to the flip, e.g. a
