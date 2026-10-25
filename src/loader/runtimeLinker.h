@@ -136,7 +136,19 @@ struct Program {
 	bool                            dbg_print_reloc             = false;
 	std::vector<uint8_t>            rela_bits;
 	uint64_t                        proc_param_vaddr            = 0;
+	// Loaded only to call its exports from the emulator (a reference implementation to compare an
+	// HLE library with): it resolves its own exports to itself, never satisfies another program's
+	// imports, and its imports of the HLE graphics libraries go to stubs.
+	bool                            reference_only              = false;
 };
+
+// Calls of stubbed (unresolved) imports so far on this thread, all programs.
+uint64_t UnresolvedImportStubCalls();
+
+// Called by the host fault handler before it gives up on a fault; a reference library caller
+// (libs/agcDiff.h) uses it to leave a faulting reference call. It returns only when the fault is
+// not one of those.
+extern void (*g_reference_fault_hook)(uint64_t pc, uint64_t address);
 
 class RuntimeLinker {
 public:
@@ -149,6 +161,10 @@ public:
 	void DbgDump(const std::string& folder);
 
 	Program* LoadProgram(const std::filesystem::path& elf_name);
+	// See Program::reference_only. Relocated, module_start not run.
+	std::vector<Program*> LoadReferencePrograms(const std::vector<std::filesystem::path>& elf_names);
+	// The address of a function the program exports, by NID (0 if it has none).
+	static uint64_t FindExportByNid(const Program* program, const std::string& nid);
 	void     SaveMainProgram(const std::filesystem::path& elf_name);
 	void     SaveProgram(Program* program, const std::filesystem::path& elf_name);
 	void     UnloadProgram(Program* program);

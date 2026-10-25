@@ -196,8 +196,17 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	return thunk;
 }
 
+static thread_local uint64_t t_unresolved_stub_calls = 0;
+
+void (*g_reference_fault_hook)(uint64_t pc, uint64_t address) = nullptr;
+
+uint64_t UnresolvedImportStubCalls() {
+	return t_unresolved_stub_calls;
+}
+
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
+	t_unresolved_stub_calls++;
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -683,6 +692,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
+	}
+	// A reference library call that faults goes back to its caller (does not return otherwise).
+	if (g_reference_fault_hook != nullptr) {
+		g_reference_fault_hook(info->exception_address, info->access_violation_vaddr);
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
@@ -1244,6 +1257,32 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 	return program;
 }
 
+std::vector<Program*> RuntimeLinker::LoadReferencePrograms(const std::vector<std::filesystem::path>& elf_names) {
+	std::vector<Program*> programs;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (const auto& name: elf_names) {
+			auto* program                        = LoadProgram(name);
+			program->reference_only              = true;
+			program->fail_if_global_not_resolved = false;
+			programs.push_back(program);
+		}
+	}
+	// All loaded before any is relocated, so they resolve against each other.
+	for (auto* program: programs) {
+		RelocateProgram(program);
+	}
+	return programs;
+}
+
+uint64_t RuntimeLinker::FindExportByNid(const Program* program, const std::string& nid) {
+	if (program == nullptr || program->export_symbols == nullptr) {
+		return 0;
+	}
+	const auto* rec = program->export_symbols->FindByNid(nid, SymbolType::Func);
+	return rec != nullptr ? rec->vaddr : 0;
+}
+
 void RuntimeLinker::SaveMainProgram(const std::filesystem::path& elf_name) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
@@ -1370,11 +1409,33 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 		*bind_self = false;
 	}
 
+	if (ids.size() == 3 && program->reference_only) {
+		// A reference library links to itself first, then to the other reference libraries (the real
+		// driver under the real libSceAgc), and only then to the emulator.
+		if (const auto* own = program->export_symbols != nullptr ? program->export_symbols->FindByNid(ids.at(0), type)
+		                                                       : nullptr;
+		    own != nullptr) {
+			*out_info = *own;
+			if (bind_self != nullptr) {
+				*bind_self = true;
+			}
+			return;
+		}
+		for (auto* p: m_programs) {
+			if (p != program && p->reference_only && p->export_symbols != nullptr) {
+				if (const auto* rec = p->export_symbols->FindByNid(ids.at(0), type); rec != nullptr) {
+					*out_info = *rec;
+					return;
+				}
+			}
+		}
+	}
+
 	if (ids.size() == 3) {
 		const LibraryId* l = FindLibrary(*program, ids.at(1));
 		const ModuleId*  m = FindModule(*program, ids.at(2));
 
-		auto resolve_by_nid = [this, type](const std::string& nid, SymbolRecord* out) -> bool {
+		auto resolve_by_nid = [this, type, program](const std::string& nid, SymbolRecord* out) -> bool {
 			EXIT_IF(out == nullptr);
 
 			if (m_symbols != nullptr) {
@@ -1385,7 +1446,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			for (auto* p: m_programs) {
-				if (p != nullptr && p->export_symbols != nullptr) {
+				if (p != nullptr && p->export_symbols != nullptr && (!p->reference_only || p == program)) {
 					if (const auto* rec = p->export_symbols->FindByNid(nid, type); rec != nullptr) {
 						*out = *rec;
 						return true;
@@ -1414,6 +1475,9 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 
 			if (rec == nullptr) {
 				for (auto* p: m_programs) {
+					if (p->reference_only && p != program) {
+						continue;
+					}
 					const auto& libs = p->dynamic_info->export_libs;
 					const auto& modules = p->dynamic_info->export_modules;
 					if (p->export_symbols == nullptr ||
@@ -1433,11 +1497,23 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 
 			if (rec == nullptr) {
 				if (resolve_by_nid(sr.name, out_info)) {
+					if (program->reference_only && type == SymbolType::Func &&
+					    out_info->name.find("[Graphics5") != std::string::npos) {
+						out_info->vaddr    = 0;
+						out_info->dbg_name = "";
+						return;
+					}
 					LOGF("PS5 NID fallback: %s -> %s\n", sr.name.c_str(), out_info->name.c_str());
 					return;
 				}
 			}
 
+			if (rec != nullptr && program->reference_only && type == SymbolType::Func &&
+			    rec->name.find("[Graphics5") != std::string::npos) {
+				// The reference library must not drive the emulator's GPU: its calls into the HLE
+				// graphics libraries become counted stubs.
+				rec = nullptr;
+			}
 			if (rec != nullptr) {
 				*out_info = *rec;
 			} else {

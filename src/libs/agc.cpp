@@ -1,9 +1,11 @@
 #include "libs/agc.h"
+#include "libs/agcDiff.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -25,15 +27,23 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/runtimeLinker.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <csetjmp>
+#include <cstdarg>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifdef min
@@ -4105,6 +4115,437 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 
 	return cmd;
 }
+
+
+namespace AgcDiff {
+
+thread_local sigjmp_buf* t_reference_jmp = nullptr;
+thread_local uint64_t    t_fault_pc      = 0;
+thread_local uint64_t    t_fault_addr    = 0;
+
+namespace {
+
+struct Export {
+	const char*           nid  = nullptr;
+	const char*           name = nullptr;
+	std::atomic<void*>    ref {nullptr};
+	std::atomic<uint64_t> calls {0};
+	std::atomic<uint64_t> faults {0};
+	std::atomic<uint64_t> markers {0};
+	std::atomic<uint64_t> mismatches {0};
+	std::atomic<uint64_t> skipped {0};
+	std::atomic<uint64_t> stubbed {0};
+	std::atomic<uint32_t> logged {0};
+};
+
+std::vector<std::unique_ptr<Export>>&           Exports() {
+	static std::vector<std::unique_ptr<Export>> v;
+	return v;
+}
+std::unordered_map<const void*, Export*>&       ByKey() {
+	static std::unordered_map<const void*, Export*> m;
+	return m;
+}
+constexpr uint32_t kUnwritten = 0xa5a5a5a5u; // reference dwords still holding it were not written
+std::once_flag     g_load_once;
+bool               g_loaded = false;
+std::mutex       g_log_mutex;
+std::FILE*       g_out = stderr; // KYTY_AGC_DIFF_FILE, default agc-diff.log in the working directory
+
+void Emit(const std::string& text) {
+	std::lock_guard lock(g_log_mutex);
+	std::fwrite(text.data(), 1, text.size(), g_out);
+	std::fflush(g_out);
+}
+
+uint32_t LogLimit() {
+	static const uint32_t limit = [] {
+		const char* v = std::getenv("KYTY_AGC_DIFF_LOG");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 4u;
+	}();
+	return limit;
+}
+
+void Summary() {
+	if (!g_loaded) {
+		return;
+	}
+	std::lock_guard lock(g_log_mutex);
+	std::fprintf(g_out, "agc diff: summary (export, calls, mismatches, Kyty markers, skipped, reference hit a stub, faults)\n");
+	for (const auto& e: Exports()) {
+		if (e->calls.load() == 0) {
+			continue;
+		}
+		std::fprintf(g_out, "agc diff:   %-48s %s calls %llu mismatches %llu markers %llu skipped %llu stubbed %llu faults %llu\n",
+		             e->name, e->nid, static_cast<unsigned long long>(e->calls.load()),
+		             static_cast<unsigned long long>(e->mismatches.load()), static_cast<unsigned long long>(e->markers.load()),
+		             static_cast<unsigned long long>(e->skipped.load()), static_cast<unsigned long long>(e->stubbed.load()),
+		             static_cast<unsigned long long>(e->faults.load()));
+	}
+}
+
+void Load() {
+	const char* path = std::getenv("KYTY_AGC_REFERENCE");
+	if (path == nullptr || path[0] == '\0') {
+		return;
+	}
+	// KYTY_AGC_REFERENCE: comma-separated ELFs, e.g. the real libSceAgcDriver and libSceAgc.
+	std::vector<std::filesystem::path> paths;
+	for (const char* p = path; *p != '\0';) {
+		const char* comma = std::strchr(p, ',');
+		paths.emplace_back(comma != nullptr ? std::string(p, comma) : std::string(p));
+		p = comma != nullptr ? comma + 1 : p + std::strlen(p);
+	}
+	auto*          rt       = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto     programs = rt->LoadReferencePrograms(paths);
+	// module_start sets up what the libraries' own allocators and state hand out (libSceAgc's
+	// AgcInit allocates from an arena module_start places). In load order: the driver first.
+	for (auto* program: programs) {
+		sigjmp_buf jb;
+		int        result = 0;
+		if (sigsetjmp(jb, 1) == 0) {
+			t_reference_jmp = &jb;
+			Loader::g_reference_fault_hook = [](uint64_t pc, uint64_t addr) {
+				if (t_reference_jmp != nullptr) {
+					t_fault_pc   = pc;
+					t_fault_addr = addr;
+					siglongjmp(*t_reference_jmp, 1);
+				}
+			};
+			result = rt->StartModule(program, 0, nullptr, nullptr);
+			t_reference_jmp = nullptr;
+			std::fprintf(stderr, "agc diff: module_start of %s returned %d\n", program->file_name.string().c_str(), result);
+		} else {
+			t_reference_jmp = nullptr;
+			std::fprintf(stderr, "agc diff: module_start of %s faulted at pc %#llx (address %#llx)\n",
+			             program->file_name.string().c_str(), static_cast<unsigned long long>(t_fault_pc),
+			             static_cast<unsigned long long>(t_fault_addr));
+		}
+	}
+	uint32_t       found    = 0;
+	for (auto& e: Exports()) {
+		// AgcSuspendPoint suspends the title's submission through the driver.
+		if (std::strstr(e->name, "AgcSuspendPoint") != nullptr) {
+			continue;
+		}
+		for (auto* program: programs) {
+			if (const uint64_t addr = Loader::RuntimeLinker::FindExportByNid(program, e->nid); addr != 0) {
+				e->ref = reinterpret_cast<void*>(addr);
+				break;
+			}
+		}
+		found += e->ref.load() != nullptr ? 1u : 0u;
+	}
+	const char* out = std::getenv("KYTY_AGC_DIFF_FILE");
+	if (std::FILE* f = std::fopen(out != nullptr ? out : "agc-diff.log", "w"); f != nullptr) {
+		std::setvbuf(f, nullptr, _IOLBF, 0); // the emulator may stop before a buffer flush
+		g_out = f;
+	}
+	g_loaded = true;
+	Loader::g_reference_fault_hook = [](uint64_t pc, uint64_t addr) {
+		if (t_reference_jmp != nullptr) {
+			t_fault_pc   = pc;
+			t_fault_addr = addr;
+			siglongjmp(*t_reference_jmp, 1);
+		}
+	};
+	std::atexit(Summary);
+	std::at_quick_exit(Summary);
+	std::fprintf(stderr, "agc diff: reference %s loaded, %u of %zu wrapped exports found in it; report in %s\n", path, found,
+	             Exports().size(), out != nullptr ? out : "agc-diff.log");
+	std::fprintf(g_out, "agc diff: reference %s loaded, %u of %zu wrapped exports found in it\n", path, found, Exports().size());
+	for (auto& e: Exports()) {
+		if (e->ref.load() == nullptr) {
+			std::fprintf(g_out, "agc diff:   not in the reference: %s %s\n", e->name, e->nid);
+		}
+	}
+}
+
+Export* Find(const void* key) {
+	std::call_once(g_load_once, Load);
+	auto it = ByKey().find(key);
+	return it != ByKey().end() ? it->second : nullptr;
+}
+
+// A dword pair or dword that differs exactly by where the two buffers live is the same address.
+bool SameRelocated(const uint32_t* h, const uint32_t* r, size_t n, size_t i, const int64_t* deltas, size_t num_deltas) {
+	for (size_t k = 0; k < num_deltas; k++) {
+		const auto d = static_cast<uint64_t>(deltas[k]);
+		for (size_t lo = (i > 0 ? i - 1 : i); lo <= i && lo + 1 < n; lo++) {
+			const uint64_t hv = h[lo] | (static_cast<uint64_t>(h[lo + 1]) << 32u);
+			const uint64_t rv = r[lo] | (static_cast<uint64_t>(r[lo + 1]) << 32u);
+			if (hv - rv == d) {
+				return true;
+			}
+		}
+		if (h[i] - r[i] == static_cast<uint32_t>(d)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+std::string Dump(const char* what, const uint32_t* p, size_t n) {
+	std::string text = fmt::format("agc diff:     {} ({} dw):", what, n);
+	for (size_t i = 0; i < n && i < 40; i++) {
+		text += fmt::format(" {:08x}", p[i]);
+	}
+	text += n > 40 ? " ...\n" : "\n";
+	return text;
+}
+
+// Compares one region; returns the first differing index or SIZE_MAX.
+size_t Compare(const uint32_t* h, size_t hn, const uint32_t* r, size_t rn, const int64_t* deltas, size_t num_deltas) {
+	const size_t n = std::min(hn, rn);
+	for (size_t i = 0; i < n; i++) {
+		if (h[i] != r[i] && r[i] != kUnwritten && !SameRelocated(h, r, n, i, deltas, num_deltas)) {
+			return i;
+		}
+	}
+	return hn == rn ? SIZE_MAX : n;
+}
+
+// Counts the mismatch; returns the report head, empty once the export has logged enough.
+std::string Report(Export* e, const char* what, uint64_t stubs0, const std::string& detail) {
+	e->mismatches++;
+	if (e->logged.fetch_add(1) >= LogLimit()) {
+		return {};
+	}
+	return fmt::format("agc diff: MISMATCH {} {} ({}){}: {}", e->name, e->nid, what,
+	                   StubCalls() != stubs0 ? " [reference called a stubbed import]" : "", detail);
+}
+
+bool KYTY_SYSV_ABI ShadowGrow(CommandBuffer* /*buf*/, uint32_t /*size_dw*/, void* /*user_data*/) {
+	return false;
+}
+
+constexpr size_t kShadowDw = size_t {1} << 20u;
+
+struct alignas(16) Shadow {
+	uint8_t               cb[256];
+	std::vector<uint32_t> mem;
+	uint32_t              patch[64];
+	uint32_t              patch_pre[64];
+};
+thread_local Shadow t_shadow;
+
+} // namespace
+
+bool Requested() {
+	static const bool on = [] {
+		const char* p = std::getenv("KYTY_AGC_REFERENCE");
+		return p != nullptr && p[0] != '\0';
+	}();
+	return on;
+}
+
+void Register(const void* key, const char* nid, const char* name) {
+	auto e  = std::make_unique<Export>();
+	e->nid  = nid;
+	e->name = name;
+	ByKey()[key] = e.get();
+	Exports().push_back(std::move(e));
+}
+
+void* Reference(const void* key) {
+	Export* e = Find(key);
+	return e != nullptr ? e->ref.load() : nullptr;
+}
+
+void Faulted(const void* key) {
+	Export* e = Find(key);
+	if (e == nullptr) {
+		return;
+	}
+	e->faults++;
+	e->ref = nullptr;
+	Emit(fmt::format("agc diff: the reference {} {} faulted at pc {:#x} (address {:#x}); not called again\n", e->name, e->nid,
+	                 t_fault_pc, t_fault_addr));
+}
+
+uint32_t* InitState(const void* key) {
+	static std::atomic<bool> done {false};
+	Export*                  e = Find(key);
+	if (e == nullptr || std::strcmp(e->name, "Gen5::AgcInit") != 0 || done.exchange(true)) {
+		return nullptr;
+	}
+	static std::vector<uint32_t> state(16384, 0u);
+	return state.data();
+}
+
+uint64_t StubCalls() {
+	return Loader::UnresolvedImportStubCalls();
+}
+
+CommandBuffer* CbBegin(CbCall* c, const void* hle, CommandBuffer* buf) {
+	Export* e = Find(hle);
+	if (e == nullptr || buf == nullptr || buf->cursor_down < buf->cursor_up) {
+		return nullptr;
+	}
+	e->calls++;
+	auto& sh = t_shadow;
+	if (sh.mem.size() != kShadowDw) {
+		sh.mem.resize(kShadowDw);
+	}
+	const auto avail = static_cast<size_t>(buf->cursor_down - buf->cursor_up);
+	const auto size  = std::min(avail, kShadowDw);
+	std::memcpy(sh.cb, buf, sizeof(sh.cb));
+	auto* s        = reinterpret_cast<CommandBuffer*>(sh.cb);
+	s->bottom      = sh.mem.data();
+	s->top         = sh.mem.data() + size;
+	s->cursor_up   = sh.mem.data();
+	s->cursor_down = sh.mem.data() + size;
+	s->callback    = ShadowGrow;
+	s->user_data   = nullptr;
+	c->hle         = hle;
+	c->buf         = buf;
+	c->shadow      = s;
+	c->up0         = buf->cursor_up;
+	c->down0       = buf->cursor_down;
+	c->bottom0     = buf->bottom;
+	c->stubs0      = StubCalls();
+	return s;
+}
+
+void CbBeforeReference(CbCall* c) {
+	auto*        s      = c->shadow;
+	auto*        b      = c->buf;
+	const size_t margin = 64;
+	if (b->cursor_up >= c->up0 && b->cursor_up <= c->down0) {
+		const size_t n = std::min(static_cast<size_t>(b->cursor_up - c->up0) + margin, static_cast<size_t>(s->top - s->bottom));
+		std::fill_n(s->bottom, n, kUnwritten);
+	}
+	if (b->cursor_down >= c->up0 && b->cursor_down <= c->down0) {
+		const size_t n = std::min(static_cast<size_t>(c->down0 - b->cursor_down) + margin, static_cast<size_t>(s->top - s->bottom));
+		std::fill_n(s->top - n, n, kUnwritten);
+	}
+}
+
+void CbEnd(CbCall* c, bool has_ret, bool ret_is_ptr, uint64_t hle_ret, uint64_t ref_ret) {
+	Export* e = Find(c->hle);
+	auto*   b = c->buf;
+	auto*   s = c->shadow;
+	if (StubCalls() != c->stubs0) {
+		e->stubbed++;
+	}
+	if (b->bottom != c->bottom0 || b->cursor_up < c->up0 || b->cursor_down > c->down0 || s->cursor_up < s->bottom ||
+	    s->cursor_down > s->top) {
+		e->skipped++; // the title's buffer grew (or the reference ran out of room): nothing to line up
+		return;
+	}
+	const uint32_t* h_up   = c->up0;
+	const size_t    h_upn  = static_cast<size_t>(b->cursor_up - c->up0);
+	const uint32_t* r_up   = s->bottom;
+	const size_t    r_upn  = static_cast<size_t>(s->cursor_up - s->bottom);
+	const uint32_t* h_dn   = b->cursor_down;
+	const size_t    h_dnn  = static_cast<size_t>(c->down0 - b->cursor_down);
+	const uint32_t* r_dn   = s->cursor_down;
+	const size_t    r_dnn  = static_cast<size_t>(s->top - s->cursor_down);
+	const int64_t   deltas[] = {(reinterpret_cast<intptr_t>(c->up0) - reinterpret_cast<intptr_t>(s->bottom)),
+	                            (reinterpret_cast<intptr_t>(c->down0) - reinterpret_cast<intptr_t>(s->top))};
+	if (const size_t i = Compare(h_up, h_upn, r_up, r_upn, deltas, 2); i != SIZE_MAX) {
+		// Kyty's command processor markers (a NOP carrying a Kyty packet type) stand in for real
+		// packets on purpose; counted apart, logged once.
+		auto opcode = [](uint32_t h) { return (h >> 30u) == 3u ? (h >> 8u) & 0xffu : 0x100u; };
+		if (i < h_upn && i < r_upn && opcode(h_up[i]) == 0x10u && opcode(r_up[i]) != 0x10u) {
+			if (e->markers.fetch_add(1) == 0) {
+				Emit(fmt::format("agc diff: marker {} {}: Kyty NOP {:08x} {:08x} where the reference has {:08x}\n", e->name, e->nid,
+				                 h_up[i], i + 1 < h_upn ? h_up[i + 1] : 0u, r_up[i]) +
+				     Dump("hle", h_up, h_upn) + Dump("ref", r_up, r_upn));
+			}
+			return;
+		}
+		if (auto text = Report(e, "command buffer", c->stubs0,
+		                       fmt::format("{} dwords vs reference {}, first difference at dword {}\n", h_upn, r_upn, i));
+		    !text.empty()) {
+			Emit(text + Dump("hle", h_up, h_upn) + Dump("ref", r_up, r_upn));
+		}
+		return;
+	}
+	if (const size_t i = Compare(h_dn, h_dnn, r_dn, r_dnn, deltas, 2); i != SIZE_MAX) {
+		if (auto text = Report(e, "command buffer tail", c->stubs0,
+		                       fmt::format("{} dwords vs reference {}, first difference at dword {}\n", h_dnn, r_dnn, i));
+		    !text.empty()) {
+			Emit(text + Dump("hle", h_dn, h_dnn) + Dump("ref", r_dn, r_dnn));
+		}
+		return;
+	}
+	if (has_ret) {
+		uint64_t h = hle_ret;
+		uint64_t r = ref_ret;
+		if (ret_is_ptr) {
+			// A pointer into the buffer: compare where it points.
+			const auto hp = reinterpret_cast<const uint32_t*>(hle_ret);
+			const auto rp = reinterpret_cast<const uint32_t*>(ref_ret);
+			h = hp >= c->up0 && hp <= c->down0 ? static_cast<uint64_t>(hp - c->up0) : hle_ret;
+			r = rp >= s->bottom && rp <= s->top ? static_cast<uint64_t>(rp - s->bottom) : ref_ret;
+		}
+		if (h != r) {
+			Emit(Report(e, "return value", c->stubs0, fmt::format("hle {:#x}, reference {:#x}\n", h, r)));
+		}
+	}
+}
+
+uint32_t* PatchBegin(PatchCall* c, const void* hle, uint32_t* cmd) {
+	Export* e = Find(hle);
+	// Only packet patchers: other exports with a dword pointer first (AgcInit's state) have effects
+	// beyond the dwords, such as allocating memory and submitting.
+	if (e == nullptr || cmd == nullptr || std::strstr(e->name, "Patch") == nullptr) {
+		return nullptr;
+	}
+	e->calls++;
+	auto& sh = t_shadow;
+	std::memcpy(sh.patch, cmd, sizeof(sh.patch));
+	std::memcpy(sh.patch_pre, cmd, sizeof(sh.patch_pre));
+	c->hle    = hle;
+	c->cmd    = cmd;
+	c->stubs0 = StubCalls();
+	return sh.patch;
+}
+
+void PatchEnd(PatchCall* c, bool has_ret, uint64_t hle_ret, uint64_t ref_ret) {
+	Export* e  = Find(c->hle);
+	auto&   sh = t_shadow;
+	if (StubCalls() != c->stubs0) {
+		e->stubbed++;
+	}
+	const int64_t delta[] = {reinterpret_cast<intptr_t>(c->cmd) - reinterpret_cast<intptr_t>(sh.patch)};
+	const size_t  n       = sizeof(sh.patch) / sizeof(sh.patch[0]);
+	if (const size_t i = Compare(c->cmd, n, sh.patch, n, delta, 1); i != SIZE_MAX) {
+		// A Kyty marker NOP in place of the packet the reference expects to patch.
+		if ((sh.patch_pre[0] >> 30u) == 3u && ((sh.patch_pre[0] >> 8u) & 0xffu) == 0x10u) {
+			if (e->markers.fetch_add(1) == 0) {
+				Emit(fmt::format("agc diff: marker {} {}: patches a Kyty NOP {:08x} {:08x}\n", e->name, e->nid, sh.patch_pre[0],
+				                 sh.patch_pre[1]) +
+				     Dump("before", sh.patch_pre, 16) + Dump("hle", c->cmd, 16) + Dump("ref", sh.patch, 16));
+			}
+			return;
+		}
+		if (auto text = Report(e, "patched packet", c->stubs0, fmt::format("first difference at dword {}\n", i)); !text.empty()) {
+			Emit(text + Dump("before", sh.patch_pre, 16) + Dump("hle", c->cmd, 16) + Dump("ref", sh.patch, 16));
+		}
+		return;
+	}
+	if (has_ret && hle_ret != ref_ret) {
+		Emit(Report(e, "return value", c->stubs0, fmt::format("hle {:#x}, reference {:#x}\n", hle_ret, ref_ret)));
+	}
+}
+
+void Value(const void* hle, uint64_t stubs0, uint64_t hle_ret, uint64_t ref_ret) {
+	Export* e = Find(hle);
+	if (e == nullptr) {
+		return;
+	}
+	e->calls++;
+	if (StubCalls() != stubs0) {
+		e->stubbed++;
+	}
+	if (hle_ret != ref_ret) {
+		Emit(Report(e, "return value", stubs0, fmt::format("hle {:#x}, reference {:#x}\n", hle_ret, ref_ret)));
+	}
+}
+
+} // namespace AgcDiff
 
 } // namespace Gen5
 
