@@ -517,6 +517,12 @@ public:
 	// Seeds every context register in `defaults` that the shadow does not hold yet (so it never
 	// overrides SeedPs5Defaults or a guest write), e.g. the PS5 library's register defaults.
 	void SeedContextDefaults(std::span<const std::pair<uint32_t, uint32_t>> defaults);
+	// libSceAgc's context start buffer: loads every register of its tables (SET_*_REG_INDIRECT), whatever
+	// was set before, and makes the context values what a context clear restores. UCONFIG registers
+	// outside UconfigAllowed are left out; returns how many.
+	uint32_t LoadStartState(std::span<const std::pair<uint32_t, uint32_t>> context,
+	                        std::span<const std::pair<uint32_t, uint32_t>> sh,
+	                        std::span<const std::pair<uint32_t, uint32_t>> uconfig);
 
 	// Writes the shadowed registers as "cx|sh|uc <offset> <value>" lines (dword offsets within each
 	// register space), for comparing against the state Kyty sees.

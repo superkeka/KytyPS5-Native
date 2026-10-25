@@ -43,6 +43,19 @@ struct Label;
 // state its templates start from. The BC-250 native backend seeds its register shadow with them.
 std::vector<std::pair<uint32_t, uint32_t>> AgcContextRegisterDefaults();
 
+// The register state libSceAgc's context start buffer loads for a register defaults version: the
+// public then the internal defaults, context (table 0), SH (table 1) and UCONFIG (table 2), the last
+// value of an offset winning.
+struct AgcStartState {
+	std::vector<std::pair<uint32_t, uint32_t>> context;
+	std::vector<std::pair<uint32_t, uint32_t>> sh;
+	std::vector<std::pair<uint32_t, uint32_t>> uconfig;
+	uint32_t                                   version = 0;
+};
+AgcStartState AgcStartStateDefaults(uint32_t ver);
+// The version the title passed to AgcInit, UINT32_MAX before it did.
+uint32_t AgcRegisterDefaultsVersion();
+
 int KYTY_SYSV_ABI   AgcInit(uint32_t* state, uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver);
 void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver);

@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -262,6 +263,35 @@ std::vector<std::pair<uint32_t, uint32_t>> AgcContextRegisterDefaults() {
 	return out;
 }
 
+static std::atomic<uint32_t> g_register_defaults_version {UINT32_MAX};
+
+uint32_t AgcRegisterDefaultsVersion() {
+	return g_register_defaults_version.load();
+}
+
+AgcStartState AgcStartStateDefaults(uint32_t ver) {
+	const auto                         index     = normalize_register_defaults_version(ver);
+	const CompactRegisterDefaults*     blobs[]   = {g_agc_public_reg_defaults_by_version[index],
+	                                                g_agc_internal_reg_defaults_by_version[index]};
+	std::map<uint32_t, uint32_t>       spaces[3];
+	for (const auto* blob: blobs) {
+		const ShaderRegister* regs[]   = {blob->tbl0_regs, blob->tbl1_regs, blob->tbl2_regs};
+		const uint32_t        counts[] = {blob->tbl0_register_count, blob->tbl1_register_count,
+		                                  blob->tbl2_register_count};
+		for (int t = 0; t < 3; t++) {
+			for (uint32_t i = 0; regs[t] != nullptr && i < counts[t]; i++) {
+				spaces[t][regs[t][i].offset] = regs[t][i].value;
+			}
+		}
+	}
+	AgcStartState out;
+	out.context.assign(spaces[0].begin(), spaces[0].end());
+	out.sh.assign(spaces[1].begin(), spaces[1].end());
+	out.uconfig.assign(spaces[2].begin(), spaces[2].end());
+	out.version = index;
+	return out;
+}
+
 static RegisterDefaults* get_internal_register_defaults(uint32_t ver) {
 	static RegisterDefaultsStorage storage[GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION + 1] = {};
 	const auto                     index = normalize_register_defaults_version(ver);
@@ -351,6 +381,7 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	}
 
 	printf("version = %u\n", ver);
+	g_register_defaults_version = ver;
 
 	return OK;
 }

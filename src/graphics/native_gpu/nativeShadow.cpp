@@ -429,6 +429,9 @@ public:
 		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
 		const char* const  kind  = acb ? "acb" : "frame";
 		Pm4Translator&     tr    = acb ? m_acb_translator : m_translator;
+		if (!acb) {
+			LoadAgcStartState();
+		}
 		SetStage(Stage::Translate, frame);
 		const double       t_translate = NowSecShadow();
 		Pm4TranslateResult result      = tr.Translate(dcb);
@@ -1767,6 +1770,31 @@ private:
 	// successful-but-slow submit is misread as a hang. Overridable with KYTY_NATIVE_GPU_TIMEOUT_SEC.
 	static constexpr double kDefaultTimeoutSec = 12.0;
 
+	// libSceAgc runs its context start buffer once, from AgcInit: every register of the register
+	// defaults of the version the title passed (public then internal; context, SH, UCONFIG). Called
+	// before each graphics translation until that version is known. KYTY_NATIVE_GPU_AGC_DEFAULTS=v11ctx
+	// keeps only the version 11 public context table.
+	void LoadAgcStartState() {
+		if (m_agc_start_loaded || EnvOn("KYTY_NATIVE_GPU_NO_PS5_DEFAULTS")) {
+			return;
+		}
+		static const bool v11ctx = [] {
+			const char* mode = std::getenv("KYTY_NATIVE_GPU_AGC_DEFAULTS");
+			return mode != nullptr && std::strcmp(mode, "v11ctx") == 0;
+		}();
+		const uint32_t ver = Gen5::AgcRegisterDefaultsVersion();
+		if (v11ctx || ver == UINT32_MAX) {
+			return;
+		}
+		m_agc_start_loaded     = true;
+		const auto     state   = Gen5::AgcStartStateDefaults(ver);
+		const uint32_t skipped = m_translator.LoadStartState(state.context, state.sh, state.uconfig);
+		std::fprintf(stderr,
+		             "native shadow: AgcInit start state, register defaults version %u (title asked for %u): %zu context, %zu SH, "
+		             "%zu UCONFIG (%u UCONFIG left out)\n",
+		             state.version, ver, state.context.size(), state.sh.size(), state.uconfig.size() - skipped, skipped);
+	}
+
 	void Init() {
 		if (!EnvOn("KYTY_NATIVE_GPU_SHADOW") && !EnvOn("KYTY_NATIVE_GPU_PRIMARY")) {
 			return;
@@ -1775,11 +1803,14 @@ private:
 		// The rest of the PS5 context state the system sets up before a title runs: the graphics
 		// library's register defaults. amdgpu's CLEAR_STATE leaves many of these at other values
 		// (rasterizer and depth controls, scissors, guard band, blend and DCC defaults).
+		// Until the title calls AgcInit, the version 11 public context table stands in; LoadAgcStartState
+		// then loads what libSceAgc's start buffer loads at that point.
 		if (!EnvOn("KYTY_NATIVE_GPU_NO_PS5_DEFAULTS")) {
 			const auto defaults = Gen5::AgcContextRegisterDefaults();
 			m_translator.SeedContextDefaults(defaults);
-			std::fprintf(stderr, "native shadow: seeded %zu PS5 context register defaults\n", defaults.size());
+			std::fprintf(stderr, "native shadow: seeded %zu PS5 context register defaults (version 11 public)\n", defaults.size());
 		}
+		LoadAgcStartState();
 		m_stats = EnvOn("KYTY_NATIVE_GPU_STATS");
 		m_dump_shaders = EnvOn("KYTY_NATIVE_GPU_DUMP_SHADERS");
 		m_log_unmapped = EnvOn("KYTY_NATIVE_GPU_LOG_UNMAPPED");
@@ -2064,6 +2095,7 @@ private:
 
 	std::mutex    m_mutex;
 	bool          m_initialized = false;
+	bool          m_agc_start_loaded = false; // LoadAgcStartState ran
 	bool          m_enabled     = false;
 	bool          m_disabled    = false;
 	Pm4Translator m_translator;

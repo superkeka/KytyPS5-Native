@@ -547,6 +547,27 @@ void Pm4Translator::SeedContextDefaults(std::span<const std::pair<uint32_t, uint
 	}
 }
 
+uint32_t Pm4Translator::LoadStartState(std::span<const std::pair<uint32_t, uint32_t>> context,
+                                       std::span<const std::pair<uint32_t, uint32_t>> sh,
+                                       std::span<const std::pair<uint32_t, uint32_t>> uconfig) {
+	for (const auto& [offset, value]: context) {
+		m_cx[offset]          = value;
+		m_cx_defaults[offset] = value;
+	}
+	for (const auto& [offset, value]: sh) {
+		m_sh[offset] = value;
+	}
+	uint32_t skipped = 0;
+	for (const auto& [offset, value]: uconfig) {
+		if (UconfigAllowed(offset)) {
+			m_uc[offset] = value;
+		} else {
+			skipped++;
+		}
+	}
+	return skipped;
+}
+
 void Pm4Translator::SeedPs5Defaults() {
 	struct Default {
 		uint32_t offset;
