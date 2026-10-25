@@ -361,6 +361,7 @@ int KYTY_SYSV_ABI      AgcDriverSetTFRing(const volatile void* base, uint32_t si
 int KYTY_SYSV_ABI  AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, uint64_t value2);
 bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress();
 int KYTY_SYSV_ABI  AgcDriverRegisterDefaultOwner();
+int KYTY_SYSV_ABI  AgcDriverGetSharedArena(void** addr, uint32_t* size);
 
 } // namespace Gen5Driver
 

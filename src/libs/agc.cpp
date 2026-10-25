@@ -4206,7 +4206,12 @@ void Load() {
 	const auto     programs = rt->LoadReferencePrograms(paths);
 	// module_start sets up what the libraries' own allocators and state hand out (libSceAgc's
 	// AgcInit allocates from an arena module_start places). In load order: the driver first.
+	const char* init_env = std::getenv("KYTY_AGC_REFERENCE_INIT");
 	for (auto* program: programs) {
+		// Only with KYTY_AGC_REFERENCE_INIT=1 (see InitState); never the driver's, which opens its device.
+		if (init_env == nullptr || init_env[0] != '1' || program->file_name.string().find("Driver") != std::string::npos) {
+			continue;
+		}
 		sigjmp_buf jb;
 		int        result = 0;
 		if (sigsetjmp(jb, 1) == 0) {
@@ -4313,12 +4318,16 @@ size_t Compare(const uint32_t* h, size_t hn, const uint32_t* r, size_t rn, const
 
 // Counts the mismatch; returns the report head, empty once the export has logged enough.
 std::string Report(Export* e, const char* what, uint64_t stubs0, const std::string& detail) {
+	// A reference that went through a stubbed import produced what the stub let it; that is
+	// counted as stubbed, not as a mismatch.
+	if (StubCalls() != stubs0) {
+		return {};
+	}
 	e->mismatches++;
 	if (e->logged.fetch_add(1) >= LogLimit()) {
 		return {};
 	}
-	return fmt::format("agc diff: MISMATCH {} {} ({}){}: {}", e->name, e->nid, what,
-	                   StubCalls() != stubs0 ? " [reference called a stubbed import]" : "", detail);
+	return fmt::format("agc diff: MISMATCH {} {} ({}): {}", e->name, e->nid, what, detail);
 }
 
 bool KYTY_SYSV_ABI ShadowGrow(CommandBuffer* /*buf*/, uint32_t /*size_dw*/, void* /*user_data*/) {
@@ -4371,8 +4380,14 @@ void Faulted(const void* key) {
 
 uint32_t* InitState(const void* key) {
 	static std::atomic<bool> done {false};
-	Export*                  e = Find(key);
-	if (e == nullptr || std::strcmp(e->name, "Gen5::AgcInit") != 0 || done.exchange(true)) {
+	// KYTY_AGC_REFERENCE_INIT=1: also run the reference's AgcInit (needed for its shader and context
+	// state exports; it hung the GPU once while the reference patched the title's shader code).
+	static const bool init = [] {
+		const char* v = std::getenv("KYTY_AGC_REFERENCE_INIT");
+		return v != nullptr && v[0] == '1';
+	}();
+	Export* e = Find(key);
+	if (!init || e == nullptr || std::strcmp(e->name, "Gen5::AgcInit") != 0 || done.exchange(true)) {
 		return nullptr;
 	}
 	static std::vector<uint32_t> state(16384, 0u);
@@ -4609,6 +4624,127 @@ void RegsEnd(RegsCall* c, bool has_ret, uint64_t hle_ret, uint64_t ref_ret) {
 		}
 	}
 	if (has_ret && hle_ret != ref_ret) {
+		Emit(Report(e, "return value", c->stubs0, fmt::format("hle {:#x}, reference {:#x}\n", hle_ret, ref_ret)));
+	}
+}
+
+namespace {
+constexpr size_t kBlobMax = size_t {1} << 20u;
+
+// Shader blocks have to be where a title's are: libSceAgc refuses addresses outside the guest's
+// (GPU) address space (0x8a6c002f). Two guest buffers per thread, from guest direct memory.
+uint8_t* GuestBlobBuffer(int index) {
+	static std::mutex          mutex;
+	static thread_local uint8_t* buffers[2] {};
+	if (buffers[index] == nullptr) {
+		std::lock_guard lock(mutex);
+		int64_t         phys = 0;
+		void*           va   = nullptr;
+		if (LibKernel::Memory::KernelAllocateMainDirectMemory(kBlobMax, 0x10000u, 0, &phys) != OK ||
+		    LibKernel::Memory::KernelMapDirectMemory(&va, kBlobMax, 0x33, 0, phys, 0x10000u) != OK) {
+			return nullptr;
+		}
+		buffers[index] = static_cast<uint8_t*>(va);
+	}
+	return buffers[index];
+}
+
+void* BlobCopy(BlobCall* c, const void* title, size_t size) {
+	if (title == nullptr || size == 0 || size > kBlobMax || c->num >= 2) {
+		return nullptr;
+	}
+	uint8_t* mem = GuestBlobBuffer(c->num);
+	if (mem == nullptr) {
+		return nullptr;
+	}
+	std::memcpy(mem, title, size);
+	c->title[c->num] = title;
+	c->copy[c->num]  = mem;
+	c->size[c->num]  = size;
+	c->num++;
+	return mem;
+}
+} // namespace
+
+void* ShaderBegin(BlobCall* c, const void* hle, void* header, const volatile void* code, const volatile void** code_copy) {
+	Export* e = Find(hle);
+	if (e == nullptr || header == nullptr || code == nullptr) {
+		return nullptr;
+	}
+	c->hle    = hle;
+	c->stubs0 = StubCalls();
+	// The header block: the Shader struct, then what its self-relative pointers lead to.
+	const auto* h    = static_cast<const Shader*>(header);
+	const auto  size = std::max<size_t>(h->header_size, sizeof(Shader));
+	void*       copy = BlobCopy(c, header, size);
+	// The code with its trailer (the reference reads a "barefoot" footer before the end).
+	*code_copy = BlobCopy(c, const_cast<const void*>(code), h->shader_size);
+	return copy;
+}
+
+bool FuseBegin(BlobCall* c, const void* hle, Shader* fused, const Shader* front, const Shader* back, void* scratch,
+               Shader** fused_copy, void** scratch_copy) {
+	Export* e = Find(hle);
+	if (e == nullptr || fused == nullptr || front == nullptr || back == nullptr) {
+		return false;
+	}
+	SizeAlign need {};
+	if (AgcGetFusedShaderSize(&need, front, back) != OK) {
+		return false;
+	}
+	c->hle        = hle;
+	c->stubs0     = StubCalls();
+	*fused_copy   = static_cast<Shader*>(BlobCopy(c, fused, sizeof(Shader)));
+	*scratch_copy = scratch != nullptr ? BlobCopy(c, scratch, need.m_size) : nullptr;
+	return *fused_copy != nullptr && (scratch == nullptr || *scratch_copy != nullptr);
+}
+
+void BlobEnd(BlobCall* c, uint64_t hle_ret, uint64_t ref_ret, const void* hle_out, const void* ref_out) {
+	Export* e = Find(c->hle);
+	if (e == nullptr) {
+		return;
+	}
+	e->calls++;
+	if (StubCalls() != c->stubs0) {
+		e->stubbed++;
+	}
+	// The reference refuses shaders until its own AgcInit has run completely (0x8a6c002f, and
+	// 0x8a6c0005 when it ran on the stubbed environment); nothing to compare then.
+	if (hle_ret == 0 && (static_cast<uint32_t>(ref_ret) >> 16u) == 0x8a6cu) {
+		if (e->skipped.fetch_add(1) == 0) {
+			Emit(fmt::format("agc diff: the reference {} {} refuses ({:#x}); not compared\n", e->name, e->nid,
+			                 static_cast<uint32_t>(ref_ret)));
+		}
+		return;
+	}
+	int64_t deltas[4] = {};
+	for (int k = 0; k < c->num; k++) {
+		deltas[k] = reinterpret_cast<intptr_t>(c->title[k]) - reinterpret_cast<intptr_t>(c->copy[k]);
+		// SPI_SHADER_PGM_LO_* hold the code address >> 8.
+		deltas[2 + k] = static_cast<int64_t>(reinterpret_cast<uintptr_t>(c->title[k]) >> 8u) -
+		                static_cast<int64_t>(reinterpret_cast<uintptr_t>(c->copy[k]) >> 8u);
+	}
+	for (int k = 0; k < c->num; k++) {
+		const auto*  h = static_cast<const uint32_t*>(c->title[k]);
+		const auto*  r = static_cast<const uint32_t*>(c->copy[k]);
+		const size_t n = c->size[k] / 4;
+		if (const size_t i = Compare(h, n, r, n, deltas, 4); i != SIZE_MAX) {
+			if (auto text = Report(e, k == 0 ? "shader block" : "second block (code or scratch)", c->stubs0,
+			                       fmt::format("{} bytes, first difference at dword {} (returned hle {:#x} -> {}, reference {:#x} -> "
+			                                   "{}; copy at {})\n",
+			                                   c->size[k], i, hle_ret, hle_out, ref_ret, ref_out, c->copy[0]));
+			    !text.empty()) {
+				const size_t from = i >= 8 ? i - 8 : 0;
+				Emit(text + Dump("hle", h + from, std::min<size_t>(24, n - from)) + Dump("ref", r + from, std::min<size_t>(24, n - from)));
+			}
+			return;
+		}
+	}
+	if (hle_out != ref_out && !(c->num > 0 && reinterpret_cast<intptr_t>(hle_out) - reinterpret_cast<intptr_t>(ref_out) == deltas[0])) {
+		Emit(Report(e, "returned shader", c->stubs0, fmt::format("hle {}, reference {}\n", hle_out, ref_out)));
+		return;
+	}
+	if (hle_ret != ref_ret) {
 		Emit(Report(e, "return value", c->stubs0, fmt::format("hle {:#x}, reference {:#x}\n", hle_ret, ref_ret)));
 	}
 }
@@ -4982,6 +5118,34 @@ int KYTY_SYSV_ABI AgcDriverRegisterDefaultOwner() {
 	PRINT_NAME();
 
 	return static_cast<int>(0x8a6c9018u);
+}
+
+// Um-jkyDy9rI (name unknown): the region the driver maps for libSceAgc at GPU VA 0xFE0040000. The
+// real libSceAgc's module_start carves its allocator arena from it (and checks the address); the
+// context start buffer's COPY_DATA works inside it. Only the real libSceAgc calls it (agc diff).
+int KYTY_SYSV_ABI AgcDriverGetSharedArena(void** addr, uint32_t* size) {
+	PRINT_NAME();
+
+	static constexpr uint64_t kAddr  = 0xFE0040000ull;
+	static constexpr uint32_t kSize  = 0x100000u;
+	static void*              mapped = nullptr;
+	if (mapped == nullptr) {
+		int64_t phys = 0;
+		void*   va   = reinterpret_cast<void*>(kAddr);
+		// CPU and GPU read/write, MAP_FIXED.
+		if (LibKernel::Memory::KernelAllocateMainDirectMemory(kSize, 0x10000u, 0, &phys) != OK ||
+		    LibKernel::Memory::KernelMapDirectMemory(&va, kSize, 0x33, 0x10, phys, 0) != OK) {
+			return -1;
+		}
+		mapped = va;
+	}
+	if (addr != nullptr) {
+		*addr = mapped;
+	}
+	if (size != nullptr) {
+		*size = kSize;
+	}
+	return OK;
 }
 
 } // namespace Gen5Driver

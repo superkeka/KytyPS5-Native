@@ -16,12 +16,15 @@
 //  - first argument a uint32_t* packet: the packet after each one patched its own copy;
 //  - only arithmetic arguments: the return value;
 //  - register arrays (non-const ShaderRegister* arguments): the first entries of each after the
-//    HLE function filled the title's and the reference its own copies.
+//    HLE function filled the title's and the reference its own copies;
+//  - AgcCreateShader: the shader header block after each one prepared its own copy;
+//  - AgcFuseShaderHalves: the fused shader and its scratch memory.
 // Everything else runs the HLE function only. Mismatches go to stderr (KYTY_AGC_DIFF_LOG=N: the
 // first N per export, default 4) with a per-export summary at exit.
 
 namespace Libs::Graphics {
 struct ShaderRegister;
+struct Shader;
 } // namespace Libs::Graphics
 
 namespace Libs::Graphics::Gen5 {
@@ -75,6 +78,22 @@ struct RegsCall {
 // Before the HLE function: a private copy of a register array the export fills (nullptr stays).
 ShaderRegister* RegsCopy(RegsCall* c, ShaderRegister* regs);
 void            RegsEnd(RegsCall* c, bool has_ret, uint64_t hle_ret, uint64_t ref_ret);
+
+struct BlobCall {
+	const void* hle    = nullptr;
+	uint64_t    stubs0 = 0;
+	const void* title[2] {};
+	void*       copy[2] {};
+	size_t      size[2] {};
+	int         num = 0;
+};
+// AgcCreateShader: copies the header block before the HLE function relocates it in place, and the
+// code (the reference may patch it; the title's must stay the HLE function's).
+void* ShaderBegin(BlobCall* c, const void* hle, void* header, const volatile void* code, const volatile void** code_copy);
+// AgcFuseShaderHalves: private fused shader and scratch memory, sized by AgcGetFusedShaderSize.
+bool  FuseBegin(BlobCall* c, const void* hle, Shader* fused, const Shader* front, const Shader* back, void* scratch,
+                Shader** fused_copy, void** scratch_copy);
+void  BlobEnd(BlobCall* c, uint64_t hle_ret, uint64_t ref_ret, const void* hle_out, const void* ref_out);
 uint64_t StubCalls();
 // AgcInit runs in the reference too (once, on a state of its own): its start state is what the
 // reference's queue resets and context state ops load.
@@ -129,6 +148,10 @@ struct Wrap<F, Tag> {
 		constexpr bool pure = ((std::is_arithmetic_v<A> || std::is_enum_v<A>) && ...) && !std::is_void_v<R> &&
 		                      !std::is_pointer_v<R>;
 		constexpr bool regs = (std::is_same_v<A, ShaderRegister*> || ...);
+		constexpr bool create_shader =
+		    std::is_same_v<std::tuple<A...>, std::tuple<Shader**, void*, const volatile void*>> && !std::is_void_v<R>;
+		constexpr bool fuse =
+		    std::is_same_v<std::tuple<A...>, std::tuple<Shader*, const Shader*, const Shader*, void*>> && !std::is_void_v<R>;
 		if (ref == nullptr) {
 			return F(a...);
 		}
@@ -191,6 +214,35 @@ struct Wrap<F, Tag> {
 					return r;
 				}
 			}
+		} else if constexpr (create_shader) {
+			auto     args = std::make_tuple(a...);
+			BlobCall             c;
+			const volatile void* code_copy = nullptr;
+			void*                copy      = ShaderBegin(&c, key, std::get<1>(args), std::get<2>(args), &code_copy);
+			R                    r         = F(a...);
+			if (copy != nullptr && code_copy != nullptr) {
+				Shader* ref_dst = nullptr;
+				R       l {};
+				if (Guarded(key, [&] { l = ref(&ref_dst, copy, code_copy); })) {
+					BlobEnd(&c, ToU64(r), ToU64(l), std::get<0>(args) != nullptr ? *std::get<0>(args) : nullptr, ref_dst);
+				}
+			}
+			return r;
+		} else if constexpr (fuse) {
+			auto     args = std::make_tuple(a...);
+			BlobCall c;
+			Shader*  fused_copy   = nullptr;
+			void*    scratch_copy = nullptr;
+			const bool ok = FuseBegin(&c, key, std::get<0>(args), std::get<1>(args), std::get<2>(args), std::get<3>(args),
+			                          &fused_copy, &scratch_copy);
+			R r = F(a...);
+			if (ok) {
+				R l {};
+				if (Guarded(key, [&] { l = ref(fused_copy, std::get<1>(args), std::get<2>(args), scratch_copy); })) {
+					BlobEnd(&c, ToU64(r), ToU64(l), nullptr, nullptr);
+				}
+			}
+			return r;
 		} else if constexpr (regs && !std::is_void_v<R>) {
 			RegsCall c;
 			c.hle      = key;

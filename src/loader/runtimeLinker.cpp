@@ -1421,10 +1421,36 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 			return;
 		}
-		for (auto* p: m_programs) {
-			if (p != program && p->reference_only && p->export_symbols != nullptr) {
-				if (const auto* rec = p->export_symbols->FindByNid(ids.at(0), type); rec != nullptr) {
+		// The real driver's per-process state needs its device, so of it only helpers that touch no
+		// state are linked; the driver's region for libSceAgc comes from the emulator's driver.
+		static const char* const kDriverHelpers[] = {"VhLnEiTuuWo", "-vc-xL+G8u0", "+b34-CLWc0s", "LEnn-4ARRJM"};
+		static const char* const kEmulatorDriver[] = {"Um-jkyDy9rI"};
+		for (const char* nid: kEmulatorDriver) {
+			if (ids.at(0) == nid && m_symbols != nullptr) {
+				if (const auto* rec = m_symbols->FindByNid(nid, type); rec != nullptr) {
 					*out_info = *rec;
+					return;
+				}
+			}
+		}
+		// Only imports of the driver's library: the driver exports some libkernel NIDs too
+		// (scePthreadMutexLock), which must stay the emulator's.
+		const LibraryId* import_lib = FindLibrary(*program, ids.at(1));
+		const bool       from_driver = import_lib != nullptr && import_lib->name.find("Driver") != std::string::npos;
+		for (auto* p: m_programs) {
+			if (from_driver && p != program && p->reference_only && p->export_symbols != nullptr) {
+				if (const auto* rec = p->export_symbols->FindByNid(ids.at(0), type); rec != nullptr) {
+					bool helper = type != SymbolType::Func;
+					for (const char* h: kDriverHelpers) {
+						helper = helper || ids.at(0) == h;
+					}
+					if (helper) {
+						*out_info = *rec;
+					} else {
+						out_info->vaddr    = 0;
+						out_info->name     = name;
+						out_info->dbg_name = "";
+					}
 					return;
 				}
 			}

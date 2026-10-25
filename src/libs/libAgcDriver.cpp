@@ -206,6 +206,7 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("MM4IZSEYytQ", Gen5Driver::AgcDriverSetHsOffchipParam);
 	LIB_FUNC("Ddwk4gLT5j0", Gen5Driver::AgcDriverIsCaptureInProgress);
 	LIB_FUNC("U9ueyEhSkF4", Gen5Driver::AgcDriverRegisterDefaultOwner);
+	LIB_FUNC("Um-jkyDy9rI", Gen5Driver::AgcDriverGetSharedArena);
 }
 
 } // namespace LibGen5Driver
