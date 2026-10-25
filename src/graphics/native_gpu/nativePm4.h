@@ -134,6 +134,7 @@ struct Pm4TranslateStats {
 	uint32_t load_context      = 0; // IT_SET_CONTEXT_REG_INDIRECT (0x9F) expanded
 	uint32_t load_sh           = 0; // IT_SET_SH_REG_INDIRECT (0x63) expanded
 	uint32_t load_uconfig      = 0; // IT_SET_UCONFIG_REG_INDIRECT (0x64) expanded
+	uint32_t load_gpu_written  = 0; // indirect loads from memory a WRITE_DATA/DMA_DATA of the same DCB wrote
 	uint32_t loaded_cx_regs    = 0; // offset/value pairs expanded from 0x9F
 	uint32_t loaded_sh_regs    = 0; // offset/value pairs expanded from 0x63
 	uint32_t loaded_uc_regs    = 0; // offset/value pairs expanded from 0x64

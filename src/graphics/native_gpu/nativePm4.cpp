@@ -635,12 +635,12 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	// processes draw on this ring between our submissions and leave theirs behind.
 	// KYTY_NATIVE_GPU_CP_STATE: mask of what is replayed, 1 index type, 2 NUM_INSTANCES, 4 INDEX_BASE and
 	// INDEX_BUFFER_SIZE once the title has sent them, 0x10 also libSceAgc's start values of those two
-	// (base 0, size 0xFFFFFFFF), 8 SET_BASE (0 leaves it to the title). With the context start state of
-	// the wrong defaults version (v11 for a v10 title, without the internal table) the index replay hung
-	// Dead Cells at its level load; with AgcInit's start state it does not.
+	// (base 0, size 0xFFFFFFFF), 8 SET_BASE (0 leaves it to the title). 0x10 is off by default: Dead Cells
+	// never binds an index buffer (it draws with DRAW_INDEX_2), and with base 0 / size 0xFFFFFFFF at the
+	// start of every IB the gfx ring hung at its level load in 4 of 6 runs (0 of 7 without).
 	static const uint32_t cp_state = [] {
 		const char* e = std::getenv("KYTY_NATIVE_GPU_CP_STATE");
-		return e == nullptr ? 0x1fu : static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+		return e == nullptr ? 0xfu : static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
 	}();
 	if ((cp_state & 1u) != 0 && uc.count(0x243) == 0) {
 		EmitSetUconfig(ib, 0x243, 0x480u); // VGT_INDEX_TYPE: 16-bit, cache policy 2
@@ -835,6 +835,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	auto sh = m_sh;
 	auto uc = m_uc;
 	auto cp = m_cp;
+	// Memory this DCB writes with WRITE_DATA / DMA_DATA before the GPU gets further. The CP reads an
+	// indirect register table when it runs the packet; the translator reads it now, so a table written
+	// earlier in the same DCB would be read before it is written.
+	std::vector<std::pair<uint64_t, uint64_t>> gpu_written;
 
 	std::vector<uint64_t> shaders;
 
@@ -1856,6 +1860,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (num == 0 || addr == 0) {
 					break;
 				}
+				for (const auto& [lo, hi]: gpu_written) {
+					if (addr < hi && lo < addr + 8ull * num) {
+						stats.load_gpu_written++;
+						if (static std::atomic<uint32_t> logged {0}; logged++ < 8) {
+							std::fprintf(stderr,
+							             "native shadow: indirect register load 0x%02x reads 0x%llx..0x%llx, which this DCB writes "
+							             "earlier (0x%llx..0x%llx); the table is read before the GPU writes it\n",
+							             op, static_cast<unsigned long long>(addr), static_cast<unsigned long long>(addr + 8ull * num),
+							             static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+						}
+						break;
+					}
+				}
 				const auto* pairs = reinterpret_cast<const uint32_t*>(addr);
 				for (uint32_t i = 0; i < num; i++) {
 					const uint32_t raw   = pairs[2 * i];
@@ -2037,7 +2054,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bytes, false);
 					}
 					if (dst_sel != 1u) {
-						add_ref(static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u), bytes, false);
+						const uint64_t dst = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
+						add_ref(dst, bytes, false);
+						gpu_written.emplace_back(dst, dst + bytes);
 					}
 				}
 				break;
@@ -2049,6 +2068,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// write itself, in order, so the native IB leaves it out.
 				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
 					return fail(op, dw);
+				}
+				{
+					const uint64_t dst = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					const uint64_t n   = ((bptr[0] >> 16u) & 1u) != 0 ? 1u : body_count - 3u;
+					gpu_written.emplace_back(dst, dst + 4u * n);
 				}
 				if (labels) {
 					// Native labels: Kyty no longer reads the buffer once it is translated, so the GPU writes
