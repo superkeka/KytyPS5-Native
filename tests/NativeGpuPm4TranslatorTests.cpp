@@ -1067,9 +1067,16 @@ void TestLabelsWait64() {
 	std::vector<uint32_t> both;
 	Append(both, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
 	wait64(both, 1);
-	auto rb = t.Translate(both);
-	Check(rb.segments.size() == 2 && rb.segments[1].held && rb.segments[1].wait_len == 0 && FindFirst(Decode(rb.ib), 0x93u) == nullptr,
-	      "one on both halves is cut and has no native form");
+	auto       rb    = t.Translate(both);
+	const auto pkts2 = Decode(rb.ib);
+	uint32_t   halves = 0;
+	for (const auto& p: pkts2) {
+		if (p.op == 0x3Cu && (p.body[1] == static_cast<uint32_t>(addr) || p.body[1] == static_cast<uint32_t>(addr + 4u))) {
+			halves++;
+		}
+	}
+	Check(rb.segments.size() == 1 && FindFirst(pkts2, 0x93u) == nullptr && halves == 2,
+	      "one on both halves becomes a WAIT_REG_MEM per half");
 	o.plan  = LabelOracle::Plan::Split;
 	auto rs = t.Translate(dcb);
 	Check(rs.segments.size() == 2 && rs.segments[1].wait_len == 7, "a held 64-bit wait carries its 32-bit form");

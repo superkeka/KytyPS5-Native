@@ -255,10 +255,17 @@ void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint3
 // on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
 // the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
 bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) {
-	if (w.function != 3 || (w.wide && ((w.mask >> 32u) != 0 || (w.ref >> 32u) != 0))) {
+	if (w.function != 3) {
 		return false;
 	}
 	EmitWaitEqual(ib, w.addr, static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.mask), compute);
+	// A 64-bit equality wait (Agc's WaitOnAddress, mask ~0) as one wait per half: the label is written
+	// once before it is waited on, so both halves holding their part is the 64-bit condition.
+	if (w.wide && (w.mask >> 32u) != 0) {
+		EmitWaitEqual(ib, w.addr + 4u, static_cast<uint32_t>(w.ref >> 32u), static_cast<uint32_t>(w.mask >> 32u), compute);
+	} else if (w.wide && (w.ref >> 32u) != 0) {
+		return false; // the high half must match a value the mask leaves out: never true
+	}
 	// MEC has no prefetch parser. PFP_SYNC_ME there is an illegal opcode; the ME wait is the whole sync.
 	if (w.pfp && !compute) {
 		ib.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
