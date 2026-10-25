@@ -252,6 +252,17 @@ void TestCountsFlatAndApertures() {
 	Check(scan.aperture_ops == 2, "src_shared_base and the SH_MEM_BASES getreg are aperture reads");
 }
 
+void TestCountsDotOps() {
+	// gfx1011 encodings (llvm-mc): v_dot2c_f32_f16 v0, v1, v2; v_dot2_f32_f16, v_dot4_i32_i8 and
+	// v_dot8_i32_i4 v0, v1, v2, v3 (VOP3P); s_endpgm. gfx1013 decodes none of the four.
+	const std::vector<uint32_t> code = {0x04000501u, 0xcc134000u, 0x1c0e0501u, 0xcc164000u, 0x1c0e0501u,
+	                                    0xcc184000u, 0x1c0e0501u, SEndpgm};
+	const auto scan = CountDot2c(code);
+	Check(scan.ended && !scan.decode_error, "dot sample decodes to s_endpgm");
+	Check(scan.sites == 1, "one v_dot2c_f32_f16 site");
+	Check(scan.dot_ops == 3, "three VOP3P dot instructions");
+}
+
 int main() {
 	TestInstructionLengths();
 	TestPatchesVgprAndSgprSites();
@@ -265,6 +276,7 @@ int main() {
 	TestLiteralThatLooksLikeDot2c();
 	TestDecodeErrorPatchesNothing();
 	TestCountsFlatAndApertures();
+	TestCountsDotOps();
 	std::puts("NativeGpuShaderPatcherTests: all cases passed");
 	return 0;
 }

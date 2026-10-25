@@ -2050,6 +2050,11 @@ private:
 			Dot2cScan   scan = CountDot2c(std::span<const uint32_t>(code, 1u << 16u));
 			m_shaders_scanned++;
 			m_dot2c_sites += scan.sites;
+			m_dot_ops += scan.dot_ops;
+			if (m_shaders_scanned % 500u == 0) {
+				std::fprintf(stderr, "native shadow: %u shaders scanned so far: %u v_dot2c_f32_f16 sites, %u other dot ops\n",
+				             m_shaders_scanned, m_dot2c_sites, m_dot_ops);
+			}
 			if (scan.decode_error && m_decode_stops++ < 16) {
 				std::fprintf(stderr, "native shadow: shader 0x%llx: sweep stopped at an undecodable word 0x%08x after %u instrs\n",
 				             static_cast<unsigned long long>(va), code[scan.dwords], scan.instructions);
@@ -2211,6 +2216,7 @@ private:
 	double        m_timeout_sec    = kDefaultTimeoutSec;
 	uint32_t      m_shaders_scanned = 0;
 	uint32_t      m_dot2c_sites    = 0;
+	uint32_t      m_dot_ops = 0; // dot instructions other than v_dot2c_f32_f16 in scanned shaders
 	uint32_t      m_decode_stops   = 0;
 	std::set<uint64_t> m_seen_shaders;
 	std::set<uint32_t> m_skipped_uconfig;
