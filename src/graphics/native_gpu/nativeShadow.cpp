@@ -992,6 +992,13 @@ public:
 			             m_gpu_busy_s.load(std::memory_order_relaxed) * per, static_cast<unsigned long long>(ResidentMiB()));
 			std::fprintf(stderr, "native shadow: flip intervals: %u under 20 ms, %u 20-37 ms, %u longer\n", m_flip_hist[0],
 			             m_flip_hist[1], m_flip_hist[2]);
+#if KYTY_GEM_BACKING_SUPPORTED
+			if (m_gem != nullptr) {
+				const auto [ext_n, ext_bytes] = m_gem->ExternalBuffers();
+				std::fprintf(stderr, "native shadow: %llu userptr buffers, %llu MiB\n", static_cast<unsigned long long>(ext_n),
+				             static_cast<unsigned long long>(ext_bytes >> 20u));
+			}
+#endif
 			m_flip_hist = {};
 			const uint64_t held   = g_held_released.exchange(0, std::memory_order_relaxed);
 			const uint64_t waited = g_held_waited.exchange(0, std::memory_order_relaxed);

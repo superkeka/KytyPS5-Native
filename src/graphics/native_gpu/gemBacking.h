@@ -438,6 +438,17 @@ public:
 		return ranges;
 	}
 
+	// The external (userptr) buffers: how many and how many bytes. Each submission revalidates their
+	// pages, so their cost grows with the size, unlike the resident blocks.
+	[[nodiscard]] std::pair<uint64_t, uint64_t> ExternalBuffers() const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		uint64_t                    bytes = 0;
+		for (const auto& [vaddr, ext]: m_external) {
+			bytes += ext.end - vaddr;
+		}
+		return {m_external.size(), bytes};
+	}
+
 	[[nodiscard]] uint64_t ResidentBytes() const {
 		std::lock_guard<std::mutex> lock(m_lock);
 		return m_resident_bytes;
