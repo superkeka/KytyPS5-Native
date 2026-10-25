@@ -1934,8 +1934,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						seg_effects = true;
 						NoteOnce(6, "WRITE_DATA label (GPU store, mirrored to the CPU)");
 					}
-					for (uint32_t i = 0; i < std::min<uint32_t>(n, 64); i++) {
-						note_write({one_addr ? dst : dst + 4u * i, bptr[3 + i], true, gpu, false});
+					// Two dwords at an 8-aligned address are one 64-bit label as far as a later
+					// WAIT_REG_MEM_64 is concerned (Agc's WaitOnAddress after a 64-bit WriteData: Dead
+					// Cells). Recorded as two 32-bit writes, the wait reads them as unknown and is held on
+					// the CPU although the write ahead of it in the ring satisfies it.
+					for (uint32_t i = 0; i < std::min<uint32_t>(n, 64);) {
+						const uint64_t at = one_addr ? dst : dst + 4u * i;
+						if (!one_addr && i + 1 < n && (at & 7u) == 0) {
+							note_write({at, bptr[3 + i] | (static_cast<uint64_t>(bptr[4 + i]) << 32u), true, gpu, true});
+							i += 2;
+							continue;
+						}
+						note_write({at, bptr[3 + i], true, gpu, false});
+						i++;
 					}
 					if (!gpu) {
 						TrackerPoint cpu;
