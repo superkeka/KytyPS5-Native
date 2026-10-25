@@ -9,7 +9,10 @@
 //      residency make guest memory usable without per-submission BO lists?
 //   7. KFD memory exported as a dma-buf and mapped for the CPU at an inner offset;
 //   8 ("gds" argument): 64 lanes of ds_add_rtn_u32 on GDS dword 0 from a KFD queue (needs the KFD
-//      VMIDs' GDS partition, which kyty-lodhw writes: GDS_VMID8..15).
+//      VMIDs' GDS partition, which kyty-lodhw writes: GDS_VMID8..15);
+//   9 ("view" argument): a KFD buffer exported as a dma-buf, imported into the render node and mapped
+//      a second time at another VA with GEM_VA (how a guest view of a block would look): written there
+//      by the KFD queue and by a render-node CS that lists the imported handle.
 // Build: cc -O2 -o kfd_probe kfd_probe.c. Needs /dev/kfd (no root).
 #define _GNU_SOURCE
 #include <drm/amdgpu_drm.h>
@@ -83,6 +86,7 @@ int main(int argc, char** argv) {
 	// "hold N": keep the queue alive N seconds after the first test, for reading registers meanwhile.
 	const int hold = argc > 2 && strcmp(argv[1], "hold") == 0 ? atoi(argv[2]) : 0;
 	const int gds  = argc > 1 && strcmp(argv[1], "gds") == 0;
+	const int view = argc > 1 && strcmp(argv[1], "view") == 0;
 	// The GPU node: the one with SIMDs.
 	char path[128];
 	for (int n = 0; n < 8 && gpu_id == 0; n++) {
@@ -282,6 +286,74 @@ int main(int argc, char** argv) {
 		printf("GDS dispatch on the KFD queue: %s after %.1f us; lane values 0x%x 0x%x 0x%x ... 64 consecutive: %s\n",
 		       d[5] == 0xcafe0008u ? "done" : "NOT done", (Now() - t0) * 1e6, o[0], o[1], o[2], seen == ~0ull ? "YES" : "no");
 		return d[5] == 0xcafe0008u && seen == ~0ull ? 0 : 8;
+	}
+
+	if (view) {
+		struct Mem blk;
+		if (Alloc(&blk, va + 0x10000000, 16 << 20, gtt)) {
+			return 9;
+		}
+		struct kfd_ioctl_export_dmabuf_args ex = {.handle = blk.handle, .flags = O_RDWR | O_CLOEXEC};
+		r = Ioctl(kfd, AMDKFD_IOC_EXPORT_DMABUF, &ex);
+		struct drm_prime_handle ph = {.fd = (int)ex.dmabuf_fd};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph);
+		printf("KFD buffer -> dma-buf -> render-node handle %u: %s\n", ph.handle, r ? strerror(-r) : "ok");
+		const uint64_t guest = 0x0000003000000000ull; // a guest-like address, 4 MiB into the block
+		struct drm_amdgpu_gem_va gv2 = {.handle = ph.handle, .operation = AMDGPU_VA_OP_MAP,
+		                                .flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE, .va_address = guest,
+		                                .offset_in_bo = 4 << 20, .map_size = 1 << 20};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_AMDGPU_GEM_VA, &gv2);
+		printf("GEM_VA of the imported buffer at 0x%llx (+4 MiB in the block): %s\n", (unsigned long long)guest, r ? strerror(-r) : "ok");
+		volatile uint32_t* bc = blk.cpu;
+		bc[(4 << 20) / 4] = 0;
+		bc[(4 << 20) / 4 + 1] = 0;
+		WRITE(guest, 0xcafe0009u);
+		t0 = Now();
+		KICK();
+		while (bc[(4 << 20) / 4] != 0xcafe0009u && Now() - t0 < 2.0) {
+		}
+		printf("KFD queue writes through the second mapping: %s\n", bc[(4 << 20) / 4] == 0xcafe0009u ? "LANDED" : "not landed");
+		// The render-node CS listing the imported handle.
+		union drm_amdgpu_ctx c = {.in = {.op = AMDGPU_CTX_OP_ALLOC_CTX}};
+		r = Ioctl(drm, DRM_IOCTL_AMDGPU_CTX, &c);
+		union drm_amdgpu_gem_create ic = {.in = {.bo_size = 65536, .alignment = 65536, .domains = AMDGPU_GEM_DOMAIN_GTT,
+		                                         .domain_flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED}};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_AMDGPU_GEM_CREATE, &ic);
+		const uint64_t ib_va = va + 0x5000000;
+		struct drm_amdgpu_gem_va iv = {.handle = ic.out.handle, .operation = AMDGPU_VA_OP_MAP,
+		                               .flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE, .va_address = ib_va, .map_size = 65536};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_AMDGPU_GEM_VA, &iv);
+		union drm_amdgpu_gem_mmap im = {.in = {.handle = ic.out.handle}};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_AMDGPU_GEM_MMAP, &im);
+		uint32_t* ib = r ? MAP_FAILED : mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, drm, im.out.addr_ptr);
+		if (ib == MAP_FAILED) {
+			printf("CS setup: %s\n", strerror(-r));
+			return 9;
+		}
+		uint32_t n = 0;
+		ib[n++] = Pkt3(0x37, 4);
+		ib[n++] = (5u << 8) | (1u << 20);
+		ib[n++] = (uint32_t)(guest + 4);
+		ib[n++] = (uint32_t)((guest + 4) >> 32);
+		ib[n++] = 0xcafe000au;
+		while (n & 7) {
+			ib[n++] = 0xffff1000u;
+		}
+		struct drm_amdgpu_bo_list_entry e[2] = {{.bo_handle = ic.out.handle}, {.bo_handle = ph.handle}};
+		struct drm_amdgpu_bo_list_in list = {.operation = ~0u, .list_handle = ~0u, .bo_number = 2, .bo_info_size = sizeof(e[0]),
+		                                     .bo_info_ptr = (uintptr_t)e};
+		struct drm_amdgpu_cs_chunk_ib ci = {.va_start = ib_va, .ib_bytes = n * 4, .ip_type = AMDGPU_HW_IP_COMPUTE};
+		struct drm_amdgpu_cs_chunk ch[2] = {{AMDGPU_CHUNK_ID_IB, sizeof(ci) / 4, (uintptr_t)&ci},
+		                                    {AMDGPU_CHUNK_ID_BO_HANDLES, sizeof(list) / 4, (uintptr_t)&list}};
+		uint64_t           cp[2] = {(uintptr_t)&ch[0], (uintptr_t)&ch[1]};
+		union drm_amdgpu_cs cs   = {.in = {.ctx_id = c.out.alloc.ctx_id, .num_chunks = 2, .chunks = (uintptr_t)cp}};
+		t0 = Now();
+		r = Ioctl(drm, DRM_IOCTL_AMDGPU_CS, &cs);
+		while (r == 0 && bc[(4 << 20) / 4 + 1] != 0xcafe000au && Now() - t0 < 2.0) {
+		}
+		printf("render-node CS listing the imported handle writes the view: CS %s, %s\n", r ? strerror(-r) : "ok",
+		       bc[(4 << 20) / 4 + 1] == 0xcafe000au ? "LANDED" : "not landed");
+		return 0;
 	}
 
 	// 3. A GEM buffer of the render node, at a VA of the same VM.
