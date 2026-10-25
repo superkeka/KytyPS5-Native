@@ -49,7 +49,7 @@ namespace Libs::Graphics::NativeGpu {
 // more direct memory than the BC-250 can keep resident (ASTRO BOT maps ~13 GiB of its 13.5 GiB
 // budget and touches ~7 GiB), and GPU buffers cannot be swapped while submissions use them.
 //
-// The GPU side works in kBlockSize blocks of the backing. A block becomes resident when the CPU
+// The GPU side works in BlockSize() blocks of the backing. A block becomes resident when the CPU
 // has written to it, which the memfd shows as data (PromoteTouched, via SEEK_DATA), or when a
 // command buffer about to run references it (PromoteGuestRange: render targets, index buffers,
 // pointers in shader user data, as the PM4 translator reports them). Promotion creates a cached GTT
@@ -83,9 +83,19 @@ namespace Libs::Graphics::NativeGpu {
 class GemBacking {
 public:
 	// Residency granularity. Every resident block is listed in every submission (a listed buffer
-	// that is in place costs about a microsecond), so smaller blocks waste less memory but make
-	// longer lists. 16 MiB divides the 13.5 GiB backing evenly.
-	static constexpr uint64_t kBlockSize = 16ull * 1024 * 1024;
+	// costs the CS ioctl about 2 us, measured), so smaller blocks waste less memory but make longer
+	// lists. ASTRO BOT in gameplay: 16 MiB is ~600 buffers, 1.5-2 ms per CS, the GPU idle 40% of the
+	// time (38 FPS); 64 MiB is ~160 buffers, 48 FPS, 0.9 GiB more resident; 128 MiB no faster and
+	// swapping. KYTY_NATIVE_GPU_BLOCK_MIB: a power of two from 2 to 1024, default 64; 16 to 512 divide
+	// the 13.5 GiB backing evenly.
+	static uint64_t BlockSize() {
+		static const uint64_t size = [] {
+			const char*    v   = std::getenv("KYTY_NATIVE_GPU_BLOCK_MIB");
+			const uint64_t mib = v != nullptr ? std::strtoull(v, nullptr, 0) : 64;
+			return (mib >= 2 && mib <= 1024 && (mib & (mib - 1)) == 0 ? mib : 64) * 1024 * 1024;
+		}();
+		return size;
+	}
 
 	// KYTY_NATIVE_GPU_RESIDENCY=map: residency as the PS5 kernel does it. A guest mapping of direct
 	// memory with GPU access (or an mprotect that adds it) makes its blocks resident at once, the way
@@ -127,15 +137,15 @@ public:
 			return nullptr;
 		}
 		self->m_alias = static_cast<uint8_t*>(alias);
-		const auto count = (size + kBlockSize - 1) / kBlockSize;
+		const auto count = (size + BlockSize() - 1) / BlockSize();
 		self->m_blocks.resize(count);
 		for (uint64_t i = 0; i < count; i++) {
-			const uint64_t start    = i * kBlockSize;
-			self->m_blocks[i].size = (size - start < kBlockSize) ? size - start : kBlockSize;
+			const uint64_t start    = i * BlockSize();
+			self->m_blocks[i].size = (size - start < BlockSize()) ? size - start : BlockSize();
 		}
 		void* dummy_cpu = MAP_FAILED;
-		if (self->CreateBo(kBlockSize, &self->m_dummy)) {
-			dummy_cpu = ::mmap(nullptr, kBlockSize, PROT_READ | PROT_WRITE, MAP_SHARED,
+		if (self->CreateBo(BlockSize(), &self->m_dummy)) {
+			dummy_cpu = ::mmap(nullptr, BlockSize(), PROT_READ | PROT_WRITE, MAP_SHARED,
 			                   self->m_dummy.dmabuf_fd, 0);
 		}
 		if (dummy_cpu == MAP_FAILED) {
@@ -169,7 +179,7 @@ public:
 			}
 		}
 		if (m_dummy_cpu != nullptr) {
-			::munmap(m_dummy_cpu, kBlockSize);
+			::munmap(m_dummy_cpu, BlockSize());
 		}
 		CloseBo(m_dummy);
 		if (m_mem_fd >= 0) {
@@ -287,11 +297,11 @@ public:
 			if (data < 0) {
 				break;
 			}
-			const uint64_t index = static_cast<uint64_t>(data) / kBlockSize;
+			const uint64_t index = static_cast<uint64_t>(data) / BlockSize();
 			if (!m_blocks[index].resident && PromoteBlockUnlocked(index)) {
 				promoted++;
 			}
-			pos = (index + 1) * kBlockSize;
+			pos = (index + 1) * BlockSize();
 		}
 		return promoted;
 	}
@@ -316,8 +326,8 @@ public:
 				return;
 			}
 			while (len > 0) {
-				const uint64_t index = backing / kBlockSize;
-				const uint64_t inner = backing % kBlockSize;
+				const uint64_t index = backing / BlockSize();
+				const uint64_t inner = backing % BlockSize();
 				const Block&   block = m_blocks[index];
 				const uint64_t piece = std::min(len, block.size - inner);
 				if (!block.resident || block.bo.dmabuf_fd < 0) {
@@ -340,7 +350,7 @@ public:
 		std::lock_guard<std::mutex> lock(m_lock);
 		uint32_t promoted = 0;
 		ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t, uint64_t backing, uint64_t len) {
-			for (uint64_t index = backing / kBlockSize; index <= (backing + len - 1) / kBlockSize; index++) {
+			for (uint64_t index = backing / BlockSize(); index <= (backing + len - 1) / BlockSize(); index++) {
 				if (!m_blocks[index].resident && PromoteBlockUnlocked(index)) {
 					promoted++;
 				}
@@ -399,11 +409,11 @@ public:
 		std::lock_guard<std::mutex> lock(m_lock);
 		static const uint8_t kZero[65536] = {};
 		bool written = false;
-		for (uint64_t at = 0; at < kBlockSize && !written; at += sizeof(kZero)) {
+		for (uint64_t at = 0; at < BlockSize() && !written; at += sizeof(kZero)) {
 			written = std::memcmp(m_dummy_cpu + at, kZero, sizeof(kZero)) != 0;
 		}
 		if (written) {
-			std::memset(m_dummy_cpu, 0, kBlockSize);
+			std::memset(m_dummy_cpu, 0, BlockSize());
 		}
 		return written;
 	}
@@ -507,7 +517,7 @@ public:
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
-		const uint64_t              index = offset / kBlockSize;
+		const uint64_t              index = offset / BlockSize();
 		if (!m_blocks[index].resident) {
 			return false;
 		}
@@ -515,7 +525,7 @@ public:
 			*handle = m_blocks[index].bo.handle;
 		}
 		if (offset_in_block != nullptr) {
-			*offset_in_block = offset - index * kBlockSize;
+			*offset_in_block = offset - index * BlockSize();
 		}
 		return true;
 	}
@@ -622,8 +632,8 @@ private:
 		uint64_t done = 0;
 		while (done < size) {
 			const uint64_t at    = offset + done;
-			const uint64_t index = at / kBlockSize;
-			const uint64_t inner = at - index * kBlockSize;
+			const uint64_t index = at / BlockSize();
+			const uint64_t inner = at - index * BlockSize();
 			const uint64_t part  = std::min(size - done, m_blocks[index].size - inner);
 			if (!cb(index, inner, done, part)) {
 				return false;
@@ -719,7 +729,7 @@ private:
 	// Calls cb(offset in block, length) for each data extent of block `index` in the memfd.
 	template <typename Cb>
 	void ForEachDataExtent(uint64_t index, Cb&& cb) const {
-		const uint64_t start = index * kBlockSize;
+		const uint64_t start = index * BlockSize();
 		const uint64_t end   = start + m_blocks[index].size;
 		uint64_t       pos   = start;
 		while (pos < end) {
@@ -817,7 +827,7 @@ private:
 
 	bool PromoteBlockUnlocked(uint64_t index) {
 		Block&         block = m_blocks[index];
-		const uint64_t start = index * kBlockSize;
+		const uint64_t start = index * BlockSize();
 		Bo             bo;
 		if (!CreateBo(block.size, &bo)) {
 			return false;

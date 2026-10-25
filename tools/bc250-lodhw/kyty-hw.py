@@ -9,6 +9,7 @@
 #   kyty-hw.py apply all|N...        apply the helper's golden entries (its /etc/kyty/ps5-golden.conf)
 #   kyty-hw.py restore all|N...      put them back to the values they had before
 #   kyty-hw.py entries               list the helper's golden entries
+#   kyty-hw.py busy [SECONDS]        how busy the GPU really is: GRBM_STATUS sampled as fast as possible
 import os
 import socket
 import struct
@@ -98,6 +99,22 @@ def main():
                 break
             print(f"{i:3d}: 0x{reg:05x} = 0x{h.read(reg):08x}")
             i += 1
+    elif a[0] == "busy":
+        import time
+        secs = float(a[1]) if len(a) > 1 else 3.0
+        bits = {"GUI_ACTIVE": 31, "CP_BUSY": 29, "CB_BUSY": 30, "SPI_BUSY": 22, "PA_BUSY": 25, "DB_BUSY": 26,
+                "TA_BUSY": 14, "GE_BUSY": 21, "SC_BUSY": 24, "CP_COHERENCY_BUSY": 28}
+        count = {k: 0 for k in bits}
+        n = 0
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            v = h.read(GC0 + 0xda4)
+            n += 1
+            for k, b in bits.items():
+                count[k] += (v >> b) & 1
+        print(f"{n} samples in {secs:.1f} s ({n / secs:.0f}/s)")
+        for k in bits:
+            print(f"  {k:18s} {100.0 * count[k] / n:5.1f} %")
     elif a[0] in ("cp", "ps5"):
         for name, reg in CP_REGS if a[0] == "cp" else PS5_REGS:
             print(f"{name:22s} 0x{reg:05x} = 0x{h.read(reg):08x}")
