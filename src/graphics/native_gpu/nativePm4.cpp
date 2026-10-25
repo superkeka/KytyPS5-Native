@@ -871,6 +871,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	std::map<uint64_t, RenderTargetInfo> targets; // by address, for Pm4TranslateResult::render_targets
 	std::vector<uint64_t> bound_targets;          // addresses bound at the last state collection
 	std::vector<uint32_t> dirty_sh;
+	// The value each user-data register had when collect_refs last took its references, within
+	// this DCB. Titles rewrite the same user data before every draw; an unchanged value names the
+	// same buckets, and a changed neighbour takes the pair itself.
+	std::array<uint32_t, RegFile::kDense> ud_seen_value {};
+	std::array<uint64_t, RegFile::kDense / 64> ud_seen {};
 	// The bound index buffer carries over from the previous DCB, as the CP state does on PS5.
 	uint64_t index_base  = m_cp.index_base & 0xffffffffffffull; // from INDEX_BASE, for draws that use the bound buffer
 	uint64_t index_bytes = m_cp.index_size != 0xffffffffu ? static_cast<uint64_t>(m_cp.index_size) * 4u
@@ -1177,6 +1182,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				continue; // shader programs come through shader_addrs, the rest is configuration
 			}
 			const uint32_t value = reg(sh, off);
+			if (off < RegFile::kDense) {
+				const uint64_t bit = 1ull << (off % 64);
+				if ((ud_seen[off / 64] & bit) != 0 && ud_seen_value[off] == value) {
+					continue;
+				}
+				ud_seen[off / 64] |= bit;
+				ud_seen_value[off] = value;
+			}
 			add_ref(static_cast<uint64_t>(value) << 8u, m_guess_span, false);
 			if (IsUserDataRegister(off + 1) && sh.count(off + 1) != 0) {
 				add_pair(value, reg(sh, off + 1));
