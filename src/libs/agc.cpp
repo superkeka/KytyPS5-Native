@@ -3900,6 +3900,18 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	     "\t poll_cycles      = %" PRIu32 "\n",
 	     size, compare_function, op, cache_policy, reinterpret_cast<uint64_t>(address), reference,
 	     mask, poll_cycles);
+	// KYTY_AGC_TRACE_WAITS=1: the first 64 GPU waits the title builds, with the guest caller.
+	static const bool trace_waits = std::getenv("KYTY_AGC_TRACE_WAITS") != nullptr;
+	static std::atomic<uint32_t> traced_waits {0};
+	if (trace_waits && traced_waits.fetch_add(1) < 64) {
+		std::fprintf(stderr,
+		             "agc wait: size %u func %u addr 0x%016" PRIx64 " ref 0x%" PRIx64 " mask 0x%" PRIx64
+		             " now 0x%" PRIx64 " caller %p\n",
+		             size, compare_function, reinterpret_cast<uint64_t>(address), reference, mask,
+		             size == 1 ? *reinterpret_cast<const volatile uint64_t*>(address)
+		                       : *reinterpret_cast<const volatile uint32_t*>(address),
+		             __builtin_return_address(0));
+	}
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	if (size != 0 && size != 1) {

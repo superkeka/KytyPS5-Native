@@ -1407,6 +1407,27 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		const uint32_t body_count  = size - 1u;
 		const uint32_t* const bptr = dcb.data() + dw + 1;
 		stats.packets++;
+		// KYTY_NATIVE_GPU_WATCH_ADDR=0xADDR: log every packet whose body holds that 64-bit address
+		// (any 8-aligned split into a low and a high dword), to find who writes or waits on a label.
+		static const uint64_t watch_addr = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_WATCH_ADDR");
+			return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+		}();
+		if (watch_addr != 0) {
+			static std::atomic<uint32_t> watch_logged {0};
+			for (uint32_t k = 0; k + 1 < body_count; k++) {
+				if ((bptr[k] & ~7u) == static_cast<uint32_t>(watch_addr & ~7ull) && (bptr[k + 1] & 0xffffu) == (watch_addr >> 32u) &&
+				    watch_logged.fetch_add(1) < 64) {
+					std::fprintf(stderr, "watch addr: %s queue packet op 0x%02x marker 0x%02x len %u at dw %u:", m_compute_queue ? "compute" : "gfx",
+					             op, (header >> 2u) & 0x3fu, size, dw);
+					for (uint32_t i = 0; i < std::min(body_count, 10u); i++) {
+						std::fprintf(stderr, " %08x", bptr[i]);
+					}
+					std::fprintf(stderr, "\n");
+					break;
+				}
+			}
+		}
 
 		if (m_skip_ops.count(op) != 0) {
 			stats.packets_skipped++;

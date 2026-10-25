@@ -2186,6 +2186,8 @@ private:
 		double                enqueued = 0.0;
 		double                picked   = 0.0;
 	};
+	std::map<uint32_t, double> m_hold_since; // queue -> when its front piece was first found held
+	uint32_t                   m_stale_logged = 0;
 	struct Piece {
 		std::vector<uint32_t> ib;  // empty: no GPU work (refused buffers, Kyty's own submissions)
 		Pm4Segment            seg; // offsets relative to `ib`
@@ -2352,6 +2354,27 @@ private:
 		return Release::No;
 	}
 
+	// A piece held for more than 2 s: what it waits for and what memory holds (the first 16).
+	void NoteStaleHold(uint32_t queue, const Piece& p) {
+		const double now   = NowSecShadow();
+		auto [it, fresh]   = m_hold_since.try_emplace(queue, now);
+		if (fresh || now - it->second < 2.0 || m_stale_logged >= 16 || it->second < 0) {
+			return;
+		}
+		const double held = now - it->second;
+		it->second        = -1.0; // logged for this hold
+		m_stale_logged++;
+		const WaitCond&  w  = p.seg.wait;
+		const RingWrite* rw = PendingRingWrite(w.addr);
+		std::fprintf(stderr,
+		             "native labels: queue 0x%x held %.1f s on WAIT_REG_MEM%s 0x%llx (mask 0x%llx func %u ref 0x%llx), memory 0x%llx, "
+		             "pending ring write %s, %zu pieces queued behind\n",
+		             queue, held, w.wide ? "_64" : "", static_cast<unsigned long long>(w.addr),
+		             static_cast<unsigned long long>(w.mask), w.function, static_cast<unsigned long long>(w.ref),
+		             static_cast<unsigned long long>(ReadLabel(w)), rw != nullptr ? (rw->submitted ? "submitted" : "not submitted") : "none",
+		             m_pending[queue].size());
+	}
+
 	// Emits what is ready, queue by queue, until nothing more is.
 	void Pump() {
 		for (bool progress = true; progress;) {
@@ -2360,8 +2383,10 @@ private:
 				while (!pieces.empty()) {
 					const Release how = Ready(queue, pieces.front());
 					if (how == Release::No) {
+						NoteStaleHold(queue, pieces.front());
 						break;
 					}
+					m_hold_since.erase(queue);
 					Emit(queue, pieces.front(), how);
 					pieces.pop_front();
 					progress = true;
