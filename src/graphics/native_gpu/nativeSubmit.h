@@ -33,8 +33,8 @@ public:
 	// the extended-memory aperture is at 0x80000000000; the device's low VA range reaches
 	// 0x800000000000, so this sits clear of both).
 	static constexpr uint64_t kIbVa      = 0x400000000000ull;
-	static constexpr uint64_t kIbSize    = 8ull * 1024 * 1024; // 4 slots of ~2 MiB in async mode
-	static constexpr uint32_t kSlots     = 4;
+	static constexpr uint64_t kIbSize    = 32ull * 1024 * 1024; // 16 slots of ~2 MiB in async mode
+	static constexpr uint32_t kSlots     = 16;
 	// The last bytes of the IB buffer are a scratch area the IB itself may write into (pipeline
 	// statistics samples); IBs must stay below it.
 	static constexpr uint64_t kScratchSize = 4096;
@@ -156,7 +156,7 @@ public:
 	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
 	              double timeout_sec, RingTarget target = {}) {
 		Result res;
-		const uint32_t slot = m_async ? m_next_slot : 0;
+		const uint32_t slot = m_async ? PickSlot(target) : 0;
 		if (ib.size() * 4 > (m_async ? kSlotSize : kIbSize - kScratchSize)) {
 			res.err = -E2BIG;
 			return res;
@@ -246,7 +246,7 @@ public:
 		if (m_async) {
 			m_slot[slot].seq    = seq;
 			m_slot[slot].target = target;
-			m_next_slot         = (slot + 1) % kSlots;
+			m_slot[slot].order  = ++m_slot_order;
 			res.completed    = true;
 			res.seq          = seq;
 			res.seconds      = NowSec() - t0;
@@ -455,11 +455,40 @@ private:
 	void*    m_ib_cpu    = nullptr;
 	uint64_t m_ib_va     = 0;
 	struct SlotUse {
-		uint64_t   seq = 0;
+		uint64_t   seq   = 0;
+		uint64_t   order = 0; // when it was last submitted
 		RingTarget target;
 	};
+
+	// A free slot, or one whose submission has finished; failing that the oldest slot of `target`'s
+	// own ring, so a compute ring parked on a WAIT_REG_MEM never holds up the submission that would
+	// release it (with shared round-robin slots, that is a deadlock). Only then the oldest overall.
+	uint32_t PickSlot(RingTarget target) {
+		for (uint32_t i = 0; i < kSlots; i++) {
+			if (m_slot[i].seq == 0) {
+				return i;
+			}
+		}
+		for (uint32_t i = 0; i < kSlots; i++) {
+			if (WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target)) {
+				m_slot[i].seq = 0;
+				return i;
+			}
+		}
+		uint32_t own = kSlots, any = 0;
+		for (uint32_t i = 0; i < kSlots; i++) {
+			const bool same = m_slot[i].target.ip_type == target.ip_type && m_slot[i].target.ring == target.ring;
+			if (same && (own == kSlots || m_slot[i].order < m_slot[own].order)) {
+				own = i;
+			}
+			if (m_slot[i].order < m_slot[any].order) {
+				any = i;
+			}
+		}
+		return own != kSlots ? own : any;
+	}
 	bool     m_async     = false;
-	uint32_t m_next_slot = 0;
+	uint64_t m_slot_order = 0;
 	SlotUse  m_slot[kSlots];
 	uint32_t m_compute_rings = 0; // bitmask from AMDGPU_INFO_HW_IP_INFO
 	std::vector<uint32_t> m_gds_handles; // GDS, GWS and OA buffers listed in every submission
