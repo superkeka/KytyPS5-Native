@@ -3,6 +3,7 @@
 #include <SDL3/SDL.h>
 #include <chrono>
 #include <cstdlib>
+#include <set>
 #include <vector>
 #include "common/assert.h"
 #include "common/common.h"
@@ -1127,8 +1128,31 @@ void CycleKeyboardPlayer() {
 	}
 }
 
+// Pads that have sent a button press. A pad that never does (Steam Input's virtual pad while Kyty is
+// not a Steam game, a second pad left on the table) must not keep player 1: the first pad whose button
+// goes down while player 1's pad has stayed silent takes player 1 over. Caller holds g_router_mutex.
+static std::set<int> g_pads_heard;
+
+static void ClaimPlayerOneIfSilent(int id) {
+	if (id == HOST_INPUT_CONTROLLER_ID || !g_pads_heard.insert(id).second) {
+		return;
+	}
+	auto self  = std::find_if(g_pad_players.begin(), g_pad_players.end(), [id](const auto& p) { return p.first == id; });
+	auto first = std::find_if(g_pad_players.begin(), g_pad_players.end(), [](const auto& p) { return p.second == 0; });
+	if (self == g_pad_players.end() || self->second == 0 || first == g_pad_players.end() ||
+	    g_pads_heard.count(first->first) != 0) {
+		return;
+	}
+	std::swap(self->second, first->second);
+	LOGF("Controller %d takes player 1 over from silent controller %d\n", id, first->first);
+	RefreshPlayers();
+}
+
 void SetButton(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(g_router_mutex);
+	if (down) {
+		ClaimPlayerOneIfSilent(id);
+	}
 	if (auto* player = PlayerForDevice(id)) {
 		player->Button(id, button, down);
 	}
