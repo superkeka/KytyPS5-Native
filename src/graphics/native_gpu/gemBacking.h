@@ -33,10 +33,12 @@
 #include <linux/falloc.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <drm/amdgpu_drm.h>
 #include <drm/drm.h>
+#include <linux/kfd_ioctl.h>
 
 namespace Libs::Graphics::NativeGpu {
 
@@ -137,6 +139,7 @@ public:
 			return nullptr;
 		}
 		self->m_alias = static_cast<uint8_t*>(alias);
+		self->InitKfd();
 		const auto count = (size + BlockSize() - 1) / BlockSize();
 		self->m_blocks.resize(count);
 		for (uint64_t i = 0; i < count; i++) {
@@ -182,6 +185,9 @@ public:
 			::munmap(m_dummy_cpu, BlockSize());
 		}
 		CloseBo(m_dummy);
+		if (m_kfd_fd >= 0) {
+			::close(m_kfd_fd);
+		}
 		if (m_mem_fd >= 0) {
 			::close(m_mem_fd);
 		}
@@ -512,6 +518,10 @@ public:
 
 	// The DRM file whose GPU VM holds the bindings; command submission must use the same file.
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
+	// KYTY_NATIVE_GPU_KFD_MEMORY: blocks are KFD buffers in this VM, so KFD user-mode queues see guest
+	// memory too. -1 / 0 when off.
+	[[nodiscard]] int      KfdFd() const { return m_kfd_fd; }
+	[[nodiscard]] uint32_t KfdGpuId() const { return m_kfd_gpu; }
 
 	// Every GEM buffer a submission must list as resident: the resident blocks, the dummy and the
 	// external ranges. Grows as blocks are promoted.
@@ -553,8 +563,9 @@ public:
 
 private:
 	struct Bo {
-		uint32_t handle    = 0;
-		int      dmabuf_fd = -1;
+		uint32_t handle     = 0;  // in m_drm_fd
+		int      dmabuf_fd  = -1;
+		uint64_t kfd_handle = 0;  // the KFD allocation behind `handle` (KFD memory), 0 otherwise
 	};
 	struct Block {
 		Bo       bo;
@@ -609,8 +620,114 @@ private:
 		Ioctl(DRM_IOCTL_GEM_CLOSE, &c);
 	}
 
+	// KYTY_NATIVE_GPU_KFD_MEMORY=1: the KFD process of this VM (AMDKFD_IOC_ACQUIRE_VM on m_drm_fd), for
+	// KFD buffers. KFD keeps its buffers resident without being listed, which is what lets a KFD
+	// user-mode queue (no CS ioctl) reach guest memory; a render-node CS still lists them (an eviction
+	// does not wait for a job that did not).
+	void InitKfd() {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_MEMORY");
+		if (v == nullptr || v[0] != '1') {
+			return;
+		}
+		struct stat st {};
+		const int   minor = ::fstat(m_drm_fd, &st) == 0 ? static_cast<int>(st.st_rdev & 0xff) : -1;
+		for (int n = 0; n < 16 && m_kfd_gpu == 0; n++) {
+			char path[128];
+			std::snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/properties", n);
+			FILE* f = std::fopen(path, "re");
+			if (f == nullptr) {
+				continue;
+			}
+			char line[128];
+			int  render_minor = -1;
+			while (std::fgets(line, sizeof(line), f) != nullptr) {
+				std::sscanf(line, "drm_render_minor %d", &render_minor);
+			}
+			std::fclose(f);
+			if (render_minor >= 128 && (render_minor & 0xff) == (minor & 0xff)) {
+				std::snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/gpu_id", n);
+				if (FILE* g = std::fopen(path, "re"); g != nullptr) {
+					unsigned id = 0;
+					if (std::fscanf(g, "%u", &id) == 1) {
+						m_kfd_gpu = id;
+					}
+					std::fclose(g);
+				}
+			}
+		}
+		m_kfd_fd = ::open("/dev/kfd", O_RDWR | O_CLOEXEC);
+		struct kfd_ioctl_acquire_vm_args acq {};
+		acq.drm_fd = static_cast<uint32_t>(m_drm_fd);
+		acq.gpu_id = m_kfd_gpu;
+		if (m_kfd_fd < 0 || m_kfd_gpu == 0 || ::ioctl(m_kfd_fd, AMDKFD_IOC_ACQUIRE_VM, &acq) != 0) {
+			std::fprintf(stderr, "GemBacking: KFD memory unavailable (gpu id %u): %s; using render-node buffers\n", m_kfd_gpu,
+			             std::strerror(errno));
+			if (m_kfd_fd >= 0) {
+				::close(m_kfd_fd);
+			}
+			m_kfd_fd  = -1;
+			m_kfd_gpu = 0;
+			return;
+		}
+		std::fprintf(stderr, "GemBacking: blocks are KFD buffers (gpu id %u)\n", m_kfd_gpu);
+	}
+
+	int KfdIoctl(unsigned long request, void* arg) const {
+		int r = -1;
+		do {
+			r = ::ioctl(m_kfd_fd, request, arg);
+		} while (r == -1 && (errno == EINTR || errno == EAGAIN));
+		return r == -1 ? -errno : 0;
+	}
+
+	// A KFD GTT buffer at a private VA of its own (KFD maps every allocation somewhere), exported as a
+	// dma-buf and imported into m_drm_fd, so it is used exactly like a render-node buffer.
+	bool CreateKfdBo(uint64_t size, Bo* out) const {
+		struct kfd_ioctl_alloc_memory_of_gpu_args a {};
+		a.va_addr = m_kfd_va_next;
+		a.size    = size;
+		a.gpu_id  = m_kfd_gpu;
+		a.flags   = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
+		          KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+		int r = KfdIoctl(AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &a);
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: KFD allocation of %llu MiB failed: %s\n",
+			             static_cast<unsigned long long>(size >> 20), std::strerror(-r));
+			return false;
+		}
+		m_kfd_va_next += (size + (2ull << 20) - 1) & ~((2ull << 20) - 1);
+		Bo bo;
+		bo.kfd_handle = a.handle;
+		struct kfd_ioctl_map_memory_to_gpu_args mp {};
+		mp.handle               = a.handle;
+		mp.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
+		mp.n_devices            = 1;
+		struct kfd_ioctl_export_dmabuf_args ex {};
+		ex.handle = a.handle;
+		ex.flags  = O_RDWR | O_CLOEXEC;
+		struct drm_prime_handle ph {};
+		if ((r = KfdIoctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, &mp)) != 0 || (r = KfdIoctl(AMDKFD_IOC_EXPORT_DMABUF, &ex)) != 0) {
+			std::fprintf(stderr, "GemBacking: KFD map/export failed: %s\n", std::strerror(-r));
+			CloseBo(bo);
+			return false;
+		}
+		bo.dmabuf_fd = static_cast<int>(ex.dmabuf_fd);
+		ph.fd        = bo.dmabuf_fd;
+		if ((r = Ioctl(DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph)) != 0) {
+			std::fprintf(stderr, "GemBacking: KFD buffer import failed: %s\n", std::strerror(-r));
+			CloseBo(bo);
+			return false;
+		}
+		bo.handle = ph.handle;
+		*out      = bo;
+		return true;
+	}
+
 	// A cached GTT buffer (TTM zeroes it) exported as a dma-buf for CPU mappings.
 	bool CreateBo(uint64_t size, Bo* out) const {
+		if (m_kfd_fd >= 0) {
+			return CreateKfdBo(size, out);
+		}
 		union drm_amdgpu_gem_create c;
 		std::memset(&c, 0, sizeof(c));
 		c.in.bo_size   = size;
@@ -643,6 +760,16 @@ private:
 		}
 		if (bo.handle != 0) {
 			GemClose(bo.handle);
+		}
+		if (bo.kfd_handle != 0) {
+			struct kfd_ioctl_unmap_memory_from_gpu_args um {};
+			um.handle               = bo.kfd_handle;
+			um.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
+			um.n_devices            = 1;
+			KfdIoctl(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &um);
+			struct kfd_ioctl_free_memory_of_gpu_args fr {};
+			fr.handle = bo.kfd_handle;
+			KfdIoctl(AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fr);
 		}
 		bo = Bo {};
 	}
@@ -1029,6 +1156,9 @@ private:
 
 	int                           m_drm_fd = -1;
 	int                           m_mem_fd = -1;
+	int                           m_kfd_fd  = -1; // KYTY_NATIVE_GPU_KFD_MEMORY: see InitKfd
+	uint32_t                      m_kfd_gpu = 0;
+	mutable uint64_t              m_kfd_va_next = 0x600000000000ull; // private VAs of the KFD allocations
 	uint8_t*                      m_alias  = nullptr;
 	uint64_t                      m_size   = 0;
 	uint64_t                      m_resident_bytes = 0;
