@@ -1144,6 +1144,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 	auto collect_refs = [&]() {
+		// VGT_SHADER_STAGES_EN.HS_EN: the title tessellates. On PS5 the kernel places the tess factor ring;
+		// here the ring is whatever the last amdgpu client programmed (see the journal).
+		if (static std::atomic<bool> tess_logged {false};
+		    !m_compute_ring && (reg(cx, 0x2d5u) & 0x4u) != 0 && !tess_logged.exchange(true)) {
+			std::fprintf(stderr, "native shadow: the title draws with tessellation (VGT_SHADER_STAGES_EN 0x%08x)\n",
+			             reg(cx, 0x2d5u));
+		}
 		if (m_lod_scan) {
 			scan_lod_banks();
 		}
