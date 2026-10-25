@@ -573,10 +573,11 @@ void Pm4Translator::ResetShadow() {
 	m_cx.clear();
 	m_sh.clear();
 	m_uc.clear();
+	m_cp = {};
 }
 
 void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx,
-                                 const RegFile& sh, const RegFile& uc) const {
+                                 const RegFile& sh, const RegFile& uc, const Pm4CpDrawState& cp) const {
 	if (m_compute_ring) {
 		// MEC has no graphics context. CONTEXT_CONTROL, CLEAR_STATE, context and UCONFIG writes are
 		// illegal opcodes on a compute ring. SH state is replayed: other jobs share the ring.
@@ -608,6 +609,35 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 		ib.push_back(0x38u | (1u << 8u));
 		ib.push_back(0x07fffc00u);
 		ib.push_back(0u);
+	}
+	// CP draw state as the title left it (libSceAgc's start values before its first DCB). Other
+	// processes draw on this ring between our submissions and leave theirs behind.
+	// KYTY_NATIVE_GPU_CP_STATE: mask of what is replayed, 1 index type, 2 NUM_INSTANCES, 4 INDEX_BASE and
+	// INDEX_BUFFER_SIZE, 8 SET_BASE (0 leaves it to the title). 4 is off by default: with it Dead Cells
+	// hangs the gfx ring at its level load every time; why is still open.
+	static const uint32_t cp_state = [] {
+		const char* e = std::getenv("KYTY_NATIVE_GPU_CP_STATE");
+		return e == nullptr ? 0xbu : static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+	}();
+	if ((cp_state & 1u) != 0 && uc.count(0x243) == 0) {
+		EmitSetUconfig(ib, 0x243, 0x480u); // VGT_INDEX_TYPE: 16-bit, cache policy 2
+	}
+	if ((cp_state & 2u) != 0) {
+		ib.push_back(Pkt3(IT_NUM_INSTANCES, 1, false));
+		ib.push_back(cp.num_instances);
+	}
+	if ((cp_state & 4u) != 0) {
+		ib.push_back(Pkt3(IT_INDEX_BASE, 2, false));
+		ib.push_back(static_cast<uint32_t>(cp.index_base));
+		ib.push_back(static_cast<uint32_t>(cp.index_base >> 32u));
+		ib.push_back(Pkt3(IT_INDEX_BUFFER_SIZE, 1, false));
+		ib.push_back(cp.index_size);
+	}
+	if ((cp_state & 8u) != 0) {
+		ib.push_back(Pkt3(IT_SET_BASE, 3, false));
+		ib.push_back(1u);
+		ib.push_back(static_cast<uint32_t>(cp.draw_base));
+		ib.push_back(static_cast<uint32_t>(cp.draw_base >> 32u));
 	}
 
 	for (const auto& [offset, value]: cx) {
@@ -781,6 +811,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	bool cx_pushed = m_cx_pushed;
 	auto sh = m_sh;
 	auto uc = m_uc;
+	auto cp = m_cp;
 
 	std::vector<uint64_t> shaders;
 
@@ -813,8 +844,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	std::map<uint64_t, RenderTargetInfo> targets; // by address, for Pm4TranslateResult::render_targets
 	std::vector<uint64_t> bound_targets;          // addresses bound at the last state collection
 	std::vector<uint32_t> dirty_sh;
-	uint64_t              index_base  = 0; // from INDEX_BASE, for draws that use the bound buffer
-	uint64_t              index_bytes = 0; // from INDEX_BUFFER_SIZE (indices, at most 4 bytes each)
+	// The bound index buffer carries over from the previous DCB, as the CP state does on PS5.
+	uint64_t index_base  = m_cp.index_base & 0xffffffffffffull; // from INDEX_BASE, for draws that use the bound buffer
+	uint64_t index_bytes = m_cp.index_size != 0xffffffffu ? static_cast<uint64_t>(m_cp.index_size) * 4u
+	                                                      : 0; // from INDEX_BUFFER_SIZE (indices, at most 4 bytes each)
 	bool                  all_sh_dirty = true;
 	bool                  rt_dirty     = true;
 	auto mark_cx = [&](uint32_t off) {
@@ -1420,7 +1453,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		seg_body.push_back(static_cast<uint32_t>(body.size()));
 		seg_pre.emplace_back();
 		seg_keep.push_back(true);
-		EmitPreamble(seg_pre.back(), stats, cx, sh, uc);
+		EmitPreamble(seg_pre.back(), stats, cx, sh, uc, cp);
 		auto& s = segs.back();
 		s.held  = true;
 		s.wait  = w;
@@ -2070,12 +2103,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
+				cp.index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1]) << 32u);
 				add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
 				stats.index_state++;
 				break;
 			case IT_INDEX_BUFFER_SIZE:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				index_bytes = static_cast<uint64_t>(bptr[0]) * 4u;
+				if (body_count >= 1) {
+					cp.index_size = bptr[0];
+				}
 				add_ref(index_base, index_bytes, false);
 				stats.index_state++;
 				break;
@@ -2172,6 +2209,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u),
 				        kMetadataSpan, false);
 				log_set_base = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u);
+				if (!m_compute_ring && (bptr[0] & 0xfu) == 1u) {
+					cp.draw_base = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+				}
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
@@ -2221,6 +2261,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_NUM_INSTANCES: // instance count for the following draws
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				log_instances = body_count >= 1 ? bptr[0] : 1u;
+				cp.num_instances = log_instances;
 				stats.num_instances++;
 				break;
 			case IT_DISPATCH_DIRECT:
@@ -2346,6 +2387,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_cx_pushed = cx_pushed;
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
+	// The IB starts where the previous DCB left the CP, not where this one leaves it.
+	const Pm4CpDrawState cp_start = m_cp;
+	m_cp                          = cp;
 
 	if (labels) {
 		close_segment(true);
@@ -2359,7 +2403,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			Pm4Segment& s = segs[k];
 			s.begin       = static_cast<uint32_t>(r.ib.size());
 			if (k == 0) {
-				EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc);
+				EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
 			} else {
 				r.ib.insert(r.ib.end(), seg_pre[k].begin(), seg_pre[k].end());
 			}
@@ -2382,7 +2426,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	} else {
 		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
-		EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc);
+		EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
 		r.ib.insert(r.ib.end(), body.begin(), body.end());
 
 		// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.

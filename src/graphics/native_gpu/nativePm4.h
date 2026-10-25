@@ -481,6 +481,16 @@ struct Pm4TranslateResult {
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
 // sets so each IB can restore the full state in a preamble (the gfx ring is shared between
 // submissions, so nothing on the hardware is assumed to survive from the previous DCB).
+// Command processor draw state outside the register file. It lives on until a packet changes it, so on
+// PS5 it carries from one DCB of the title to the next; the values are what libSceAgc's context start
+// buffer sets once.
+struct Pm4CpDrawState {
+	uint32_t num_instances = 1;           // NUM_INSTANCES
+	uint64_t index_base    = 0;           // INDEX_BASE
+	uint32_t index_size    = 0xffffffffu; // INDEX_BUFFER_SIZE
+	uint64_t draw_base     = 0;           // SET_BASE, BASE_INDEX 1 (indirect draw/dispatch arguments)
+};
+
 class Pm4Translator {
 public:
 	Pm4Translator()  = default;
@@ -631,7 +641,7 @@ public:
 
 private:
 	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
-	                      const RegFile& uc) const;
+	                      const RegFile& uc, const Pm4CpDrawState& cp) const;
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
 
 	RegFile                      m_cx; // context registers (SET_CONTEXT_REG space)
@@ -640,6 +650,7 @@ private:
 	bool                         m_cx_pushed = false;
 	RegFile                      m_sh; // SH registers (SET_SH_REG space)
 	RegFile                      m_uc; // whitelisted UCONFIG registers
+	Pm4CpDrawState               m_cp; // CP draw state where the next DCB starts
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 	bool                         m_no_dcc     = false;
