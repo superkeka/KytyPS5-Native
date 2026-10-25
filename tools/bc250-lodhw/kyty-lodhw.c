@@ -4,8 +4,13 @@
 // counts texture samples per counter bank for every T# with MIP_STATS_CNT_EN and, when CNTL3's
 // REPORT_AND_RESET is set, writes a 0x40-byte header plus one 8-byte record per bank to a GPU VA in a
 // given VMID and resets the counters. The registers are privileged MMIO, so Kyty asks this helper to
-// do it at each GET_LOD_STATS packet. Only those four registers (and reads of the VMID and status)
-// are touched, through debugfs amdgpu_regs, which keeps GFX powered for the access.
+// do it at each GET_LOD_STATS packet. Registers are accessed through debugfs amdgpu_regs, which keeps
+// GFX powered for the access. Besides the reporter it reads any register (op 4, for probing what the
+// PS5 kernel programs) and writes the few registers kWritable lists (op 5): what the PS5 kernel sets
+// differently from Linux. A golden table in /etc/kyty/ps5-golden.conf (lines "dword mask value name",
+// kept out of the repository) can be applied entry by entry and restored (ops 7-9); its registers
+// are writable through op 5 too. Nothing persists past a reboot. Several clients can be connected at
+// once; register access is serialized.
 //
 // Protocol on the unix socket (default /run/kyty-lodhw.sock): the client sends 16 bytes
 // {uint32 op, uint32 size, uint64 va}; the reply is 8 bytes {int32 status, uint32 value}.
@@ -14,12 +19,20 @@
 //   op 3 | pasid << 8: the same in whichever VMID the kernel last mapped to `pasid` on the gfx hub
 //      (IH_VMID_n_LUT, written at every VMID assignment); value = that VMID. The client's PASID is the
 //      "pasid:" line of its DRM fd's /proc fdinfo. No VMID has to be reserved.
-// Build: cc -O2 -o kyty-lodhw kyty-lodhw.c. Run as root: kyty-lodhw [socket path] [socket group gid]
+//   op 4: read register `size` (absolute dword offset); value = its contents.
+//   op 5: write the low 32 bits of `va` to register `size`, if kWritable lists it; value = read back.
+//   op 6: jump table entry `va` of engine `size` (0 PFP, 1 ME, 2 CE) through CP_*_UCODE_ADDR/DATA.
+//   op 7: apply golden entry `size` ((reg & ~mask) | (value & mask)), all with 0xffffffff; value = the
+//      register afterwards (one entry) or how many entries changed (all). The old value is kept.
+//   op 8: restore golden entry `size` (all with 0xffffffff) to the value it had before op 7.
+//   op 9: golden entry `size`: status -ENOENT past the end; value = its register; `va` unused.
+// Build: cc -O2 -pthread -o kyty-lodhw kyty-lodhw.c. Run as root: kyty-lodhw [socket path] [socket group gid]
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +55,80 @@ enum {
 	kCachePol   = 1u << 28,
 	kEnable     = 1u << 29, // always set by the PS5 kernel
 	kMaxReport  = 0x4000,
+	kMmioDwords = 0x20000, // register MMIO aperture: 512 KiB
 };
+
+// GC registers the PS5 kernel programs differently from Linux (ps5-kernel-gc-findings, section 6).
+// Absolute dword offsets: GC segment 0 is 0x1260.
+static const struct {
+	uint32_t    reg;
+	const char* name;
+} kWritable[] = {
+    {0x1260 + 0x13ac, "DB_DEBUG"},       {0x1260 + 0x13af, "DB_DEBUG4"},   {0x1260 + 0x1423, "CB_HW_CONTROL_3"},
+    {0x1260 + 0x1422, "CB_HW_CONTROL_4"}, {0x1260 + 0x12e2, "TA_CNTL_AUX"}, {0x1260 + 0x1588, "UTCL1_CTRL"},
+};
+
+// CP jump table access (GC segment 1 is 0xA000): {address register, data register} per engine.
+static const uint32_t kJt[3][2] = {{0xA000 + 0x5814, 0xA000 + 0x5815}, {0xA000 + 0x5816, 0xA000 + 0x5817},
+                                   {0xA000 + 0x5818, 0xA000 + 0x5819}};
+
+static pthread_mutex_t g_hw = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t Rd(uint32_t reg);
+static int      Wr(uint32_t reg, uint32_t v);
+
+#define kGoldenPath "/etc/kyty/ps5-golden.conf"
+static struct Golden {
+	uint32_t reg, mask, value, saved;
+	int      applied;
+	char     name[40];
+} g_golden[128];
+static uint32_t g_golden_count;
+
+// Entries whose register reads all ones (blocked for the host while PSP owns it) are skipped.
+static void LoadGolden(void) {
+	FILE* f = fopen(kGoldenPath, "re");
+	if (f == NULL) {
+		return;
+	}
+	char line[256];
+	while (fgets(line, sizeof(line), f) != NULL && g_golden_count < sizeof(g_golden) / sizeof(g_golden[0])) {
+		struct Golden e;
+		memset(&e, 0, sizeof(e));
+		if (line[0] == '#' || sscanf(line, "%x %x %x %39s", &e.reg, &e.mask, &e.value, e.name) < 3) {
+			continue;
+		}
+		if (e.reg >= kMmioDwords || Rd(e.reg) == 0xffffffffu) {
+			fprintf(stderr, "kyty-lodhw: golden %s 0x%05x not accessible, skipped\n", e.name, e.reg);
+			continue;
+		}
+		g_golden[g_golden_count++] = e;
+	}
+	fclose(f);
+	fprintf(stderr, "kyty-lodhw: %u golden entries from %s\n", g_golden_count, kGoldenPath);
+}
+
+static uint32_t ApplyGolden(struct Golden* e) {
+	const uint32_t cur  = Rd(e->reg);
+	const uint32_t want = (cur & ~e->mask) | (e->value & e->mask);
+	if (!e->applied) {
+		e->saved   = cur;
+		e->applied = 1;
+	}
+	if (want != cur) {
+		Wr(e->reg, want);
+		fprintf(stderr, "kyty-lodhw: golden %s 0x%08x -> 0x%08x\n", e->name, cur, want);
+	}
+	return Rd(e->reg);
+}
+
+static void RestoreGolden(struct Golden* e) {
+	if (e->applied) {
+		Wr(e->reg, e->saved);
+		e->applied = 0;
+		fprintf(stderr, "kyty-lodhw: golden %s restored to 0x%08x\n", e->name, e->saved);
+	}
+}
 
 static int g_regs = -1;
 
@@ -98,6 +184,134 @@ static int Report(uint64_t va, uint32_t size, uint32_t vmid) {
 	return Idle(0.01);
 }
 
+static const char* WritableName(uint32_t reg) {
+	for (size_t i = 0; i < sizeof(kWritable) / sizeof(kWritable[0]); i++) {
+		if (kWritable[i].reg == reg) {
+			return kWritable[i].name;
+		}
+	}
+	for (uint32_t i = 0; i < g_golden_count; i++) {
+		if (g_golden[i].reg == reg) {
+			return g_golden[i].name;
+		}
+	}
+	return NULL;
+}
+
+// One connected client. Only a client that issued reports leaves the reporter to be reset.
+static void* Client(void* arg) {
+	const int     c       = (int)(intptr_t)arg;
+	unsigned long reports = 0, failures = 0;
+	for (;;) {
+		struct {
+			uint32_t op, size;
+			uint64_t va;
+		} q;
+		if (recv(c, &q, sizeof(q), 0) != (ssize_t)sizeof(q)) {
+			break;
+		}
+		struct {
+			int32_t  status;
+			uint32_t value;
+		} rep = {0, 0};
+		pthread_mutex_lock(&g_hw);
+		if (q.op == 1) {
+			rep.value = Rd(kSpmMcCntl) & 0xfu;
+		} else if (q.op == 2) {
+			rep.status = Report(q.va, q.size, Rd(kSpmMcCntl) & 0xfu);
+			if (rep.status == 0) {
+				reports++;
+			} else if (failures++ < 8) {
+				fprintf(stderr, "kyty-lodhw: report of 0x%x bytes at 0x%llx failed: %s\n", q.size,
+				        (unsigned long long)q.va, strerror(-rep.status));
+			}
+		} else if ((q.op & 0xffu) == 3) {
+			const uint32_t pasid = q.op >> 8;
+			uint32_t       vmid  = 0;
+			for (uint32_t v = 1; v < 15 && pasid != 0; v++) {
+				if (Rd(kIhVmidLut + v) == pasid) {
+					vmid = v;
+					break;
+				}
+			}
+			rep.value  = vmid;
+			rep.status = vmid == 0 ? -ESRCH : Report(q.va, q.size, vmid);
+			// The VMID could have gone to another VM meanwhile; the report then landed there.
+			if (rep.status == 0 && Rd(kIhVmidLut + vmid) != pasid) {
+				rep.status = -EAGAIN;
+			}
+			if (rep.status == 0) {
+				reports++;
+			} else if (failures++ < 8) {
+				fprintf(stderr, "kyty-lodhw: report for pasid %u (VMID %u) at 0x%llx failed: %s\n", pasid, vmid,
+				        (unsigned long long)q.va, strerror(-rep.status));
+			}
+		} else if (q.op == 4) {
+			rep.status = q.size < kMmioDwords ? 0 : -EINVAL;
+			rep.value  = rep.status == 0 ? Rd(q.size) : 0;
+		} else if (q.op == 5) {
+			const char* name = WritableName(q.size);
+			if (name == NULL) {
+				rep.status = -EPERM;
+			} else {
+				const uint32_t old = Rd(q.size);
+				rep.status         = Wr(q.size, (uint32_t)q.va);
+				rep.value          = Rd(q.size);
+				fprintf(stderr, "kyty-lodhw: %s 0x%08x -> 0x%08x (reads 0x%08x)\n", name, old, (uint32_t)q.va, rep.value);
+			}
+		} else if (q.op == 6) {
+			if (q.size > 2 || q.va >= 0x100) {
+				rep.status = -EINVAL;
+			} else {
+				rep.status = Wr(kJt[q.size][0], (uint32_t)q.va);
+				rep.value  = rep.status == 0 ? Rd(kJt[q.size][1]) : 0;
+			}
+		} else if (q.op == 7 || q.op == 8) {
+			if (q.size == 0xffffffffu) {
+				for (uint32_t i = 0; i < g_golden_count; i++) {
+					const uint32_t before = Rd(g_golden[i].reg);
+					if (q.op == 7) {
+						rep.value += ApplyGolden(&g_golden[i]) != before;
+					} else {
+						RestoreGolden(&g_golden[i]);
+					}
+				}
+			} else if (q.size < g_golden_count) {
+				if (q.op == 7) {
+					rep.value = ApplyGolden(&g_golden[q.size]);
+				} else {
+					RestoreGolden(&g_golden[q.size]);
+					rep.value = Rd(g_golden[q.size].reg);
+				}
+			} else {
+				rep.status = -ENOENT;
+			}
+		} else if (q.op == 9) {
+			rep.status = q.size < g_golden_count ? 0 : -ENOENT;
+			rep.value  = rep.status == 0 ? g_golden[q.size].reg : 0;
+		} else {
+			rep.status = -EINVAL;
+		}
+		pthread_mutex_unlock(&g_hw);
+		if (send(c, &rep, sizeof(rep), MSG_NOSIGNAL) != (ssize_t)sizeof(rep)) {
+			break;
+		}
+	}
+	close(c);
+	if (reports != 0 || failures != 0) {
+		// The client is gone: leave the reporter idle with no buffer behind it.
+		pthread_mutex_lock(&g_hw);
+		Idle(0.05);
+		Wr(kCntl3, 0);
+		Wr(kCntl2, 0);
+		Wr(kCntl1, 0);
+		Wr(kCntl0, 0);
+		pthread_mutex_unlock(&g_hw);
+		fprintf(stderr, "kyty-lodhw: client done, %lu reports, %lu failures\n", reports, failures);
+	}
+	return NULL;
+}
+
 int main(int argc, char** argv) {
 	const char* path = argc > 1 ? argv[1] : "/run/kyty-lodhw.sock";
 	const int   gid  = argc > 2 ? atoi(argv[2]) : -1;
@@ -112,6 +326,7 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	globfree(&g);
+	LoadGolden();
 
 	const int s = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
 	struct sockaddr_un a;
@@ -138,64 +353,11 @@ int main(int argc, char** argv) {
 		if (c < 0) {
 			continue;
 		}
-		unsigned long reports = 0, failures = 0;
-		for (;;) {
-			struct {
-				uint32_t op, size;
-				uint64_t va;
-			} q;
-			if (recv(c, &q, sizeof(q), 0) != (ssize_t)sizeof(q)) {
-				break;
-			}
-			struct {
-				int32_t  status;
-				uint32_t value;
-			} rep = {0, 0};
-			if (q.op == 1) {
-				rep.value = Rd(kSpmMcCntl) & 0xfu;
-			} else if (q.op == 2) {
-				rep.status = Report(q.va, q.size, Rd(kSpmMcCntl) & 0xfu);
-				if (rep.status == 0) {
-					reports++;
-				} else if (failures++ < 8) {
-					fprintf(stderr, "kyty-lodhw: report of 0x%x bytes at 0x%llx failed: %s\n", q.size,
-					        (unsigned long long)q.va, strerror(-rep.status));
-				}
-			} else if ((q.op & 0xffu) == 3) {
-				const uint32_t pasid = q.op >> 8;
-				uint32_t       vmid  = 0;
-				for (uint32_t v = 1; v < 15 && pasid != 0; v++) {
-					if (Rd(kIhVmidLut + v) == pasid) {
-						vmid = v;
-						break;
-					}
-				}
-				rep.value  = vmid;
-				rep.status = vmid == 0 ? -ESRCH : Report(q.va, q.size, vmid);
-				// The VMID could have gone to another VM meanwhile; the report then landed there.
-				if (rep.status == 0 && Rd(kIhVmidLut + vmid) != pasid) {
-					rep.status = -EAGAIN;
-				}
-				if (rep.status == 0) {
-					reports++;
-				} else if (failures++ < 8) {
-					fprintf(stderr, "kyty-lodhw: report for pasid %u (VMID %u) at 0x%llx failed: %s\n", pasid, vmid,
-					        (unsigned long long)q.va, strerror(-rep.status));
-				}
-			} else {
-				rep.status = -EINVAL;
-			}
-			if (send(c, &rep, sizeof(rep), MSG_NOSIGNAL) != (ssize_t)sizeof(rep)) {
-				break;
-			}
+		pthread_t t;
+		if (pthread_create(&t, NULL, Client, (void*)(intptr_t)c) != 0) {
+			close(c);
+			continue;
 		}
-		close(c);
-		// The client is gone: leave the reporter idle with no buffer behind it.
-		Idle(0.05);
-		Wr(kCntl3, 0);
-		Wr(kCntl2, 0);
-		Wr(kCntl1, 0);
-		Wr(kCntl0, 0);
-		fprintf(stderr, "kyty-lodhw: client done, %lu reports, %lu failures\n", reports, failures);
+		pthread_detach(t);
 	}
 }
