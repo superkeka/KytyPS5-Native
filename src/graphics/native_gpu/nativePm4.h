@@ -221,6 +221,23 @@ struct DrawSnapshot {
 	uint32_t gs_user_data[32] = {}; // SPI_SHADER_USER_DATA_GS_*: the NGG (merged ES/GS) stage on gfx10
 };
 
+// One draw or dispatch as the translator saw it (SetDrawLog), for comparing frames: which shaders,
+// targets and counts it used. `indirect` is the argument address of an indirect draw or dispatch
+// (its values are read when the frame is dumped, after the GPU wrote them).
+struct DrawRecord {
+	uint32_t op        = 0;
+	uint32_t index     = 0; // draw or dispatch number in the buffer
+	uint32_t count     = 0; // vertices / indices (direct draws), threadgroups X (direct dispatches)
+	uint32_t instances = 1;
+	uint64_t ps        = 0; // pixel shader (draws) or compute shader (dispatches)
+	uint64_t gs        = 0; // the NGG ES/GS stage
+	uint64_t cb0       = 0; // first bound color target
+	uint64_t zbase     = 0; // depth read base
+	uint64_t indirect  = 0;
+	uint32_t ud_hash   = 0; // FNV of the PS (or compute) user data
+	uint32_t gs_hash   = 0; // FNV of the GS user data
+};
+
 // A draw or dispatch whose resources point into the range given to SetFindRange: directly from a
 // user-data register, or through a table it points at (depth 1) or a table in that table (depth 2).
 struct FindHit {
@@ -438,6 +455,7 @@ struct Pm4TranslateResult {
 	std::vector<uint32_t> ref_buckets;        // compact mode: the 16 MiB buckets (addr >> 24) of those refs
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
+	std::vector<DrawRecord>       draw_log;       // SetDrawLog: every draw and dispatch
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
 	std::vector<LodBankScan>      lod_scans;      // SetLodBankScan: one per GET_LOD_STATS packet
 	struct UnmetWait {
@@ -555,6 +573,8 @@ public:
 	// (ref_buckets); refs then keeps just the index buffers. What residency needs, without sorting a
 	// list that grows with every draw.
 	void SetCompactRefs(bool compact) { m_compact_refs = compact; }
+	// Record every draw and dispatch in Pm4TranslateResult::draw_log.
+	void SetDrawLog(bool on) { m_draw_log = on; }
 	// Residency at map time (GemBacking::ResidencyAtMap): no per-draw references are collected.
 	void SetCollectRefs(bool on) { m_collect_refs = on; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
@@ -646,6 +666,7 @@ private:
 	bool                         m_acquire_full      = false;
 	uint32_t                     m_write_data_native = 0;
 	bool                         m_collect_refs      = true;
+	bool                         m_draw_log          = false;
 	bool                         m_lod_scan          = false;
 	uint32_t                     m_lod_scan_dwords   = 1024;
 	LodGuestReadFn               m_lod_read          = nullptr;

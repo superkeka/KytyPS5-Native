@@ -6,6 +6,7 @@
 
 #include "kernel/memory.h"
 #include "libs/agc.h"
+#include "libs/controller.h"
 
 #include <algorithm>
 #include <atomic>
@@ -69,9 +70,79 @@ bool EnvOn(const char* name) {
 // overrides it). One command per line, one reply line each:
 //   dump [N]  dump the next N flips (default 8) into KYTY_NATIVE_GPU_DUMP_DIR, render targets included
 //   ping      "pong"
+//   pad play FILE [ELAPSED]  replay a gamepad recording as player 1 (PlayPadRecording)
 std::atomic<uint32_t>& DemandedDumps() {
 	static std::atomic<uint32_t> n {0};
 	return n;
+}
+
+// "pad play FILE [ELAPSED]": replays a padrec.py recording (evdev events of an 8BitDo in DInput mode,
+// "t type code value" with t in seconds since the game was launched) as player 1's input. ELAPSED is
+// how long the game has already been running, so the recording keeps its timing.
+void PlayPadRecording(std::string path, double elapsed) {
+	std::thread([path, elapsed] {
+		namespace C = Libs::Controller;
+		std::FILE* f = std::fopen(path.c_str(), "r");
+		if (f == nullptr) {
+			std::fprintf(stderr, "pad play: cannot open %s\n", path.c_str());
+			return;
+		}
+		const double start = NowSecShadow() - elapsed;
+		char         line[128];
+		uint32_t     events = 0;
+		while (std::fgets(line, sizeof(line), f) != nullptr) {
+			double t = 0;
+			int    type = 0, code = 0, value = 0;
+			if (line[0] == '#' || std::sscanf(line, "%lf %d %d %d", &t, &type, &code, &value) != 4) {
+				continue;
+			}
+			if (const double wait = t - (NowSecShadow() - start); wait > 0) {
+				std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+			}
+			const int id = C::HOST_INPUT_CONTROLLER_ID;
+			if (type == 1) {
+				uint32_t button = 0;
+				switch (code) {
+					case 304: button = C::PAD_BUTTON_CROSS; break;
+					case 305: button = C::PAD_BUTTON_CIRCLE; break;
+					case 307: button = C::PAD_BUTTON_SQUARE; break;
+					case 308: button = C::PAD_BUTTON_TRIANGLE; break;
+					case 310: button = C::PAD_BUTTON_L1; break;
+					case 311: button = C::PAD_BUTTON_R1; break;
+					case 312: C::SetAxis(id, C::Axis::TriggerLeft, value != 0 ? 255 : 0); break;
+					case 313: C::SetAxis(id, C::Axis::TriggerRight, value != 0 ? 255 : 0); break;
+					case 315: button = C::PAD_BUTTON_OPTIONS; break;
+					case 317: button = C::PAD_BUTTON_L3; break;
+					case 318: button = C::PAD_BUTTON_R3; break;
+					default: break;
+				}
+				if (button != 0) {
+					C::SetButton(id, button, value != 0);
+				}
+			} else if (type == 3) {
+				switch (code) {
+					case 0: C::SetAxis(id, C::Axis::LeftX, value); break;
+					case 1: C::SetAxis(id, C::Axis::LeftY, value); break;
+					case 2: C::SetAxis(id, C::Axis::RightX, value); break;
+					case 5: C::SetAxis(id, C::Axis::RightY, value); break;
+					case 9: C::SetAxis(id, C::Axis::TriggerRight, value); break;
+					case 10: C::SetAxis(id, C::Axis::TriggerLeft, value); break;
+					case 16:
+						C::SetButton(id, C::PAD_BUTTON_LEFT, value < 0);
+						C::SetButton(id, C::PAD_BUTTON_RIGHT, value > 0);
+						break;
+					case 17:
+						C::SetButton(id, C::PAD_BUTTON_UP, value < 0);
+						C::SetButton(id, C::PAD_BUTTON_DOWN, value > 0);
+						break;
+					default: break;
+				}
+			}
+			events++;
+		}
+		std::fclose(f);
+		std::fprintf(stderr, "pad play: %s done, %u events\n", path.c_str(), events);
+	}).detach();
 }
 
 void StartControlSocket() {
@@ -108,12 +179,17 @@ void StartControlSocket() {
 				unsigned count = 0;
 				if (line == "ping") {
 					std::snprintf(reply, sizeof(reply), "pong\n");
+				} else if (char file[256]; std::sscanf(line.c_str(), "pad play %255s", file) == 1) {
+					double elapsed = 0;
+					std::sscanf(line.c_str(), "pad play %*s %lf", &elapsed);
+					PlayPadRecording(file, elapsed);
+					std::snprintf(reply, sizeof(reply), "ok playing %s from %.1f s\n", file, elapsed);
 				} else if (line == "dump" || std::sscanf(line.c_str(), "dump %u", &count) == 1) {
 					count = count != 0 ? count : 8u;
 					DemandedDumps().store(count);
 					std::snprintf(reply, sizeof(reply), "ok dumping the next %u flips\n", count);
 				} else {
-					std::snprintf(reply, sizeof(reply), "unknown command; try: dump [N], ping\n");
+					std::snprintf(reply, sizeof(reply), "unknown command; try: dump [N], pad play FILE [ELAPSED], ping\n");
 				}
 				::send(c, reply, std::strlen(reply), MSG_NOSIGNAL);
 				line.clear();
@@ -289,6 +365,20 @@ public:
 	// Lock-free: Kyty's command processor asks for every draw and dispatch, while the pipeline's
 	// worker may hold m_mutex for a whole submission.
 	bool Active() const { return m_active.load(std::memory_order_acquire); }
+
+	// The draws and dispatches translated since the last call (KYTY_NATIVE_GPU_CTL), for the flip dump.
+	struct FrameDraw {
+		bool       acb;
+		uint32_t   buffer; // submission number within the frame
+		DrawRecord draw;
+	};
+	std::vector<FrameDraw> TakeFrameDraws() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::vector<FrameDraw>      out;
+		out.swap(m_frame_draws);
+		m_frame_buffers = 0;
+		return out;
+	}
 
 	// The color targets the DCBs bound since the last call, for the flip dump.
 	std::vector<RenderTargetInfo> TakeFrameTargets() {
@@ -491,6 +581,12 @@ public:
 					m_refused++;
 					return false;
 				}
+			}
+		}
+		if (!result.draw_log.empty()) {
+			const uint32_t buffer = m_frame_buffers++;
+			for (const auto& d: result.draw_log) {
+				m_frame_draws.push_back(FrameDraw {acb, buffer, d});
 			}
 		}
 		if (m_collect_targets) {
@@ -1744,6 +1840,8 @@ private:
 		m_collect_targets = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr || EnvOn("KYTY_NATIVE_GPU_CTL");
 		if (EnvOn("KYTY_NATIVE_GPU_CTL")) {
 			StartControlSocket();
+			m_translator.SetDrawLog(true);
+			m_acb_translator.SetDrawLog(true);
 		}
 		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
 			StartWatchdog();
@@ -2047,6 +2145,8 @@ private:
 	std::string   m_breadcrumbs; // KYTY_NATIVE_GPU_BREADCRUMBS directory, empty when off
 	bool          m_collect_targets = false;           // flip dumps compare render targets too
 	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
+	std::vector<FrameDraw>               m_frame_draws;   // KYTY_NATIVE_GPU_CTL: draws since the last flip
+	uint32_t                             m_frame_buffers = 0;
 	uint64_t      m_frames         = 0;
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
@@ -3196,6 +3296,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	}
 	if (!wanted) {
 		(void)Shadow::Instance().TakeFrameTargets(); // keep only the dumped frame's targets
+		(void)Shadow::Instance().TakeFrameDraws();
 		return;
 	}
 	if (demand_left > 0) {
@@ -3237,6 +3338,39 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			std::snprintf(path, sizeof(path), "%s/flip_%llu.range_%llx.raw", dir, flip, static_cast<unsigned long long>(raddr));
 			WriteFile(path, bytes.data(), got);
 			p = (*end == ',') ? end + 1 : end;
+		}
+	}
+	// Every draw and dispatch of the frame, with the arguments of indirect ones as the GPU left them.
+	if (const auto draws = Shadow::Instance().TakeFrameDraws(); !draws.empty()) {
+		std::snprintf(path, sizeof(path), "%s/flip_%llu.draws.txt", dir, flip);
+		if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+			std::fprintf(f, "# q buf idx op count inst ps gs cb0 zbase ud_hash gs_hash indirect args\n");
+			for (const auto& fd: draws) {
+				const auto& d = fd.draw;
+				uint32_t    args[5] = {};
+				if (d.op == 0x46u && d.indirect != 0) {
+					// An occlusion dump: 16 RBs x 64-bit counters (bit 63 = written). args: RBs written,
+					// their counter sum (low 32 bits), and the first counter's low and high dwords.
+					uint64_t c[16] = {};
+					Shadow::Instance().ReadGuest(d.indirect, c, sizeof(c));
+					uint64_t sum = 0;
+					for (uint64_t v: c) {
+						args[0] += static_cast<uint32_t>(v >> 63u);
+						sum += v & 0x7fffffffffffffffull;
+					}
+					args[1] = static_cast<uint32_t>(sum);
+					args[2] = static_cast<uint32_t>(c[0]);
+					args[3] = static_cast<uint32_t>(c[0] >> 32u);
+				} else if (d.indirect != 0) {
+					Shadow::Instance().ReadGuest(d.indirect, args, sizeof(args));
+				}
+				std::fprintf(f, "%s %u %u 0x%02x %u %u 0x%llx 0x%llx 0x%llx 0x%llx %08x %08x 0x%llx %u,%u,%u,%u,%u\n", fd.acb ? "acb" : "dcb",
+				             fd.buffer, d.index, d.op, d.count, d.instances, static_cast<unsigned long long>(d.ps),
+				             static_cast<unsigned long long>(d.gs), static_cast<unsigned long long>(d.cb0),
+				             static_cast<unsigned long long>(d.zbase), d.ud_hash, d.gs_hash, static_cast<unsigned long long>(d.indirect),
+				             args[0], args[1], args[2], args[3], args[4]);
+			}
+			std::fclose(f);
 		}
 	}
 	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, flip);

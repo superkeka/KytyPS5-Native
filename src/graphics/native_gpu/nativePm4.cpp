@@ -1225,6 +1225,39 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 
 	// True when the bound pixel shader is one SetSkippedPixelShaders named; the draw is then left out.
+	uint32_t log_instances = 1;
+	uint64_t log_set_base  = 0;
+	uint32_t log_draws     = 0;
+	auto     log_draw      = [&](uint32_t op, uint32_t count, uint64_t indirect, bool dispatch) {
+		if (!m_draw_log) {
+			return;
+		}
+		auto fnv = [&](uint32_t first) {
+			uint32_t h = 2166136261u;
+			for (uint32_t i = 0; i < (dispatch ? 16u : 32u); i++) {
+				h = (h ^ reg(sh, first + i)) * 16777619u;
+			}
+			return h;
+		};
+		DrawRecord d;
+		d.op       = op;
+		d.index    = log_draws++;
+		d.count    = count;
+		d.indirect = indirect;
+		if (dispatch) {
+			d.ps      = (static_cast<uint64_t>(reg(sh, 0x20C)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20D)) << 40u);
+			d.ud_hash = fnv(0x240);
+		} else {
+			d.instances = log_instances;
+			d.ps        = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
+			d.gs        = (static_cast<uint64_t>(reg(sh, 0x0C8)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x0C9)) << 40u);
+			d.cb0       = (static_cast<uint64_t>(reg(cx, kCbColor0Base)) << 8u) | (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt) & 0xffu) << 40u);
+			d.zbase     = (static_cast<uint64_t>(reg(cx, kDbZReadBase)) << 8u) | (static_cast<uint64_t>(reg(cx, kDbZReadBaseHi) & 0xffu) << 40u);
+			d.ud_hash   = fnv(0x00C);
+			d.gs_hash   = fnv(0x08C);
+		}
+		r.draw_log.push_back(d);
+	};
 	auto skip_draw = [&]() {
 		fix_fmask();
 		const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
@@ -2004,6 +2037,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			case IT_DRAW_INDEX_2:
+				log_draw(op, body_count >= 4 ? bptr[3] : 0, 0, false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
@@ -2039,6 +2073,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (body_count < 4) {
 					return fail(op, dw);
 				}
+				log_draw(op, bptr[2], 0, false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
@@ -2059,6 +2094,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			case IT_DRAW_INDIRECT:       // arguments at the SET_BASE address + DATA_OFFSET; same on the gfx ring
 			case IT_DRAW_INDEX_INDIRECT: // the same, indexed through INDEX_BASE / INDEX_BUFFER_SIZE
+				log_draw(op, 0, log_set_base + (body_count >= 1 ? bptr[0] : 0u), false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
@@ -2102,6 +2138,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			case IT_DRAW_INDEX_AUTO: // a non-indexed draw: no index buffer to reference
+				log_draw(op, body_count >= 1 ? bptr[0] : 0, 0, false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
@@ -2120,9 +2157,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u),
 				        kMetadataSpan, false);
+				log_set_base = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u);
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
+				log_draw(op, 0,
+				         m_compute_queue && body_count >= 2 ? (static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u))
+				                                           : log_set_base + (body_count >= 1 ? bptr[0] : 0u),
+				         true);
 				if (m_compute_ring) {
 					// The guest packet already carries ADDR_LO, ADDR_HI, DISPATCH_INITIATOR. MEC reads
 					// that form; the gfx-ring SET_BASE rewrite would be the wrong engine.
@@ -2164,9 +2206,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			case IT_NUM_INSTANCES: // instance count for the following draws
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				log_instances = body_count >= 1 ? bptr[0] : 1u;
 				stats.num_instances++;
 				break;
 			case IT_DISPATCH_DIRECT:
+				log_draw(op, body_count >= 1 ? bptr[0] : 0, 0, true);
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				if (m_compute_ring) {
 					body[body.size() - size] |= 2u;
@@ -2201,6 +2245,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				if (m_compute_ring) {
 					body[body.size() - size] |= 2u;
+				}
+				// KYTY_NATIVE_GPU_ZPASS_SYNC=1 (experiment): an occlusion dump (PIXEL_PIPE_STAT_DUMP 0x39,
+				// ZPASS_DONE 0x15) lands at the end of the pixel pipe; wait for it before what follows reads the
+				// counters (a dispatch that turns them into draw arguments).
+				if (static const bool zpass_sync = std::getenv("KYTY_NATIVE_GPU_ZPASS_SYNC") != nullptr;
+				    zpass_sync && !m_compute_ring && body_count >= 1 && ((bptr[0] & 0x3fu) == 0x39u || (bptr[0] & 0x3fu) == 0x15u)) {
+					emit_barrier(true);
+				}
+				// The draw log keeps occlusion dumps with their address, so a flip dump can show the counters.
+				if (body_count >= 3 && ((bptr[0] & 0x3fu) == 0x39u || (bptr[0] & 0x3fu) == 0x15u)) {
+					log_draw(op, bptr[0] & 0x3fu, (static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), false);
 				}
 				// Events with an address (ZPASS_DONE occlusion counters, 16 DBs x begin/end) write there.
 				if (body_count >= 3) {
