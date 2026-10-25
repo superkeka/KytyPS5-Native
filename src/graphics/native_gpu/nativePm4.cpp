@@ -455,8 +455,13 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 	if (cover != 0) {
 		// A write already emitted still owns the address. Matching memory is stale until it lands,
 		// and an unknown value cannot be proved to satisfy the wait, so the segment stays held.
+		// Across rings the GPU wait itself reads that stale memory: a label still holding the value
+		// from its previous use passes it before the writer's ring has even run (ASTRO BOT: the gfx
+		// ring then reset the label its compute ring was about to wait for, and the compute ring
+		// waited forever). Such a wait goes to the GPU only while memory does not satisfy it yet;
+		// otherwise it is held until the writer lands and becomes a barrier.
 		const bool gpu_wait = cover == 1 && value_satisfies && gpu_write && native_wait &&
-		                      (same_ring || writer_submitted);
+		                      (same_ring || (writer_submitted && !label_in_memory));
 		return gpu_wait ? RingWaitRelease::GpuWait : RingWaitRelease::Hold;
 	}
 	if (label_in_memory) {

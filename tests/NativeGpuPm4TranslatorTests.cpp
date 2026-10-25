@@ -1380,6 +1380,12 @@ void TestPlanRingWait() {
 	      "a pending write of unknown value keeps the segment held");
 	Check(PlanRingWait(1, true, true, false, true, false, false) == RingWaitRelease::Hold,
 	      "no native wait form: do not tell the GPU to wait");
+	// Other ring, writer submitted, but memory already holds a satisfying value: possibly stale from
+	// the label's previous use, which the GPU wait would pass before the writer's ring runs.
+	Check(PlanRingWait(1, true, true, false, true, true, true) == RingWaitRelease::Hold,
+	      "other ring, memory already satisfies: hold until the writer lands");
+	Check(PlanRingWait(1, true, true, true, false, true, true) == RingWaitRelease::GpuWait,
+	      "same ring, memory already satisfies: the ring order still holds, real GPU wait");
 }
 
 void TestComputeRingForQueue() {

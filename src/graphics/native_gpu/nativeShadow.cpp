@@ -2460,7 +2460,9 @@ public:
 			if (auto plan = decide(w->write)) {
 				// Another ring's write is not ahead of this waiter. A real GPU wait before that CS
 				// has returned can block the ring on a label nobody has been asked to write.
-				if (*plan == Plan::Native && m_acb_rings && w->slot != SlotOf(m_translating) && !Submitted(*w)) {
+				// Nor while memory already satisfies it: that value may be stale (see PlanRingWait).
+				if (*plan == Plan::Native && m_acb_rings && w->slot != SlotOf(m_translating) &&
+				    (!Submitted(*w) || wait.Met(ReadLabel(wait)))) {
 					return Plan::Split;
 				}
 				return *plan;
