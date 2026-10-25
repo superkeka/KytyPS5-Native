@@ -7,7 +7,9 @@
 //   5. submission cost: doorbell to completion of a single WRITE_DATA, many times;
 //   6. KFD memory written by a render-node CS (compute ring) that does NOT list it: does KFD's
 //      residency make guest memory usable without per-submission BO lists?
-//   7. KFD memory exported as a dma-buf and mapped for the CPU at an inner offset.
+//   7. KFD memory exported as a dma-buf and mapped for the CPU at an inner offset;
+//   8 ("gds" argument): 64 lanes of ds_add_rtn_u32 on GDS dword 0 from a KFD queue (needs the KFD
+//      VMIDs' GDS partition, which kyty-lodhw writes: GDS_VMID8..15).
 // Build: cc -O2 -o kfd_probe kfd_probe.c. Needs /dev/kfd (no root).
 #define _GNU_SOURCE
 #include <drm/amdgpu_drm.h>
@@ -23,6 +25,8 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "shaders.h"
 
 static int kfd = -1, drm = -1;
 static uint32_t gpu_id;
@@ -75,7 +79,10 @@ static int Alloc(struct Mem* m, uint64_t va, uint64_t size, uint32_t flags) {
 	return 0;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+	// "hold N": keep the queue alive N seconds after the first test, for reading registers meanwhile.
+	const int hold = argc > 2 && strcmp(argv[1], "hold") == 0 ? atoi(argv[2]) : 0;
+	const int gds  = argc > 1 && strcmp(argv[1], "gds") == 0;
 	// The GPU node: the one with SIMDs.
 	char path[128];
 	for (int n = 0; n < 8 && gpu_id == 0; n++) {
@@ -209,6 +216,72 @@ int main(void) {
 	       (Now() - t0) * 1e6, (unsigned long long)*rptr, (unsigned long long)w);
 	if (d[0] != 0xcafe0001u) {
 		return 5;
+	}
+	if (hold > 0) {
+		char fdinfo[64], line[128];
+		snprintf(fdinfo, sizeof(fdinfo), "/proc/self/fdinfo/%d", drm);
+		FILE* fi = fopen(fdinfo, "r");
+		while (fi && fgets(line, sizeof(line), fi)) {
+			if (strncmp(line, "pasid:", 6) == 0) {
+				printf("render node %s", line);
+			}
+		}
+		if (fi) {
+			fclose(fi);
+		}
+		printf("holding the queue %d s\n", hold);
+		fflush(stdout);
+		sleep(hold);
+	}
+
+	if (gds) {
+		// 8. A wave64 dispatch: s[0:1] = destination, each lane adds 1 to GDS dword 0 and stores what it got.
+		struct Mem code, out;
+		if (Alloc(&code, va + 0x6000000, 65536, gtt) || Alloc(&out, va + 0x7000000, 65536, gtt)) {
+			return 7;
+		}
+		memcpy(code.cpu, k_gds_w64, sizeof(k_gds_w64));
+		memset(out.cpu, 0xff, 256);
+		d[5] = 0;
+		__sync_synchronize();
+#define SETSH(reg, n)                                   \
+	do {                                                \
+		PUSH(Pkt3(0x76, (n) + 1));                      \
+		PUSH(((reg) - 0xb000u) / 4u);                   \
+	} while (0)
+		SETSH(0xb830, 2); PUSH((uint32_t)(code.va >> 8)); PUSH((uint32_t)(code.va >> 40));            // COMPUTE_PGM_LO/HI
+		SETSH(0xb848, 2); PUSH(((16 + 3) / 4 - 1) | (0xc0u << 12) | (1u << 21) | (1u << 30)); PUSH(2u << 1); // RSRC1/2: 16 VGPRs, 2 user SGPRs
+		SETSH(0xb8a0, 1); PUSH(0);                                                                      // RSRC3
+		SETSH(0xb854, 1); PUSH(0);                                                                      // RESOURCE_LIMITS
+		SETSH(0xb860, 1); PUSH(0);                                                                      // TMPRING_SIZE
+		SETSH(0xb858, 2); PUSH(0xffffffffu); PUSH(0xffffffffu);                                         // STATIC_THREAD_MGMT_SE0/1
+		SETSH(0xb864, 2); PUSH(0xffffffffu); PUSH(0xffffffffu);                                         // SE2/3
+		SETSH(0xb810, 3); PUSH(0); PUSH(0); PUSH(0);                                                    // START_X/Y/Z
+		SETSH(0xb81c, 3); PUSH(64); PUSH(1); PUSH(1);                                                   // NUM_THREAD_X/Y/Z
+		SETSH(0xb900, 2); PUSH((uint32_t)out.va); PUSH((uint32_t)(out.va >> 32));                       // USER_DATA_0/1
+		PUSH(Pkt3(0x15, 4)); PUSH(1); PUSH(1); PUSH(1); PUSH(1u | (1u << 2) | (1u << 6));              // DISPATCH_DIRECT, wave64
+		PUSH(Pkt3(0x46, 1)); PUSH(7u | (4u << 8));                                                      // EVENT_WRITE CS_PARTIAL_FLUSH
+		WRITE(data.va + 20, 0xcafe0008u);
+		t0 = Now();
+		KICK();
+		while (d[5] != 0xcafe0008u && Now() - t0 < 5.0) {
+		}
+		// GDS at base 0 is shared with the render node's jobs, so dword 0 starts wherever they left it:
+		// a working GDS gives 64 consecutive values from there.
+		const uint32_t* o  = out.cpu;
+		uint32_t        lo = o[0];
+		for (int i = 1; i < 64; i++) {
+			lo = o[i] < lo ? o[i] : lo;
+		}
+		uint64_t seen = 0;
+		for (int i = 0; i < 64; i++) {
+			if (o[i] - lo < 64) {
+				seen |= 1ull << (o[i] - lo);
+			}
+		}
+		printf("GDS dispatch on the KFD queue: %s after %.1f us; lane values 0x%x 0x%x 0x%x ... 64 consecutive: %s\n",
+		       d[5] == 0xcafe0008u ? "done" : "NOT done", (Now() - t0) * 1e6, o[0], o[1], o[2], seen == ~0ull ? "YES" : "no");
+		return d[5] == 0xcafe0008u && seen == ~0ull ? 0 : 8;
 	}
 
 	// 3. A GEM buffer of the render node, at a VA of the same VM.

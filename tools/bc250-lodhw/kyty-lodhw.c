@@ -66,6 +66,14 @@ static const struct {
 } kWritable[] = {
     {0x1260 + 0x13ac, "DB_DEBUG"},       {0x1260 + 0x13af, "DB_DEBUG4"},   {0x1260 + 0x1423, "CB_HW_CONTROL_3"},
     {0x1260 + 0x1422, "CB_HW_CONTROL_4"}, {0x1260 + 0x12e2, "TA_CNTL_AUX"}, {0x1260 + 0x1588, "UTCL1_CTRL"},
+    // The GDS partition of the VMIDs KFD gives user-mode compute queues (8-15). amdgpu programs it only
+    // for the VMIDs of its own jobs; the PS5 kernel gives the game's queues a static one at base 0.
+    {0x1260 + 0x20b0, "GDS_VMID8_BASE"},  {0x1260 + 0x20b1, "GDS_VMID8_SIZE"},  {0x1260 + 0x20b2, "GDS_VMID9_BASE"},
+    {0x1260 + 0x20b3, "GDS_VMID9_SIZE"},  {0x1260 + 0x20b4, "GDS_VMID10_BASE"}, {0x1260 + 0x20b5, "GDS_VMID10_SIZE"},
+    {0x1260 + 0x20b6, "GDS_VMID11_BASE"}, {0x1260 + 0x20b7, "GDS_VMID11_SIZE"}, {0x1260 + 0x20b8, "GDS_VMID12_BASE"},
+    {0x1260 + 0x20b9, "GDS_VMID12_SIZE"}, {0x1260 + 0x20ba, "GDS_VMID13_BASE"}, {0x1260 + 0x20bb, "GDS_VMID13_SIZE"},
+    {0x1260 + 0x20bc, "GDS_VMID14_BASE"}, {0x1260 + 0x20bd, "GDS_VMID14_SIZE"}, {0x1260 + 0x20be, "GDS_VMID15_BASE"},
+    {0x1260 + 0x20bf, "GDS_VMID15_SIZE"},
 };
 
 // CP jump table access (GC segment 1 is 0xA000): {address register, data register} per engine.
