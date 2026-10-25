@@ -4537,6 +4537,82 @@ void PatchEnd(PatchCall* c, bool has_ret, uint64_t hle_ret, uint64_t ref_ret) {
 	}
 }
 
+namespace {
+constexpr int kRegsCompared = 64;  // entries compared per array
+constexpr int kRegsCopy     = 512; // room for a reference that writes more (detected by a sentinel)
+struct RegsShadow {
+	ShaderRegister regs[4][kRegsCopy];
+};
+thread_local RegsShadow t_regs;
+} // namespace
+
+ShaderRegister* RegsCopy(RegsCall* c, ShaderRegister* regs) {
+	if (regs == nullptr) {
+		return nullptr;
+	}
+	if (c->num >= 4) {
+		c->ok = false;
+		return regs;
+	}
+	auto* copy = t_regs.regs[c->num];
+	std::memcpy(copy, regs, sizeof(ShaderRegister) * kRegsCompared);
+	for (int i = kRegsCompared; i < kRegsCopy; i++) {
+		copy[i] = {kUnwritten, kUnwritten};
+	}
+	c->title[c->num] = regs;
+	c->copy[c->num]  = copy;
+	c->num++;
+	return copy;
+}
+
+void RegsEnd(RegsCall* c, bool has_ret, uint64_t hle_ret, uint64_t ref_ret) {
+	Export* e = Find(c->hle);
+	if (e == nullptr) {
+		return;
+	}
+	e->calls++;
+	if (StubCalls() != c->stubs0) {
+		e->stubbed++;
+	}
+	for (int k = 0; k < c->num; k++) {
+		const auto* h = reinterpret_cast<const uint32_t*>(c->title[k]);
+		const auto* r = reinterpret_cast<const uint32_t*>(c->copy[k]);
+		// Titles pass arrays from one structure (AgcCreatePrimState: cx_regs a few entries after
+		// uc_regs); each private copy stands alone, so an array is compared up to the next one.
+		int entries = kRegsCompared;
+		for (int j = 0; j < c->num; j++) {
+			if (c->title[j] > c->title[k] && c->title[j] - c->title[k] < entries) {
+				entries = static_cast<int>(c->title[j] - c->title[k]);
+			}
+		}
+		for (int i = 0; i < entries * 2; i++) {
+			// Without its AgcInit the reference names some registers by a token (0x10000000 | index)
+			// instead of their offset; only the value is compared for those.
+			if (i % 2 == 0 && h[i] != r[i] && (r[i] & 0xf0000000u) == 0x10000000u) {
+				e->markers++;
+				continue;
+			}
+			if (h[i] != r[i]) {
+				if (auto text = Report(e, "register array", c->stubs0,
+				                       fmt::format("array {} entry {} ({}): hle {{{:#x}, {:#x}}}, reference {{{:#x}, {:#x}}}\n", k,
+				                                   i / 2, i % 2 == 0 ? "offset" : "value", h[i & ~1], h[i | 1], r[i & ~1], r[i | 1]));
+				    !text.empty()) {
+					Emit(text + Dump("hle", h, 32) + Dump("ref", r, 32));
+				}
+				return;
+			}
+		}
+		if (c->copy[k][kRegsCompared].offset != kUnwritten) {
+			Emit(Report(e, "register array", c->stubs0,
+			            fmt::format("array {}: the reference wrote past entry {}\n", k, kRegsCompared)));
+			return;
+		}
+	}
+	if (has_ret && hle_ret != ref_ret) {
+		Emit(Report(e, "return value", c->stubs0, fmt::format("hle {:#x}, reference {:#x}\n", hle_ret, ref_ret)));
+	}
+}
+
 void Value(const void* hle, uint64_t stubs0, uint64_t hle_ret, uint64_t ref_ret) {
 	Export* e = Find(hle);
 	if (e == nullptr) {

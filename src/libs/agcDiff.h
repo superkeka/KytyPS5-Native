@@ -14,9 +14,15 @@
 // title's data, then the reference on a private copy, and the results are compared.
 //  - first argument a CommandBuffer*: the dwords each one writes (from both cursors);
 //  - first argument a uint32_t* packet: the packet after each one patched its own copy;
-//  - only arithmetic arguments: the return value.
+//  - only arithmetic arguments: the return value;
+//  - register arrays (non-const ShaderRegister* arguments): the first entries of each after the
+//    HLE function filled the title's and the reference its own copies.
 // Everything else runs the HLE function only. Mismatches go to stderr (KYTY_AGC_DIFF_LOG=N: the
 // first N per export, default 4) with a per-export summary at exit.
+
+namespace Libs::Graphics {
+struct ShaderRegister;
+} // namespace Libs::Graphics
 
 namespace Libs::Graphics::Gen5 {
 
@@ -57,6 +63,18 @@ uint32_t* PatchBegin(PatchCall* c, const void* hle, uint32_t* cmd);
 void      PatchEnd(PatchCall* c, bool has_ret, uint64_t hle_ret, uint64_t ref_ret);
 
 void Value(const void* hle, uint64_t stubs0, uint64_t hle_ret, uint64_t ref_ret);
+
+struct RegsCall {
+	const void*     hle    = nullptr;
+	uint64_t        stubs0 = 0;
+	ShaderRegister* title[4] {};
+	ShaderRegister* copy[4] {};
+	int             num = 0;
+	bool            ok  = true;
+};
+// Before the HLE function: a private copy of a register array the export fills (nullptr stays).
+ShaderRegister* RegsCopy(RegsCall* c, ShaderRegister* regs);
+void            RegsEnd(RegsCall* c, bool has_ret, uint64_t hle_ret, uint64_t ref_ret);
 uint64_t StubCalls();
 // AgcInit runs in the reference too (once, on a state of its own): its start state is what the
 // reference's queue resets and context state ops load.
@@ -110,6 +128,7 @@ struct Wrap<F, Tag> {
 		constexpr bool pk = sizeof...(A) > 0 && std::is_same_v<First, uint32_t*>;
 		constexpr bool pure = ((std::is_arithmetic_v<A> || std::is_enum_v<A>) && ...) && !std::is_void_v<R> &&
 		                      !std::is_pointer_v<R>;
+		constexpr bool regs = (std::is_same_v<A, ShaderRegister*> || ...);
 		if (ref == nullptr) {
 			return F(a...);
 		}
@@ -172,6 +191,24 @@ struct Wrap<F, Tag> {
 					return r;
 				}
 			}
+		} else if constexpr (regs && !std::is_void_v<R>) {
+			RegsCall c;
+			c.hle      = key;
+			c.stubs0   = StubCalls();
+			auto sub   = [&](auto v) {
+                if constexpr (std::is_same_v<decltype(v), ShaderRegister*>) {
+                    return RegsCopy(&c, v);
+                } else {
+                    return v;
+                }
+			};
+			auto refargs = std::make_tuple(sub(a)...);
+			R    r       = F(a...);
+			R    l {};
+			if (c.ok && Guarded(key, [&] { l = std::apply(ref, refargs); })) {
+				RegsEnd(&c, true, ToU64(r), ToU64(l));
+			}
+			return r;
 		} else if constexpr (pure) {
 			const uint64_t stubs0 = StubCalls();
 			R              r      = F(a...);
