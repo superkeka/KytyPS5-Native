@@ -2413,7 +2413,7 @@ public:
 			if (auto plan = decide(w->write)) {
 				// Another ring's write is not ahead of this waiter. A real GPU wait before that CS
 				// has returned can block the ring on a label nobody has been asked to write.
-				if (*plan == Plan::Native && m_acb_rings && w->slot != SlotOf(m_translating) && !w->submitted) {
+				if (*plan == Plan::Native && m_acb_rings && w->slot != SlotOf(m_translating) && !Submitted(*w)) {
 					return Plan::Split;
 				}
 				return *plan;
@@ -2457,10 +2457,12 @@ private:
 	struct RingWrite {
 		LabelWrite write;
 		uint64_t   landed;    // the tracker value once its segment is done
-		uint32_t   slot = 0;  // which ring wrote it
-		bool       submitted = false; // that ring's CS ioctl has returned
+		uint32_t   slot  = 0; // which ring wrote it
+		uint64_t   batch = 0; // the m_batch it was appended in: its CS ioctl has returned once that is flushed
 	};
 	enum class Release { No, Plain, Native, Observed };
+
+	bool Submitted(const RingWrite& w) const { return w.batch < m_batch; }
 
 	LabelPipeline() {
 		m_native = Shadow::Instance().EnableLabels(this);
@@ -2526,9 +2528,7 @@ private:
 					break;
 				}
 				Shadow::Instance().FlushBatch();
-				for (auto& entry: m_ring) {
-					entry.second.submitted = true;
-				}
+				m_batch++; // everything appended so far is submitted, without walking m_ring
 				m_last_cs.store(Shadow::Instance().TakeLastSeq(), std::memory_order_release);
 				m_appended = false;
 			}
@@ -2594,7 +2594,7 @@ private:
 			}
 			gpu       = w->write.gpu;
 			same      = w->slot == SlotOf(queue);
-			submitted = w->submitted;
+			submitted = Submitted(*w);
 		}
 		// Hold until a writer is guaranteed to run (PlanRingWait). A label already in memory, with
 		// no pending write about to replace it, is a barrier: the GPU never waits for a writer that
@@ -2625,7 +2625,7 @@ private:
 		             "pending ring write %s, %zu pieces queued behind\n",
 		             queue, held, w.wide ? "_64" : "", static_cast<unsigned long long>(w.addr),
 		             static_cast<unsigned long long>(w.mask), w.function, static_cast<unsigned long long>(w.ref),
-		             static_cast<unsigned long long>(ReadLabel(w)), rw != nullptr ? (rw->submitted ? "submitted" : "not submitted") : "none",
+		             static_cast<unsigned long long>(ReadLabel(w)), rw != nullptr ? (Submitted(*rw) ? "submitted" : "not submitted") : "none",
 		             m_pending[queue].size());
 	}
 
@@ -2677,10 +2677,10 @@ private:
 			entries.push_back(Entry {m_slot_seq[slot], queue, slot, TrackerPoint {}, p.done});
 		}
 		for (const auto& w: p.seg.writes) {
-			m_ring[w.addr] = RingWrite {w, m_seq, slot, false};
+			m_ring[w.addr] = RingWrite {w, m_seq, slot, m_batch};
 			if (w.wide) {
 				m_ring[w.addr + 4] =
-				    RingWrite {LabelWrite {w.addr + 4, w.value >> 32u, w.known, w.gpu, false}, m_seq, slot, false};
+				    RingWrite {LabelWrite {w.addr + 4, w.value >> 32u, w.known, w.gpu, false}, m_seq, slot, m_batch};
 			}
 		}
 		if (m_ring.size() > 16384) {
@@ -2944,6 +2944,7 @@ private:
 	uint64_t                                m_seq         = 0;
 	bool                                    m_appended    = false;
 	std::map<uint64_t, RingWrite>           m_ring; // label -> the latest write emitted into the ring
+	uint64_t                                m_batch = 1; // the batch being appended to (RingWrite::batch)
 	uint64_t                                m_released_native   = 0;
 	uint64_t                                m_released_observed = 0;
 	std::atomic<uint64_t>                   m_last_cs {0};
