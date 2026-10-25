@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -299,7 +300,10 @@ void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 
 void TextureCache::TrackImage(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (!image.registered) {
+	// Native primary rendering: the GPU writes the images (only video-out ones reach this cache) and
+	// every flip invalidates its surface explicitly, so write-protecting its pages buys nothing and
+	// costs two mprotect calls over the whole surface per flip, each a TLB shootdown on every core.
+	if (!image.registered || NativeGpu::PrimaryRendering()) {
 		return;
 	}
 	const auto image_begin = image.info.data.address;
