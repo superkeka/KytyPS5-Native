@@ -93,6 +93,7 @@ public:
 	}
 
 	~NativeSubmitter() {
+		DestroyList();
 		for (uint32_t h: m_gds_handles) {
 			struct drm_gem_close c;
 			std::memset(&c, 0, sizeof(c));
@@ -171,30 +172,17 @@ public:
 		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
 		__sync_synchronize();
 
-		std::vector<drm_amdgpu_bo_list_entry> entries;
-		entries.reserve(bo_handles.size() + 1);
-		drm_amdgpu_bo_list_entry e;
-		std::memset(&e, 0, sizeof(e));
-		e.bo_handle = m_ib_handle;
-		entries.push_back(e);
-		// A GDS, GWS or OA buffer in the list is what gives the job its GDS partition. Gfx and compute
-		// jobs list the same buffers, so they share one partition at base 0 (the PS5 VMID partition).
-		for (uint32_t h: m_gds_handles) {
-			e.bo_handle = h;
-			entries.push_back(e);
+		// The resident set changes only when a block is promoted or a range bound, so the list
+		// lives in the kernel and is rebuilt then: creating it inline costs a third of each CS.
+		if (bo_handles != m_list_bos || m_list == 0) {
+			DestroyList();
+			const int lr = CreateList(bo_handles);
+			if (lr != 0) {
+				res.err = lr;
+				return res;
+			}
+			m_list_bos = bo_handles;
 		}
-		for (uint32_t h: bo_handles) {
-			e.bo_handle = h;
-			entries.push_back(e);
-		}
-
-		struct drm_amdgpu_bo_list_in list;
-		std::memset(&list, 0, sizeof(list));
-		list.operation    = ~0u;
-		list.list_handle  = ~0u;
-		list.bo_number    = static_cast<uint32_t>(entries.size());
-		list.bo_info_size = sizeof(entries[0]);
-		list.bo_info_ptr  = reinterpret_cast<uintptr_t>(entries.data());
 
 		struct drm_amdgpu_cs_chunk_ib ib_info;
 		std::memset(&ib_info, 0, sizeof(ib_info));
@@ -204,22 +192,19 @@ public:
 		ib_info.ip_instance = 0;
 		ib_info.ring        = target.ring;
 
-		struct drm_amdgpu_cs_chunk chunks[2];
-		std::memset(chunks, 0, sizeof(chunks));
-		chunks[0].chunk_id   = AMDGPU_CHUNK_ID_IB;
-		chunks[0].length_dw  = sizeof(ib_info) / 4;
-		chunks[0].chunk_data = reinterpret_cast<uintptr_t>(&ib_info);
-		chunks[1].chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES;
-		chunks[1].length_dw  = sizeof(list) / 4;
-		chunks[1].chunk_data = reinterpret_cast<uintptr_t>(&list);
-		uint64_t chunk_ptrs[2] = {reinterpret_cast<uintptr_t>(&chunks[0]),
-		                          reinterpret_cast<uintptr_t>(&chunks[1])};
+		struct drm_amdgpu_cs_chunk chunk;
+		std::memset(&chunk, 0, sizeof(chunk));
+		chunk.chunk_id        = AMDGPU_CHUNK_ID_IB;
+		chunk.length_dw       = sizeof(ib_info) / 4;
+		chunk.chunk_data      = reinterpret_cast<uintptr_t>(&ib_info);
+		uint64_t chunk_ptrs[1] = {reinterpret_cast<uintptr_t>(&chunk)};
 
 		union drm_amdgpu_cs cs;
 		std::memset(&cs, 0, sizeof(cs));
-		cs.in.ctx_id     = m_ctx;
-		cs.in.num_chunks = 2;
-		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs);
+		cs.in.ctx_id         = m_ctx;
+		cs.in.bo_list_handle = m_list;
+		cs.in.num_chunks     = 1;
+		cs.in.chunks         = reinterpret_cast<uintptr_t>(chunk_ptrs);
 
 		const double t0 = NowSec();
 		// userptr BOs (the external ranges outside direct memory) are revalidated against
@@ -438,6 +423,50 @@ private:
 		             gws_size, oa_size);
 	}
 
+	// The IB buffer, the GDS partition buffers and `bo_handles`, as a kernel BO list. A GDS, GWS or
+	// OA buffer in the list is what gives the job its GDS partition. Gfx and compute jobs list the
+	// same buffers, so they share one partition at base 0 (the PS5 VMID partition).
+	int CreateList(const std::vector<uint32_t>& bo_handles) {
+		std::vector<drm_amdgpu_bo_list_entry> entries;
+		entries.reserve(bo_handles.size() + 1 + m_gds_handles.size());
+		drm_amdgpu_bo_list_entry e;
+		std::memset(&e, 0, sizeof(e));
+		e.bo_handle = m_ib_handle;
+		entries.push_back(e);
+		for (uint32_t h: m_gds_handles) {
+			e.bo_handle = h;
+			entries.push_back(e);
+		}
+		for (uint32_t h: bo_handles) {
+			e.bo_handle = h;
+			entries.push_back(e);
+		}
+		union drm_amdgpu_bo_list list;
+		std::memset(&list, 0, sizeof(list));
+		list.in.operation    = AMDGPU_BO_LIST_OP_CREATE;
+		list.in.bo_number    = static_cast<uint32_t>(entries.size());
+		list.in.bo_info_size = sizeof(entries[0]);
+		list.in.bo_info_ptr  = reinterpret_cast<uintptr_t>(entries.data());
+		const int r          = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_BO_LIST, &list);
+		if (r == 0) {
+			m_list = list.out.list_handle;
+		}
+		return r;
+	}
+
+	void DestroyList() {
+		if (m_list == 0) {
+			return;
+		}
+		union drm_amdgpu_bo_list list;
+		std::memset(&list, 0, sizeof(list));
+		list.in.operation   = AMDGPU_BO_LIST_OP_DESTROY;
+		list.in.list_handle = m_list;
+		Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_BO_LIST, &list);
+		m_list = 0;
+		m_list_bos.clear();
+	}
+
 	bool ContextReset() const {
 		union drm_amdgpu_ctx ctx;
 		std::memset(&ctx, 0, sizeof(ctx));
@@ -464,6 +493,8 @@ private:
 	uint32_t m_compute_rings = 0; // bitmask from AMDGPU_INFO_HW_IP_INFO
 	std::vector<uint32_t> m_gds_handles; // GDS, GWS and OA buffers listed in every submission
 	uint32_t              m_gds_size = 0;
+	uint32_t              m_list     = 0; // kernel BO list for m_list_bos (0: none)
+	std::vector<uint32_t> m_list_bos;     // the bo_handles m_list was created from
 };
 
 } // namespace Libs::Graphics::NativeGpu
