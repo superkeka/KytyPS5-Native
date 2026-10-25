@@ -488,6 +488,7 @@ struct Pm4CpDrawState {
 	uint32_t num_instances = 1;           // NUM_INSTANCES
 	uint64_t index_base    = 0;           // INDEX_BASE
 	uint32_t index_size    = 0xffffffffu; // INDEX_BUFFER_SIZE
+	bool     index_set     = false;       // the title has sent INDEX_BASE or INDEX_BUFFER_SIZE
 	uint64_t draw_base     = 0;           // SET_BASE, BASE_INDEX 1 (indirect draw/dispatch arguments)
 };
 

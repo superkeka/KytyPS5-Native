@@ -634,11 +634,13 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	// CP draw state as the title left it (libSceAgc's start values before its first DCB). Other
 	// processes draw on this ring between our submissions and leave theirs behind.
 	// KYTY_NATIVE_GPU_CP_STATE: mask of what is replayed, 1 index type, 2 NUM_INSTANCES, 4 INDEX_BASE and
-	// INDEX_BUFFER_SIZE, 8 SET_BASE (0 leaves it to the title). 4 is off by default: with it Dead Cells
-	// hangs the gfx ring at its level load every time; why is still open.
+	// INDEX_BUFFER_SIZE once the title has sent them, 0x10 also libSceAgc's start values of those two
+	// (base 0, size 0xFFFFFFFF), 8 SET_BASE (0 leaves it to the title). With the context start state of
+	// the wrong defaults version (v11 for a v10 title, without the internal table) the index replay hung
+	// Dead Cells at its level load; with AgcInit's start state it does not.
 	static const uint32_t cp_state = [] {
 		const char* e = std::getenv("KYTY_NATIVE_GPU_CP_STATE");
-		return e == nullptr ? 0xbu : static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
+		return e == nullptr ? 0x1fu : static_cast<uint32_t>(std::strtoul(e, nullptr, 0));
 	}();
 	if ((cp_state & 1u) != 0 && uc.count(0x243) == 0) {
 		EmitSetUconfig(ib, 0x243, 0x480u); // VGT_INDEX_TYPE: 16-bit, cache policy 2
@@ -647,7 +649,7 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 		ib.push_back(Pkt3(IT_NUM_INSTANCES, 1, false));
 		ib.push_back(cp.num_instances);
 	}
-	if ((cp_state & 4u) != 0) {
+	if ((cp_state & 4u) != 0 && (cp.index_set || (cp_state & 0x10u) != 0)) {
 		ib.push_back(Pkt3(IT_INDEX_BASE, 2, false));
 		ib.push_back(static_cast<uint32_t>(cp.index_base));
 		ib.push_back(static_cast<uint32_t>(cp.index_base >> 32u));
@@ -2125,6 +2127,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
 				cp.index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1]) << 32u);
+				cp.index_set  = true;
 				add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
 				stats.index_state++;
 				break;
@@ -2133,6 +2136,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				index_bytes = static_cast<uint64_t>(bptr[0]) * 4u;
 				if (body_count >= 1) {
 					cp.index_size = bptr[0];
+					cp.index_set  = true;
 				}
 				add_ref(index_base, index_bytes, false);
 				stats.index_state++;
