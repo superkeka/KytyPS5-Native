@@ -1918,12 +1918,16 @@ private:
 			Dot2cScan   scan = CountDot2c(std::span<const uint32_t>(code, 1u << 16u));
 			m_shaders_scanned++;
 			m_dot2c_sites += scan.sites;
-			if (scan.sites > 0) {
+			if (scan.decode_error && m_decode_stops++ < 16) {
+				std::fprintf(stderr, "native shadow: shader 0x%llx: sweep stopped at an undecodable word 0x%08x after %u instrs\n",
+				             static_cast<unsigned long long>(va), code[scan.dwords], scan.instructions);
+			}
+			if (scan.sites > 0 || scan.dot_ops > 0) {
 				std::fprintf(stderr,
-				             "native shadow: shader 0x%llx has %u v_dot2c_f32_f16 site(s) "
+				             "native shadow: shader 0x%llx has %u v_dot2c_f32_f16 site(s) and %u other dot op(s) "
 				             "(%u instrs, %s); patching is future work\n",
-				             static_cast<unsigned long long>(va), scan.sites, scan.instructions,
-				             scan.ended ? "s_endpgm" : (scan.decode_error ? "decode stop" : "capped"));
+				             static_cast<unsigned long long>(va), scan.sites, scan.dot_ops, scan.instructions,
+				             scan.ended ? "end" : (scan.decode_error ? "decode stop" : "capped"));
 			}
 			// The PS5 kernel gives the game VMID SH_MEM_BASES 0x80007000, Linux 0x20001000: a shader that
 			// reads the apertures adapts, one that hardcodes PS5 aperture addresses in FLAT accesses does not.
@@ -2072,6 +2076,7 @@ private:
 	double        m_timeout_sec    = kDefaultTimeoutSec;
 	uint32_t      m_shaders_scanned = 0;
 	uint32_t      m_dot2c_sites    = 0;
+	uint32_t      m_decode_stops   = 0;
 	std::set<uint64_t> m_seen_shaders;
 	std::set<uint32_t> m_skipped_uconfig;
 #if KYTY_GEM_BACKING_SUPPORTED

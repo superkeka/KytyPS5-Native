@@ -44,6 +44,7 @@ ShaderPatchResult PatchDot2c(std::span<const uint32_t> code, uint32_t num_vgprs)
 
 struct Dot2cScan {
 	uint32_t sites        = 0;     // v_dot2c_f32_f16 instructions found before s_endpgm
+	uint32_t dot_ops      = 0;     // every other dot instruction: v_dot4c_i32_i8 (VOP2), v_dot2/4/8_* (VOP3P)
 	uint32_t instructions = 0;     // instructions decoded
 	uint32_t gds_ops      = 0;     // DS instructions with the GDS bit (GDS memory, append/consume)
 	uint32_t ordered_ops  = 0;     // ds_ordered_count (ordered append; needs the GDS OA engine)
@@ -51,7 +52,7 @@ struct Dot2cScan {
 	uint32_t flat_ops     = 0;     // FLAT-segment loads/stores: the address goes through the LDS/scratch apertures
 	uint32_t aperture_ops = 0;     // reads of SH_MEM_BASES (s_getreg) or src_{shared,private}_{base,limit}
 	uint32_t dwords       = 0;     // dwords swept, s_endpgm included
-	bool     ended        = false; // true if an s_endpgm terminated the sweep
+	bool     ended        = false; // true if an s_endpgm (or a subroutine's s_setpc_b64 return) ended the sweep
 	bool     decode_error = false; // true if an instruction could not be decoded
 };
 

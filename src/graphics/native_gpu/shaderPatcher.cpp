@@ -265,6 +265,14 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 			scan.dwords = dw + 1;
 			break;
 		}
+		// SOP1 s_setpc_b64 (op 0x20): a subroutine returning to its caller (fetch shaders and helpers
+		// a main shader reaches with s_swappc_b64); what follows is data, not code.
+		if ((w >> 23u) == 0x17du && ((w >> 8u) & 0xffu) == 0x20u) {
+			scan.instructions++;
+			scan.ended  = true;
+			scan.dwords = dw + 1;
+			break;
+		}
 		const uint32_t len = InstructionDwords(code.subspan(dw));
 		if (len == 0) {
 			scan.decode_error = true;
@@ -272,6 +280,12 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 		}
 		if ((w >> 31u) == 0u && (w >> 25u) == OpVop2Dot2cF32F16) {
 			scan.sites++;
+		}
+		// The other dot instructions gfx1013 lacks: VOP2 v_dot4c_i32_i8 (0x0d) and VOP3P v_dot2_f32_f16
+		// .. v_dot8_u32_u4 (0x13..0x19).
+		if (((w >> 31u) == 0u && (w >> 25u) == 0x0du) || ((w >> 23u) == 0x198u && ((w >> 16u) & 0x7fu) >= 0x13u &&
+		                                                   ((w >> 16u) & 0x7fu) <= 0x19u)) {
+			scan.dot_ops++;
 		}
 		// DS (gfx10): bits 31:26 = 0x36, OP in 25:18, GDS in bit 17.
 		if ((w >> 26u) == 0x36u) {
