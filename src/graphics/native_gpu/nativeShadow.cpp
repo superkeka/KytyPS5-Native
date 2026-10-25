@@ -5,6 +5,7 @@
 #include "graphics/native_gpu/shaderPatcher.h"
 
 #include "kernel/memory.h"
+#include "kernel/syncOnAddress.h"
 #include "libs/agc.h"
 #include "libs/controller.h"
 
@@ -60,6 +61,18 @@ double NowSecShadow() {
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
+
+// Held pieces (a guest wait the GPU could not take on its own) released since the last flip report:
+// how many, how many had to wait for a later pump, and how long those waited in total.
+std::atomic<uint64_t> g_held_released {0};
+std::atomic<uint64_t> g_held_waited {0};
+std::atomic<uint64_t> g_held_wait_us {0};
+// By why the piece was first held: 0 cross-ring writer not submitted yet, 1 the write ahead does not
+// satisfy the wait (value or function), 2 the write ahead is a CPU (tracker) write, 3 partial cover,
+// 4 no write ahead and the label not in memory yet, 5 no native form of the wait.
+constexpr int kHoldReasons = 6;
+std::atomic<uint64_t> g_hold_reason_n[kHoldReasons] {};
+std::atomic<uint64_t> g_hold_reason_us[kHoldReasons] {};
 
 bool EnvOn(const char* name) {
 	const char* v = std::getenv(name);
@@ -955,6 +968,12 @@ public:
 		const double now = NowSecShadow();
 		m_flips++;
 		m_present_s += present_s;
+		// Flip-to-flip intervals by display refreshes: on time (one 60 Hz period), one late (two), worse.
+		if (m_flip_last != 0.0) {
+			const double ms = (now - m_flip_last) * 1e3;
+			m_flip_hist[ms < 20.0 ? 0 : ms < 37.0 ? 1 : 2]++;
+		}
+		m_flip_last = now;
 		if (m_flip_t0 == 0.0) {
 			m_flip_t0 = now;
 			m_busy_s = m_wait_lock_s = m_present_s = 0.0;
@@ -971,6 +990,25 @@ public:
 			             "lock %.1f ms, presenter %.1f ms, GPU busy %.1f ms; %llu MiB guest memory resident\n",
 			             (now - m_flip_t0) * per, m_busy_s * per, m_wait_lock_s * per, m_present_s * per,
 			             m_gpu_busy_s.load(std::memory_order_relaxed) * per, static_cast<unsigned long long>(ResidentMiB()));
+			std::fprintf(stderr, "native shadow: flip intervals: %u under 20 ms, %u 20-37 ms, %u longer\n", m_flip_hist[0],
+			             m_flip_hist[1], m_flip_hist[2]);
+			m_flip_hist = {};
+			const uint64_t held   = g_held_released.exchange(0, std::memory_order_relaxed);
+			const uint64_t waited = g_held_waited.exchange(0, std::memory_order_relaxed);
+			const uint64_t wait_us = g_held_wait_us.exchange(0, std::memory_order_relaxed);
+			std::fprintf(stderr, "native shadow: held pieces per flip: %.1f released, %.1f after waiting, %.2f ms waited\n",
+			             static_cast<double>(held) / m_flips, static_cast<double>(waited) / m_flips,
+			             static_cast<double>(wait_us) / 1e3 / m_flips);
+			static const char* const kReason[kHoldReasons] = {"cross-ring unsubmitted", "write does not satisfy", "CPU writer",
+			                                                  "partial cover", "no writer yet", "no native form"};
+			for (int r = 0; r < kHoldReasons; r++) {
+				const uint64_t n  = g_hold_reason_n[r].exchange(0, std::memory_order_relaxed);
+				const uint64_t us = g_hold_reason_us[r].exchange(0, std::memory_order_relaxed);
+				if (n != 0) {
+					std::fprintf(stderr, "native shadow:   held for %s: %.1f per flip, %.2f ms\n", kReason[r],
+					             static_cast<double>(n) / m_flips, static_cast<double>(us) / 1e3 / m_flips);
+				}
+			}
 #if defined(__GLIBC__)
 			if (EnvOn("KYTY_NATIVE_GPU_MALLOC_STATS")) {
 				const struct mallinfo2 mi = mallinfo2();
@@ -2178,6 +2216,8 @@ private:
 	double        m_chain_max_s     = 0.0;
 	double        m_flip_t0     = 0.0;
 	uint32_t      m_flips       = 0;
+	double                  m_flip_last = 0.0;
+	std::array<uint32_t, 3> m_flip_hist {}; // flip intervals: on time, one refresh late, later
 	std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> m_find_seen; // KYTY_NATIVE_GPU_FIND hits logged
 	bool          m_stats          = false;
 	uint32_t      m_stats_logged   = 0;
@@ -2603,7 +2643,9 @@ private:
 		switch (PlanRingWait(cover, satisfies, gpu, same, submitted, wait.Met(ReadLabel(wait)), native)) {
 			case RingWaitRelease::GpuWait: return Release::Native;
 			case RingWaitRelease::Barrier: return Release::Observed;
-			case RingWaitRelease::Hold: return Release::No;
+			case RingWaitRelease::Hold:
+				m_last_hold_reason = cover == 0 ? 4 : cover != 1 ? 3 : !gpu ? 2 : !satisfies ? 1 : !native ? 5 : 0;
+				return Release::No;
 		}
 		return Release::No;
 	}
@@ -2637,8 +2679,22 @@ private:
 				while (!pieces.empty()) {
 					const Release how = Ready(queue, pieces.front());
 					if (how == Release::No) {
+						if (m_hold_since.count(queue) == 0) {
+							m_hold_reason[queue] = m_last_hold_reason;
+						}
 						NoteStaleHold(queue, pieces.front());
 						break;
+					}
+					if (pieces.front().seg.held) {
+						g_held_released.fetch_add(1, std::memory_order_relaxed);
+						if (auto h = m_hold_since.find(queue); h != m_hold_since.end() && h->second > 0.0) {
+							const auto us = static_cast<uint64_t>((NowSecShadow() - h->second) * 1e6);
+							const int  r  = m_hold_reason[queue];
+							g_held_waited.fetch_add(1, std::memory_order_relaxed);
+							g_held_wait_us.fetch_add(us, std::memory_order_relaxed);
+							g_hold_reason_n[r].fetch_add(1, std::memory_order_relaxed);
+							g_hold_reason_us[r].fetch_add(us, std::memory_order_relaxed);
+						}
 					}
 					m_hold_since.erase(queue);
 					Emit(queue, pieces.front(), how);
@@ -2837,7 +2893,8 @@ private:
 				}
 				// sync-on-address sleeps in FUTEX_WAIT on this word. The store alone does not wake it;
 				// the 10 ms poll would, but the waiter returns as soon as it is woken and then reads.
-				if (published) {
+				// Most labels have no sleeper: skip the syscall then (~20k per second in ASTRO BOT).
+				if (published && LibKernel::SyncOnAddress::HasWaiters(reinterpret_cast<void*>(p.addr))) {
 #if defined(__linux__)
 					syscall(SYS_futex, reinterpret_cast<uint32_t*>(p.addr), FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
 #endif
@@ -2946,6 +3003,8 @@ private:
 	std::map<uint64_t, RingWrite>           m_ring; // label -> the latest write emitted into the ring
 	uint64_t                                m_batch = 1; // the batch being appended to (RingWrite::batch)
 	uint64_t                                m_released_native   = 0;
+	int                                     m_last_hold_reason  = 0;
+	std::map<uint32_t, int>                 m_hold_reason; // queue -> why its front piece was first held
 	uint64_t                                m_released_observed = 0;
 	std::atomic<uint64_t>                   m_last_cs {0};
 	// Tracker side.
