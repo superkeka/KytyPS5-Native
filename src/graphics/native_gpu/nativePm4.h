@@ -3,10 +3,14 @@
 
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <set>
+#include <unordered_set>
 #include <span>
 #include <utility>
 #include <vector>
@@ -158,6 +162,13 @@ struct Pm4TranslateStats {
 	uint32_t write_data_dropped = 0; // IT_WRITE_DATA to memory, left to Kyty (see Translate)
 	uint32_t write_data_native  = 0; // IT_WRITE_DATA to memory also kept in the IB (SetWriteDataNative)
 	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
+	uint32_t labels_native     = 0; // native labels: WRITE_DATA / RELEASE_MEM label writes run on the GPU
+	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU (unreachable, or a mirror of a GPU store)
+	uint32_t timestamps        = 0; // native labels: timestamps the tracker still writes (CPU clock)
+	uint32_t timestamps_native = 0; // native labels: timestamps the GPU writes (DATA_SEL 3)
+	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
+	uint32_t waits_native      = 0; // native labels: guest waits passed through (an earlier GPU write satisfies them)
+	uint32_t waits_split       = 0; // native labels: guest waits the IB is cut at (no known writer yet)
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
@@ -225,6 +236,194 @@ struct FindHit {
 	bool     image    = false; // a T# base (address >> 8) rather than a 48-bit V#/pointer
 };
 
+// Native labels (Pm4Translator::SetNativeLabels). The GPU writes the guest's completion labels
+// itself, and the CPU-side effects of a buffer (EOP interrupts, labels the GPU cannot write) hang off
+// tracker points: end-of-pipe RELEASE_MEMs that write a sequence number into a slot the backend
+// polls. Guest waits pass through when an earlier write in ring order satisfies them; otherwise the
+// IB is cut there and the rest is held back until the label is written.
+
+// A guest WAIT_REG_MEM(_64) on memory: (value & mask) <function> ref.
+struct WaitCond {
+	uint64_t addr     = 0;
+	uint64_t ref      = 0;
+	uint64_t mask     = ~0ull;
+	uint32_t function = 3;
+	bool     wide     = false; // WAIT_REG_MEM_64
+	bool     pfp      = false; // ENGINE_SEL = PFP
+
+	[[nodiscard]] bool Met(uint64_t value) const;
+};
+
+// A label write a buffer performs, for deciding who satisfies later waits.
+struct LabelWrite {
+	uint64_t addr  = 0;
+	uint64_t value = 0;
+	bool     known = true;  // false: the value is not known when translating (GDS data, timestamps)
+	bool     gpu   = true;  // written by the GPU (false: by the tracker or Kyty on the CPU)
+	bool     wide  = false; // 64 bits
+
+	// What a WAIT at `a` (64-bit when `wide_wait`) reads once this write has landed: 0 unrelated,
+	// 1 the value in `out`, 2 touched but unknown.
+	int Covers(uint64_t a, bool wide_wait, uint64_t* out) const;
+};
+
+struct TrackerPoint {
+	enum class Kind : uint8_t {
+		End,       // the end of a segment (the last one: the buffer is done)
+		Interrupt, // RELEASE_MEM INT_SEL: raise the queue's EOP interrupt with `ctx`
+		           // (points with nothing between them share one packet, i.e. one `dw`)
+		CpuWrite,  // write `data` (dwords) at `addr`, all to one address when `one_addr`
+		Timestamp, // write the reference clock at `addr` (`size` bytes)
+		LodStats,  // fill `size` bytes at `addr` like Kyty's GET_LOD_STATS
+	};
+	Kind                  kind     = Kind::End;
+	uint32_t              dw       = 0; // the point's 32-bit sequence value in the IB (patched before submission)
+	uint32_t              ctx      = 0;
+	uint64_t              addr     = 0;
+	uint32_t              size     = 0;
+	bool                  one_addr = false;
+	bool                  mirror   = false; // also stored by the GPU; publish on the CPU only if the guest has not replaced it
+	std::vector<uint32_t> data;
+	std::vector<uint32_t> prior; // dwords at `addr` when the buffer was translated; empty: write unconditionally
+};
+
+// One self-contained piece of a translated buffer, IB dwords [begin, end) of Pm4TranslateResult::ib.
+// Every segment after the first starts held, at a guest wait that no earlier write satisfied: its
+// IB begins with the preamble, a barrier block (our fence) and the guest wait, so the backend can
+// keep the wait (a GPU write ahead in the ring will satisfy it) or the barrier (the label was seen
+// written) and NOP the other.
+struct Pm4Segment {
+	uint32_t                  begin       = 0;
+	uint32_t                  end         = 0;
+	bool                      held        = false;
+	WaitCond                  wait;
+	uint32_t                  barrier_dw  = 0;
+	uint32_t                  barrier_len = 0;
+	uint32_t                  wait_dw     = 0;
+	uint32_t                  wait_len    = 0;
+	std::vector<TrackerPoint> points;
+	std::vector<LabelWrite>   writes;
+};
+
+// Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
+void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len);
+
+// Which ring an IB is about to be submitted to. Compute allows the same RELEASE_MEM / WAIT_REG_MEM
+// bodies as the gfx ring, with the shader-type bit set, and rejects graphics-only packets (a draw or
+// PFP_SYNC_ME on MEC is an illegal opcode).
+enum class NativeIbKind { Gfx, Compute };
+
+// The native-labels packet check: true when every packet of `ib` is one the translator has run on the
+// board before (in particular RELEASE_MEM and WAIT_REG_MEM only in the barrier's forms, NOPs only as
+// fillers, GET_LOD_STATS only with `lod_stats`), so an "Illegal opcode in command stream" cannot come
+// from a form never tried. On failure `bad_dw` is the offending packet.
+bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw = nullptr,
+                      NativeIbKind kind = NativeIbKind::Gfx);
+
+// How a held guest wait may leave the CPU (KYTY_NATIVE_GPU_ACB_RINGS). The GPU is only given the
+// wait once a writer that satisfies it is guaranteed to run:
+//   same ring — the write is already ahead in that ring's batch, so the waiter is appended behind it;
+//   another ring — only after that writer's CS ioctl has returned, so a compute ring cannot block on
+// a label the gfx ring has not been asked to write (and the other way around).
+// Until then the segment stays on the CPU (Hold). A label already in memory, and no pending write
+// that will replace it, is a barrier: a wait whose writer will never be submitted does not block the
+// GPU. `cover` is LabelWrite::Covers (0 unrelated, 1 known value, 2 touched but unknown).
+enum class RingWaitRelease { Hold, GpuWait, Barrier };
+
+RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
+                             bool label_in_memory, bool native_wait);
+
+// Guest compute queues are 0x20 + n (7 pipes x 8 queues). `available_rings` is the
+// AMDGPU_INFO_HW_IP_INFO bitmask. Returns one of its set bits; queues spread across the rings the
+// kernel exposes. No bit set: 0.
+uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings);
+
+// What the backend knows about labels beyond the buffer being translated.
+class LabelOracle {
+public:
+	enum class Plan {
+		Native, // a GPU write ahead in the ring satisfies the wait: pass it through
+		Met,    // the label already holds a satisfying value: a barrier, as without native labels
+		Split,  // nobody known satisfies it yet: cut the IB here
+	};
+	virtual ~LabelOracle() = default;
+	// True when the GPU may write `addr` (GPU-mapped, writable guest memory).
+	virtual bool GpuWritable(uint64_t addr) = 0;
+	// The dword currently at `addr`, when it can be read without faulting. False leaves the tracker's
+	// mirror of a GPU label store unconditional.
+	virtual bool SampleDword(uint64_t addr, uint32_t* out) {
+		(void)addr;
+		(void)out;
+		return false;
+	}
+	// Decides a wait no earlier write of the same buffer decides.
+	virtual Plan PlanWait(const WaitCond& wait) = 0;
+};
+
+// Texture LOD statistics (SetLodBankScan): the PS5 T#s that count into GET_LOD_STATS, seen by the
+// draws and dispatches since the previous GET_LOD_STATS packet. Gfx10 layout, as Kyty decodes it:
+// word5 bit 25 MIP_STATS_CNT_EN, word5[19:8] MIN_LOD_WARN, word6[7:0] the counter bank (one 8-byte
+// record per bank behind the packet's 64-byte header). The gfx9 layout (word6: MIN_LOD_WARN[11:0],
+// COUNTER_BANK_ID[19:12], LOD_HDW_CNT_EN[20]) is counted next to it to tell which one the game uses.
+struct LodBankScan {
+	uint64_t                             addr = 0; // the GET_LOD_STATS buffer this scan ends at
+	std::bitset<256>                     banks;     // banks of the counting T#s
+	uint32_t                             tsharps  = 0; // plausible T#s scanned (repeats included)
+	uint32_t                             counting = 0; // of those, with MIP_STATS_CNT_EN
+	uint32_t                             inline_ud = 0; // counting T#s found in user data
+	uint32_t                             depth1    = 0; // ... in a table a user-data pointer points at
+	uint32_t                             depth2    = 0; // ... in a table such a table points at
+	uint32_t                             tables    = 0; // tables read
+	uint32_t                             max_word  = 0; // furthest dword a counting T# sat at in a table
+	uint32_t                             alt_counting = 0; // gfx9 layout: word6 bit 20 set
+	std::bitset<256>                     alt_banks;        // gfx9 layout: word6[19:12] of those
+	std::map<uint32_t, uint32_t>         min_lod_warn;     // MIN_LOD_WARN of the counting T#s -> count
+	std::vector<std::array<uint32_t, 8>> samples;          // the first counting T#s, whole
+	void                                 Merge(const LodBankScan& o);
+};
+
+// What CpOpGetLodStats writes. Usage (the default, and KYTY_LOD_STATS_MODE=usage) is one record per
+// bank from the translator's window. all / fill is the old whole-buffer fill (KYTY_LOD_STATS_FILL,
+// 0xff unless overridden). banks / even / lo / hi are the earlier diagnostics.
+enum class LodStatsMode { Usage, All, Banks, Even, Lo, Hi };
+LodStatsMode ParseLodStatsMode(const char* mode);
+
+// GET_LOD_STATS record, as ASTRO BOT's reader (eboot 0x900479d40) decodes it. Bits 23:0 are the
+// sample count, bits 31:24 an id byte the streamer folds in (left 0), bits 59:56 the minimum mip
+// actually sampled (0 finest; 0xF means this bank has no data). A used bank is reported as sampled
+// at the finest mip; the exact mip comes later, from shader instrumentation.
+constexpr uint64_t kLodStatsUsed   = 1ull;
+constexpr uint64_t kLodStatsNoData = 0x0F00000000000000ull;
+constexpr uint32_t kLodStatsHeader = 64;
+
+// Writes a usage report: header dword 0 = 1 (after the records, so a reader that sees the label
+// sees the records too), record `kLodStatsUsed` for each set bank, `kLodStatsNoData` for the rest.
+// Returns how many used records were written. `size_bytes` is the packet's buffer size.
+uint32_t WriteLodUsageReport(void* dst, uint32_t size_bytes, const std::bitset<256>& banks);
+
+// "12-13,87" or "none". `dst` is NUL-terminated when `dst_size` > 0.
+void FormatLodBankRanges(const std::bitset<256>& banks, char* dst, uint32_t dst_size);
+
+// Banks published by the pipeline thread that translates DCBs and ACBs, taken by the command
+// processor when it runs the matching GET_LOD_STATS. The processor runs after that translation
+// (same thread when the pipeline is off; the completion thread when KYTY_NATIVE_GPU_THREAD is on),
+// so Take sees every buffer submitted before the packet.
+class LodStatsHandoff {
+public:
+	void Push(uint64_t addr, const std::bitset<256>& banks);
+	bool Take(uint64_t addr, std::bitset<256>& banks);
+
+private:
+	static constexpr size_t kCap = 1024;
+	std::mutex m_mutex;
+	std::deque<std::pair<uint64_t, std::bitset<256>>> m_queue;
+	uint32_t m_dropped = 0;
+};
+LodStatsHandoff& LodStatsReports();
+
+// Optional stand-in for the guest-memory read the bank scan uses (process_vm_readv on Linux).
+using LodGuestReadFn = size_t (*)(uint64_t addr, uint32_t* dst, size_t dwords, void* user);
+
 struct Pm4TranslateResult {
 	bool                  ok         = true;  // false when an unknown packet forced a refusal
 	uint32_t              unknown_op = 0;     // the opcode that could not be translated
@@ -240,6 +439,7 @@ struct Pm4TranslateResult {
 	std::vector<RenderTargetInfo> render_targets; // color targets bound for its draws, by address
 	std::vector<DrawSnapshot>     inspected;      // draws with the inspected pixel shader
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
+	std::vector<LodBankScan>      lod_scans;      // SetLodBankScan: one per GET_LOD_STATS packet
 	struct UnmetWait {
 		uint64_t addr;
 		uint64_t ref;
@@ -253,6 +453,11 @@ struct Pm4TranslateResult {
 	std::vector<std::pair<uint64_t, uint64_t>> label_writes; // (address, value) of this buffer's labels
 	std::vector<std::pair<uint64_t, uint32_t>> data_writes;  // (address, dwords) of WRITE_DATA with more than one dword
 	std::vector<std::pair<uint32_t, uint32_t>> gds_dma;      // (GDS offset | 0x80000000 if written, bytes)
+	// Native labels only: the IB's segments in order (empty without native labels), and the packets
+	// Kyty's command processor still has to run once the buffer is done (flips, waits for a flip),
+	// copied out of the guest buffer.
+	std::vector<Pm4Segment> segments;
+	std::vector<uint32_t>   cpu_tail;
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -313,9 +518,27 @@ public:
 	// that every submission maps); 0 drops them as before.
 	void SetFenceAddress(uint64_t va) { m_fence_va = va; }
 
+	// Native labels: label writes run on the GPU (or at tracker points that write `tracker_va`),
+	// waits pass through, become barriers or cut the IB as `oracle` decides; Kyty's command processor
+	// only gets Pm4TranslateResult::cpu_tail. nullptr turns it off. The fence (SetFenceAddress) is
+	// needed for the barriers of held segments. The dword at `tracker_va` + 8 takes flush-only releases.
+	void SetNativeLabels(LabelOracle* oracle, uint64_t tracker_va) {
+		m_labels     = oracle;
+		m_tracker_va = tracker_va;
+	}
+	// With native labels: false turns the waits an earlier GPU write satisfies into barriers too.
+	void SetNativeWaits(bool on) { m_native_waits = on; }
+	// Timestamps stay on the tracker (Kyty's host TSC scaled to 100 MHz) instead of the GPU clock.
+	// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1. The two clocks have the same unit and different zeros.
+	void SetCpuTimestamps(bool on) { m_cpu_timestamps = on; }
+
 	// The buffers come from a compute queue (ACBs), whose packets differ from the gfx ring's
 	// (DISPATCH_INDIRECT carries its argument address); they are rewritten for the gfx ring.
 	void SetComputeQueue(bool compute_queue) { m_compute_queue = compute_queue; }
+	// Submit those buffers to an amdgpu compute ring (MEC) instead of rewriting them for the gfx
+	// ring: the guest DISPATCH_INDIRECT is kept, and RELEASE_MEM / WAIT_REG_MEM carry the compute
+	// shader bit. Graphics-only packets are refused.
+	void SetComputeRing(bool compute_ring) { m_compute_ring = compute_ring; }
 
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
@@ -334,6 +557,27 @@ public:
 	void SetCompactRefs(bool compact) { m_compact_refs = compact; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
+	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
+	// scan every stage's user-data SGPRs (PS, VS, GS, ES, HS, LS) and USER_DATA_ADDR; dispatches
+	// scan COMPUTE_USER_DATA_0..15. Descriptor tables those pointers name are read two levels deep
+	// (`table_dwords` of each first-level table). A non-zero-size GET_LOD_STATS closes the window:
+	// Pm4TranslateResult::lod_scans gets one scan, and TakeLodScan returns what was seen since the
+	// previous report. A zero-size packet does not close it.
+	void SetLodBankScan(bool on, uint32_t table_dwords = 1024) {
+		m_lod_scan        = on;
+		m_lod_scan_dwords = table_dwords != 0 ? table_dwords : 1024;
+	}
+	void SetLodGuestRead(LodGuestReadFn fn, void* user) {
+		m_lod_read      = fn;
+		m_lod_read_user = user;
+	}
+	LodBankScan TakeLodScan() {
+		LodBankScan out = std::move(m_lod_cur);
+		m_lod_cur       = {};
+		m_lod_tables.clear();
+		m_lod_stages.clear();
+		return out;
+	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
 	// DMA_DATA to or from GDS with CP_SYNC, and a CS_PARTIAL_FLUSH before a copy out of GDS, so the
@@ -364,7 +608,8 @@ public:
 	static bool UconfigAllowed(uint32_t normalized_offset);
 
 private:
-	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats) const;
+	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
+	                      const RegFile& uc) const;
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
 
 	RegFile                      m_cx; // context registers (SET_CONTEXT_REG space)
@@ -381,7 +626,12 @@ private:
 	bool                         m_no_cmask_clear = false;
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
+	bool                         m_compute_ring   = false;
 	uint64_t                     m_fence_va       = 0;
+	LabelOracle*                 m_labels         = nullptr;
+	uint64_t                     m_tracker_va     = 0;
+	bool                         m_native_waits   = true;
+	bool                         m_cpu_timestamps = false;
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;
@@ -393,6 +643,13 @@ private:
 	bool                         m_gds_dma_sync      = false;
 	bool                         m_acquire_full      = false;
 	uint32_t                     m_write_data_native = 0;
+	bool                         m_lod_scan          = false;
+	uint32_t                     m_lod_scan_dwords   = 1024;
+	LodGuestReadFn               m_lod_read          = nullptr;
+	void*                        m_lod_read_user     = nullptr;
+	LodBankScan                  m_lod_cur;          // SetLodBankScan: since the last GET_LOD_STATS
+	std::unordered_set<uint64_t> m_lod_tables;       // tables already read for m_lod_cur
+	std::unordered_set<uint64_t> m_lod_stages;       // user-data blocks already scanned for m_lod_cur (hashes)
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;

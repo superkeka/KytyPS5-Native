@@ -1,6 +1,9 @@
 #include "graphics/native_gpu/nativePm4.h"
 
 #include <algorithm>
+#include <cstring>
+#include <atomic>
+#include <cstdio>
 #if defined(__linux__)
 #include <sys/uio.h>
 #include <unistd.h>
@@ -44,6 +47,7 @@ constexpr uint32_t IT_SET_UCONFIG_REG_INDEX    = 0x7A;
 constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT = 0x9F;
 
 // IT_NOP marker codes carried in the register field (Kyty custom codes in pm4.h).
+constexpr uint32_t R_ZERO           = 0x00;
 constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
@@ -196,7 +200,285 @@ bool WriteDataToMemory(uint32_t control) {
 	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
 }
 
+// Native labels emit RELEASE_MEM and WAIT_REG_MEM only in the forms the barrier has run on the board
+// countless times (guest forms of them stopped the gfx ring with "Illegal opcode in command stream"):
+// RELEASE_MEM with CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX 5 (end of pipe), GCR_CNTL GLM_WB |
+// GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB, 32-bit data to memory and no interrupt; and
+// WAIT_REG_MEM EQUAL on memory by the micro engine, poll interval 4. ValidateNativeIb holds the IB to
+// that.
+constexpr uint32_t kFlushEventCntl = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
+                                     (1u << 20u) | (1u << 21u);
+constexpr uint32_t kData32Cntl     = 1u << 29u;
+// DATA_SEL 3: the 64-bit GPU clock counter. amdgpu's gfx_v10_0_ring_emit_fence stores a
+// sequence with DATA_SEL 1 or 2 in this same packet (CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX
+// 5); Mesa's write-timestamp uses DATA_SEL 3 and ignores the data dwords. The event dword stays
+// the one this board already runs. The data dwords are zero: the clock replaces them.
+constexpr uint32_t kDataTimestampCntl = 3u << 29u;
+constexpr uint32_t kWaitEqualMemMe = 3u | (1u << 4u);
+constexpr uint32_t kWaitPoll       = 4u;
+constexpr uint32_t kFiller         = 0xffff1000u; // the one-dword NOP IBs are padded with
+
+void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value, bool compute) {
+	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, compute));
+	ib.push_back(kFlushEventCntl);
+	ib.push_back(kData32Cntl);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+	ib.push_back(value);
+	ib.push_back(0u);
+	ib.push_back(0u);
+}
+
+// End-of-pipe GPU clock at `addr` (8-byte aligned). Same event as EmitRelease32, DATA_SEL 3.
+void EmitTimestampRelease(std::vector<uint32_t>& ib, uint64_t addr, bool compute) {
+	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, compute));
+	ib.push_back(kFlushEventCntl);
+	ib.push_back(kDataTimestampCntl);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+	ib.push_back(0u);
+	ib.push_back(0u);
+	ib.push_back(0u);
+}
+
+void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint32_t mask, bool compute) {
+	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, compute));
+	ib.push_back(kWaitEqualMemMe);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+	ib.push_back(ref);
+	ib.push_back(mask);
+	ib.push_back(kWaitPoll);
+}
+
+// Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
+// on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
+// the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
+bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) {
+	if (w.function != 3) {
+		return false;
+	}
+	EmitWaitEqual(ib, w.addr, static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.mask), compute);
+	// A 64-bit equality wait (Agc's WaitOnAddress, mask ~0) as one wait per half: the label is written
+	// once before it is waited on, so both halves holding their part is the 64-bit condition.
+	if (w.wide && (w.mask >> 32u) != 0) {
+		EmitWaitEqual(ib, w.addr + 4u, static_cast<uint32_t>(w.ref >> 32u), static_cast<uint32_t>(w.mask >> 32u), compute);
+	} else if (w.wide && (w.ref >> 32u) != 0) {
+		return false; // the high half must match a value the mask leaves out: never true
+	}
+	// MEC has no prefetch parser. PFP_SYNC_ME there is an illegal opcode; the ME wait is the whole sync.
+	if (w.pfp && !compute) {
+		ib.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
+		ib.push_back(0);
+	}
+	return true;
+}
+
+// R_ZERO NOP payloads Kyty's command processor runs as flips (pm4Handlers.cpp CpOpMarker): a flip, a
+// flip that writes a label first, and one that also raises the EOP interrupt.
+bool IsFlipMarker(uint32_t tag) {
+	return tag == 0x68750777u || tag == 0x68750778u || tag == 0x68750781u;
+}
+
+// Packets that make the GPU do something (as opposed to setting state), for dropping an empty first
+// segment. Labels, waits and LOD statistics say so themselves.
+bool IsWork(uint32_t op) {
+	switch (op) {
+		case IT_DRAW_INDEX_2:
+		case IT_DRAW_INDEX_OFFSET_2:
+		case IT_DRAW_INDIRECT:
+		case IT_DRAW_INDEX_INDIRECT:
+		case IT_DRAW_INDEX_AUTO:
+		case IT_DISPATCH_DIRECT:
+		case IT_DISPATCH_INDIRECT:
+		case IT_DMA_DATA:
+		case IT_EVENT_WRITE:
+		case IT_ACQUIRE_MEM:
+		case IT_PFP_SYNC_ME:
+		case IT_GET_LOD_STATS: return true;
+		default: return false;
+	}
+}
+
 } // namespace
+
+// First time each guest side effect is handled. A board run then shows which forms the title uses.
+void NoteOnce(uint32_t id, const char* msg) {
+	static std::atomic<uint64_t> lo {0};
+	static std::atomic<uint64_t> hi {0};
+	if (id >= 128u) {
+		return;
+	}
+	auto&          word = id < 64u ? lo : hi;
+	const uint64_t bit  = 1ull << (id & 63u);
+	if ((word.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) {
+		return;
+	}
+	std::fprintf(stderr, "native labels: %s\n", msg);
+}
+
+void NoteEvent(uint32_t event_type) {
+	static std::atomic<uint64_t> seen {0};
+	if (event_type >= 64u) {
+		return;
+	}
+	const uint64_t bit = 1ull << event_type;
+	if ((seen.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) {
+		return;
+	}
+	std::fprintf(stderr, "native labels: EVENT_WRITE type 0x%02x\n", event_type);
+}
+
+bool WaitCond::Met(uint64_t value) const {
+	return WaitConditionMet(function, value & mask, ref);
+}
+
+int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out) const {
+	if (a == addr) {
+		if (wide_wait && !wide) {
+			return 2; // half of what the wait reads
+		}
+		*out = wide_wait ? value : (value & 0xffffffffull);
+		return known ? 1 : 2;
+	}
+	if (wide && !wide_wait && a == addr + 4) {
+		*out = value >> 32u;
+		return known ? 1 : 2;
+	}
+	if (wide_wait && !wide && a + 4 == addr) {
+		return 2;
+	}
+	return 0;
+}
+
+void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
+	if (dw + len > ib.size()) {
+		return;
+	}
+	for (uint32_t i = 0; i < len; i++) {
+		ib[dw + i] = kFiller;
+	}
+}
+
+bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind) {
+	const bool compute = kind == NativeIbKind::Compute;
+	uint32_t dw = 0;
+	auto     bad = [&]() {
+		if (bad_dw != nullptr) {
+			*bad_dw = dw;
+		}
+		return false;
+	};
+	while (dw < ib.size()) {
+		const uint32_t header = ib[dw];
+		if ((header >> 30u) != 3u) {
+			return bad();
+		}
+		const uint32_t size = PacketSizeDw(header);
+		if (dw + size > ib.size()) {
+			return bad();
+		}
+		const uint32_t* b = ib.data() + dw + 1;
+		switch ((header >> 8u) & 0xffu) {
+			case IT_NOP:
+				if (header != kFiller) {
+					return bad();
+				}
+				break;
+			case IT_RELEASE_MEM:
+				// The barrier's form (any address and data), a GPU-clock timestamp (DATA_SEL 3, data
+				// dwords zero, 8-byte address), or a GDS release as the translator has always run it
+				// (DATA_SEL 5, no interrupt). Compute rings use the same bodies with the shader bit.
+				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || b[6] != 0u) {
+					return bad();
+				}
+				if (b[0] == kFlushEventCntl && b[1] == kData32Cntl) {
+					break;
+				}
+				if (b[0] == kFlushEventCntl && b[1] == kDataTimestampCntl && b[4] == 0u && b[5] == 0u &&
+				    (b[2] & 7u) == 0u) {
+					break;
+				}
+				if (((b[1] >> 29u) & 0x7u) == 5u && ((b[1] >> 24u) & 0x7u) == 0u) {
+					break;
+				}
+				return bad();
+			case IT_WAIT_REG_MEM:
+				if (header != Pkt3(IT_WAIT_REG_MEM, 6, compute) || b[0] != kWaitEqualMemMe || b[5] != kWaitPoll) {
+					return bad();
+				}
+				break;
+			case IT_GET_LOD_STATS:
+				if (compute || !lod_stats) {
+					return bad();
+				}
+				break;
+			// Packets both rings run. On MEC the shader-type bit is set.
+			case IT_SET_BASE:
+			case IT_DISPATCH_DIRECT:
+			case IT_DISPATCH_INDIRECT:
+			case IT_EVENT_WRITE:
+			case IT_DMA_DATA:
+			case IT_ACQUIRE_MEM:
+			case IT_SET_SH_REG:
+				if (compute && (header & 2u) == 0) {
+					return bad();
+				}
+				break;
+			// Graphics-only. An illegal opcode on a compute ring.
+			case IT_CLEAR_STATE:
+			case IT_INDEX_BUFFER_SIZE:
+			case IT_DRAW_INDIRECT:
+			case IT_DRAW_INDEX_INDIRECT:
+			case IT_INDEX_BASE:
+			case IT_DRAW_INDEX_2:
+			case IT_CONTEXT_CONTROL:
+			case IT_DRAW_INDEX_AUTO:
+			case IT_NUM_INSTANCES:
+			case IT_PFP_SYNC_ME:
+			case IT_SET_CONTEXT_REG:
+			case IT_SET_UCONFIG_REG:
+			case IT_SET_UCONFIG_REG_INDEX:
+				if (compute) {
+					return bad();
+				}
+				break;
+			default: return bad();
+		}
+		dw += size;
+	}
+	return true;
+}
+
+RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
+                             bool label_in_memory, bool native_wait) {
+	if (cover != 0) {
+		// A write already emitted still owns the address. Matching memory is stale until it lands,
+		// and an unknown value cannot be proved to satisfy the wait, so the segment stays held.
+		const bool gpu_wait = cover == 1 && value_satisfies && gpu_write && native_wait &&
+		                      (same_ring || writer_submitted);
+		return gpu_wait ? RingWaitRelease::GpuWait : RingWaitRelease::Hold;
+	}
+	if (label_in_memory) {
+		return RingWaitRelease::Barrier;
+	}
+	return RingWaitRelease::Hold;
+}
+
+uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings) {
+	uint32_t rings[32];
+	uint32_t n = 0;
+	for (uint32_t bit = 0; bit < 32; bit++) {
+		if ((available_rings & (1u << bit)) != 0) {
+			rings[n++] = bit;
+		}
+	}
+	if (n == 0) {
+		return 0;
+	}
+	const uint32_t index = guest_queue >= 0x20u ? guest_queue - 0x20u : guest_queue;
+	return rings[index % n];
+}
 
 uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
 	// CB_COLORn_INFO.DCC_ENABLE (bit 28) off, for the no-DCC experiment.
@@ -293,7 +575,17 @@ void Pm4Translator::ResetShadow() {
 	m_uc.clear();
 }
 
-void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats) const {
+void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx,
+                                 const RegFile& sh, const RegFile& uc) const {
+	if (m_compute_ring) {
+		// MEC has no graphics context. CONTEXT_CONTROL, CLEAR_STATE, context and UCONFIG writes are
+		// illegal opcodes on a compute ring. SH state is replayed: other jobs share the ring.
+		for (const auto& [offset, value]: sh) {
+			EmitSet(ib, IT_SET_SH_REG, offset, value, true);
+			stats.preamble_sh++;
+		}
+		return;
+	}
 	// RADV-style preamble: take back context ownership, clear to defaults, then replay the whole
 	// shadowed state. Other processes share the gfx ring between our submissions, so nothing from
 	// the previous DCB is assumed to survive on the hardware.
@@ -304,24 +596,158 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
 	ib.push_back(0u);
 
-	for (const auto& [offset, value]: m_cx) {
+	for (const auto& [offset, value]: cx) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
 		stats.preamble_cx++;
 	}
-	if (m_ps5_reg_overrides && m_cx.count(kPaScShaderControl) == 0) {
+	if (m_ps5_reg_overrides && cx.count(kPaScShaderControl) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kPaScShaderControl, PatchContext(kPaScShaderControl, 0), false);
 	}
-	if (m_depth_mode == DepthDebugMode::HizOff && m_cx.count(kDbRenderOverride) == 0) {
+	if (m_depth_mode == DepthDebugMode::HizOff && cx.count(kDbRenderOverride) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
 	}
-	for (const auto& [offset, value]: m_sh) {
+	for (const auto& [offset, value]: sh) {
 		EmitSet(ib, IT_SET_SH_REG, offset, value, offset >= kShComputeBase);
 		stats.preamble_sh++;
 	}
-	for (const auto& [offset, value]: m_uc) {
+	for (const auto& [offset, value]: uc) {
 		EmitSetUconfig(ib, offset, value);
 		stats.preamble_uc++;
 	}
+}
+
+void LodBankScan::Merge(const LodBankScan& o) {
+	banks |= o.banks;
+	tsharps += o.tsharps;
+	counting += o.counting;
+	inline_ud += o.inline_ud;
+	depth1 += o.depth1;
+	depth2 += o.depth2;
+	tables += o.tables;
+	max_word = std::max(max_word, o.max_word);
+	alt_counting += o.alt_counting;
+	alt_banks |= o.alt_banks;
+	for (const auto& [warn, n]: o.min_lod_warn) {
+		min_lod_warn[warn] += n;
+	}
+	for (const auto& t: o.samples) {
+		if (samples.size() < 8) {
+			samples.push_back(t);
+		}
+	}
+}
+
+LodStatsMode ParseLodStatsMode(const char* mode) {
+	if (mode == nullptr || mode[0] == '\0' || std::strcmp(mode, "usage") == 0 || std::strcmp(mode, "hw") == 0) {
+		return LodStatsMode::Usage;
+	}
+	if (std::strcmp(mode, "banks") == 0) {
+		return LodStatsMode::Banks;
+	}
+	if (std::strcmp(mode, "even") == 0) {
+		return LodStatsMode::Even;
+	}
+	if (std::strcmp(mode, "lo") == 0) {
+		return LodStatsMode::Lo;
+	}
+	if (std::strcmp(mode, "hi") == 0) {
+		return LodStatsMode::Hi;
+	}
+	return LodStatsMode::All; // "all", "fill", or unrecognised: the whole-buffer fill
+}
+
+uint32_t WriteLodUsageReport(void* dst, uint32_t size_bytes, const std::bitset<256>& banks) {
+	if (dst == nullptr || size_bytes == 0) {
+		return 0;
+	}
+	auto*          bytes  = static_cast<uint8_t*>(dst);
+	const uint32_t header = std::min(size_bytes, kLodStatsHeader);
+	std::memset(bytes, 0, header);
+	uint32_t records = 0;
+	if (size_bytes > kLodStatsHeader) {
+		records = (size_bytes - kLodStatsHeader) / 8u;
+		if (records > 256u) {
+			records = 256u;
+		}
+	}
+	uint32_t used = 0;
+	for (uint32_t bank = 0; bank < records; bank++) {
+		const uint64_t rec = banks.test(bank) ? kLodStatsUsed : kLodStatsNoData;
+		used += banks.test(bank) ? 1u : 0u;
+		std::memcpy(bytes + kLodStatsHeader + bank * 8u, &rec, sizeof(rec));
+	}
+	const uint32_t tail = kLodStatsHeader + records * 8u;
+	if (size_bytes > tail) {
+		std::memset(bytes + tail, 0, size_bytes - tail);
+	}
+	if (size_bytes >= sizeof(uint32_t)) {
+		*static_cast<uint32_t*>(dst) = 1;
+	}
+	return used;
+}
+
+void FormatLodBankRanges(const std::bitset<256>& banks, char* dst, uint32_t dst_size) {
+	if (dst == nullptr || dst_size == 0) {
+		return;
+	}
+	uint32_t used = 0;
+	dst[0]        = '\0';
+	auto append   = [&](const char* s) {
+		while (*s != '\0' && used + 1 < dst_size) {
+			dst[used++] = *s++;
+		}
+		dst[used] = '\0';
+	};
+	bool any = false;
+	for (uint32_t i = 0; i < 256; i++) {
+		if (!banks.test(i)) {
+			continue;
+		}
+		uint32_t j = i;
+		while (j + 1 < 256 && banks.test(j + 1)) {
+			j++;
+		}
+		char piece[32];
+		std::snprintf(piece, sizeof(piece), "%s%u%s", any ? "," : "", i, j != i ? "" : "");
+		append(piece);
+		if (j != i) {
+			std::snprintf(piece, sizeof(piece), "-%u", j);
+			append(piece);
+		}
+		any = true;
+		i   = j;
+	}
+	if (!any) {
+		append("none");
+	}
+}
+
+void LodStatsHandoff::Push(uint64_t addr, const std::bitset<256>& banks) {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	if (m_queue.size() >= kCap) {
+		m_queue.pop_front();
+		if (m_dropped++ == 0) {
+			std::fprintf(stderr, "LOD stats: the report queue is full; the oldest report was dropped\n");
+		}
+	}
+	m_queue.emplace_back(addr, banks);
+}
+
+bool LodStatsHandoff::Take(uint64_t addr, std::bitset<256>& banks) {
+	std::lock_guard<std::mutex> lock(m_mutex);
+	for (auto it = m_queue.begin(); it != m_queue.end(); ++it) {
+		if (it->first == addr) {
+			banks = it->second;
+			m_queue.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
+LodStatsHandoff& LodStatsReports() {
+	static LodStatsHandoff handoff;
+	return handoff;
 }
 
 Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
@@ -420,6 +846,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 		}
 	};
+	// A label the GPU can actually touch. GpuWritable is a mapping (a GPU view, or a writable
+	// external range). A view's block stays the dummy page until MakeResident promotes it, and
+	// that only happens for addresses this buffer references, so a reachable label is added
+	// here. No mapping means it cannot be made resident: the wait stays on the CPU and the
+	// write stays on the tracker. A GPU wait or release on the dummy never sees the guest
+	// label, and the ring does not finish.
+	auto label_gpu = [&](uint64_t addr, uint64_t bytes) -> bool {
+		if (addr == 0 || bytes == 0 || m_labels == nullptr || !m_labels->GpuWritable(addr) ||
+		    !m_labels->GpuWritable(addr + bytes - 1)) {
+			return false;
+		}
+		add_ref(addr, bytes, false);
+		return true;
+	};
 	// A user-data dword pair can be a 48-bit pointer (V# and table pointers) or the 40-bit
 	// 256-byte-aligned base of a T# (dword 0 = address >> 8, low byte of dword 1 = address >> 40);
 	// a single dword can be address >> 8 (shader programs, inline image bases).
@@ -430,7 +870,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// SetFindRange diagnostics. Guest VA == host VA, but a stale pointer must not crash the emulator,
 	// so tables are read with process_vm_readv on ourselves (EFAULT instead of SIGSEGV).
 	uint32_t cur_op = 0;
-	auto read_safe = [](uint64_t addr, uint32_t* dst, size_t dwords) -> size_t {
+	auto read_safe = [&](uint64_t addr, uint32_t* dst, size_t dwords) -> size_t {
+		if (m_lod_read != nullptr) {
+			return m_lod_read(addr, dst, dwords, m_lod_read_user);
+		}
 #if defined(__linux__)
 		struct iovec local  = {dst, dwords * 4};
 		struct iovec remote = {reinterpret_cast<void*>(addr), dwords * 4};
@@ -522,7 +965,118 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 		}
 	};
+	// SetLodBankScan: the counter banks of the T#s this draw or dispatch can sample. A T# is 8 dwords
+	// inline in user data or in a descriptor table (read like find_refs, two levels deep); tables are
+	// read once per GET_LOD_STATS interval.
+	auto scan_lod_banks = [&]() {
+		const bool dispatch = cur_op == IT_DISPATCH_DIRECT || cur_op == IT_DISPATCH_INDIRECT;
+		LodBankScan& s = m_lod_cur;
+		auto guest = [](uint64_t a) {
+			return (a >= 0x100000000ull && a < 0x10000000000ull) || (a >= 0x080000000000ull && a < 0x088000000000ull);
+		};
+		// where: 0 user data, 1/2 table depth.
+		auto tsharp = [&](const uint32_t* t, uint32_t where, uint32_t word) {
+			const uint64_t base = (static_cast<uint64_t>(t[0]) | (static_cast<uint64_t>(t[1] & 0xffu) << 32u)) << 8u;
+			if ((t[3] >> 28u) < 8u || ((t[1] >> 20u) & 0x1ffu) == 0 || ((t[3] >> 12u) & 0xfu) > ((t[3] >> 16u) & 0xfu) ||
+			    !guest(base)) {
+				return;
+			}
+			s.tsharps++;
+			if (((t[6] >> 20u) & 1u) != 0) {
+				s.alt_counting++;
+				s.alt_banks.set((t[6] >> 12u) & 0xffu);
+			}
+			if (((t[5] >> 25u) & 1u) == 0) {
+				return;
+			}
+			s.counting++;
+			s.banks.set(t[6] & 0xffu);
+			s.min_lod_warn[(t[5] >> 8u) & 0xfffu]++;
+			(where == 0 ? s.inline_ud : where == 1 ? s.depth1 : s.depth2)++;
+			if (where != 0) {
+				s.max_word = std::max(s.max_word, word);
+			}
+			if (s.samples.size() < 8) {
+				std::array<uint32_t, 8> a {};
+				std::copy(t, t + 8, a.begin());
+				s.samples.push_back(a);
+			}
+		};
+		auto plausible = [&](uint64_t p) { return guest(p) && (p & 3u) == 0; };
+		auto scan_table = [&](uint64_t table, uint32_t depth, std::vector<uint64_t>* next) {
+			if (m_lod_tables.size() >= 16384 || !m_lod_tables.insert(table).second) {
+				return;
+			}
+			static thread_local std::vector<uint32_t> d;
+			d.resize(depth == 1 ? m_lod_scan_dwords : 256);
+			const size_t n = read_safe(table, d.data(), d.size());
+			s.tables++;
+			for (size_t k = 0; k + 8 <= n; k += 4) {
+				tsharp(&d[k], depth, static_cast<uint32_t>(k));
+			}
+			for (size_t j = 0; next != nullptr && j + 1 < n && next->size() < 64; j++) {
+				const uint64_t p = static_cast<uint64_t>(d[j]) | (static_cast<uint64_t>(d[j + 1] & 0xffffu) << 32u);
+				if (plausible(p)) {
+					next->push_back(p);
+				}
+			}
+		};
+		auto stage = [&](uint32_t first, uint32_t count) {
+			uint32_t ud[32] = {};
+			bool     have[32] = {};
+			for (uint32_t i = 0; i < count; i++) {
+				if (const uint32_t* v = sh.Find(first + i); v != nullptr) {
+					ud[i]   = *v;
+					have[i] = true;
+				}
+			}
+			// Draws mostly repeat a stage's user data; the same block reaches the same T#s and
+			// tables, which were read for this window already.
+			uint64_t h = 0xcbf29ce484222325ull ^ first;
+			for (uint32_t i = 0; i < count; i++) {
+				h = (h ^ (have[i] ? ud[i] : 0x9e3779b9u) ^ (static_cast<uint64_t>(have[i]) << 32u)) * 0x100000001b3ull;
+				h ^= h >> 29u;
+			}
+			if (m_lod_stages.size() >= 65536) {
+				m_lod_stages.clear();
+			}
+			if (!m_lod_stages.insert(h).second) {
+				return;
+			}
+			for (uint32_t i = 0; i + 8 <= count; i++) {
+				if (have[i] && have[i + 7]) {
+					tsharp(&ud[i], 0, i);
+				}
+			}
+			std::vector<uint64_t> next;
+			for (uint32_t i = 0; i + 1 < count; i++) {
+				const uint64_t p = static_cast<uint64_t>(ud[i]) | (static_cast<uint64_t>(ud[i + 1] & 0xffffu) << 32u);
+				if (have[i] && have[i + 1] && plausible(p)) {
+					scan_table(p, 1, &next);
+				}
+			}
+			for (uint64_t p: next) {
+				scan_table(p, 2, nullptr);
+			}
+		};
+		// Every user-data SGPR a draw or dispatch can reach, the same blocks IsUserDataRegister
+		// covers. Graphics: PS, VS, GS, ES, HS, LS, each with 32 user-data dwords at +0x0C and the
+		// spill table at USER_DATA_ADDR (+0x02). Compute: COMPUTE_USER_DATA_0..15. stage() follows
+		// descriptor tables two levels deep.
+		if (dispatch) {
+			stage(0x240, 16);
+		} else {
+			static constexpr uint32_t kStageBase[] = {0x000, 0x040, 0x080, 0x0C0, 0x100, 0x140};
+			for (uint32_t base: kStageBase) {
+				stage(base + 0x0Cu, 32);
+				stage(base + 0x02u, 2);
+			}
+		}
+	};
 	auto collect_refs = [&]() {
+		if (m_lod_scan) {
+			scan_lod_banks();
+		}
 		if (m_find_hi > m_find_lo) {
 			find_refs();
 		}
@@ -688,11 +1242,152 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// WRITE_DATA). On the gfx ring the PFP fetches them ahead of the ME that performs those writes,
 	// which a compute queue (one engine) never does: sync the PFP to the ME first, as RADV does.
 	auto pfp_sync_me = [&]() {
-		if (m_pfp_sync_indirect) {
+		// A compute ring has one engine; the PFP race this closes exists only on the gfx ring, and
+		// PFP_SYNC_ME is illegal on MEC.
+		if (m_pfp_sync_indirect && !m_compute_ring) {
 			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
 			body.push_back(0);
 			stats.pfp_syncs_emitted++;
 		}
+	};
+
+	// A guest wait turned into a full barrier on our fence: an end-of-pipe RELEASE_MEM that flushes and
+	// invalidates the caches (Mesa's gfx10 wait-for-idle) and a wait on that fence. A wait the prefetch
+	// parser does (ENGINE_SEL = PFP) on a label the micro engine has just written is how the guest keeps
+	// the PFP from fetching ahead of the ME past a cache flush; PFP_SYNC_ME is that synchronization
+	// without memory.
+	auto emit_barrier = [&](bool pfp) {
+		if (m_fence_va != 0) {
+			const uint32_t seq = ++m_fence_seq;
+			body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
+			// EVENT_TYPE CACHE_FLUSH_AND_INV_TS_EVENT (0x14), EVENT_INDEX 5 (end of pipe), GCR_CNTL:
+			// GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB.
+			body.push_back(0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
+			               (1u << 20u) | (1u << 21u));
+			body.push_back(1u << 29u); // DATA_SEL 1: 32-bit data; DST_SEL 0 memory; no interrupt
+			body.push_back(static_cast<uint32_t>(m_fence_va));
+			body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
+			body.push_back(seq);
+			body.push_back(0u);
+			body.push_back(0u);
+			body.push_back(Pkt3(IT_WAIT_REG_MEM, 6, m_compute_ring));
+			body.push_back(3u | (1u << 4u)); // function EQUAL, memory space, ME engine
+			body.push_back(static_cast<uint32_t>(m_fence_va));
+			body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
+			body.push_back(seq);
+			body.push_back(0xffffffffu);
+			body.push_back(4u); // poll interval
+			stats.wait_barriers++;
+		}
+		if (pfp && !m_compute_ring) {
+			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u)); // PKT3 PFP_SYNC_ME, one body dword
+			body.push_back(0);
+			stats.pfp_syncs_emitted++;
+		}
+	};
+
+	// Native labels: the segments of the IB (body offsets until it is assembled), where each starts in
+	// the body, the preamble of each one after the first (the state where it starts) and whether it
+	// does anything (an empty first segment is left out), plus every label write so far in order.
+	const bool                         labels = m_labels != nullptr;
+	std::vector<Pm4Segment>            segs(1);
+	std::vector<uint32_t>              seg_body(1, 0);
+	std::vector<std::vector<uint32_t>> seg_pre(1);
+	std::vector<bool>                  seg_keep(1, true);
+	bool                               seg_effects = false;
+	std::vector<LabelWrite>            local_writes;
+	// CPU-side points of this segment (interrupts the guest asked for, labels the GPU cannot write,
+	// the end). They share one sequence packet, emitted when the segment closes, instead of a cache
+	// flush per point. A guest interrupt still runs, at the end of the segment, which is where the
+	// continuation runs too.
+	std::vector<TrackerPoint> queued_points;
+	auto                      tracker_point = [&](TrackerPoint p) {
+		queued_points.push_back(std::move(p));
+		seg_effects = true;
+	};
+	// Kyty's command processor wrote this label with a CPU store after the buffer's GPU work. A guest
+	// that waits on the address (sync-on-address is a futex on that word) sees that store. A GPU
+	// RELEASE_MEM does not wake the futex, and on this path it is not what Dead Cells observes: the
+	// title never asks for an interrupt, and the level load sleeps until the label changes. The
+	// tracker writes the same bytes when the GPU reaches the end of this segment. `prior` is the
+	// dword at translate time, so a label the guest has already replaced is left alone, and a store
+	// the GPU made visible is not written again.
+	auto mirror_store = [&](uint64_t addr, std::vector<uint32_t> words, bool one_addr) {
+		if (words.empty() || addr == 0) {
+			return;
+		}
+		TrackerPoint cpu;
+		cpu.kind     = TrackerPoint::Kind::CpuWrite;
+		cpu.mirror   = true;
+		cpu.addr     = addr;
+		cpu.one_addr = one_addr;
+		cpu.data     = std::move(words);
+		const uint32_t samples = one_addr ? 1u : static_cast<uint32_t>(cpu.data.size());
+		cpu.prior.resize(samples);
+		bool sampled = m_labels != nullptr;
+		for (uint32_t i = 0; sampled && i < samples; i++) {
+			uint32_t v = 0;
+			if (!m_labels->SampleDword(addr + 4ull * i, &v)) {
+				sampled = false;
+			} else {
+				cpu.prior[i] = v;
+			}
+		}
+		if (!sampled) {
+			cpu.prior.clear();
+		}
+		tracker_point(std::move(cpu));
+		stats.labels_cpu++;
+	};
+	auto note_write = [&](const LabelWrite& w) {
+		segs.back().writes.push_back(w);
+		local_writes.push_back(w);
+	};
+	// Ends the current segment with its End point; a first segment that does nothing is dropped (the
+	// next segment's preamble holds its register writes).
+	auto close_segment = [&](bool last) {
+		if (seg_effects || last || segs.size() > 1 || !queued_points.empty()) {
+			TrackerPoint end;
+			end.kind = TrackerPoint::Kind::End;
+			queued_points.push_back(std::move(end));
+			const uint32_t dw = static_cast<uint32_t>(body.size()) + 5u;
+			EmitRelease32(body, m_tracker_va, 0u, m_compute_ring);
+			for (auto& p: queued_points) {
+				p.dw = dw;
+				segs.back().points.push_back(std::move(p));
+			}
+			queued_points.clear();
+		} else {
+			seg_keep.back() = false;
+		}
+		seg_effects = false;
+	};
+	// Cuts the IB at a guest wait nobody known satisfies yet: the rest starts held, with its own
+	// preamble, a barrier block and the guest wait (the backend NOPs one of the two).
+	auto split_at_wait = [&](const WaitCond& w) {
+		close_segment(false);
+		segs.emplace_back();
+		seg_body.push_back(static_cast<uint32_t>(body.size()));
+		seg_pre.emplace_back();
+		seg_keep.push_back(true);
+		EmitPreamble(seg_pre.back(), stats, cx, sh, uc);
+		auto& s = segs.back();
+		s.held  = true;
+		s.wait  = w;
+		s.barrier_dw = static_cast<uint32_t>(body.size());
+		emit_barrier(w.pfp);
+		s.barrier_len = static_cast<uint32_t>(body.size()) - s.barrier_dw;
+		s.wait_dw     = static_cast<uint32_t>(body.size());
+		// No native form (not EQUAL, or a 64-bit wait on both halves), or an address the GPU cannot
+		// reach: only seeing the label in memory releases it. A WAIT_REG_MEM there reads the dummy.
+		s.wait_len = 0;
+		// The native form polls one dword. That dword has to be resident; the rest of a 64-bit
+		// wait is not what this packet reads.
+		if (label_gpu(w.addr, 4)) {
+			s.wait_len = EmitNativeWait(body, w, m_compute_ring) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
+		}
+		seg_effects = true;
+		stats.waits_split++;
 	};
 
 	auto fail = [&](uint32_t op, uint32_t dw) {
@@ -719,11 +1414,61 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		const uint32_t body_count  = size - 1u;
 		const uint32_t* const bptr = dcb.data() + dw + 1;
 		stats.packets++;
+		// KYTY_NATIVE_GPU_WATCH_ADDR=0xADDR: log every packet whose body holds that 64-bit address
+		// (any 8-aligned split into a low and a high dword), to find who writes or waits on a label.
+		static const uint64_t watch_addr = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_WATCH_ADDR");
+			return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+		}();
+		if (watch_addr != 0) {
+			static std::atomic<uint32_t> watch_logged {0};
+			for (uint32_t k = 0; k + 1 < body_count; k++) {
+				if ((bptr[k] & ~7u) == static_cast<uint32_t>(watch_addr & ~7ull) && (bptr[k + 1] & 0xffffu) == (watch_addr >> 32u) &&
+				    watch_logged.fetch_add(1) < 64) {
+					std::fprintf(stderr, "watch addr: %s queue packet op 0x%02x marker 0x%02x len %u at dw %u:", m_compute_queue ? "compute" : "gfx",
+					             op, (header >> 2u) & 0x3fu, size, dw);
+					for (uint32_t i = 0; i < std::min(body_count, 10u); i++) {
+						std::fprintf(stderr, " %08x", bptr[i]);
+					}
+					std::fprintf(stderr, "\n");
+					break;
+				}
+			}
+		}
 
 		if (m_skip_ops.count(op) != 0) {
 			stats.packets_skipped++;
 			dw += size;
 			continue;
+		}
+		if (m_compute_ring) {
+			// MEC has no graphics engine. These opcodes hang a compute ring ("Illegal opcode").
+			// SET_UCONFIG_REG / INDEX / INDIRECT are handled below: profiler UCONFIG is dropped,
+			// geometry-engine UCONFIG still refuses the buffer.
+			switch (op) {
+				case IT_DRAW_INDIRECT:
+				case IT_DRAW_INDEX_INDIRECT:
+				case IT_DRAW_INDEX_2:
+				case IT_DRAW_INDEX_OFFSET_2:
+				case IT_DRAW_INDEX_AUTO:
+				case IT_INDEX_BASE:
+				case IT_INDEX_BUFFER_SIZE:
+				case IT_CONTEXT_CONTROL:
+				case IT_CLEAR_STATE:
+				case IT_NUM_INSTANCES:
+				case IT_PFP_SYNC_ME:
+				case IT_SET_CONTEXT_REG:
+				case IT_SET_CONTEXT_REG_INDIRECT:
+				case IT_GET_LOD_STATS:
+					if (r.unknown_ops.empty()) {
+						r.unknown_op = op;
+						r.unknown_dw = dw;
+					}
+					r.unknown_ops.insert(op);
+					dw += size;
+					continue;
+				default: break;
+			}
 		}
 		switch (op) {
 			case IT_NOP: {
@@ -731,6 +1476,130 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const uint32_t marker = (header >> 2u) & 0x3fu;
 				if (marker == R_FLIP) {
 					stats.marker_flip++;
+					if (labels) {
+						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
+				} else if (marker == R_ZERO && labels && body_count >= 1 && IsFlipMarker(bptr[0])) {
+					stats.marker_flip++;
+					r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (bptr[0] != 0x68750777u && body_count >= 4) { // writes a label first, on the CPU
+						note_write({static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bptr[3], true,
+						            false, false});
+					}
+				} else if (marker == R_RELEASE_MEM && labels) {
+					stats.marker_release++;
+					if (body_count < 7) {
+						return fail(op, dw);
+					}
+					const uint64_t dst = static_cast<uint64_t>(bptr[2]) | (static_cast<uint64_t>(bptr[3]) << 32u);
+					const uint64_t value = static_cast<uint64_t>(bptr[4]) | (static_cast<uint64_t>(bptr[5]) << 32u);
+					const uint32_t data_sel = (bptr[1] >> 29u) & 0x7u;
+					const uint32_t int_sel  = (bptr[1] >> 24u) & 0x7u;
+					r.label_writes.emplace_back(dst, value);
+					// What Kyty's command processor does with it (CpOpReleaseMem, WriteAtEndOfPipe): no data
+					// for INT_SEL 4, nor for INT_SEL 1 on the graphics queue (the interrupt alone); 32-bit
+					// (1) or 64-bit (2) data; the reference clock for a timestamp (3); GDS data (5).
+					uint32_t sel = data_sel;
+					if (dst == 0 || int_sel == 4 || (int_sel == 1 && !m_compute_queue && data_sel != 5)) {
+						sel = 0;
+					}
+					if (sel == 5 && !m_gds) {
+						r.unknown_ops.insert(op); // GDS data without a GDS partition: leave the buffer to Kyty
+						break;
+					}
+					if (sel != 0 && sel != 1 && sel != 2 && sel != 3 && sel != 5) {
+						r.unknown_detail = {bptr[0], bptr[1]};
+						return fail(op, dw);
+					}
+					TrackerPoint cpu;
+					bool         cpu_point = false;
+					if (sel == 3) {
+						// Kyty's CPU timestamp is Sync::ReadReferenceClock(): the host TSC scaled to
+						// 100 MHz. DATA_SEL 3 writes the GPU clock counter, also 100 MHz on this board
+						// (gfx_v10_0's counter, the same kGpuClockHz the scratch samples use), but it
+						// is not the host TSC: the zeros differ, deltas match. A game that compares the
+						// value to a later ReadReferenceClock() needs the CPU clock, which
+						// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1 keeps on the tracker.
+						const bool gpu_clock = !m_cpu_timestamps && (dst & 7ull) == 0 && label_gpu(dst, 8);
+						if (gpu_clock) {
+							EmitTimestampRelease(body, dst, m_compute_ring);
+							note_write({dst, 0, false, true, true});
+							stats.timestamps_native++;
+							stats.labels_native++;
+							seg_effects = true;
+							NoteOnce(2, "RELEASE_MEM timestamp written by the GPU clock");
+						} else {
+							stats.timestamps++;
+							cpu.kind  = TrackerPoint::Kind::Timestamp;
+							cpu.addr  = dst;
+							cpu.size  = 8;
+							cpu_point = true;
+							NoteOnce(3, "RELEASE_MEM timestamp written by the tracker (CPU clock)");
+						}
+						sel = 0;
+					} else if ((sel == 1 || sel == 2) && !label_gpu(dst, sel == 1 ? 4ull : 8ull)) {
+						cpu.kind  = TrackerPoint::Kind::CpuWrite;
+						cpu.addr  = dst;
+						cpu.data  = sel == 1 ? std::vector<uint32_t> {bptr[4]} : std::vector<uint32_t> {bptr[4], bptr[5]};
+						cpu_point = true;
+						sel       = 0;
+					}
+					// Not the guest's packet: its event, cache actions and data forms stopped the gfx ring
+					// ("Illegal opcode in command stream"). The label is written in the barrier's form, which
+					// flushes more than any guest release asks for; a 64-bit one as two 32-bit writes, the
+					// high dword first. GDS data goes as the translator always ran it. A release that only
+					// flushes caches becomes a flush into our scratch dword, unless a tracker point (also a
+					// flush) follows anyway.
+					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
+					if (sel == 1) {
+						EmitRelease32(body, dst, bptr[4], m_compute_ring);
+						mirror_store(dst, {bptr[4]}, false);
+						NoteOnce(0, "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)");
+					} else if (sel == 2) {
+						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring);
+						EmitRelease32(body, dst, bptr[4], m_compute_ring);
+						mirror_store(dst, {bptr[4], bptr[5]}, false);
+						NoteOnce(1, "RELEASE_MEM 64-bit label (GPU store, mirrored to the CPU)");
+					} else if (sel == 5) {
+						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
+						body.push_back(bptr[0]);
+						body.push_back(bptr[1] & ~(0x7u << 24u)); // INT_SEL 0
+						for (uint32_t i = 2; i < 7; i++) {
+							body.push_back(i == 6 ? 0u : bptr[i]);
+						}
+					} else if (!interrupt && !cpu_point && ((bptr[0] >> 12u) & 0x1fffu) != 0) {
+						EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring);
+					}
+					seg_effects = true;
+					if (sel != 0) {
+						if (sel == 5) {
+							add_ref(dst, 8, false); // GDS data; a memory label is referenced in label_gpu
+						}
+						note_write({dst, sel == 1 ? (value & 0xffffffffull) : value, sel != 5, true, sel == 2});
+						stats.labels_native++;
+						stats.gds_releases += sel == 5 ? 1u : 0u;
+						if (sel == 5) {
+							NoteOnce(4, "RELEASE_MEM GDS data (GPU store, no CPU mirror)");
+						}
+					} else if (data_sel == 0 && !interrupt && !cpu_point) {
+						NoteOnce(5, "RELEASE_MEM with no data and no interrupt (cache action only)");
+					}
+					if (cpu_point) {
+						note_write({dst, cpu.data.size() == 1 ? (value & 0xffffffffull) : value, cpu.kind != TrackerPoint::Kind::Timestamp,
+						            false, cpu.data.size() != 1});
+						tracker_point(std::move(cpu));
+						stats.labels_cpu++;
+					}
+					if (interrupt) {
+						TrackerPoint irq;
+						irq.kind = TrackerPoint::Kind::Interrupt;
+						irq.ctx  = bptr[6] & 0x07ffffffu;
+						tracker_point(irq);
+						stats.interrupts++;
+						NoteOnce(16u + int_sel, int_sel == 1 ? "RELEASE_MEM INT_SEL 1 (EOP interrupt)"
+						                                     : (int_sel == 2 ? "RELEASE_MEM INT_SEL 2 (EOP interrupt)"
+						                                                     : "RELEASE_MEM INT_SEL 4 (interrupt only)"));
+					}
 				} else if (marker == R_RELEASE_MEM) {
 					stats.marker_release++;
 					if (body_count >= 4) {
@@ -742,7 +1611,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// would copy its own, never written, GDS buffer instead. Without the interrupt, which
 					// Kyty still raises.
 					if (body_count >= 7 && ((bptr[1] >> 29u) & 0x7u) == 5u && m_gds) {
-						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_queue));
+						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
 						body.push_back(bptr[0]);
 						body.push_back(bptr[1] & ~(0x7u << 24u)); // INT_SEL 0
 						for (uint32_t i = 2; i < 7; i++) {
@@ -753,6 +1622,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				} else if (marker == R_WAIT_FLIP_DONE) {
 					stats.marker_wait_flip++;
+					if (labels) {
+						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
 					context_state_op(bptr[0]);
 				}
@@ -784,6 +1656,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				stats.set_sh++;
 				break;
 			}
@@ -791,6 +1666,28 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_SET_UCONFIG_REG:
 			case IT_SET_UCONFIG_REG_INDEX: {
 				// Pass through only whitelisted UCONFIG registers; drop the rest for board safety.
+				// On a compute ring the whitelist is geometry-engine state (no GE on MEC), so it
+				// refuses the buffer. SQ_THREAD_TRACE_USERDATA_0..7 (0x340..0x347) and every other
+				// non-whitelisted offset are dropped, same as the gfx path. Refusing the opcode
+				// refused every ACB: they write 0x342 and 0x343 as profiler markers.
+				if (m_compute_ring && body_count >= 1) {
+					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
+					                                                        : Normalize(bptr[0]);
+					bool graphics = false;
+					for (uint32_t i = 1; i < body_count; i++) {
+						if (UconfigAllowed(base + (i - 1))) {
+							graphics = true;
+						}
+					}
+					if (graphics) {
+						if (r.unknown_ops.empty()) {
+							r.unknown_op = op;
+							r.unknown_dw = dw;
+						}
+						r.unknown_ops.insert(op);
+						break;
+					}
+				}
 				bool allowed = body_count >= 1;
 				if (allowed) {
 					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
@@ -877,6 +1774,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							r.skipped_uconfig.insert(off);
 							continue;
 						}
+						if (m_compute_ring) {
+							if (r.unknown_ops.empty()) {
+								r.unknown_op = op;
+								r.unknown_dw = dw;
+							}
+							r.unknown_ops.insert(op);
+							continue;
+						}
 						uc[off] = value;
 						EmitSetUconfig(body, off, value);
 						stats.loaded_uc_regs++;
@@ -917,41 +1822,58 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.waits_unmet++;
 					r.unmet_waits.push_back({addr, ref, value, bptr[0] & 0x7u, dw, stats.draws, stats.dispatches});
 				}
+				const bool pfp = (bptr[0] & (1u << 8u)) != 0;
+				if (labels) {
+					// The latest label write of this buffer decides; otherwise the backend does, from what is
+					// ahead in the ring and from guest memory.
+					WaitCond w {addr, ref, mask, bptr[0] & 0x7u, wide, pfp};
+					LabelOracle::Plan plan    = LabelOracle::Plan::Split;
+					bool              decided = false;
+					for (auto it = local_writes.rbegin(); it != local_writes.rend() && !decided; ++it) {
+						uint64_t  v = 0;
+						const int c = it->Covers(addr, wide, &v);
+						if (c != 0) {
+							decided = true;
+							plan    = c == 1 && w.Met(v) && it->gpu ? LabelOracle::Plan::Native : LabelOracle::Plan::Split;
+						}
+					}
+					if (!decided) {
+						plan = m_labels->PlanWait(w);
+					}
+					if (plan == LabelOracle::Plan::Native && !m_native_waits) {
+						plan = LabelOracle::Plan::Met;
+					}
+					// A native wait reads whatever the GPU is mapped at. If that is not this label,
+					// hold the segment: the tracker (or a later CPU write) puts the value in guest
+					// memory, and the barrier is the only GPU wait.
+					if (plan == LabelOracle::Plan::Native && !label_gpu(addr, 4)) {
+						plan = LabelOracle::Plan::Split;
+					}
+					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, w, m_compute_ring)) {
+						plan = LabelOracle::Plan::Split;
+					}
+					switch (plan) {
+						case LabelOracle::Plan::Native:
+							stats.waits_native++;
+							seg_effects = true;
+							NoteOnce(8, "guest WAIT_REG_MEM passed through (a GPU write satisfies it)");
+							break;
+						case LabelOracle::Plan::Met:
+							emit_barrier(pfp);
+							seg_effects = true;
+							NoteOnce(10, "guest WAIT_REG_MEM already met (barrier)");
+							break;
+						case LabelOracle::Plan::Split:
+							split_at_wait(w);
+							NoteOnce(9, "guest WAIT_REG_MEM held on the CPU (no known writer yet)");
+							break;
+					}
+					break;
+				}
 				// The guest waits for its own end-of-pipe label: everything before has finished and its
 				// writes are visible. The label itself is written by Kyty later, so give the GPU the same
-				// guarantee with a fence of ours: an end-of-pipe RELEASE_MEM that flushes and invalidates
-				// the caches (Mesa's gfx10 wait-for-idle), and a wait on that fence.
-				if (m_fence_va != 0) {
-					const uint32_t seq = ++m_fence_seq;
-					body.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
-					// EVENT_TYPE CACHE_FLUSH_AND_INV_TS_EVENT (0x14), EVENT_INDEX 5 (end of pipe), GCR_CNTL:
-					// GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB.
-					body.push_back(0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
-					               (1u << 20u) | (1u << 21u));
-					body.push_back(1u << 29u); // DATA_SEL 1: 32-bit data; DST_SEL 0 memory; no interrupt
-					body.push_back(static_cast<uint32_t>(m_fence_va));
-					body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
-					body.push_back(seq);
-					body.push_back(0u);
-					body.push_back(0u);
-					body.push_back(Pkt3(IT_WAIT_REG_MEM, 6, false));
-					body.push_back(3u | (1u << 4u)); // function EQUAL, memory space, ME engine
-					body.push_back(static_cast<uint32_t>(m_fence_va));
-					body.push_back(static_cast<uint32_t>(m_fence_va >> 32u));
-					body.push_back(seq);
-					body.push_back(0xffffffffu);
-					body.push_back(4u); // poll interval
-					stats.wait_barriers++;
-				}
-				// A wait the prefetch parser does (ENGINE_SEL = PFP) on a label the micro engine has just
-				// written is how the guest keeps the PFP from fetching ahead of the ME past a cache flush.
-				// The label pair cannot run natively, but PFP_SYNC_ME is that same synchronization
-				// without memory.
-				if ((bptr[0] & (1u << 8u)) != 0) {
-					body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u)); // PKT3 PFP_SYNC_ME, one body dword
-					body.push_back(0);
-					stats.pfp_syncs_emitted++;
-				}
+				// guarantee with a fence of ours.
+				emit_barrier(pfp);
 				break;
 			}
 			case IT_DMA_DATA:
@@ -973,10 +1895,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint32_t src_sel = (bptr[0] >> 29u) & 0x3u;
 					const uint32_t dst_sel = (bptr[0] >> 20u) & 0x3u;
 					if (m_gds_dma_sync && src_sel == 1u) {
-						body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // CS_PARTIAL_FLUSH (event 7, index 4)
+						body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u) | (m_compute_ring ? 2u : 0u)); // CS_PARTIAL_FLUSH
 						body.push_back((4u << 8u) | 7u);
 					}
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (m_compute_ring) {
+						body[body.size() - size] |= 2u;
+					}
 					if (m_gds_dma_sync && (src_sel == 1u || dst_sel == 1u)) {
 						body[body.size() - size + 1] |= 1u << 31u; // CP_SYNC
 						stats.gds_dma_synced++;
@@ -1011,6 +1936,58 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// write itself, in order, so the native IB leaves it out.
 				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
 					return fail(op, dw);
+				}
+				if (labels) {
+					// Native labels: Kyty no longer reads the buffer once it is translated, so the GPU writes
+					// the label where the guest put it. Memory the GPU cannot write (or a constant-engine
+					// write) is written by the tracker once the GPU gets there.
+					const uint64_t dst      = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					const uint32_t n        = body_count - 3u;
+					const bool     one_addr = ((bptr[0] >> 16u) & 1u) != 0;
+					const uint32_t engine   = bptr[0] >> 30u;
+					const uint64_t bytes    = one_addr ? 4u : 4u * static_cast<uint64_t>(n);
+					if (n == 0 || dst == 0) {
+						break;
+					}
+					// Not as WRITE_DATA (never run natively in this form): each dword as a label release in
+					// the barrier's form, at the end of the pipe instead of when the micro engine gets there,
+					// which only makes it later; Kyty used to write it later still.
+					const bool gpu = engine <= 1 && n <= 16 && label_gpu(dst, bytes);
+					if (gpu) {
+						for (uint32_t i = 0; i < n; i++) {
+							EmitRelease32(body, one_addr ? dst : dst + 4u * i, bptr[3 + i], m_compute_ring);
+						}
+						mirror_store(dst, std::vector<uint32_t>(bptr + 3, bptr + 3 + n), one_addr);
+						stats.labels_native++;
+						seg_effects = true;
+						NoteOnce(6, "WRITE_DATA label (GPU store, mirrored to the CPU)");
+					}
+					// Two dwords at an 8-aligned address are one 64-bit label as far as a later
+					// WAIT_REG_MEM_64 is concerned (Agc's WaitOnAddress after a 64-bit WriteData: Dead
+					// Cells). Recorded as two 32-bit writes, the wait reads them as unknown and is held on
+					// the CPU although the write ahead of it in the ring satisfies it.
+					for (uint32_t i = 0; i < std::min<uint32_t>(n, 64);) {
+						const uint64_t at = one_addr ? dst : dst + 4u * i;
+						if (!one_addr && i + 1 < n && (at & 7u) == 0) {
+							note_write({at, bptr[3 + i] | (static_cast<uint64_t>(bptr[4 + i]) << 32u), true, gpu, true});
+							i += 2;
+							continue;
+						}
+						note_write({at, bptr[3 + i], true, gpu, false});
+						i++;
+					}
+					if (!gpu) {
+						TrackerPoint cpu;
+						cpu.kind     = TrackerPoint::Kind::CpuWrite;
+						cpu.addr     = dst;
+						cpu.one_addr = one_addr;
+						cpu.data.assign(bptr + 3, bptr + 3 + n);
+						tracker_point(std::move(cpu));
+						stats.labels_cpu++;
+						NoteOnce(7, "WRITE_DATA label written by the tracker (GPU cannot reach it)");
+					}
+					r.label_writes.emplace_back(dst, bptr[3]);
+					break;
 				}
 				stats.write_data_dropped++;
 				r.label_writes.emplace_back(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bptr[3]);
@@ -1092,6 +2069,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			case IT_GET_LOD_STATS: // texture LOD statistics, which the game's texture streaming reads
+				// BU_SIZE == 0 is the per-frame disable: no buffer the streamer reads, so it must not
+				// close the window (those samples belong to the next real report).
+				if (m_lod_scan && body_count >= 3 && bptr[0] != 0) {
+					LodBankScan scan = TakeLodScan();
+					scan.addr        = (static_cast<uint64_t>(bptr[1]) & ~0x3full) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					r.lod_scans.push_back(std::move(scan));
+				}
 				if (m_lod_stats && body_count >= 4) {
 					// A gfx10 packet (PAL: GET_LOD_STATS): BU_SIZE, BASE_LO (64-byte aligned), BASE_HI, and
 					// the interval / reset control word.
@@ -1101,6 +2085,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.lod_stats_issued++;
 				} else {
 					stats.lod_stats_dropped++;
+					// Native labels: Kyty's command processor never sees the packet, so the tracker fills the
+					// statistics as Kyty would (its first dword reads as a label: 1).
+					const uint64_t dst = (static_cast<uint64_t>(bptr[1]) & ~0x3full) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					if (labels && body_count >= 3 && dst != 0 && bptr[0] != 0) {
+						TrackerPoint fill;
+						fill.kind = TrackerPoint::Kind::LodStats;
+						fill.addr = dst;
+						fill.size = bptr[0];
+						tracker_point(std::move(fill));
+						note_write({dst, 1u, true, false, false});
+					}
 				}
 				break;
 			case IT_DRAW_INDEX_AUTO: // a non-indexed draw: no index buffer to reference
@@ -1117,30 +2112,45 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					return fail(op, dw);
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u),
 				        kMetadataSpan, false);
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
-				pfp_sync_me();
-				if (m_compute_queue) {
-					// A compute-queue buffer carries the argument address itself (ADDR_LO, ADDR_HI,
-					// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,
-					// so set the base to that address and dispatch at offset 0, as RADV does.
+				if (m_compute_ring) {
+					// The guest packet already carries ADDR_LO, ADDR_HI, DISPATCH_INITIATOR. MEC reads
+					// that form; the gfx-ring SET_BASE rewrite would be the wrong engine.
 					if (body_count < 3) {
 						return fail(op, dw);
 					}
-					const uint64_t args = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
-					body.push_back(Pkt3(IT_SET_BASE, 3, true));
-					body.push_back(1u); // BASE_INDEX: DISPATCH_INDIRECT / DRAW_INDIRECT base
-					body.push_back(static_cast<uint32_t>(args));
-					body.push_back(static_cast<uint32_t>(args >> 32u));
-					body.push_back(Pkt3(IT_DISPATCH_INDIRECT, 2, true));
-					body.push_back(0u);
-					body.push_back(bptr[2]);
-					add_ref(args, kMetadataSpan, false);
+					body.push_back(dcb[dw] | 2u);
+					body.insert(body.end(), dcb.begin() + dw + 1, dcb.begin() + dw + size);
+					add_ref(static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u), kMetadataSpan,
+					        false);
 				} else {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					pfp_sync_me();
+					if (m_compute_queue) {
+						// A compute-queue buffer carries the argument address itself (ADDR_LO, ADDR_HI,
+						// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,
+						// so set the base to that address and dispatch at offset 0, as RADV does.
+						if (body_count < 3) {
+							return fail(op, dw);
+						}
+						const uint64_t args = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
+						body.push_back(Pkt3(IT_SET_BASE, 3, true));
+						body.push_back(1u); // BASE_INDEX: DISPATCH_INDIRECT / DRAW_INDIRECT base
+						body.push_back(static_cast<uint32_t>(args));
+						body.push_back(static_cast<uint32_t>(args >> 32u));
+						body.push_back(Pkt3(IT_DISPATCH_INDIRECT, 2, true));
+						body.push_back(0u);
+						body.push_back(bptr[2]);
+						add_ref(args, kMetadataSpan, false);
+					} else {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
 				}
 				stats.dispatches++;
 				collect_refs();
@@ -1155,6 +2165,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			case IT_DISPATCH_DIRECT:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				stats.dispatches++;
 				collect_refs();
 				break;
@@ -1176,10 +2189,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					a[6] |= 0x1u | 0x10u | 0x20u | 0x40u | 0x80u | 0x100u | 0x200u | 0x4000u | 0x8000u;
 					a[6] &= ~((0x3u << 2u) | (0x3u << 11u)); // GL1_RANGE, GL2_RANGE = all
 				}
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				stats.acquire_mem++;
 				break;
 			case IT_EVENT_WRITE:
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				if (m_compute_ring) {
+					body[body.size() - size] |= 2u;
+				}
 				// Events with an address (ZPASS_DONE occlusion counters, 16 DBs x begin/end) write there.
 				if (body_count >= 3) {
 					add_ref((static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), 256, false);
@@ -1191,6 +2210,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.event_index[(bptr[0] >> 8u) & 0xfu]++;
 				}
 				stats.event_write++;
+				if (body_count >= 1) {
+					NoteEvent(bptr[0] & 0x3fu);
+				}
 				break;
 			case IT_CLEAR_STATE:
 				// The hardware resets the context to amdgpu's clear state, the PS5 CP to its own
@@ -1220,6 +2242,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				r.unknown_ops.insert(op);
 				break;
 		}
+		if (IsWork(op)) {
+			seg_effects = true;
+		}
 
 		dw += size;
 	}
@@ -1240,13 +2265,48 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
 
-	r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
-	EmitPreamble(r.ib, stats);
-	r.ib.insert(r.ib.end(), body.begin(), body.end());
+	if (labels) {
+		close_segment(true);
+		// Each kept segment: its preamble (the first one's from the committed shadow, as without native
+		// labels), its body, padding; tracker points and patch sites move from body to IB offsets.
+		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 * segs.size() + 8 * segs.size());
+		for (size_t k = 0; k < segs.size(); k++) {
+			if (!seg_keep[k]) {
+				continue;
+			}
+			Pm4Segment& s = segs[k];
+			s.begin       = static_cast<uint32_t>(r.ib.size());
+			if (k == 0) {
+				EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc);
+			} else {
+				r.ib.insert(r.ib.end(), seg_pre[k].begin(), seg_pre[k].end());
+			}
+			const uint32_t from  = seg_body[k];
+			const uint32_t to    = k + 1 < segs.size() ? seg_body[k + 1] : static_cast<uint32_t>(body.size());
+			const int64_t  shift = static_cast<int64_t>(r.ib.size()) - static_cast<int64_t>(from);
+			r.ib.insert(r.ib.end(), body.begin() + from, body.begin() + to);
+			while ((r.ib.size() & 7u) != 0) {
+				r.ib.push_back(0xffff1000u);
+			}
+			s.end = static_cast<uint32_t>(r.ib.size());
+			for (auto& p: s.points) {
+				p.dw = static_cast<uint32_t>(p.dw + shift);
+			}
+			if (s.held) {
+				s.barrier_dw = static_cast<uint32_t>(s.barrier_dw + shift);
+				s.wait_dw    = static_cast<uint32_t>(s.wait_dw + shift);
+			}
+			r.segments.push_back(std::move(s));
+		}
+	} else {
+		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
+		EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc);
+		r.ib.insert(r.ib.end(), body.begin(), body.end());
 
-	// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
-	while ((r.ib.size() & 7u) != 0) {
-		r.ib.push_back(0xffff1000u);
+		// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
+		while ((r.ib.size() & 7u) != 0) {
+			r.ib.push_back(0xffff1000u);
+		}
 	}
 
 	r.stats        = stats;

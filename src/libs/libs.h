@@ -9,17 +9,51 @@
 
 #include <fmt/format.h>
 
+#include <cstdlib>
+#include <cstring>
+#include <string_view>
+
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLE(flag) PRINT_NAME_ENABLED = flag;
 
+namespace Libs {
+// KYTY_TRACE_HLE=all, or a comma-separated list of library names (libkernel, Graphics5Driver,
+// VideoOut, ...): every HLE call of those libraries is logged on every thread.
+// KYTY_TRACE_HLE_SKIP: comma-separated substrings of function names left out (MutexLock, ...).
+inline bool ListHas(const char* list, const char* name, bool substring) {
+	if (list == nullptr || name == nullptr) {
+		return false;
+	}
+	const size_t n = std::strlen(name);
+	for (const char* p = list; *p != '\0';) {
+		const char*  end = std::strchr(p, ',');
+		const size_t len = end != nullptr ? static_cast<size_t>(end - p) : std::strlen(p);
+		if (len != 0 && (substring ? std::string_view(name).find(std::string_view(p, len)) != std::string_view::npos
+		                           : (len == n && std::strncmp(p, name, len) == 0))) {
+			return true;
+		}
+		p += len + (end != nullptr ? 1 : 0);
+	}
+	return false;
+}
+inline bool PrintNameWanted(const char* library) {
+	static const char* list = std::getenv("KYTY_TRACE_HLE");
+	return list != nullptr && (std::strcmp(list, "all") == 0 || ListHas(list, library, false));
+}
+inline bool PrintNameSkipped(const char* function) {
+	static const char* list = std::getenv("KYTY_TRACE_HLE_SKIP");
+	return ListHas(list, function, true);
+}
+} // namespace Libs
+
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_DEFINE(name) void name(Loader::SymbolDatabase* s)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_NAME(l, m)                                                                             \
-	[[maybe_unused]] static thread_local bool PRINT_NAME_ENABLED = false;                          \
+	[[maybe_unused]] static thread_local bool PRINT_NAME_ENABLED = ::Libs::PrintNameWanted(l);     \
 	static constexpr char                     g_library[]        = l;                              \
 	static constexpr char                     g_module[]         = m;
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
@@ -62,7 +96,7 @@ namespace Libs {
 
 // Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {
-	if (Log::GetDirection() != Log::Direction::Silent) {
+	if (Log::GetDirection() != Log::Direction::Silent && !PrintNameSkipped(function)) {
 		const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
 		const auto print_name_time = fmt::format(
 		    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,

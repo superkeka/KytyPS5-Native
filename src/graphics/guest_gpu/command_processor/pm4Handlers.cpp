@@ -2,6 +2,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "graphics/native_gpu/nativePm4.h"
 #include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -19,10 +20,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cinttypes>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define KYTY_HW_CTX_PARSER_ARGS                                                                    \
@@ -1320,21 +1324,116 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	if (NativeGpu::NativeLodStats() && NativeGpu::PrimaryRendering()) {
 		return 4;
 	}
-	// Games stream texture mips by these statistics. All zeros reads as "never sampled": ASTRO BOT then
-	// keeps only the smallest mips (flat, overexposed terrain). All ones keeps every texture at full
-	// detail. KYTY_LOD_STATS_FILL=<byte> overrides the fill.
+	// Games stream texture mips by these statistics: a 64-byte header, then one 8-byte record per
+	// counter bank (T# word6[7:0], 256 banks). The streamer (ASTRO BOT eboot 0x907021120) coarsens a
+	// texture when the record is "no data" with a zero sample count, and keeps full detail when the
+	// record is "no data" with a non-zero count, which is what a 0xff fill looks like.
+	// KYTY_LOD_STATS_MODE:
+	//   usage (default) — banks sampled since the previous report get count 1 / min mip 0; every
+	//     other bank gets 0x0F00000000000000 (no data, count 0). The pipeline thread publishes the
+	//     bank set while translating the DCBs and ACBs submitted before this packet; this handler
+	//     writes the buffer (the completion thread when submissions are pipelined, otherwise the
+	//     guest thread, after that translation).
+	//   all / fill — the old whole-buffer fill. KYTY_LOD_STATS_FILL=<byte> overrides it (default 0xff).
+	//   banks — fill only the sampled banks (the rest zero); even / lo / hi — the other diagnostics.
+	// KYTY_LOD_STATS_LOG=N logs every Nth packet (N = 120 is about once per 120 frames);
+	// KYTY_LOD_STATS_TRAP=N[@P] makes the buffer's pages fault on the next CPU access after each of N
+	// fills (from packet P on), to log who reads it.
 	static const int fill = [] {
 		const char* v = std::getenv("KYTY_LOD_STATS_FILL");
 		return v != nullptr ? static_cast<int>(std::strtol(v, nullptr, 0)) : 0xff;
 	}();
+	static const NativeGpu::LodStatsMode mode = NativeGpu::ParseLodStatsMode(std::getenv("KYTY_LOD_STATS_MODE"));
+	static const unsigned long log_every = [] {
+		const char* v = std::getenv("KYTY_LOD_STATS_LOG");
+		return v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
+	}();
+	static unsigned long trap_from = 0;
+	static unsigned long traps     = [] {
+		const char* v   = std::getenv("KYTY_LOD_STATS_TRAP");
+		char*       end = nullptr;
+		const auto  n   = v != nullptr ? std::strtoul(v, &end, 0) : 0ul;
+		if (end != nullptr && *end == '@') {
+			trap_from = std::strtoul(end + 1, nullptr, 0);
+		}
+		return n;
+	}();
+	static uint64_t packets = 0;
+	static uint64_t no_scan = 0;
+	constexpr uint32_t kHeader = 64;
+	static uint64_t filled = 0; // packets with a buffer
+	if (log_every != 0 && (packets < 16 || packets % log_every == 0)) {
+		std::fprintf(stderr, "LOD stats %" PRIu64 " (%" PRIu64 " with a buffer): packet %08x %08x %08x %08x\n", packets, filled,
+		             buffer[0], buffer[1], buffer[2], buffer[3]);
+	}
+	const bool log_fill = log_every != 0 && dst != nullptr && buffer_size != 0 && (filled < 16 || filled % log_every == 0);
 	if (dst != nullptr && buffer_size != 0) {
-		memset(dst, fill, buffer_size);
-		// Hack?
-		if (buffer_size >= sizeof(uint32_t)) {
-			auto* label = static_cast<uint32_t*>(dst);
-			*label      = 1;
+		filled++;
+		auto* bytes = static_cast<uint8_t*>(dst);
+		if (log_fill) {
+			const auto* d = static_cast<const uint32_t*>(dst);
+			uint32_t    nonzero = 0;
+			for (uint32_t i = kHeader / 4; i < buffer_size / 4; i++) {
+				nonzero += d[i] != 0 ? 1u : 0u;
+			}
+			std::fprintf(stderr, "LOD stats %" PRIu64 ": buffer 0x%016" PRIx64 " size 0x%x control 0x%08x; before fill: header %08x %08x %08x %08x "
+			       "%08x %08x %08x %08x, %u nonzero record dwords, records 0-1 %08x %08x %08x %08x\n",
+			       packets, reinterpret_cast<uint64_t>(dst), buffer_size, buffer[3], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+			       nonzero, buffer_size >= kHeader + 16 ? d[16] : 0u, buffer_size >= kHeader + 16 ? d[17] : 0u,
+			       buffer_size >= kHeader + 16 ? d[18] : 0u, buffer_size >= kHeader + 16 ? d[19] : 0u);
+		}
+		std::bitset<256> banks;
+		const bool       want_banks = mode == NativeGpu::LodStatsMode::Usage || mode == NativeGpu::LodStatsMode::Banks;
+		bool             have_banks = want_banks && NativeGpu::TakeLodStatsBanks(reinterpret_cast<uint64_t>(dst), banks);
+		uint32_t         used_records = 0;
+		if (want_banks && !have_banks && no_scan++ < 8) {
+			std::fprintf(stderr, "LOD stats %" PRIu64 ": no bank scan for buffer 0x%016" PRIx64 ", filling every record\n", packets,
+			       reinterpret_cast<uint64_t>(dst));
+		}
+		if (mode == NativeGpu::LodStatsMode::Usage && have_banks) {
+			used_records = NativeGpu::WriteLodUsageReport(dst, buffer_size, banks);
+		} else if (mode == NativeGpu::LodStatsMode::All || mode == NativeGpu::LodStatsMode::Usage ||
+		           (mode == NativeGpu::LodStatsMode::Banks && !have_banks)) {
+			memset(dst, fill, buffer_size);
+		} else {
+			memset(dst, fill, std::min(buffer_size, kHeader));
+			for (uint32_t bank = 0; kHeader + bank * 8u + 8u <= buffer_size; bank++) {
+				uint8_t* rec = bytes + kHeader + bank * 8u;
+				switch (mode) {
+					case NativeGpu::LodStatsMode::Banks: memset(rec, banks.test(bank % 256u) ? fill : 0, 8); break;
+					case NativeGpu::LodStatsMode::Even: memset(rec, bank % 2u == 0 ? fill : 0, 8); break;
+					case NativeGpu::LodStatsMode::Lo: memset(rec, fill, 4); memset(rec + 4, 0, 4); break;
+					case NativeGpu::LodStatsMode::Hi: memset(rec, 0, 4); memset(rec + 4, fill, 4); break;
+					default: break;
+				}
+			}
+		}
+		// Header dword 0 non-zero: the streamer treats 0 as "report not present". Usage writes it
+		// last, inside WriteLodUsageReport; the other modes set it here, after the fill.
+		if (mode != NativeGpu::LodStatsMode::Usage || !have_banks) {
+			if (buffer_size >= sizeof(uint32_t)) {
+				auto* label = static_cast<uint32_t*>(dst);
+				*label      = 1;
+			}
+		}
+		if (mode == NativeGpu::LodStatsMode::Usage && have_banks && log_every != 0 && filled % log_every == 0) {
+			char ranges[2048];
+			NativeGpu::FormatLodBankRanges(banks, ranges, sizeof(ranges));
+			const uint32_t nrecs = buffer_size > kHeader ? std::min(256u, (buffer_size - kHeader) / 8u) : 0u;
+			std::fprintf(stderr,
+			             "LOD usage %" PRIu64 ": buffer 0x%016" PRIx64 " %zu banks used in the window (%s); "
+			             "%u records written as used (count 1, mip 0), %u as no-data\n",
+			             filled, reinterpret_cast<uint64_t>(dst), banks.count(), ranges, used_records,
+			             nrecs >= used_records ? nrecs - used_records : 0u);
+		} else if (log_fill && have_banks) {
+			std::fprintf(stderr, "LOD stats %" PRIu64 ": %zu banks filled\n", packets, banks.count());
+		}
+		if (traps != 0 && packets >= trap_from) {
+			traps--;
+			NativeGpu::LodStatsTrapArm(reinterpret_cast<uint64_t>(dst), buffer_size);
 		}
 	}
+	packets++;
 
 	return 4;
 }

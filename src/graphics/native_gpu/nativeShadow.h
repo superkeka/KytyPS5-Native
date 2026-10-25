@@ -1,8 +1,10 @@
 #ifndef EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESHADOW_H_
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESHADOW_H_
 
+#include <bitset>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <vector>
 
 // Shadow-mode native GPU submission for the BC-250. Called from Kyty's DCB submit path, it reads
@@ -27,16 +29,31 @@ namespace Libs::Graphics::NativeGpu {
 void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
 
 // The same for an asynchronous compute buffer (KYTY_NATIVE_GPU_ACB=1, or "dry" to only translate
-// and report). ACBs run on the gfx ring in guest submission order with the DCBs.
+// and report). ACBs run on the gfx ring in guest submission order with the DCBs, unless
+// KYTY_NATIVE_GPU_ACB_RINGS=1 (with native labels): then each guest compute queue is a compute
+// ring and waits between the rings are real GPU waits.
 void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords);
 
 // KYTY_NATIVE_GPU_THREAD=1: submissions go through a pipeline (ShadowEnqueue) instead of running on the
 // caller's thread: `then` (handing the buffer to Kyty's command processor) runs once the native GPU
-// work has completed, in submission order.
+// work has completed, in submission order. `queue` is 0 for a DCB (and for Kyty's own submissions, with
+// a null buffer, which only keep their place in that order), the guest compute queue for an ACB.
 bool ShadowThreaded();
 // True on the pipeline thread that hands finished buffers to Kyty.
 bool ShadowOnPipelineThread();
-void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, bool acb, std::function<void()> then);
+void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, uint32_t queue,
+                   std::function<void(std::span<const uint32_t>)> then);
+
+// Native labels (KYTY_NATIVE_GPU_LABELS, on by default in primary mode with the pipeline; =0 brings
+// back Kyty writing them): the GPU writes the guest's labels, EOP interrupts come from a tracker that
+// watches the GPU pass points in the IB, and `then` gets only the packets Kyty's command processor
+// still has to run (flips, waits for a flip), or nothing at all, instead of the whole guest buffer,
+// which Kyty then never reads again. Buffers the native path refuses still go to Kyty whole.
+bool ShadowNativeLabels();
+// What native labels signal on the host: a queue's EOP interrupt (event id: 0 for graphics, else the
+// guest compute queue) and the reference clock written for timestamp labels.
+void ShadowSetHost(std::function<void(int event_id, uint32_t context_id)> interrupt,
+                   std::function<uint64_t()> reference_clock);
 
 // Guest memory rendered natively, as pieces of exported GPU buffers (dma-buf fd, buffer size, offset,
 // length), so Kyty's presenter can copy a surface on the GPU instead of reading it on the CPU. False
@@ -72,6 +89,17 @@ void ShadowToggleNativeFrames();
 bool PrimaryRendering();
 // KYTY_NATIVE_GPU_LOD_STATS=1: the native path runs GET_LOD_STATS, so Kyty must not fill the buffer.
 bool NativeLodStats();
+// KYTY_LOD_STATS_MODE=usage (the default) or =banks, or KYTY_LOD_STATS_LOG=N: the translator collects
+// the counter banks of the T#s each draw and dispatch reaches (MIP_STATS_CNT_EN, word6[7:0]).
+bool LodBankScanOn();
+// The banks seen before the GET_LOD_STATS packet that writes `addr`, once per packet; false when the
+// scan is off or no report was published for it. The pipeline thread publishes; this takes.
+bool TakeLodStatsBanks(uint64_t addr, std::bitset<256>& banks);
+// KYTY_LOD_STATS_TRAP: makes the pages of [addr, addr + size) inaccessible; LodStatsTrapFault
+// (called from the host fault handler with the faulting thread's ucontext_t) logs each CPU access with
+// its PC and single-steps it before closing the pages again.
+void LodStatsTrapArm(uint64_t addr, uint64_t size);
+bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context);
 
 // Called at every video-out flip with the guest surface about to be presented. For the flips
 // listed in KYTY_NATIVE_GPU_DUMP_FLIPS ("300,600" or a range "300-2000/10"), writes to
