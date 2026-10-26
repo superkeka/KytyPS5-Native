@@ -2937,21 +2937,24 @@ private:
 		bool            gpu = false;
 		bool            same = false;
 		bool            submitted = false;
+		const uint32_t  slot = SlotOf(queue);
+		bool            gfx_writer = false; // see PlanRingWait
 		if (const RingWrite* w = PendingRingWrite(wait.addr)) {
 			uint64_t v = 0;
 			cover = w->write.Covers(wait.addr, wait.wide, &v);
 			if (cover == 1) {
 				satisfies = wait.Met(v);
 			}
-			gpu       = w->write.gpu;
-			same      = w->slot == SlotOf(queue);
-			submitted = Submitted(*w);
+			gpu        = w->write.gpu;
+			same       = w->slot == slot;
+			submitted  = Submitted(*w);
+			gfx_writer = m_early_waits && slot != 0 && w->slot == 0;
 		}
 		// Hold until a writer is guaranteed to run (PlanRingWait). A label already in memory, with
 		// no pending write about to replace it, is a barrier: the GPU never waits for a writer that
 		// will not be submitted.
 		const bool native = p.seg.wait_len != 0 && m_native_waits;
-		switch (PlanRingWait(cover, satisfies, gpu, same, submitted, wait.Met(ReadLabel(wait)), native)) {
+		switch (PlanRingWait(cover, satisfies, gpu, same, submitted, wait.Met(ReadLabel(wait)), native, gfx_writer)) {
 			case RingWaitRelease::GpuWait: return Release::Native;
 			case RingWaitRelease::Barrier: return Release::Observed;
 			case RingWaitRelease::Hold:
@@ -3333,6 +3336,12 @@ private:
 	uint64_t                                m_slot_seq[33] = {};
 	bool                                    m_native_waits = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
+		return v == nullptr || v[0] != '0';
+	}();
+	// KYTY_NATIVE_GPU_EARLY_WAITS=0: a compute wait on a gfx-written label stays held on the CPU until
+	// the writer's CS has returned (see PlanRingWait).
+	bool                                    m_early_waits = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_EARLY_WAITS");
 		return v == nullptr || v[0] != '0';
 	}();
 	double                                  m_timeout = 12.0;

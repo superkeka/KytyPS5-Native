@@ -884,9 +884,13 @@ void TestDisplayDccRestore() {
 	Append(dcb, IT_SET_CONTEXT_REG, {0x31cu, kInfo}, false);
 	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
 	const auto r = t.Translate(dcb);
+	// The INFO values sent after the display draw (the guest's own DCC write for the display target
+	// passes through before it).
 	std::vector<uint32_t> infos;
+	bool                  drawn = false;
 	for (const auto& p: Decode(r.ib)) {
-		if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && (p.body[0] & 0xffffu) == 0x31cu) {
+		drawn = drawn || p.op == IT_DRAW_INDEX_AUTO;
+		if (drawn && p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && (p.body[0] & 0xffffu) == 0x31cu) {
 			infos.push_back(p.body[1]);
 		}
 	}
@@ -1232,9 +1236,10 @@ void TestValidateNativeIb() {
 		o.plan = plan;
 		auto r = t.Translate(dcb);
 		Check(r.ok && ValidateNativeIb(r.ib, false), "the native-labels IB passes the packet check");
-		const auto* wd = FindFirst(Decode(r.ib), IT_WRITE_DATA);
-		Check((wd == nullptr || (wd->body[0] & (1u << 20u)) != 0) && FindFirst(Decode(r.ib), 0x93u) == nullptr,
-		      "no guest forms in it but a write-confirmed WRITE_DATA");
+		const auto pkts = Decode(r.ib);
+		const auto* wd   = FindFirst(pkts, IT_WRITE_DATA);
+		Check(wd == nullptr || (wd->body[0] & (1u << 20u)) != 0, "a WRITE_DATA in it is write-confirmed");
+		Check(FindFirst(pkts, 0x93u) == nullptr, "no 64-bit guest wait in it");
 	}
 
 	auto rejects = [&](std::vector<uint32_t> ib, const char* what) {
@@ -1494,6 +1499,15 @@ void TestPlanRingWait() {
 	      "other ring, memory already satisfies: hold until the writer lands");
 	Check(PlanRingWait(1, true, true, true, false, true, true) == RingWaitRelease::GpuWait,
 	      "same ring, memory already satisfies: the ring order still holds, real GPU wait");
+	// A compute waiter whose pending writer is the gfx ring waits on the GPU before that CS.
+	Check(PlanRingWait(0, false, false, false, false, false, true, true) == RingWaitRelease::Hold,
+	      "no write emitted yet: hold, whoever wrote the label before");
+	Check(PlanRingWait(1, true, true, false, false, false, true, true) == RingWaitRelease::GpuWait,
+	      "gfx writer still in its batch: compute waits on the GPU");
+	Check(PlanRingWait(1, true, true, false, false, true, true, true) == RingWaitRelease::Hold,
+	      "gfx writer pending, memory already satisfies (stale): hold until it lands");
+	Check(PlanRingWait(1, false, true, false, false, false, true, true) == RingWaitRelease::Hold,
+	      "a gfx write that does not satisfy keeps the segment held");
 }
 
 void TestComputeRingForQueue() {

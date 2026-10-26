@@ -355,10 +355,18 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 // Until then the segment stays on the CPU (Hold). A label already in memory, and no pending write
 // that will replace it, is a barrier: a wait whose writer will never be submitted does not block the
 // GPU. `cover` is LabelWrite::Covers (0 unrelated, 1 known value, 2 touched but unknown).
+// `gfx_writer`: the waiter is on a compute ring and the pending write is on the gfx ring, emitted
+// into its batch but not submitted yet. That wait goes to the GPU at once: the gfx ring is another
+// engine, so the write cannot be queued behind the waiter, whichever compute ring the kernel runs
+// the waiter on (it balances contexts across them, so two compute rings may be one), and the batch
+// is submitted whatever the compute ring does. With no write emitted yet the segment stays held:
+// the label's previous writer says nothing about this use (ASTRO BOT cycles three label sets; a
+// compute wait given to the GPU on the strength of the last frame's gfx writer deadlocked against a
+// gfx wait on that compute ring's later write).
 enum class RingWaitRelease { Hold, GpuWait, Barrier };
 
 RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
-                             bool label_in_memory, bool native_wait);
+                             bool label_in_memory, bool native_wait, bool gfx_writer = false);
 
 // Guest compute queues are 0x20 + n (7 pipes x 8 queues). `available_rings` is the
 // AMDGPU_INFO_HW_IP_INFO bitmask. Returns one of its set bits; queues spread across the rings the

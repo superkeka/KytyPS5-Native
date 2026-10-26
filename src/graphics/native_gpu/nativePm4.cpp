@@ -505,7 +505,7 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 }
 
 RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
-                             bool label_in_memory, bool native_wait) {
+                             bool label_in_memory, bool native_wait, bool gfx_writer) {
 	if (cover != 0) {
 		// A write already emitted still owns the address. Matching memory is stale until it lands,
 		// and an unknown value cannot be proved to satisfy the wait, so the segment stays held.
@@ -515,7 +515,7 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 		// waited forever). Such a wait goes to the GPU only while memory does not satisfy it yet;
 		// otherwise it is held until the writer lands and becomes a barrier.
 		const bool gpu_wait = cover == 1 && value_satisfies && gpu_write && native_wait &&
-		                      (same_ring || (writer_submitted && !label_in_memory));
+		                      (same_ring || ((writer_submitted || gfx_writer) && !label_in_memory));
 		return gpu_wait ? RingWaitRelease::GpuWait : RingWaitRelease::Hold;
 	}
 	if (label_in_memory) {
