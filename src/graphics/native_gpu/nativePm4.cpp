@@ -1711,15 +1711,29 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		queued_points.push_back(std::move(p));
 		seg_effects = true;
 	};
-	// Kyty's command processor wrote this label with a CPU store after the buffer's GPU work. A guest
-	// that waits on the address (sync-on-address is a futex on that word) sees that store. A GPU
-	// RELEASE_MEM does not wake the futex, and on this path it is not what Dead Cells observes: the
-	// title never asks for an interrupt, and the level load sleeps until the label changes. The
-	// tracker writes the same bytes when the GPU reaches the end of this segment. `prior` is the
-	// dword at translate time, so a label the guest has already replaced is left alone, and a store
-	// the GPU made visible is not written again.
+	// A label the GPU has just been given to write. A guest that waits on the address sleeps in
+	// sync-on-address, a futex on that word, and a GPU store does not wake it (Dead Cells: the title
+	// never asks for an interrupt, and the level load sleeps until the label changes). So the tracker
+	// wakes the address once the GPU passes the end of this segment, whose release has written back
+	// GL2 by then, so the woken guest reads the GPU's value. Nothing is stored on the CPU: on PS5 the
+	// GPU alone writes the label, in stream order, and a CPU copy landing at the end of the segment
+	// comes after writes that follow it (the next use's reset on another ring, a guest store) and can
+	// put back a value they replaced.
+	//
+	// SetTrackerWrites keeps the old mirror: the tracker writes the same bytes when the GPU reaches
+	// the end of this segment. `prior` is the dword at translate time, so a label the guest has
+	// already replaced is left alone, and a store the GPU made visible is not written again. That
+	// test cannot see a label that went back to its translate-time value in between: the mirror
+	// then overwrites the newer write.
 	auto mirror_store = [&](uint64_t addr, std::vector<uint32_t> words, bool one_addr) {
 		if (words.empty() || addr == 0) {
+			return;
+		}
+		if (!m_tracker_writes) {
+			TrackerPoint wake;
+			wake.kind = TrackerPoint::Kind::Wake;
+			wake.addr = addr;
+			tracker_point(std::move(wake));
 			return;
 		}
 		TrackerPoint cpu;
@@ -1972,12 +1986,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (sel == 1) {
 						EmitRelease32(body, dst, bptr[4], m_compute_ring);
 						mirror_store(dst, {bptr[4]}, false);
-						NoteOnce(0, "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)");
+						NoteOnce(0, m_tracker_writes ? "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)"
+						                             : "RELEASE_MEM 32-bit label (GPU store only)");
 					} else if (sel == 2) {
 						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring);
 						EmitRelease32(body, dst, bptr[4], m_compute_ring);
 						mirror_store(dst, {bptr[4], bptr[5]}, false);
-						NoteOnce(1, "RELEASE_MEM 64-bit label (GPU store, mirrored to the CPU)");
+						NoteOnce(1, m_tracker_writes ? "RELEASE_MEM 64-bit label (GPU store, mirrored to the CPU)"
+						                             : "RELEASE_MEM 64-bit label (GPU store only, two halves)");
 					} else if (sel == 5) {
 						body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
 						body.push_back(bptr[0]);
@@ -2383,8 +2399,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				if (labels) {
 					// Native labels: Kyty no longer reads the buffer once it is translated, so the GPU writes
-					// the label where the guest put it. Memory the GPU cannot write (or a constant-engine
-					// write) is written by the tracker once the GPU gets there.
+					// the label where the guest put it. Memory the GPU cannot write is written by the
+					// tracker once the GPU gets there.
 					const uint64_t dst      = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
 					const uint32_t n        = body_count - 3u;
 					const bool     one_addr = ((bptr[0] >> 16u) & 1u) != 0;
@@ -2398,19 +2414,29 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// WRITE_DATA, then dispatches). As end-of-pipe releases the data landed after that dispatch
 					// had read it, and longer writes went to the tracker, after the whole segment. The write is
 					// confirmed before the engine moves on; a compute ring has only the micro engine.
-					const bool gpu = engine <= 1 && label_gpu(dst, bytes);
+					// A constant-engine write (ENGINE_SEL 2) is the micro engine's here: the native IB is
+					// not a CE IB, and the ME writes it at its place in the stream, where the tracker would
+					// only write it after the whole segment. KYTY_NATIVE_GPU_TRACKER_WRITES=1 leaves it to
+					// the tracker as before.
+					const bool gpu = (engine <= 1 || !m_tracker_writes) && label_gpu(dst, bytes);
 					if (gpu) {
 						const size_t at = body.size();
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 						body[at + 1] |= 1u << 20u; // WR_CONFIRM
 						if (m_compute_ring) {
 							body[at] |= 2u;                 // SHADER_TYPE compute
+						}
+						if (m_compute_ring || engine > 1) {
 							body[at + 1] &= ~(3u << 30u);   // ENGINE_SEL micro engine
 						}
 						mirror_store(dst, std::vector<uint32_t>(bptr + 3, bptr + 3 + n), one_addr);
 						stats.labels_native++;
 						seg_effects = true;
-						NoteOnce(6, "WRITE_DATA label (native WRITE_DATA, mirrored to the CPU)");
+						NoteOnce(6, m_tracker_writes ? "WRITE_DATA label (native WRITE_DATA, mirrored to the CPU)"
+						                             : "WRITE_DATA label (native WRITE_DATA only)");
+						if (engine > 1) {
+							NoteOnce(11, "WRITE_DATA by the constant engine (run on the micro engine)");
+						}
 					}
 					// Two dwords at an 8-aligned address are one 64-bit label as far as a later
 					// WAIT_REG_MEM_64 is concerned (Agc's WaitOnAddress after a 64-bit WriteData: Dead
