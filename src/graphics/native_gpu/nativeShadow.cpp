@@ -457,6 +457,7 @@ public:
 			return false;
 		}
 
+		SyncCollectRefs();
 		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
 		const char* const  kind  = acb ? "acb" : "frame";
 		Pm4Translator&     tr    = acb ? m_acb_translator : m_translator;
@@ -1896,13 +1897,29 @@ private:
 		dump_stage("gs", snap.gs_user_data);
 	}
 
+	// Per-draw references are collected only while map-time residency is incomplete (see
+	// GemBacking::ResidencyAtMap): once a block stayed out of it, submissions make memory resident.
+	void SyncCollectRefs() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		const bool collect = m_gem == nullptr || !m_gem->MapComplete();
+		if (collect == m_collect_refs) {
+			return;
+		}
+		m_collect_refs = collect;
+		m_translator.SetCollectRefs(collect);
+		m_acb_translator.SetCollectRefs(collect);
+		std::fprintf(stderr, collect ? "native shadow: residency by reference: per-draw references and the CPU-write scan are on\n"
+		                             : "native shadow: residency at map time (PS5): no per-draw references, no CPU-write scan\n");
+#endif
+	}
+
 	void MakeResident(const Pm4TranslateResult& result) {
 		constexpr uint64_t kTableSpan = 4096;
 		constexpr uint64_t kImageSpan = 32ull << 20u;
 		constexpr uint64_t kBufferCap = 64ull << 20u;
 		constexpr size_t   kMaxTables = 2048;
 		constexpr uint32_t kBucketShift = 24; // 16 MiB guest-address buckets, the block size
-		if (GemBacking::ResidencyAtMap()) {
+		if (m_gem->MapComplete()) {
 			return; // mappings with GPU access were made resident when the guest mapped them
 		}
 		m_promoted_by[0] += m_gem->PromoteTouched();
@@ -2254,11 +2271,7 @@ private:
 			m_translator.SetCompactRefs(true);
 			m_acb_translator.SetCompactRefs(true);
 		}
-		if (GemBacking::ResidencyAtMap()) {
-			m_translator.SetCollectRefs(false);
-			m_acb_translator.SetCollectRefs(false);
-			std::fprintf(stderr, "native shadow: residency at map time (PS5): no per-draw references, no CPU-write scan\n");
-		}
+		SyncCollectRefs();
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT"); v != nullptr && v[0] == '0') {
 			m_translator.SetPfpSyncIndirect(false);
 			m_acb_translator.SetPfpSyncIndirect(false);
@@ -2524,6 +2537,7 @@ private:
 	std::string   m_hang_dump;   // KYTY_NATIVE_GPU_HANG_DUMP directory, empty when off
 	std::array<std::deque<std::pair<uint64_t, std::vector<uint32_t>>>, kTrackerSlots> m_hang_kept; // per tracker slot
 	bool          m_collect_targets = false;           // flip dumps compare render targets too
+	bool          m_collect_refs    = true;            // the translators collect per-draw references (SyncCollectRefs)
 	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
 	std::vector<FrameDraw>               m_frame_draws;   // KYTY_NATIVE_GPU_CTL: draws since the last flip
 	uint32_t                             m_frame_buffers = 0;
@@ -2797,6 +2811,7 @@ private:
 		std::vector<uint32_t> ib;  // empty: no GPU work (refused buffers, Kyty's own submissions)
 		Pm4Segment            seg; // offsets relative to `ib`
 		std::shared_ptr<Done> done; // on the last piece of a buffer
+		uint64_t              made = 0; // m_emits when it was translated: later emits carry writes it may wait for
 	};
 	struct Entry {
 		uint64_t              seq;
@@ -2909,6 +2924,7 @@ private:
 		done->tail = std::move(r.cpu_tail);
 		for (size_t k = 0; k < r.segments.size(); k++) {
 			Piece p;
+			p.made = m_emits;
 			p.seg = std::move(r.segments[k]);
 			p.ib.assign(r.ib.begin() + p.seg.begin, r.ib.begin() + p.seg.end);
 			for (auto& point: p.seg.points) {
@@ -2949,6 +2965,14 @@ private:
 			same       = w->slot == slot;
 			submitted  = Submitted(*w);
 			gfx_writer = m_early_waits && slot != 0 && w->slot == 0;
+		} else if (auto last = m_last_write.find(wait.addr); last != m_last_write.end() && last->second.second > p.made) {
+			// A write emitted after this waiter was translated has already landed. On PS5 the waiting
+			// queue would have seen it, even if the title has reset the label since (ASTRO BOT does that
+			// when a level loads, faster than a held piece is looked at again): the wait is met.
+			uint64_t v = 0;
+			if (last->second.first.Covers(wait.addr, wait.wide, &v) == 1 && wait.Met(v)) {
+				return Release::Observed;
+			}
 		}
 		// Hold until a writer is guaranteed to run (PlanRingWait). A label already in memory, with
 		// no pending write about to replace it, is a barrier: the GPU never waits for a writer that
@@ -2993,6 +3017,44 @@ private:
 		             how == Release::Native ? "as a GPU wait" : "on memory", writer, m_pending[queue].size() - 1);
 	}
 
+	// KYTY_NATIVE_GPU_LABEL_TRACE=<lo>-<hi> (hex guest addresses): the last 1024 label events in that
+	// range, dumped with the first stale holds: W a GPU write emitted (C: one the CPU side makes), H a
+	// hold begins, G / M it ends as a GPU wait / on memory; each with the queue, the value (the wait's
+	// reference for H, G, M) and what memory held at that moment.
+	struct LabelEvent {
+		double   t;
+		char     kind;
+		uint32_t queue;
+		uint64_t addr;
+		uint64_t value;
+		uint64_t memory;
+	};
+	void TraceLabel(char kind, uint32_t queue, uint64_t addr, uint64_t value) {
+		static const std::pair<uint64_t, uint64_t> range = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_LABEL_TRACE");
+			uint64_t    lo = 0, hi = 0;
+			if (v != nullptr) {
+				char* end = nullptr;
+				lo        = std::strtoull(v, &end, 16);
+				hi        = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : lo + 8;
+			}
+			return std::make_pair(lo, hi);
+		}();
+		if (addr < range.first || addr >= range.second) {
+			return;
+		}
+		const uint64_t memory = *reinterpret_cast<const volatile uint32_t*>(addr);
+		m_label_trace[m_label_trace_next++ % m_label_trace.size()] = LabelEvent {NowSecShadow(), kind, queue, addr, value, memory};
+	}
+	void DumpLabelTrace() const {
+		const size_t n = std::min<uint64_t>(m_label_trace_next, m_label_trace.size());
+		for (size_t i = 0; i < n; i++) {
+			const LabelEvent& e = m_label_trace[(m_label_trace_next - n + i) % m_label_trace.size()];
+			std::fprintf(stderr, "label trace %.4f %c q%x %llx v%llx mem %llx\n", e.t, e.kind, e.queue, static_cast<unsigned long long>(e.addr),
+			             static_cast<unsigned long long>(e.value), static_cast<unsigned long long>(e.memory));
+		}
+	}
+
 	// A piece held for more than 2 s: what it waits for and what memory holds (the first 16).
 	void NoteStaleHold(uint32_t queue, const Piece& p) {
 		const double now   = NowSecShadow();
@@ -3012,6 +3074,36 @@ private:
 		             static_cast<unsigned long long>(w.mask), w.function, static_cast<unsigned long long>(w.ref),
 		             static_cast<unsigned long long>(ReadLabel(w)), rw != nullptr ? (Submitted(*rw) ? "submitted" : "not submitted") : "none",
 		             m_pending[queue].size());
+		// The first stalls: every queue's pending pieces in order, as the label waits that hold them
+		// ("wait") and the label writes they carry, to see which queue would write what another waits for.
+		if (m_pending_dumps < 3) {
+			m_pending_dumps++;
+			for (const auto& [q, pieces]: m_pending) {
+				std::string line;
+				size_t      items = 0;
+				for (const auto& piece: pieces) {
+					if (items >= 40) {
+						line += " ...";
+						break;
+					}
+					char text[64];
+					if (piece.seg.held) {
+						std::snprintf(text, sizeof(text), " wait %llx=%llx", static_cast<unsigned long long>(piece.seg.wait.addr),
+						              static_cast<unsigned long long>(piece.seg.wait.ref));
+						line += text;
+						items++;
+					}
+					for (const auto& lw: piece.seg.writes) {
+						std::snprintf(text, sizeof(text), " %llx<-%llx%s", static_cast<unsigned long long>(lw.addr),
+						              static_cast<unsigned long long>(lw.value), lw.gpu ? "" : "(cpu)");
+						line += text;
+						items++;
+					}
+				}
+				std::fprintf(stderr, "native labels:   queue 0x%x (slot %u), %zu pieces:%s\n", q, SlotOf(q), pieces.size(), line.c_str());
+			}
+			DumpLabelTrace();
+		}
 	}
 
 	// Emits what is ready, queue by queue, until nothing more is.
@@ -3025,6 +3117,7 @@ private:
 						if (m_hold_since.count(queue) == 0) {
 							m_hold_reason[queue] = m_last_hold_reason;
 							m_hold_start_value[queue] = ReadLabel(pieces.front().seg.wait);
+							TraceLabel('H', queue, pieces.front().seg.wait.addr, pieces.front().seg.wait.ref);
 						}
 						NoteStaleHold(queue, pieces.front());
 						break;
@@ -3042,6 +3135,9 @@ private:
 						}
 					}
 					m_hold_since.erase(queue);
+					if (pieces.front().seg.held) {
+						TraceLabel(how == Release::Native ? 'G' : 'M', queue, pieces.front().seg.wait.addr, pieces.front().seg.wait.ref);
+					}
 					Emit(queue, pieces.front(), how);
 					pieces.pop_front();
 					progress = true;
@@ -3077,7 +3173,13 @@ private:
 			// No GPU work: done once everything ahead of it on its own ring is.
 			entries.push_back(Entry {m_slot_seq[slot], queue, slot, TrackerPoint {}, p.done});
 		}
+		if (m_last_write.size() > 65536) {
+			m_last_write.clear();
+		}
+		m_emits++;
 		for (const auto& w: p.seg.writes) {
+			TraceLabel(w.gpu ? 'W' : 'C', queue, w.addr, w.value);
+			m_last_write[w.addr] = {w, m_emits};
 			m_ring[w.addr] = RingWrite {w, m_seq, slot, m_batch};
 			if (w.wide) {
 				m_ring[w.addr + 4] =
@@ -3348,6 +3450,11 @@ private:
 	std::map<uint32_t, std::deque<Piece>>   m_pending; // by queue
 	uint32_t                                m_translating = 0;
 	uint64_t                                m_held        = 0;
+	uint32_t                                m_pending_dumps = 0; // NoteStaleHold's queue dumps so far
+	std::unordered_map<uint64_t, std::pair<LabelWrite, uint64_t>> m_last_write; // label -> its last write emitted, and when
+	uint64_t                                m_emits = 0; // Emit calls so far
+	std::array<LabelEvent, 1024>            m_label_trace {}; // KYTY_NATIVE_GPU_LABEL_TRACE ring
+	uint64_t                                m_label_trace_next = 0;
 	bool                                    m_wake        = false; // the tracker moved; recheck held labels
 	uint64_t                                m_seq         = 0;
 	bool                                    m_appended    = false;

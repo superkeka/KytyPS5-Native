@@ -1157,7 +1157,7 @@ static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size) {
 		VirtualRanges::Range range {};
 		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtMap() && g_virtual_ranges != nullptr &&
 		    g_virtual_ranges->Query(vaddr, 0, &range) && (range.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
-			gem->PromoteGuestRange(vaddr, size);
+			gem->PromoteAtMap(vaddr, size);
 		}
 		return;
 	}
@@ -1206,7 +1206,7 @@ static void NativeGpuRebindGpuRange(uint64_t vaddr, uint64_t size) {
 		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtMap() && IsCommittedRangeType(r.type) &&
 		    (r.protection & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0 && g_guest_address_space != nullptr &&
 		    g_guest_address_space->BackingContains(r.start, r.size)) {
-			gem->PromoteGuestRange(r.start, r.size);
+			gem->PromoteAtMap(r.start, r.size);
 			continue;
 		}
 		if (r.type == VirtualRangeType::Stack || !IsCommittedRangeType(r.type) ||

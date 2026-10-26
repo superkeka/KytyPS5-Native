@@ -113,16 +113,49 @@ public:
 		return size;
 	}
 
-	// KYTY_NATIVE_GPU_RESIDENCY=map: residency as the PS5 kernel does it. A guest mapping of direct
-	// memory with GPU access (or an mprotect that adds it) makes its blocks resident at once, the way
-	// the PS5 writes the GPU page table entries at map time, and command buffers carry no residency
-	// work (no per-draw references, no CPU-write scan before each submission).
+	// Residency as the PS5 kernel does it (the default): a guest mapping of direct memory with GPU
+	// access (or an mprotect that adds it) makes its blocks resident at once, the way the PS5 writes
+	// the GPU page table entries at map time, and command buffers carry no residency work (no
+	// per-draw references, no CPU-write scan before each submission) while every such block got
+	// resident (MapComplete). That is within a budget: the PS5's game memory is its own, here the
+	// system and Steam share it (ASTRO BOT maps 12.5 GiB of 15). A block that would leave less than
+	// KYTY_NATIVE_GPU_MAP_RESERVE_MIB (default 1536) of available RAM stays out, and from then on
+	// submissions make blocks resident as they reference them. KYTY_NATIVE_GPU_RESIDENCY=partial:
+	// always that way.
 	static bool ResidencyAtMap() {
 		static const bool on = [] {
 			const char* v = std::getenv("KYTY_NATIVE_GPU_RESIDENCY");
-			return v != nullptr && std::strcmp(v, "map") == 0;
+			return v == nullptr || std::strcmp(v, "partial") != 0;
 		}();
 		return on;
+	}
+
+	// True while every block with GPU access was made resident at map time.
+	[[nodiscard]] bool MapComplete() const { return ResidencyAtMap() && !m_map_overflow.load(std::memory_order_acquire); }
+
+	// Map-time residency (see ResidencyAtMap) for guest addresses [vaddr, vaddr + size): their blocks
+	// become resident while the budget allows. Returns how many blocks were promoted.
+	uint32_t PromoteAtMap(uint64_t vaddr, uint64_t size) {
+		std::lock_guard<std::mutex> lock(m_lock);
+		uint32_t                    promoted = 0;
+		ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t, uint64_t backing, uint64_t len) {
+			for (uint64_t index = backing / BlockSize(); index <= (backing + len - 1) / BlockSize(); index++) {
+				Block& block = m_blocks[index];
+				if (block.resident || block.code) {
+					continue;
+				}
+				if (MapBudgetAllows(block.size) && PromoteBlockUnlocked(index)) {
+					promoted++;
+				} else if (!block.code && !m_map_overflow.exchange(true, std::memory_order_acq_rel)) {
+					std::fprintf(stderr,
+					             "GemBacking: map-time residency stops at %llu MiB (less than %llu MiB of RAM would be left); "
+					             "submissions make the rest resident as they reference it\n",
+					             static_cast<unsigned long long>(m_resident_bytes >> 20u),
+					             static_cast<unsigned long long>(MapReserve() >> 20u));
+				}
+			}
+		});
+		return promoted;
 	}
 
 	// With map residency, blocks are VM_ALWAYS_VALID buffers, the way PS5 memory is always in the GPU
@@ -1218,6 +1251,28 @@ private:
 		m_mover_cv.wait(lock, [job] { return job->done; });
 	}
 
+	static uint64_t MapReserve() {
+		static const uint64_t reserve = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_MAP_RESERVE_MIB");
+			return (v != nullptr ? std::strtoull(v, nullptr, 0) : 1536ull) << 20u;
+		}();
+		return reserve;
+	}
+
+	// True when `bytes` more of resident memory still leave MapReserve() of MemAvailable.
+	static bool MapBudgetAllows(uint64_t bytes) {
+		FILE* f = std::fopen("/proc/meminfo", "re");
+		if (f == nullptr) {
+			return true;
+		}
+		char               line[128];
+		unsigned long long kib = 0;
+		while (std::fgets(line, sizeof(line), f) != nullptr && std::sscanf(line, "MemAvailable: %llu kB", &kib) != 1) {
+		}
+		std::fclose(f);
+		return kib == 0 || (kib << 10u) >= bytes + MapReserve();
+	}
+
 	// Moves block `index` into a new buffer: from the memfd, or, for a resident block, from its old
 	// buffer, which is freed (the caller has made sure the GPU no longer uses it). `exportable`: an
 	// ordinary buffer with a dma-buf even when blocks are otherwise always valid.
@@ -1541,6 +1596,7 @@ private:
 	bool                          m_mover_stop = false;
 	std::map<uint64_t, External>  m_external; // guest VA -> userptr buffer for non-direct ranges
 	std::array<std::pair<uint64_t, uint64_t>, 3> m_prt {}; // PRT apertures (start, size), SetPrtAperture
+	std::atomic<bool>             m_map_overflow {false}; // a block with GPU access stayed out of map-time residency
 	mutable std::mutex            m_lock;     // guards blocks, views, m_external and the dummy
 };
 
