@@ -1216,6 +1216,9 @@ public:
 		const char*    native  = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
 		const bool     waits   = native == nullptr || native[0] != '0';
 		const bool     cpu_ts  = EnvOn("KYTY_NATIVE_GPU_CPU_TIMESTAMPS");
+		// KYTY_NATIVE_GPU_TRACKER_WRITES=1: the tracker mirrors GPU label stores on the CPU (see
+		// Pm4Translator::SetTrackerWrites).
+		const bool     mirrors = EnvOn("KYTY_NATIVE_GPU_TRACKER_WRITES");
 		m_label_oracle = oracle;
 		m_translator.SetNativeLabels(oracle, va);
 		m_acb_translator.SetNativeLabels(oracle, va);
@@ -1223,13 +1226,16 @@ public:
 		m_acb_translator.SetNativeWaits(waits);
 		m_translator.SetCpuTimestamps(cpu_ts);
 		m_acb_translator.SetCpuTimestamps(cpu_ts);
+		m_translator.SetTrackerWrites(mirrors);
+		m_acb_translator.SetTrackerWrites(mirrors);
 		if (m_acb_rings) {
 			// MEC packet forms. The gfx translator is unchanged.
 			m_acb_translator.SetComputeRing(true);
 		}
 		m_labels = true;
-		std::fprintf(stderr, "native shadow: native labels (the GPU writes labels, a tracker raises interrupts%s)\n",
-		             waits ? ", guest waits pass through" : "; guest waits stay barriers");
+		std::fprintf(stderr, "native shadow: native labels (the GPU writes labels, a tracker raises interrupts%s%s)\n",
+		             waits ? ", guest waits pass through" : "; guest waits stay barriers",
+		             mirrors ? "; the tracker mirrors GPU label stores" : "");
 		if (m_acb_rings) {
 			std::fprintf(stderr,
 			             "native shadow: ACBs on compute rings (mask 0x%x); a guest wait is a GPU wait only once its "
@@ -2728,8 +2734,9 @@ Host& HostCallbacks() {
 // runs when its ring passes the buffer's end point.
 //
 // A tracker thread blocks on the ring fence and performs what each point stands for as soon as the
-// GPU passes it: EOP interrupts, labels the GPU cannot write (and a CPU mirror of the ones it can,
-// so a guest futex-waiting on the address observes the store), the end of a buffer (its continuation:
+// GPU passes it: EOP interrupts, labels the GPU cannot write (and, for the ones it wrote, a wake of a
+// guest futex-waiting on the address; a CPU mirror of the store only with
+// KYTY_NATIVE_GPU_TRACKER_WRITES=1), the end of a buffer (its continuation:
 // Kyty's command processor runs the few packets it still needs, flips and waits for flips, copied
 // out at translation; refused buffers whole).
 class LabelPipeline final: public LabelOracle {
@@ -3294,6 +3301,17 @@ private:
 		}
 	}
 
+	// sync-on-address sleeps in FUTEX_WAIT on a label's word. A store alone, the GPU's or the CPU's,
+	// does not wake it; the 10 ms poll would, but the waiter returns as soon as it is woken and then
+	// reads. Most labels have no sleeper: skip the syscall then (~20k per second in ASTRO BOT).
+	static void WakeAddress(uint64_t addr) {
+		if (LibKernel::SyncOnAddress::HasWaiters(reinterpret_cast<void*>(addr))) {
+#if defined(__linux__)
+			syscall(SYS_futex, reinterpret_cast<uint32_t*>(addr), FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#endif
+		}
+	}
+
 	void Run(Entry& e) {
 		const TrackerPoint& p = e.point;
 		switch (p.kind) {
@@ -3338,16 +3356,12 @@ private:
 						published = false;
 					}
 				}
-				// sync-on-address sleeps in FUTEX_WAIT on this word. The store alone does not wake it;
-				// the 10 ms poll would, but the waiter returns as soon as it is woken and then reads.
-				// Most labels have no sleeper: skip the syscall then (~20k per second in ASTRO BOT).
-				if (published && LibKernel::SyncOnAddress::HasWaiters(reinterpret_cast<void*>(p.addr))) {
-#if defined(__linux__)
-					syscall(SYS_futex, reinterpret_cast<uint32_t*>(p.addr), FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
-#endif
+				if (published) {
+					WakeAddress(p.addr);
 				}
 				break;
 			}
+			case TrackerPoint::Kind::Wake: WakeAddress(p.addr); break;
 			case TrackerPoint::Kind::Timestamp: {
 				const uint64_t clock = HostCallbacks().reference_clock ? HostCallbacks().reference_clock() : 0;
 				std::memcpy(reinterpret_cast<void*>(p.addr), &clock, std::min<uint32_t>(p.size, 8));

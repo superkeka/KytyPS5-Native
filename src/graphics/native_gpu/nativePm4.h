@@ -173,7 +173,8 @@ struct Pm4TranslateStats {
 	uint32_t write_data_native  = 0; // IT_WRITE_DATA to memory also kept in the IB (SetWriteDataNative)
 	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
 	uint32_t labels_native     = 0; // native labels: WRITE_DATA / RELEASE_MEM label writes run on the GPU
-	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU (unreachable, or a mirror of a GPU store)
+	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU (unreachable, or with
+	                                // SetTrackerWrites a mirror of a GPU store)
 	uint32_t timestamps        = 0; // native labels: timestamps the tracker still writes (CPU clock)
 	uint32_t timestamps_native = 0; // native labels: timestamps the GPU writes (DATA_SEL 3)
 	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
@@ -302,6 +303,7 @@ struct TrackerPoint {
 		CpuWrite,  // write `data` (dwords) at `addr`, all to one address when `one_addr`
 		Timestamp, // write the reference clock at `addr` (`size` bytes)
 		LodStats,  // fill `size` bytes at `addr` like Kyty's GET_LOD_STATS
+		Wake,      // the GPU has written the label at `addr`: wake a guest sleeping on it, store nothing
 	};
 	Kind                  kind     = Kind::End;
 	uint32_t              dw       = 0; // the point's 32-bit sequence value in the IB (patched before submission)
@@ -310,6 +312,7 @@ struct TrackerPoint {
 	uint32_t              size     = 0;
 	bool                  one_addr = false;
 	bool                  mirror   = false; // also stored by the GPU; publish on the CPU only if the guest has not replaced it
+	                                        // (SetTrackerWrites only)
 	std::vector<uint32_t> data;
 	std::vector<uint32_t> prior; // dwords at `addr` when the buffer was translated; empty: write unconditionally
 };
@@ -636,6 +639,13 @@ public:
 	// Timestamps stay on the tracker (Kyty's host TSC scaled to 100 MHz) instead of the GPU clock.
 	// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1. The two clocks have the same unit and different zeros.
 	void SetCpuTimestamps(bool on) { m_cpu_timestamps = on; }
+	// The old split of label writes (KYTY_NATIVE_GPU_TRACKER_WRITES=1): the tracker also stores every
+	// label the GPU writes once the GPU passes the segment's end (a mirror), and a WRITE_DATA by the
+	// constant engine is written by the tracker alone. Off (the default), a label the GPU can reach is
+	// written by the GPU only, in stream order as on PS5, and the tracker just wakes a guest sleeping
+	// on it: a mirror lands later than the GPU store, after writes that follow it in the ring or on
+	// another ring, and can put back a value those writes replaced.
+	void SetTrackerWrites(bool on) { m_tracker_writes = on; }
 
 	// The buffers come from a compute queue (ACBs), whose packets differ from the gfx ring's
 	// (DISPATCH_INDIRECT carries its argument address); they are rewritten for the gfx ring.
@@ -746,6 +756,7 @@ private:
 	uint64_t                     m_tracker_va     = 0;
 	bool                         m_native_waits   = true;
 	bool                         m_cpu_timestamps = false;
+	bool                         m_tracker_writes = false;
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;

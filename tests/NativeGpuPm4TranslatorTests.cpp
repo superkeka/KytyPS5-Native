@@ -940,14 +940,15 @@ void TestLabelsWriteData() {
 	          (wd->body[0] & (1u << 20u)) != 0,
 	      "the label WRITE_DATA runs on the GPU as the guest's WRITE_DATA, in order, write confirmed");
 	const auto& s = r.segments[0];
-	Check(s.points.size() == 2 && s.points[0].kind == TrackerPoint::Kind::CpuWrite && s.points[0].mirror &&
-	          s.points[0].data.size() == 1 && s.points[0].data[0] == 7u && s.points[1].kind == TrackerPoint::Kind::End &&
-	          s.points[0].dw == s.points[1].dw && IsTrackerPacket(r.ib, s.points[0].dw),
-	      "the GPU label is mirrored to the CPU at the segment's tracker point");
+	Check(s.points.size() == 2 && s.points[0].kind == TrackerPoint::Kind::Wake && s.points[0].addr == 0x202000100ull &&
+	          s.points[0].data.empty() && s.points[1].kind == TrackerPoint::Kind::End && s.points[0].dw == s.points[1].dw &&
+	          IsTrackerPacket(r.ib, s.points[0].dw),
+	      "the GPU label only wakes its sleepers at the segment's tracker point; the CPU stores nothing");
 	Check(s.writes.size() == 1 && s.writes[0].addr == 0x202000100ull && s.writes[0].value == 7u && s.writes[0].gpu,
 	      "the write is reported as a GPU label write");
 	Check(s.begin == 0 && s.end == r.ib.size() && IbAligned(r.ib), "the segment spans the aligned IB");
-	Check(r.stats.labels_native == 1 && r.cpu_tail.empty(), "native label counted, nothing left for Kyty");
+	Check(r.stats.labels_native == 1 && r.stats.labels_cpu == 0 && r.cpu_tail.empty(),
+	      "native label counted, nothing left for Kyty or the tracker");
 
 	// A long WRITE_DATA (a dispatch's constants) stays one in-order GPU write, and on a compute ring
 	// it is a compute packet on the micro engine.
@@ -1005,10 +1006,10 @@ void TestLabelsReleaseMem() {
 	Check(rels.size() == 1 && HasLabelRelease(pkts, 0x202000300ull, 5u),
 	      "the first writes its 32-bit label in the barrier's form; INT_SEL 1 on the graphics queue writes nothing");
 	const auto& pts = r.segments[0].points;
-	Check(pts.size() == 4 && pts[0].kind == TrackerPoint::Kind::CpuWrite && pts[0].mirror && pts[0].data.size() == 1 &&
-	          pts[0].data[0] == 5u && pts[1].kind == TrackerPoint::Kind::Interrupt && pts[1].ctx == 0x1234 &&
+	Check(pts.size() == 4 && pts[0].kind == TrackerPoint::Kind::Wake && pts[0].addr == 0x202000300ull && pts[0].data.empty() &&
+	          pts[1].kind == TrackerPoint::Kind::Interrupt && pts[1].ctx == 0x1234 &&
 	          pts[2].kind == TrackerPoint::Kind::Interrupt && pts[2].ctx == 0x55 && pts[3].kind == TrackerPoint::Kind::End,
-	      "the 32-bit label is mirrored, then each interrupt, then the end");
+	      "the 32-bit label's sleepers are woken (no CPU store), then each interrupt, then the end");
 	Check(pts[1].dw == pts[0].dw && pts[2].dw == pts[0].dw && pts[3].dw == pts[0].dw,
 	      "points with nothing between them share one packet");
 
@@ -1019,10 +1020,10 @@ void TestLabelsReleaseMem() {
 	const auto wpkts = Decode(rw.ib);
 	Check(HasLabelRelease(wpkts, 0x202000324ull, 9u) && HasLabelRelease(wpkts, 0x202000320ull, 8u), "64-bit label as two halves");
 	const auto& wpts = rw.segments[0].points;
-	Check(!wpts.empty() && wpts[0].kind == TrackerPoint::Kind::CpuWrite && wpts[0].mirror && wpts[0].data.size() == 2 &&
-	          wpts[0].data[0] == 8u && wpts[0].data[1] == 9u,
-	      "the 64-bit label is mirrored as both halves");
-	Check(r.stats.interrupts == 2 && r.stats.labels_native == 1, "stats");
+	Check(wpts.size() == 2 && wpts[0].kind == TrackerPoint::Kind::Wake && wpts[0].addr == 0x202000320ull &&
+	          wpts[1].kind == TrackerPoint::Kind::End,
+	      "the 64-bit label is the GPU's alone; the tracker only wakes it");
+	Check(r.stats.interrupts == 2 && r.stats.labels_native == 1 && r.stats.labels_cpu == 0 && rw.stats.labels_cpu == 0, "stats");
 
 	// A timestamp the GPU can reach is a DATA_SEL 3 release, not a tracker write. The interrupt
 	// after it still shares the segment's one tracker packet with the end.
@@ -1035,10 +1036,10 @@ void TestLabelsReleaseMem() {
 	const auto  tpk = Decode(rt.ib);
 	Check(rt.ok && rt.stats.timestamps_native == 1 && rt.stats.timestamps == 0 && HasGpuTimestamp(tpk, 0x202000310ull),
 	      "a reachable timestamp is a GPU clock release");
-	Check(tsp.size() == 3 && tsp[0].kind == TrackerPoint::Kind::CpuWrite && tsp[0].mirror && tsp[0].addr == 0x202000318ull &&
+	Check(tsp.size() == 3 && tsp[0].kind == TrackerPoint::Kind::Wake && tsp[0].addr == 0x202000318ull &&
 	          tsp[1].kind == TrackerPoint::Kind::Interrupt && tsp[1].ctx == 7 && tsp[2].kind == TrackerPoint::Kind::End &&
 	          tsp[0].dw == tsp[2].dw,
-	      "the label mirror and the interrupt share the segment's one tracker packet with the end");
+	      "the label's wake and the interrupt share the segment's one tracker packet with the end");
 	Check(HasRef(rt.refs, 0x202000310ull, 8, false), "the timestamp address is made resident");
 }
 
@@ -1471,6 +1472,113 @@ void TestGpuTimestamp() {
 	Check(!ValidateNativeIb(bad_align, false, &bad, NativeIbKind::Gfx), "an unaligned GPU timestamp is rejected");
 }
 
+// Index of the first decoded packet that satisfies `pred`, or the packet count.
+template <typename Pred>
+size_t IndexOf(const std::vector<Packet>& pkts, Pred pred) {
+	for (size_t i = 0; i < pkts.size(); i++) {
+		if (pred(pkts[i])) {
+			return i;
+		}
+	}
+	return pkts.size();
+}
+
+void TestLabelsGpuOnly() {
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	// A label the GPU can reach is written by the GPU alone, in stream order, as on PS5. A CPU store at
+	// the segment's tracker point would land after later writes to the same label (the next use's reset,
+	// another ring) and could put the old value back.
+	static uint32_t label = 0;
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	const uint32_t  lo    = static_cast<uint32_t>(addr);
+	const uint32_t  hi    = static_cast<uint32_t>(addr >> 32u);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(dcb, 1, 2, addr, 1, 0x21);                       // the label, with an interrupt
+	Append(dcb, IT_WRITE_DATA, {(5u << 8u) | (2u << 30u), lo, hi, 0u}, false); // reset by the constant engine
+	AppendWait(dcb, addr, 0);
+	Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(dcb, 1, 0, addr, 2, 0);
+
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 1 && o.asked == 0 && r.stats.waits_native == 1,
+	      "the wait on the constant engine's reset passes through: the GPU writes it ahead of the wait");
+	Check(r.stats.labels_native == 3 && r.stats.labels_cpu == 0 && r.stats.interrupts == 1,
+	      "three GPU label writes, none by the tracker");
+	const auto pkts = Decode(r.ib);
+	const auto first = IndexOf(pkts, [&](const Packet& p) {
+		return p.op == 0x49u && p.body[0] == kFlushEvent && p.body[1] == (1u << 29u) && p.body[2] == lo && p.body[4] == 1u;
+	});
+	const auto reset = IndexOf(pkts, [&](const Packet& p) { return p.op == IT_WRITE_DATA && p.body[1] == lo; });
+	const auto wait  = IndexOf(pkts, [&](const Packet& p) { return p.op == 0x3Cu && p.body[1] == lo; });
+	const auto last  = IndexOf(pkts, [&](const Packet& p) {
+		return p.op == 0x49u && p.body[0] == kFlushEvent && p.body[1] == (1u << 29u) && p.body[2] == lo && p.body[4] == 2u;
+	});
+	Check(first < reset && reset < wait && wait < last && last < pkts.size(), "the GPU writes the label in stream order");
+	Check((pkts[reset].body[0] >> 30u) == 0u && (pkts[reset].body[0] & (1u << 20u)) != 0 && pkts[reset].body[3] == 0u,
+	      "the constant-engine WRITE_DATA runs on the micro engine, write confirmed");
+	const auto& pts   = r.segments[0].points;
+	uint32_t    wakes = 0;
+	uint32_t    irqs  = 0;
+	bool        cpu   = false;
+	for (const auto& p: pts) {
+		wakes += p.kind == TrackerPoint::Kind::Wake && p.addr == addr ? 1u : 0u;
+		irqs += p.kind == TrackerPoint::Kind::Interrupt && p.ctx == 0x21 ? 1u : 0u;
+		cpu = cpu || p.kind == TrackerPoint::Kind::CpuWrite || !p.data.empty();
+		Check(p.dw == pts.back().dw, "every point shares the end's tracker packet");
+	}
+	Check(!cpu && wakes == 3 && irqs == 1 && pts.back().kind == TrackerPoint::Kind::End,
+	      "the tracker wakes the label and raises the interrupt, and stores nothing");
+	bool all_gpu = !r.segments[0].writes.empty();
+	for (const auto& w: r.segments[0].writes) {
+		all_gpu = all_gpu && w.gpu;
+	}
+	Check(all_gpu, "every write is reported as the GPU's");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the gfx packet check");
+
+	// On a compute ring the constant-engine write is a compute-bit micro engine WRITE_DATA.
+	{
+		Pm4Translator tc;
+		TestOracle    oc;
+		tc.SetComputeQueue(true);
+		tc.SetComputeRing(true);
+		tc.SetNativeLabels(&oc, kTrackerVa);
+		tc.SetFenceAddress(kFenceVa);
+		std::vector<uint32_t> acb;
+		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+		Append(acb, IT_WRITE_DATA, {(5u << 8u) | (2u << 30u), lo, hi, 4u}, true);
+		const auto rc = tc.Translate(acb);
+		const auto pc = Decode(rc.ib);
+		const auto* wd = FindFirst(pc, IT_WRITE_DATA);
+		Check(rc.ok && wd != nullptr && wd->compute && (wd->body[0] >> 30u) == 0u && rc.stats.labels_cpu == 0 &&
+		          ValidateNativeIb(rc.ib, false, &bad, NativeIbKind::Compute),
+		      "a compute-ring constant-engine write is the GPU's and passes the compute check");
+	}
+
+	// KYTY_NATIVE_GPU_TRACKER_WRITES=1: the old split. The tracker mirrors the GPU's label stores and
+	// writes the constant engine's on its own, so the wait on that write is cut.
+	Pm4Translator tm;
+	TestOracle    om;
+	tm.SetNativeLabels(&om, kTrackerVa);
+	tm.SetFenceAddress(kFenceVa);
+	tm.SetTrackerWrites(true);
+	auto rm = tm.Translate(dcb);
+	Check(rm.ok && rm.segments.size() == 2 && rm.segments[1].held && FindFirst(Decode(rm.ib), IT_WRITE_DATA) == nullptr,
+	      "with tracker writes the constant-engine write is the tracker's and the wait is held");
+	bool mirror = false;
+	bool ce     = false;
+	for (const auto& p: rm.segments[0].points) {
+		mirror = mirror || (p.kind == TrackerPoint::Kind::CpuWrite && p.mirror && p.data.size() == 1 && p.data[0] == 1u);
+		ce     = ce || (p.kind == TrackerPoint::Kind::CpuWrite && !p.mirror && p.data.size() == 1 && p.data[0] == 0u);
+	}
+	Check(mirror && ce && rm.stats.labels_cpu == 3, "the GPU label is mirrored and the reset written on the CPU");
+}
+
 void TestPlanRingWait() {
 	// No pending write, label already in memory: a barrier. The GPU is not left waiting for a writer
 	// that no submitted buffer will produce.
@@ -1842,6 +1950,7 @@ int main() {
 	TestComputeRingPackets();
 	TestUnreachableLabel();
 	TestGpuTimestamp();
+	TestLabelsGpuOnly();
 	TestPlanRingWait();
 	TestComputeRingForQueue();
 	TestSplitIbAtPackets();
