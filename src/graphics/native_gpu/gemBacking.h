@@ -61,7 +61,7 @@ namespace Libs::Graphics::NativeGpu {
 // GEM buffer for the block, write-protects the block's views and alias slot, copies its data into
 // the buffer, maps them onto the buffer with their protection restored through a dma-buf export
 // (mmap through the DRM file only maps a buffer whole and from its start; a dma-buf mmap takes any
-// page offset), punches the block out of the memfd and rebinds the GPU mappings. A guest write
+// page offset; an always-valid buffer has no dma-buf, see MapBoPiece), punches the block out of the memfd and rebinds the GPU mappings. A guest write
 // during the move faults; the fault hook (WaitIfPromoting, from Memory::HandleGpuFault) waits for the
 // move and retries it, so no write is lost and no read sees a stale copy. Blocks are never demoted. Resident blocks are TTM mappings (VM_PFNMAP | VM_IO): get_user_pages does not
 // work on them, which only matters for process_vm_readv (Kyty uses it for crash-report stacks).
@@ -121,6 +121,20 @@ public:
 		static const bool on = [] {
 			const char* v = std::getenv("KYTY_NATIVE_GPU_RESIDENCY");
 			return v != nullptr && std::strcmp(v, "map") == 0;
+		}();
+		return on;
+	}
+
+	// With map residency, blocks are VM_ALWAYS_VALID buffers, the way PS5 memory is always in the GPU
+	// page tables: the kernel keeps them valid for every submission of this VM, so submissions list
+	// none of them (a listed buffer costs the CS ioctl ~2 us; ASTRO BOT has ~800 blocks). Such a buffer
+	// has no dma-buf (the kernel refuses the export) and its DRM mmap only maps it whole from its start,
+	// so CPU views map it whole and mremap the piece they need into place (MapBoPiece).
+	// KYTY_NATIVE_GPU_ALWAYS_VALID=0 keeps listed, exportable blocks.
+	static bool AlwaysValidWanted() {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_ALWAYS_VALID");
+			return ResidencyAtMap() && !KfdQueuesWanted() && (v == nullptr || v[0] != '0');
 		}();
 		return on;
 	}
@@ -247,11 +261,12 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
 		bool ok = ForEachBlockPiece(offset, size, [&](uint64_t index, uint64_t inner, uint64_t done, uint64_t part) {
-			const Block&   block = m_blocks[index];
-			const int      fd    = block.resident ? block.bo.dmabuf_fd : m_mem_fd;
-			const uint64_t at    = block.resident ? inner : offset + done;
-			void* const    dst   = reinterpret_cast<void*>(vaddr + done);
-			if (::mmap(dst, part, prot, MAP_SHARED | MAP_FIXED, fd, static_cast<off_t>(at)) != dst) {
+			const Block& block = m_blocks[index];
+			void* const  dst   = reinterpret_cast<void*>(vaddr + done);
+			const bool   mapped =
+			    block.resident ? MapBoPiece(block.bo, block.size, inner, part, prot, dst)
+			                   : ::mmap(dst, part, prot, MAP_SHARED | MAP_FIXED, m_mem_fd, static_cast<off_t>(offset + done)) == dst;
+			if (!mapped) {
 				std::fprintf(stderr, "GemBacking: view mmap at 0x%llx (+0x%llx, block %llu) failed: %s\n",
 				             static_cast<unsigned long long>(vaddr + done),
 				             static_cast<unsigned long long>(part), static_cast<unsigned long long>(index),
@@ -401,6 +416,38 @@ public:
 			}
 		});
 		return promoted;
+	}
+
+	// The presenter reads display buffers through dma-bufs, which an always-valid buffer cannot export:
+	// the always-valid blocks behind guest addresses [vaddr, vaddr + size) move to ordinary buffers
+	// (data copied, views and GPU mappings moved over), listed in every submission again. `idle` runs
+	// first, without the lock, if any block has to move: the old buffers are freed, so it must leave
+	// the GPU idle. Returns how many blocks moved.
+	template <typename Idle>
+	uint32_t ExportGuestRange(uint64_t vaddr, uint64_t size, Idle&& idle) {
+		std::vector<uint64_t> indices;
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t, uint64_t backing, uint64_t len) {
+				for (uint64_t index = backing / BlockSize(); index <= (backing + len - 1) / BlockSize(); index++) {
+					if (m_blocks[index].resident && m_blocks[index].bo.always_valid) {
+						indices.push_back(index);
+					}
+				}
+			});
+		}
+		if (indices.empty()) {
+			return 0;
+		}
+		idle();
+		std::lock_guard<std::mutex> lock(m_lock);
+		uint32_t                    moved = 0;
+		for (const uint64_t index: indices) {
+			if (m_blocks[index].resident && m_blocks[index].bo.always_valid && PromoteBlockUnlocked(index, true)) {
+				moved++;
+			}
+		}
+		return moved;
 	}
 
 	// True when `vaddr` lies in a view of this backing.
@@ -600,14 +647,14 @@ public:
 		CloseBo(bo);
 	}
 
-	// Every GEM buffer a submission must list as resident: the resident blocks, the dummy and the
-	// external ranges. Grows as blocks are promoted.
+	// Every GEM buffer a submission must list as resident: the resident blocks (unless always valid),
+	// the dummy and the external ranges. Grows as blocks are promoted.
 	[[nodiscard]] std::vector<uint32_t> CreatedHandles() const {
 		std::lock_guard<std::mutex> lock(m_lock);
 		std::vector<uint32_t>       handles;
 		handles.reserve(m_blocks.size() + m_external.size() + 1);
 		for (const auto& block: m_blocks) {
-			if (block.resident) {
+			if (block.resident && !block.bo.always_valid) {
 				handles.push_back(block.bo.handle);
 			}
 		}
@@ -642,9 +689,11 @@ public:
 
 private:
 	struct Bo {
-		uint32_t handle     = 0;  // in m_drm_fd
-		int      dmabuf_fd  = -1;
-		uint64_t kfd_handle = 0;  // the KFD allocation behind `handle` (KFD memory), 0 otherwise
+		uint32_t handle       = 0;  // in m_drm_fd
+		int      dmabuf_fd    = -1; // -1 for an always-valid buffer
+		uint64_t kfd_handle   = 0;  // the KFD allocation behind `handle` (KFD memory), 0 otherwise
+		uint64_t mmap_offset  = 0;  // an always-valid buffer's DRM mmap offset
+		bool     always_valid = false;
 	};
 	struct Block {
 		Bo       bo;
@@ -840,6 +889,70 @@ private:
 		return true;
 	}
 
+	// A block's buffer: always valid with AlwaysValidWanted() (no dma-buf), otherwise CreateBo.
+	bool CreateBlockBo(uint64_t size, Bo* out) const {
+		if (!AlwaysValidWanted() || m_kfd_fd >= 0) {
+			return CreateBo(size, out);
+		}
+		union drm_amdgpu_gem_create c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.bo_size      = size;
+		c.in.alignment    = 2ull * 1024 * 1024;
+		c.in.domains      = AMDGPU_GEM_DOMAIN_GTT;
+		c.in.domain_flags = AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
+		int r             = Ioctl(DRM_IOCTL_AMDGPU_GEM_CREATE, &c);
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: always-valid GEM_CREATE of %llu MiB failed: %s\n",
+			             static_cast<unsigned long long>(size / (1024 * 1024)), std::strerror(-r));
+			return false;
+		}
+		union drm_amdgpu_gem_mmap m;
+		std::memset(&m, 0, sizeof(m));
+		m.in.handle = c.out.handle;
+		if ((r = Ioctl(DRM_IOCTL_AMDGPU_GEM_MMAP, &m)) != 0) {
+			std::fprintf(stderr, "GemBacking: GEM_MMAP failed: %s\n", std::strerror(-r));
+			GemClose(c.out.handle);
+			return false;
+		}
+		out->handle       = c.out.handle;
+		out->mmap_offset  = m.out.addr_ptr;
+		out->always_valid = true;
+		return true;
+	}
+
+	// Maps bytes [inner, inner + len) of `bo` (of `bo_size` bytes) at exactly `dst` with `prot`,
+	// replacing whatever was there. A dma-buf maps from any page offset; an always-valid buffer is
+	// mapped whole elsewhere, the piece moved to `dst` (one mremap, atomic for other threads) and the
+	// rest unmapped. Safe on the mover thread.
+	bool MapBoPiece(const Bo& bo, uint64_t bo_size, uint64_t inner, uint64_t len, int prot, void* dst) const {
+		if (bo.dmabuf_fd >= 0) {
+			return ::mmap(dst, len, prot, MAP_SHARED | MAP_FIXED, bo.dmabuf_fd, static_cast<off_t>(inner)) == dst;
+		}
+		auto* whole =
+		    static_cast<uint8_t*>(::mmap(nullptr, bo_size, prot, MAP_SHARED, m_drm_fd, static_cast<off_t>(bo.mmap_offset)));
+		if (whole == MAP_FAILED) {
+			return false;
+		}
+		const bool moved = ::mremap(whole + inner, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, dst) == dst;
+		if (inner != 0) {
+			::munmap(whole, inner);
+		}
+		if (inner + len < bo_size) {
+			::munmap(whole + inner + len, bo_size - inner - len);
+		}
+		if (!moved) {
+			::munmap(whole + inner, len);
+		}
+		return moved;
+	}
+
+	// The whole of `bo` read-write at an address of the kernel's choice, or nullptr.
+	[[nodiscard]] uint8_t* MapBoWhole(const Bo& bo, uint64_t bo_size) const {
+		void* p = ::mmap(nullptr, bo_size, PROT_READ | PROT_WRITE, MAP_SHARED, bo.dmabuf_fd >= 0 ? bo.dmabuf_fd : m_drm_fd,
+		                 static_cast<off_t>(bo.dmabuf_fd >= 0 ? 0 : bo.mmap_offset));
+		return p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
+	}
+
 	void CloseBo(Bo& bo) const {
 		if (bo.dmabuf_fd >= 0) {
 			::close(bo.dmabuf_fd);
@@ -1032,8 +1145,9 @@ private:
 		uint64_t               index  = 0;
 		uint64_t               start  = 0; // backing offset of the block
 		uint64_t               size   = 0;
-		uint8_t*               bo_cpu = nullptr;
-		int                    fd     = -1; // the block buffer's dma-buf
+		uint8_t*               bo_cpu   = nullptr;
+		const Bo*              bo       = nullptr; // the block's new buffer
+		const uint8_t*         from_cpu = nullptr; // the block's old buffer, when it had one
 		std::vector<MovePiece> pieces;
 		bool                   moved  = false;
 		bool                   done   = false;
@@ -1054,6 +1168,9 @@ private:
 		}
 		// pread rather than a mapping of the memfd, which would allocate pages for the holes; holes
 		// stay zero in the buffer.
+		if (job->from_cpu != nullptr) {
+			std::memcpy(job->bo_cpu, job->from_cpu, job->size);
+		}
 		ForEachDataExtent(job->index, [&](uint64_t at, uint64_t len) {
 			uint64_t done = 0;
 			while (done < len) {
@@ -1068,7 +1185,7 @@ private:
 		bool moved = true;
 		for (const auto& p: job->pieces) {
 			void* const dst = reinterpret_cast<void*>(p.addr);
-			moved = ::mmap(dst, p.len, p.prot, MAP_SHARED | MAP_FIXED, job->fd, static_cast<off_t>(p.inner)) == dst && moved;
+			moved = MapBoPiece(*job->bo, job->size, p.inner, p.len, p.prot, dst) && moved;
 		}
 		job->moved = moved;
 		s_promoting.fetch_sub(1, std::memory_order_acq_rel);
@@ -1101,16 +1218,22 @@ private:
 		m_mover_cv.wait(lock, [job] { return job->done; });
 	}
 
-	bool PromoteBlockUnlocked(uint64_t index) {
+	// Moves block `index` into a new buffer: from the memfd, or, for a resident block, from its old
+	// buffer, which is freed (the caller has made sure the GPU no longer uses it). `exportable`: an
+	// ordinary buffer with a dma-buf even when blocks are otherwise always valid.
+	bool PromoteBlockUnlocked(uint64_t index, bool exportable = false) {
 		Block&         block = m_blocks[index];
 		const uint64_t start = index * BlockSize();
 		Bo             bo;
-		if (!CreateBo(block.size, &bo)) {
+		if (!(exportable ? CreateBo(block.size, &bo) : CreateBlockBo(block.size, &bo))) {
 			return false;
 		}
-		auto* bo_cpu = static_cast<uint8_t*>(
-		    ::mmap(nullptr, block.size, PROT_READ | PROT_WRITE, MAP_SHARED, bo.dmabuf_fd, 0));
-		if (bo_cpu == MAP_FAILED) {
+		uint8_t* bo_cpu   = MapBoWhole(bo, block.size);
+		uint8_t* from_cpu = block.resident ? MapBoWhole(block.bo, block.size) : nullptr;
+		if (bo_cpu == nullptr || (block.resident && from_cpu == nullptr)) {
+			if (bo_cpu != nullptr) {
+				::munmap(bo_cpu, block.size);
+			}
 			std::fprintf(stderr, "GemBacking: CPU map of block %llu failed: %s\n",
 			             static_cast<unsigned long long>(index), std::strerror(errno));
 			CloseBo(bo);
@@ -1126,7 +1249,8 @@ private:
 		job->start  = start;
 		job->size   = block.size;
 		job->bo_cpu = bo_cpu;
-		job->fd     = bo.dmabuf_fd;
+		job->bo     = &bo;
+		job->from_cpu = from_cpu;
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_pieces; // (guest address, offset in block)
 		std::vector<uint64_t>                      gpu_lengths;
 		job->pieces.push_back(MovePiece {reinterpret_cast<uint64_t>(m_alias + start), block.size, PROT_READ | PROT_WRITE, 0});
@@ -1156,6 +1280,9 @@ private:
 			std::fprintf(stderr, "GemBacking: block %llu holds executable views, not made resident\n",
 			             static_cast<unsigned long long>(index));
 			::munmap(bo_cpu, block.size);
+			if (from_cpu != nullptr) {
+				::munmap(from_cpu, block.size);
+			}
 			CloseBo(bo);
 			block.code = true;
 			return false;
@@ -1167,12 +1294,19 @@ private:
 			             static_cast<unsigned long long>(index), std::strerror(errno));
 		}
 		::munmap(bo_cpu, block.size);
-		::fallocate(m_mem_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(start),
-		            static_cast<off_t>(block.size));
-		// GPU mappings of the block's views now map the buffer instead of the dummy.
+		// GPU mappings of the block's views now map the buffer instead of the dummy (or the old buffer).
 		for (size_t i = 0; i < gpu_pieces.size(); i++) {
 			VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, gpu_pieces[i].first, gpu_pieces[i].second, gpu_lengths[i]);
 		}
+		if (from_cpu != nullptr) {
+			::munmap(from_cpu, block.size);
+			CloseBo(block.bo);
+			block.bo = bo;
+			std::fprintf(stderr, "GemBacking: block %llu moved to an exportable buffer\n", static_cast<unsigned long long>(index));
+			return true;
+		}
+		::fallocate(m_mem_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(start),
+		            static_cast<off_t>(block.size));
 		block.bo       = bo;
 		block.resident = true;
 		m_resident_bytes += block.size;

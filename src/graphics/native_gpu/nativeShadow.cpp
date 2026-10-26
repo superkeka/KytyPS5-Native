@@ -974,8 +974,10 @@ public:
 			return;
 		}
 		const uint32_t promoted = m_gem->PromoteGuestRange(addr, size);
-		std::fprintf(stderr, "native shadow: display buffer 0x%llx (%llu MiB) kept resident, %u block(s) promoted\n",
-		             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size >> 20u), promoted);
+		// The presenter imports the buffer's dma-bufs: always-valid blocks under it become ordinary ones.
+		const uint32_t exported = m_gem->ExportGuestRange(addr, size, [this] { WaitIdle(); });
+		std::fprintf(stderr, "native shadow: display buffer 0x%llx (%llu MiB) kept resident, %u block(s) promoted, %u made exportable\n",
+		             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size >> 20u), promoted, exported);
 #else
 		(void)addr;
 		(void)size;
