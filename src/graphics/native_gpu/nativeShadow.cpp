@@ -292,6 +292,35 @@ public:
 		return r != 0 ? r : (back == value ? 0 : -EIO);
 	}
 
+	// Banked registers (ops 10-13): `sel` is GRBM_GFX_CNTL's layout plus kSel, which selects at all.
+	static constexpr uint32_t kSel = 1u << 11u;
+	static constexpr uint32_t SelVmid(uint32_t vmid) { return kSel | vmid << 4u; }
+	static constexpr uint32_t SelGfxPipe(uint32_t pipe) { return kSel | pipe; }
+	static constexpr uint32_t SelHqd(uint32_t me, uint32_t pipe, uint32_t queue) { return kSel | queue << 8u | me << 2u | pipe; }
+	int ReadReg(uint32_t reg, uint32_t sel, uint32_t* value) { return Call(12u | sel << 8u, reg, 0, value); }
+	// reg = (reg & ~mask) | (value & mask) if the helper allows it; `now` is the register afterwards.
+	// The helper keeps the old value and puts it back on RestoreRegs or when this connection closes.
+	int WriteRegMasked(uint32_t reg, uint32_t sel, uint32_t value, uint32_t mask, uint32_t* now) {
+		return Call(10u | sel << 8u, reg, static_cast<uint64_t>(mask) << 32u | value, now);
+	}
+	// Puts back what WriteRegMasked changed in `reg` (everything with 0xffffffff); how many registers.
+	int RestoreRegs(uint32_t reg = 0xffffffffu, uint32_t sel = 0) {
+		uint32_t  n = 0;
+		const int r = Call(11u | sel << 8u, reg, 0, &n);
+		return r != 0 ? r : static_cast<int>(n);
+	}
+	// The gfx VMID (1-7) the kernel last gave the VM with `pasid`; 0 when none.
+	uint32_t GfxVmid(uint32_t pasid) {
+		uint32_t v = 0;
+		return pasid != 0 && Call(13u | pasid << 8u, 0, 0, &v) == 0 ? v : 0;
+	}
+	// Applies the helper's local golden table, put back when this connection closes; how many changed.
+	int ApplyGolden() {
+		uint32_t  n = 0;
+		const int r = Call(7, 0xffffffffu, 1, &n);
+		return r != 0 ? r : static_cast<int>(n);
+	}
+
 private:
 	int Call(uint32_t op, uint32_t size, uint64_t va, uint32_t* value) {
 		std::lock_guard<std::mutex> lock(m_mutex);
@@ -1272,6 +1301,29 @@ public:
 	// Guest compute queues run on KFD user-mode queues of their own (EnableKfdQueues).
 	bool KfdQueuesOn() const { return m_kfd_queues; }
 
+	// The per-VMID PS5 settings follow this VM's gfx VMID, which amdgpu may change between jobs: once
+	// per flip they move to the VMID it holds now and the one it left gets the Linux values back.
+	void Ps5RegsOnFlip() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if ((m_ps5_regs & (kPs5Accum | kPs5ShMem)) == 0) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(m_ps5_mutex);
+		const uint32_t vmid = m_ps5_hw.GfxVmid(m_ps5_pasid);
+		if (vmid == 0 || vmid == m_ps5_gfx_vmid) {
+			return;
+		}
+		if (m_ps5_gfx_vmid != 0) {
+			for (uint32_t reg: {kPs5ShMemBases, kPs5UserAccumVmid}) {
+				m_ps5_hw.RestoreRegs(reg, LodStatsHw::SelVmid(m_ps5_gfx_vmid));
+			}
+		}
+		std::fprintf(stderr, "native shadow: PS5 per-VMID registers on gfx VMID %u (was %u)\n", vmid, m_ps5_gfx_vmid);
+		m_ps5_gfx_vmid = vmid;
+		Ps5VmidRegs(vmid);
+#endif
+	}
+
 	// The ACB translator's tracker slot, one per compute ring (slot 0 is the gfx ring), and its barrier
 	// fence, the slot's last dword. Compute rings run at once, and a barrier releases its own value into
 	// the fence and waits for exactly that value: a fence shared with another ring can be overwritten in
@@ -1540,6 +1592,11 @@ private:
 		}
 		std::fprintf(stderr, "native shadow: signal %d: %u pending GPU waits released, rings %s; exiting\n", sig, released,
 		             idle ? "idle" : "STILL BUSY");
+		if (m_ps5_regs != 0) {
+			// The helper would do it when the connection closes; here it shows in this log too.
+			std::lock_guard<std::mutex> lock(m_ps5_mutex);
+			std::fprintf(stderr, "native shadow: %d PS5 registers put back (kyty-lodhw logs each)\n", m_ps5_hw.RestoreRegs());
+		}
 #endif
 		::_exit(128 + sig);
 	}
@@ -1577,6 +1634,10 @@ private:
 		m_kfd_queues = true;
 		std::fprintf(stderr, "native shadow: ACBs on KFD user-mode queues, one per guest queue (indexes 0x%x, doorbell submission, GDS %u bytes)\n",
 		             rings, m_submitter->GdsSize());
+		{
+			std::lock_guard<std::mutex> lock(m_ps5_mutex);
+			Ps5KfdRegs();
+		}
 		// The wave save area KFD gives a queue holds the CUs amdgpu counted at init; on a board with more
 		// CUs enabled after it (the BC-250's 40 of 24), a preempted queue would overflow it. ACBs stay on
 		// those CUs unless KYTY_NATIVE_GPU_KFD_CU_CLAMP=0.
@@ -1613,6 +1674,163 @@ private:
 		LodStatsHw::Instance().SetPasid(pasid);
 		std::fprintf(stderr, "native shadow: GET_LOD_STATS by the GPU's LOD statistics reporter (kyty-lodhw helper, PASID %u)\n", pasid);
 #endif
+	}
+
+	// KYTY_NATIVE_GPU_PS5_REGS: GPU state the PS5 kernel sets up for the title's queues and amdgpu does
+	// not, written through the kyty-lodhw helper (root). A comma list of:
+	//   gfx_pipe  GFX_PIPE_CONTROL.CONTEXT_SUSPEND_EN on both gfx pipes
+	//   accum     SPI_CONFIG_CNTL_1.EN_USER_ACCUM, and SPI_USER_ACCUM_VMID_CNTL = 0xf on the game's VMIDs
+	//   kfd_gds   GWS 0-31 and OA 0-7 for KFD's VMIDs 8-15 (the PS5 title VMID's; GDS itself is
+	//             EnableKfdQueues'; the gfx VMID's comes from KYTY_NATIVE_GPU_GDS)
+	//   shmem     SH_MEM_BASES = 0x80007000 (the PS5 aperture bases) on the game's VMIDs
+	//   hqd       on each active KFD compute queue: TUNNEL_DISPATCH, the PS5 PERSISTENT_STATE bits and
+	//             the GDS resource state (OA and 48 GWS); written while it runs, and KFD's scheduler
+	//             may reload the queue from its MQD on any remap
+	//   golden    the helper's local golden table (/etc/kyty/ps5-golden.conf)
+	// "all" (or 1) is gfx_pipe,accum,kfd_gds. The game's VMIDs are this VM's gfx VMID (by PASID,
+	// followed per flip) and, with KFD queues, 8-15. Nothing is written before a setting is asked for;
+	// the helper puts every register back when the connection closes (exit or crash).
+	static constexpr uint32_t kPs5GfxPipe = 1u, kPs5Accum = 2u, kPs5KfdGds = 4u, kPs5ShMem = 8u, kPs5Hqd = 16u, kPs5Golden = 32u;
+	// Absolute dword offsets (GC segment 0 is 0x1260).
+	static constexpr uint32_t kPs5GfxPipeControl = 0x1260 + 0x100d, kPs5ShMemBases = 0x1260 + 0x10aa,
+	                          kPs5UserAccumVmid = 0x1260 + 0x11df, kPs5SpiConfigCntl1 = 0x1260 + 0x11ef,
+	                          kPs5HqdActive = 0x1260 + 0x1fab, kPs5HqdVmid = 0x1260 + 0x1fac,
+	                          kPs5HqdPersistentState = 0x1260 + 0x1fad, kPs5HqdPqControl = 0x1260 + 0x1fba,
+	                          kPs5HqdGdsResourceState = 0x1260 + 0x1fdb, kPs5GdsGwsVmid0 = 0x1260 + 0x20c0,
+	                          kPs5GdsOaVmid0 = 0x1260 + 0x20d0;
+
+	void InitPs5Regs() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		const char* v = std::getenv("KYTY_NATIVE_GPU_PS5_REGS");
+		if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0) {
+			return;
+		}
+		uint32_t    regs = 0;
+		std::string list = v;
+		for (size_t pos = 0; pos <= list.size();) {
+			size_t end = list.find(',', pos);
+			end        = end == std::string::npos ? list.size() : end;
+			const std::string name = list.substr(pos, end - pos);
+			pos                    = end + 1;
+			static const std::pair<const char*, uint32_t> kNames[] = {
+			    {"all", kPs5GfxPipe | kPs5Accum | kPs5KfdGds}, {"1", kPs5GfxPipe | kPs5Accum | kPs5KfdGds},
+			    {"gfx_pipe", kPs5GfxPipe}, {"accum", kPs5Accum}, {"kfd_gds", kPs5KfdGds}, {"shmem", kPs5ShMem},
+			    {"hqd", kPs5Hqd}, {"golden", kPs5Golden}};
+			const auto* it = std::find_if(std::begin(kNames), std::end(kNames), [&](const auto& n) { return name == n.first; });
+			if (it != std::end(kNames)) {
+				regs |= it->second;
+			} else if (!name.empty()) {
+				std::fprintf(stderr, "native shadow: KYTY_NATIVE_GPU_PS5_REGS: unknown setting '%s'\n", name.c_str());
+			}
+		}
+		uint32_t probe = 0;
+		if (regs == 0 || !m_ps5_hw.Connect()) {
+			std::fprintf(stderr, "native shadow: KYTY_NATIVE_GPU_PS5_REGS set but %s; no PS5 registers written\n",
+			             regs == 0 ? "no known setting" : "the kyty-lodhw helper is not running");
+			return;
+		}
+		if (m_ps5_hw.ReadReg(kPs5SpiConfigCntl1, 0, &probe) != 0) {
+			std::fprintf(stderr, "native shadow: the kyty-lodhw helper has no banked register ops (rebuild it); no PS5 registers written\n");
+			m_ps5_hw.Disconnect();
+			return;
+		}
+		std::lock_guard<std::mutex> lock(m_ps5_mutex);
+		m_ps5_regs  = regs;
+		m_ps5_pasid = LodStatsHw::Pasid(m_gem->DrmFd());
+		std::fprintf(stderr, "native shadow: PS5 registers (0x%x) through the kyty-lodhw helper, PASID %u\n", regs, m_ps5_pasid);
+		if ((regs & kPs5GfxPipe) != 0) {
+			for (uint32_t pipe = 0; pipe < 2; pipe++) {
+				Ps5Reg("GFX_PIPE_CONTROL", "gfx pipe " + std::to_string(pipe), kPs5GfxPipeControl, LodStatsHw::SelGfxPipe(pipe),
+				       1u << 16u, 1u << 16u);
+			}
+		}
+		if ((regs & kPs5Accum) != 0) {
+			Ps5Reg("SPI_CONFIG_CNTL_1", "global", kPs5SpiConfigCntl1, 0, 1u << 21u, 1u << 21u);
+		}
+		if ((regs & kPs5Golden) != 0) {
+			std::fprintf(stderr, "native shadow: PS5 golden table: %d registers changed (kyty-lodhw logs each)\n", m_ps5_hw.ApplyGolden());
+		}
+		if ((regs & (kPs5Accum | kPs5ShMem)) != 0 && m_ps5_pasid == 0) {
+			std::fprintf(stderr, "native shadow: no PASID in the DRM fdinfo; the gfx VMID gets no per-VMID PS5 registers\n");
+		}
+		if ((regs & (kPs5Accum | kPs5KfdGds | kPs5ShMem | kPs5Hqd)) != 0) {
+			// KFD queues are created on their first submission; each gets its settings then.
+			m_submitter->SetKfdQueueHook([this](uint32_t ring) {
+				std::lock_guard<std::mutex> lock(m_ps5_mutex);
+				std::fprintf(stderr, "native shadow: PS5 registers after KFD queue %u was created\n", ring);
+				Ps5KfdRegs();
+			});
+		}
+#endif
+	}
+
+	// One PS5 setting: (reg & ~mask) | (value & mask), logged with the old and new value when it changes.
+	void Ps5Reg(const char* name, const std::string& where, uint32_t reg, uint32_t sel, uint32_t value, uint32_t mask) {
+		uint32_t old = 0;
+		uint32_t now = 0;
+		if (m_ps5_hw.ReadReg(reg, sel, &old) == 0 && (old & mask) == (value & mask)) {
+			return;
+		}
+		const int r = m_ps5_hw.WriteRegMasked(reg, sel, value, mask, &now);
+		if (r != 0) {
+			std::fprintf(stderr, "native shadow: PS5 register %s (%s) not written: %s\n", name, where.c_str(), std::strerror(-r));
+			return;
+		}
+		std::fprintf(stderr, "native shadow: PS5 register %s (%s) 0x%08x -> 0x%08x%s\n", name, where.c_str(), old, now,
+		             (now & mask) != (value & mask) ? " (does not hold)" : "");
+	}
+
+	// The per-VMID settings of one of the game's VMIDs. Callers hold m_ps5_mutex.
+	void Ps5VmidRegs(uint32_t vmid) {
+		const std::string where = "VMID " + std::to_string(vmid);
+		if ((m_ps5_regs & kPs5Accum) != 0) {
+			Ps5Reg("SPI_USER_ACCUM_VMID_CNTL", where, kPs5UserAccumVmid, LodStatsHw::SelVmid(vmid), 0xfu, 0xfu);
+		}
+		if ((m_ps5_regs & kPs5ShMem) != 0) {
+			// PRIVATE_BASE 0x7000, SHARED_BASE 0x8000; amdgpu has 0x1000/0x2000 for gfx VMIDs, KFD 0x2/0x1.
+			Ps5Reg("SH_MEM_BASES", where, kPs5ShMemBases, LodStatsHw::SelVmid(vmid), 0x80007000u, 0xffffffffu);
+		}
+	}
+
+	// KFD's VMIDs (8-15) and, with hqd, its active compute queues. Runs again after each KFD queue is
+	// created (a new runlist remaps the process, which can rewrite SH_MEM_*). Callers hold m_ps5_mutex.
+	void Ps5KfdRegs() {
+		if (m_ps5_regs == 0 || !m_kfd_queues) {
+			return;
+		}
+		for (uint32_t vmid = 8; vmid < 16; vmid++) {
+			if ((m_ps5_regs & kPs5KfdGds) != 0) {
+				// GDS_GWS_VMIDn: BASE [5:0] 0, SIZE [22:16] 32. GDS_OA_VMIDn: MASK [15:0] counters 0-7.
+				Ps5Reg("GDS_GWS_VMID", "VMID " + std::to_string(vmid), kPs5GdsGwsVmid0 + vmid, 0, 32u << 16u, 0xffffffffu);
+				Ps5Reg("GDS_OA_VMID", "VMID " + std::to_string(vmid), kPs5GdsOaVmid0 + vmid, 0, 0xffu, 0xffffffffu);
+			}
+			Ps5VmidRegs(vmid);
+		}
+		if ((m_ps5_regs & kPs5Hqd) == 0) {
+			return;
+		}
+		// The hardware queues KFD mapped: active, in a KFD VMID (amdgpu's own rings and the KIQ are VMID 0).
+		for (uint32_t me = 1; me <= 2; me++) {
+			for (uint32_t pipe = 0; pipe < 4; pipe++) {
+				for (uint32_t queue = 0; queue < 8; queue++) {
+					const uint32_t sel    = LodStatsHw::SelHqd(me, pipe, queue);
+					uint32_t       active = 0;
+					uint32_t       vmid   = 0;
+					if (m_ps5_hw.ReadReg(kPs5HqdActive, sel, &active) != 0 || (active & 1u) == 0 ||
+					    m_ps5_hw.ReadReg(kPs5HqdVmid, sel, &vmid) != 0 || (vmid & 0xfu) < 8) {
+						continue;
+					}
+					char where[64];
+					std::snprintf(where, sizeof(where), "ME%u pipe %u queue %u, VMID %u", me, pipe, queue, vmid & 0xfu);
+					Ps5Reg("CP_HQD_PQ_CONTROL", where, kPs5HqdPqControl, sel, 1u << 29u, 1u << 29u); // TUNNEL_DISPATCH
+					// PRELOAD_REQ, PRELOAD_SIZE 0x53, the WPP/IQ/IB/EOP/PQ switch QOS enables and
+					// CACHE_FULL_PACKET_EN; KFD's QSWITCH_MODE (CWSR) stays.
+					Ps5Reg("CP_HQD_PERSISTENT_STATE", where, kPs5HqdPersistentState, sel, 0x0be05301u, 0x0be0ff01u);
+					// OA_REQUIRED, GWS_SIZE 48.
+					Ps5Reg("CP_HQD_GDS_RESOURCE_STATE", where, kPs5HqdGdsResourceState, sel, 0x301u, 0x3f1u);
+				}
+			}
+		}
 	}
 
 	// Deferred ACBs leave in order, once nothing they wait for is outstanding: a submitted DCB wrote
@@ -2271,6 +2489,7 @@ private:
 			return;
 		}
 		InitLodStatsHw();
+		InitPs5Regs();
 		InstallStopDrain();
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
@@ -2495,6 +2714,13 @@ private:
 	bool                  m_acb_rings    = false;
 	uint32_t              m_compute_mask = 0;
 	bool                  m_kfd_queues   = false; // EnableKfdQueues succeeded
+	// KYTY_NATIVE_GPU_PS5_REGS (InitPs5Regs): its own helper connection, so closing it (exit, crash)
+	// puts the registers back, and the LOD statistics client is not turned on by it.
+	LodStatsHw            m_ps5_hw;
+	std::mutex            m_ps5_mutex;
+	uint32_t              m_ps5_regs     = 0; // kPs5* bits
+	uint32_t              m_ps5_pasid    = 0;
+	uint32_t              m_ps5_gfx_vmid = 0; // the gfx VMID the per-VMID settings are on now
 	LabelOracle*          m_label_oracle = nullptr;
 	std::vector<uint32_t> m_ring_batch[kTrackerSlots];
 	SlotFence             m_slot_fence[kTrackerSlots];
@@ -3924,6 +4150,9 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
+	}
+	if (Shadow::Instance().Active()) {
+		Shadow::Instance().Ps5RegsOnFlip();
 	}
 	// KYTY_NATIVE_GPU_CTL=1: "dump N" on the control socket dumps the next N flips, render targets
 	// included (see ControlSocket).

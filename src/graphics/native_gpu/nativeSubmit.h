@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <functional>
 #include <span>
 #include <string>
 #include <thread>
@@ -152,6 +153,9 @@ public:
 			m_kfd_priority[ring] = std::min(priority, 15u);
 		}
 	}
+	// Called with the ring index after each KFD queue is created (it is mapped to a hardware queue by
+	// then), on the submitting thread.
+	void SetKfdQueueHook(std::function<void(uint32_t)> hook) { m_kfd_queue_hook = std::move(hook); }
 
 	// KYTY_NATIVE_GPU_KFD_QUEUES: compute submissions to the ring indexes in `rings` (bits below
 	// kMaxKfdQueues) go to KFD user-mode queues, one per index, rung by doorbell instead of a CS
@@ -476,6 +480,8 @@ private:
 		             m_kfd_priority[target.ring], m_kfd_queue[target.ring] != nullptr ? "" : " failed");
 		if (m_kfd_queue[target.ring] == nullptr) {
 			m_kfd_rings &= ~(1u << target.ring);
+		} else if (m_kfd_queue_hook) {
+			m_kfd_queue_hook(target.ring);
 		}
 	}
 
@@ -672,6 +678,7 @@ private:
 	uint64_t    m_kfd_va_changes = 0;                // GemBacking::VaChanges at the last KFD TLB flush
 	uint32_t    m_kfd_tlb_flushes = 0;
 	uint32_t    m_kfd_priority[kMaxKfdQueues] = {7, 7, 7, 7, 7, 7, 7, 7};
+	std::function<void(uint32_t)> m_kfd_queue_hook; // SetKfdQueueHook
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	struct SlotUse {
 		uint64_t   seq   = 0;
