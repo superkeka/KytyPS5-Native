@@ -1093,14 +1093,25 @@ static ProgramBacking g_program_backing;
 static bool ReleaseRuntimeMemory(uint64_t vaddr, uint64_t size, std::vector<ProgramBacking::Piece>* pieces) {
 	std::vector<ProgramBacking::Piece> taken;
 	if (g_program_backing.On() && g_program_backing.Take(vaddr, size, &taken)) {
+		std::sort(taken.begin(), taken.end(), [](const auto& a, const auto& b) { return a.vaddr < b.vaddr; });
+		bool     ok  = true;
+		uint64_t cur = vaddr;
 		for (const auto& p: taken) {
 			EXIT_IF(!g_guest_address_space->UnmapBacking(p.vaddr, p.size));
 			g_program_backing.Free(p.offset, p.size);
+			// A module keeps its code in committed memory next to data segments in the backing.
+			if (p.vaddr > cur) {
+				ok = g_guest_address_space->ReleaseCommitted(cur, p.vaddr - cur) && ok;
+			}
+			cur = std::max(cur, p.vaddr + p.size);
+		}
+		if (cur < vaddr + size) {
+			ok = g_guest_address_space->ReleaseCommitted(cur, vaddr + size - cur) && ok;
 		}
 		if (pieces != nullptr) {
 			pieces->insert(pieces->end(), taken.begin(), taken.end());
 		}
-		return true;
+		return ok;
 	}
 	return g_guest_address_space->ReleaseCommitted(vaddr, size);
 }
@@ -1109,18 +1120,26 @@ static bool ReleaseRuntimeMemory(uint64_t vaddr, uint64_t size, std::vector<Prog
 // committed anew.
 static bool RestoreRuntimeMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
                                  const std::vector<ProgramBacking::Piece>& pieces) {
-	bool from_backing = false;
+	std::vector<ProgramBacking::Piece> inside;
 	for (const auto& p: pieces) {
 		if (p.vaddr >= vaddr && p.vaddr + p.size <= vaddr + size) {
-			from_backing = true;
-			if (!g_program_backing.AllocAt(p.offset, p.size) ||
-			    !g_guest_address_space->MapBacking(p.vaddr, p.size, p.offset, mode)) {
-				return false;
-			}
-			g_program_backing.Record(p.vaddr, p.size, p.offset);
+			inside.push_back(p);
 		}
 	}
-	return from_backing || g_guest_address_space->Commit(vaddr, size, mode);
+	std::sort(inside.begin(), inside.end(), [](const auto& a, const auto& b) { return a.vaddr < b.vaddr; });
+	uint64_t cur = vaddr;
+	for (const auto& p: inside) {
+		if (p.vaddr > cur && !g_guest_address_space->Commit(cur, p.vaddr - cur, mode)) {
+			return false;
+		}
+		if (!g_program_backing.AllocAt(p.offset, p.size) ||
+		    !g_guest_address_space->MapBacking(p.vaddr, p.size, p.offset, mode)) {
+			return false;
+		}
+		g_program_backing.Record(p.vaddr, p.size, p.offset);
+		cur = std::max(cur, p.vaddr + p.size);
+	}
+	return cur >= vaddr + size || g_guest_address_space->Commit(cur, vaddr + size - cur, mode);
 }
 
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -1154,6 +1173,11 @@ static void NativeGpuBindGpuRange(uint64_t vaddr, uint64_t size) {
 			return;
 		}
 		gpu_write = (range.protection & PROT_GPU_WRITE) != 0;
+	}
+	if (const char* v = std::getenv("KYTY_LOG_DIRECT_MEMORY"); v != nullptr && v[0] == '1') {
+		std::fprintf(stderr, "external range: 0x%llx +0x%llx (%llu KiB), type %d, %s, gpu %s\n", static_cast<unsigned long long>(vaddr),
+		             static_cast<unsigned long long>(size), static_cast<unsigned long long>(size >> 10u), static_cast<int>(range.type),
+		             range.name, gpu_write ? "rw" : "ro");
 	}
 	gem->BindExternal(vaddr, size, gpu_write);
 }
@@ -3087,6 +3111,22 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 	return OK;
 }
 
+// KYTY_LOG_DIRECT_MEMORY=1: every direct-memory allocation and release with the running total, to
+// size what a title really takes (the native backend gives each allocation its own GPU memory).
+static void LogDirectMemory(const char* what, uint64_t addr, uint64_t len, int memory_type, int64_t delta) {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_LOG_DIRECT_MEMORY");
+		return v != nullptr && v[0] == '1';
+	}();
+	static std::atomic<int64_t> total {0};
+	const int64_t now = total.fetch_add(delta) + delta;
+	if (on) {
+		std::fprintf(stderr, "direct memory: %s 0x%llx +0x%llx (%llu MiB, type %d), %lld MiB allocated\n", what,
+		             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(len),
+		             static_cast<unsigned long long>(len >> 20u), memory_type, static_cast<long long>(now >> 20));
+	}
+}
+
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic) {
 
@@ -3116,6 +3156,7 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	}
 
 	*phys_addr_out = static_cast<int64_t>(addr);
+	LogDirectMemory(automatic ? "automatic" : "allocate", addr, len, memory_type, static_cast<int64_t>(len));
 
 	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
 
@@ -3224,6 +3265,7 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 		GpuAccessMode unused_gpu   = GpuAccessMode::NoAccess;
 		EXIT_IF(!g_physical_memory->Release(block.start_addr, block.size, &unused_vaddr,
 		                                    &unused_size, &unused_gpu));
+		LogDirectMemory("release", block.start_addr, block.size, block.memory_type, -static_cast<int64_t>(block.size));
 	}
 
 	if (g_free_callback != nullptr) {
@@ -4139,6 +4181,47 @@ uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemor
 	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
 }
 
+// Moves a committed piece of a module's image into the program backing, keeping its bytes (the loader
+// has already copied the segment in). Code stays in committed memory: a block that moves into a GPU
+// buffer is mapped for the CPU through its dma-buf, which cannot be executable. False (nothing
+// changed) without the backing or when it is full.
+static bool MoveProgramSegmentToBacking(uint64_t vaddr, uint64_t size) {
+	if (!g_program_backing.On() || size == 0 || g_guest_address_space->BackingContains(vaddr, size)) {
+		return false;
+	}
+	const uint64_t offset = g_program_backing.Alloc(size);
+	if (offset == 0) {
+		return false;
+	}
+	std::vector<uint8_t> bytes(size);
+	std::memcpy(bytes.data(), reinterpret_cast<const void*>(vaddr), size);
+#if KYTY_GEM_BACKING_SUPPORTED
+	if (auto* gem = GetGemBacking(); gem != nullptr) {
+		gem->UnbindExternal(vaddr, size);
+	}
+#endif
+	if (!g_guest_address_space->ReleaseCommitted(vaddr, size)) {
+		g_program_backing.Free(offset, size);
+		return false;
+	}
+	if (!g_guest_address_space->MapBacking(vaddr, size, offset, VirtualMemory::Mode::ReadWrite)) {
+		EXIT_IF(!g_guest_address_space->Commit(vaddr, size, VirtualMemory::Mode::ExecuteReadWrite));
+		std::memcpy(reinterpret_cast<void*>(vaddr), bytes.data(), size);
+		g_program_backing.Free(offset, size);
+		return false;
+	}
+	std::memcpy(reinterpret_cast<void*>(vaddr), bytes.data(), size);
+	g_program_backing.Record(vaddr, size, offset);
+#if KYTY_GEM_BACKING_SUPPORTED
+	// Resident at once, as the PS5 kernel writes the GPU page table entries of a module at load: the
+	// GPU fetches shaders from here whether or not a command buffer names the address.
+	if (auto* gem = GetGemBacking(); gem != nullptr) {
+		gem->PromoteGuestRange(vaddr, size);
+	}
+#endif
+	return true;
+}
+
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -4152,6 +4235,11 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 
 	const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
 	                                                      : VirtualMemory::Mode::ReadWrite;
+	// The native backend gives a module's data segments (shaders live there) real GPU memory: moved
+	// into the backing, they are guest memory like any other instead of a userptr buffer.
+	if (!VirtualMemory::IsExecute(mode) && mode != VirtualMemory::Mode::NoAccess) {
+		MoveProgramSegmentToBacking(vaddr, size);
+	}
 	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
 #if KYTY_GEM_BACKING_SUPPORTED
