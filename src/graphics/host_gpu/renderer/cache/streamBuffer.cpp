@@ -84,6 +84,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		graphics.LogMemoryBudget();
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// KYTY_LOG_VMA=1: every buffer of 4 MiB or more (see GraphicContext::CreateImage).
+	if (static const bool log_vma = [] {
+		    const char* v = std::getenv("KYTY_LOG_VMA");
+		    return v != nullptr && v[0] == '1';
+	    }();
+	    log_vma && size >= (4ull << 20u)) {
+		std::fprintf(stderr, "vma: buffer usage %d flags 0x%x: %llu MiB\n", static_cast<int>(usage), static_cast<uint32_t>(flags),
+		             static_cast<unsigned long long>(size >> 20u));
+	}
 
 	m_buffer = native_buffer;
 	if (with_bda) {

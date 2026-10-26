@@ -43,6 +43,12 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
+	// Native primary mode: the GPU draws through the native backend, and this device only presents.
+	// VMA's 256 MiB blocks then mostly hold nothing, and every byte of them is RAM the guest's memory
+	// does not get (ASTRO BOT needs nearly all of it): 32 MiB blocks.
+	if (const char* v = std::getenv("KYTY_NATIVE_GPU_PRIMARY"); v != nullptr && v[0] != '\0' && v[0] != '0') {
+		info.preferredLargeHeapBlockSize = 32ull << 20u;
+	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
@@ -161,6 +167,21 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
 		return false;
+	}
+	// KYTY_LOG_VMA=1: every image of 4 MiB or more, to see what the Vulkan side holds.
+	if (static const bool log_vma = [] {
+		    const char* v = std::getenv("KYTY_LOG_VMA");
+		    return v != nullptr && v[0] == '1';
+	    }();
+	    log_vma) {
+		VmaAllocationInfo info {};
+		vmaGetAllocationInfo(allocator, image.allocation, &info);
+		if (info.size >= (4ull << 20u)) {
+			std::fprintf(stderr, "vma: image %ux%ux%u %u layers %u mips format %d usage 0x%x: %llu MiB\n", image_info.extent.width,
+			             image_info.extent.height, image_info.extent.depth, image_info.arrayLayers, image_info.mipLevels,
+			             static_cast<int>(image_info.format), static_cast<uint32_t>(image_info.usage),
+			             static_cast<unsigned long long>(info.size >> 20u));
+		}
 	}
 
 	image.format     = image_info.format;

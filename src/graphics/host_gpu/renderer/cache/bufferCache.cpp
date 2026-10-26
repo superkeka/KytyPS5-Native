@@ -272,10 +272,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              LeanCaches() ? 64 * 1024 : BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, (LeanCaches() ? 64 : 512) * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, (LeanCaches() ? 16 : 64) * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, (LeanCaches() ? 16 : 64) * MiB),
-      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, (LeanCaches() ? 32 : 128) * MiB),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, (LeanCaches() ? 16 : 512) * MiB),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, (LeanCaches() ? 8 : 64) * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, (LeanCaches() ? 8 : 64) * MiB),
+      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, (LeanCaches() ? 8 : 128) * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
