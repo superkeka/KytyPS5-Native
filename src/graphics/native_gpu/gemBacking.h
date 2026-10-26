@@ -795,8 +795,24 @@ private:
 		return r == -1 ? -errno : 0;
 	}
 
-	static constexpr uint32_t kRwxPageFlags =
-	    AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE;
+	// KYTY_NATIVE_GPU_MTYPE=uc|nc|cc|wc (experiment): the GL2 cache mode of guest memory's GPU
+	// mappings instead of amdgpu's default for GTT. uc makes every GPU write reach memory at once, so
+	// the CPU sees a label without a cache write-back.
+	static uint32_t MtypeFlags() {
+		static const uint32_t flags = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_MTYPE");
+			if (v == nullptr) {
+				return 0u;
+			}
+			const std::string m = v;
+			return m == "uc" ? AMDGPU_VM_MTYPE_UC : m == "nc" ? AMDGPU_VM_MTYPE_NC : m == "cc" ? AMDGPU_VM_MTYPE_CC
+			                                     : m == "wc"  ? AMDGPU_VM_MTYPE_WC
+			                                                  : 0u;
+		}();
+		return flags;
+	}
+	static inline const uint32_t kRwxPageFlags =
+	    AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE | MtypeFlags();
 
 	int VaOp(uint32_t op, uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t size,
 	         uint32_t page_flags = kRwxPageFlags) const {

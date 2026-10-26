@@ -2775,6 +2775,12 @@ public:
 	// pieces of the same queue still held come before it, then writes ahead in the ring that have not
 	// landed yet, then guest memory.
 	Plan PlanWait(const WaitCond& wait) override {
+		// Every queue a hardware queue of its own (KFD for compute): a wait is what the title wrote, run
+		// by the GPU as on PS5. Whatever writes the label can always make progress, so no wait needs
+		// holding on the CPU.
+		if (AllWaitsOnGpu()) {
+			return Plan::Native;
+		}
 		auto decide = [&](const LabelWrite& w) -> std::optional<Plan> {
 			uint64_t  v = 0;
 			const int c = w.Covers(wait.addr, wait.wide, &v, wait.mask);
@@ -2857,6 +2863,16 @@ private:
 		m_timeout = Shadow::Instance().TimeoutSec();
 		std::thread([this] { Work(); }).detach();
 		std::thread([this] { Track(); }).detach();
+	}
+
+	// KYTY_NATIVE_GPU_ALL_GPU_WAITS=1 with KFD queues: PlanWait sends every wait to the GPU. Not yet the
+	// default: a label the GPU writes stays in GL2, unseen by the CPU, until a write-back, which today
+	// only the segment ends of split buffers bring; on PS5 the title maps its label memory CPU-coherent.
+	// Without the splits ASTRO BOT stopped before its first frame, the title waiting on the CPU for a
+	// label the GPU had written.
+	bool AllWaitsOnGpu() const {
+		static const bool on = EnvOn("KYTY_NATIVE_GPU_ALL_GPU_WAITS");
+		return on && Shadow::Instance().KfdQueuesOn();
 	}
 
 	// Slot 0 is the gfx ring. A guest compute queue (0x20 + n) maps onto a kernel compute ring, or,
@@ -3221,6 +3237,9 @@ private:
 		m_emits++;
 		for (const auto& w: p.seg.writes) {
 			TraceLabel(w.gpu ? 'W' : 'C', queue, w.addr, w.value);
+			if (AllWaitsOnGpu()) {
+				continue; // nothing is held, so nothing asks who writes a label
+			}
 			m_last_write[w.addr] = {w, m_emits};
 			m_ring[w.addr] = RingWrite {w, m_seq, slot, m_batch};
 			if (w.wide) {
