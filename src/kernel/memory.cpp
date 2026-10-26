@@ -2735,6 +2735,14 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 	if (len != 0) {
 		MapGpuRange(address, len);
 	}
+#if KYTY_GEM_BACKING_SUPPORTED
+	// Native backend: the aperture's unmapped pages read zeros and drop writes on the GPU, as on PS5.
+	if (auto* gem = GetGemBacking(); gem != nullptr) {
+		std::fprintf(stderr, "memory: PRT aperture %d: 0x%llx +0x%llx\n", index, static_cast<unsigned long long>(address),
+		             static_cast<unsigned long long>(len));
+		gem->SetPrtAperture(index, address, len);
+	}
+#endif
 
 	LOGF_COLOR(Log::Color::Green, "\t[Ok]\n");
 

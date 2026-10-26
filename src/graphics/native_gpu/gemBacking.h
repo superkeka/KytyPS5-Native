@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <string>
 #include <cstdlib>
@@ -300,7 +301,32 @@ public:
 		std::lock_guard<std::mutex> lock(m_lock);
 		EraseViewsUnlocked(vaddr, size);
 		m_views_generation++;
-		return VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, size) == 0;
+		const bool ok = VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, size) == 0;
+		MapPrtHolesUnlocked(vaddr, size);
+		return ok;
+	}
+
+	// sceKernelSetPrtAperture (index 0-2): on PS5 the GPU reads zeros from, and drops writes to, the
+	// pages of a PRT aperture that nothing is mapped at. Titles map sparse resources into one piece by
+	// piece and clear them whole (My First Gran Turismo's track load), which here faulted and hung the
+	// gfx ring. The holes get PRT mappings, which behave the same; guest mappings replace them
+	// (REPLACE), and unbinding one gives the hole back.
+	void SetPrtAperture(int index, uint64_t vaddr, uint64_t size) {
+		if (index < 0 || static_cast<size_t>(index) >= m_prt.size()) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(m_lock);
+		const auto old = m_prt[static_cast<size_t>(index)];
+		m_prt[static_cast<size_t>(index)] = {vaddr, size};
+		if (old.second != 0) {
+			ForEachHoleUnlocked(old.first, old.second,
+			                    [&](uint64_t start, uint64_t len) { VaOp(AMDGPU_VA_OP_CLEAR, 0, start, 0, len); });
+		}
+		for (const auto& [start, len]: m_prt) {
+			if (len != 0) {
+				MapPrtHolesUnlocked(start, len);
+			}
+		}
 	}
 
 	// Makes every block the CPU has written to resident. Promoted blocks are punched out of the
@@ -539,6 +565,7 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
 		ClearExternalRangeUnlocked(vaddr, size);
+		MapPrtHolesUnlocked(vaddr, size);
 		return true;
 	}
 
@@ -1250,6 +1277,59 @@ private:
 	// portions of a straddling buffer that fall outside the range as their own buffers (closing a GEM
 	// handle unmaps all of its VA, so a survivor needs its own handle). Chunk mappings never appear in
 	// m_external, so they are never touched. Caller holds m_lock.
+	// Calls fn(start, size) for each part of [vaddr, vaddr + size) with no view and no external buffer.
+	template <typename Fn>
+	void ForEachHoleUnlocked(uint64_t vaddr, uint64_t size, Fn&& fn) const {
+		const uint64_t                             end = vaddr + size;
+		std::vector<std::pair<uint64_t, uint64_t>> used;
+		auto collect = [&](uint64_t start, uint64_t stop) {
+			if (stop > vaddr && start < end) {
+				used.emplace_back(std::max(start, vaddr), std::min(stop, end));
+			}
+		};
+		for (auto it = m_views.lower_bound(vaddr); it != m_views.begin();) {
+			--it;
+			collect(it->first, it->first + it->second.size);
+			break;
+		}
+		for (auto it = m_views.lower_bound(vaddr); it != m_views.end() && it->first < end; ++it) {
+			collect(it->first, it->first + it->second.size);
+		}
+		for (auto it = m_external.lower_bound(vaddr); it != m_external.begin();) {
+			--it;
+			collect(it->first, it->second.end);
+			break;
+		}
+		for (auto it = m_external.lower_bound(vaddr); it != m_external.end() && it->first < end; ++it) {
+			collect(it->first, it->second.end);
+		}
+		std::sort(used.begin(), used.end());
+		uint64_t at = vaddr;
+		for (const auto& [start, stop]: used) {
+			if (start > at) {
+				fn(at, start - at);
+			}
+			at = std::max(at, stop);
+		}
+		if (at < end) {
+			fn(at, end - at);
+		}
+	}
+
+	// PRT mappings on the holes of [vaddr, vaddr + size) that lie in a PRT aperture.
+	void MapPrtHolesUnlocked(uint64_t vaddr, uint64_t size) const {
+		for (const auto& [start, len]: m_prt) {
+			const uint64_t lo = std::max(start, vaddr);
+			const uint64_t hi = std::min(start + len, vaddr + size);
+			if (len == 0 || lo >= hi) {
+				continue;
+			}
+			ForEachHoleUnlocked(lo, hi - lo, [&](uint64_t hole, uint64_t hole_size) {
+				VaOp(AMDGPU_VA_OP_REPLACE, 0, hole, 0, hole_size, AMDGPU_VM_PAGE_PRT);
+			});
+		}
+	}
+
 	void ClearExternalRangeUnlocked(uint64_t vaddr, uint64_t size) {
 		const uint64_t end = vaddr + size;
 
@@ -1326,6 +1406,7 @@ private:
 	MoveJob*                      m_mover_job  = nullptr;
 	bool                          m_mover_stop = false;
 	std::map<uint64_t, External>  m_external; // guest VA -> userptr buffer for non-direct ranges
+	std::array<std::pair<uint64_t, uint64_t>, 3> m_prt {}; // PRT apertures (start, size), SetPrtAperture
 	mutable std::mutex            m_lock;     // guards blocks, views, m_external and the dummy
 };
 
