@@ -1154,6 +1154,76 @@ static bool DangerGds(Device* d, Common* c) {
 	return true;
 }
 
+// GDS through DMA_DATA, as My First Gran Turismo's async compute does it: 400 bytes from memory into
+// GDS at 0x190, then back out of GDS into another buffer, with the title's exact packet controls.
+// Runs on compute ring 0, then on the gfx ring.
+static bool DangerGdsDma(Device* d, Common* c) {
+	printf("== danger gdsdma: DMA_DATA memory -> GDS 0x190 (400 bytes) -> memory, compute ring 0 then gfx\n");
+	Bo  gds;
+	Bo  buf;
+	int r = BoCreate(d, &gds, 4 * KiB, AMDGPU_GEM_DOMAIN_GDS, 0);
+	if (r == 0) {
+		r = MemCreate(d, &buf, MEM_GTT, 64 * KiB, NULL);
+		if (r == 0) {
+			r = BoBind(d, &buf, 0x0300000000ull, AMDGPU_VM_MTYPE_UC);
+		}
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	static const struct {
+		uint32_t    ip;
+		const char* name;
+	} rings[] = {{AMDGPU_HW_IP_COMPUTE, "compute 0"}, {AMDGPU_HW_IP_GFX, "gfx"}};
+	bool ok = true;
+	for (size_t k = 0; k < ARRAY_SIZE(rings) && ok; k++) {
+		uint32_t* src = (uint32_t*)buf.cpu;
+		uint32_t* dst = src + 1024;
+		for (int i = 0; i < 100; i++) {
+			src[i] = 0x5a000000u + (uint32_t)k * 0x10000u + (uint32_t)i;
+			dst[i] = 0xeeeeeeeeu;
+		}
+		__sync_synchronize();
+		const uint64_t sva = buf.va;
+		const uint64_t dva = buf.va + 4096;
+		Ib ib = {.n = 0};
+		IbPush(&ib, Pkt3(0x50u, 6)); // DMA_DATA memory (L2) -> GDS
+		IbPush(&ib, 0x60104000u);
+		IbPush(&ib, (uint32_t)sva);
+		IbPush(&ib, (uint32_t)(sva >> 32));
+		IbPush(&ib, 0x190u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0x40000190u);
+		IbPush(&ib, Pkt3(0x50u, 6)); // DMA_DATA GDS -> memory (L2)
+		IbPush(&ib, 0x26300000u);
+		IbPush(&ib, 0x190u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, (uint32_t)dva);
+		IbPush(&ib, (uint32_t)(dva >> 32));
+		IbPush(&ib, 0x40000190u | (1u << 31)); // RAW_WAIT: the read waits for the write
+		IbPad(&ib);
+		Bo*      bos[] = {&buf, &gds};
+		uint64_t seq   = 0;
+		double   t0    = NowSec();
+		r              = SubmitOn(d, rings[k].ip, 0, &c->ib, &ib, bos, 2, &seq);
+		if (r == 0) {
+			r = WaitOn(d, rings[k].ip, 0, seq, 10.0);
+		}
+		int good = 0;
+		for (int i = 0; i < 100; i++) {
+			good += dst[i] == src[i];
+		}
+		printf("  %-9s: %s after %.1f ms, %d/100 dwords back, dst[0] 0x%08x, context state 0x%" PRIx64 "\n",
+		       rings[k].name, r == 0 ? "signaled" : (r == 1 ? "TIMEOUT" : ErrStr(r)), (NowSec() - t0) * 1e3, good,
+		       dst[0], (uint64_t)ContextState(d));
+		ok = r == 0;
+	}
+	BoDestroy(d, &buf);
+	BoDestroy(d, &gds);
+	return ok;
+}
+
 // Job A on compute ring 1 waits (WAIT_REG_MEM) for a memory flag; 100 ms later job B on
 // compute ring 0 writes it (WRITE_DATA). Checks that queues can wait on each other via memory.
 static bool DangerCrossQueue(Device* d, Common* c) {
@@ -1437,7 +1507,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds crossqueue uconfig\n");
+	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig\n");
 }
 
 int main(int argc, char** argv) {
@@ -1496,6 +1566,8 @@ int main(int argc, char** argv) {
 			ok = DangerDot2x(&d, &c);
 		} else if (strcmp(danger, "gds") == 0) {
 			ok = DangerGds(&d, &c);
+		} else if (strcmp(danger, "gdsdma") == 0) {
+			ok = DangerGdsDma(&d, &c);
 		} else if (strcmp(danger, "crossqueue") == 0) {
 			ok = DangerCrossQueue(&d, &c);
 		} else if (strcmp(danger, "uconfig") == 0) {
