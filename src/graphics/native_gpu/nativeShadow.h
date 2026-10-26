@@ -71,6 +71,11 @@ bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufP
 // so the presenter can take it as uncompressed; true then.
 bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size);
 
+// sceAgcDriverSetTFRing / sceAgcDriverSetHsOffchipParam: the title's tessellation rings, which native
+// IBs program as the PS5 driver would (VGT_TF_*, VGT_HS_OFFCHIP_PARAM).
+void ShadowSetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint64_t offchip_granularity,
+                                uint64_t offchip_buffering);
+
 // KYTY_NATIVE_GPU_FLIP_STATS=1: called at each flip with the time the presenter spent preparing it;
 // logs per-flip averages (flip interval, native submission time, presenter time).
 void ShadowFlipStats(double present_seconds);

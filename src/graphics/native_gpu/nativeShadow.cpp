@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
+#include <array>
 #include <deque>
 #include <functional>
 #include <ctime>
@@ -85,6 +86,14 @@ bool EnvOn(const char* name) {
 //   ping      "pong"
 //   pad play FILE [ELAPSED]  replay a gamepad recording as player 1 (PlayPadRecording)
 std::atomic<uint32_t>& DemandedDumps() {
+	static std::atomic<uint32_t> n {0};
+	return n;
+}
+
+// Control socket "crumbs N": the next N translated buffers (DCBs and ACBs) are written to
+// KYTY_NATIVE_GPU_DUMP_DIR as <kind><n>.dcb.bin / .ib.bin, without slowing every frame like
+// KYTY_NATIVE_GPU_BREADCRUMBS.
+std::atomic<uint32_t>& DemandedCrumbs() {
 	static std::atomic<uint32_t> n {0};
 	return n;
 }
@@ -170,7 +179,7 @@ void StartControlSocket() {
 		std::fprintf(stderr, "native shadow: control socket %s failed: %s\n", path, std::strerror(errno));
 		return;
 	}
-	std::fprintf(stderr, "native shadow: control socket %s (dump [N], ping)\n", path);
+	std::fprintf(stderr, "native shadow: control socket %s (dump [N], crumbs N, ping)\n", path);
 	std::thread([fd] {
 		for (;;) {
 			const int c = ::accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
@@ -197,12 +206,15 @@ void StartControlSocket() {
 					std::sscanf(line.c_str(), "pad play %*s %lf", &elapsed);
 					PlayPadRecording(file, elapsed);
 					std::snprintf(reply, sizeof(reply), "ok playing %s from %.1f s\n", file, elapsed);
+				} else if (std::sscanf(line.c_str(), "crumbs %u", &count) == 1) {
+					DemandedCrumbs().store(count);
+					std::snprintf(reply, sizeof(reply), "ok writing the next %u buffers\n", count);
 				} else if (line == "dump" || std::sscanf(line.c_str(), "dump %u", &count) == 1) {
 					count = count != 0 ? count : 8u;
 					DemandedDumps().store(count);
 					std::snprintf(reply, sizeof(reply), "ok dumping the next %u flips\n", count);
 				} else {
-					std::snprintf(reply, sizeof(reply), "unknown command; try: dump [N], pad play FILE [ELAPSED], ping\n");
+					std::snprintf(reply, sizeof(reply), "unknown command; try: dump [N], crumbs N, pad play FILE [ELAPSED], ping\n");
 				}
 				::send(c, reply, std::strlen(reply), MSG_NOSIGNAL);
 				line.clear();
@@ -688,8 +700,8 @@ public:
 		if (out != nullptr) {
 			// Only packet forms that have run on the board before go to the GPU; anything else and the
 			// buffer is Kyty's.
-			const NativeIbKind kind = acb && m_acb_rings ? NativeIbKind::Compute : NativeIbKind::Gfx;
-			if (uint32_t bad = 0; m_validate && !ValidateNativeIb(result.ib, NativeLodStats(), &bad, kind)) {
+			const NativeIbKind ib_kind = acb && m_acb_rings ? NativeIbKind::Compute : NativeIbKind::Gfx;
+			if (uint32_t bad = 0; m_validate && !ValidateNativeIb(result.ib, NativeLodStats(), &bad, ib_kind)) {
 				if (m_validate_refused++ < 16) {
 					std::fprintf(stderr,
 					             "native shadow: %s %llu left to Kyty by the packet check: op 0x%02x (header 0x%08x) at dw %u\n",
@@ -701,6 +713,7 @@ public:
 			if (!m_breadcrumbs.empty()) {
 				WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, result.ib);
 			}
+			WriteDemandedCrumb(acb, frame, dcb, result.ib);
 			m_translate_ms_total += translate_ms;
 			m_labels_stats[0] += result.stats.labels_native;
 			m_labels_stats[1] += result.stats.labels_cpu;
@@ -761,6 +774,7 @@ public:
 		if (!m_breadcrumbs.empty()) {
 			WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, wrapped);
 		}
+		WriteDemandedCrumb(acb, frame, dcb, wrapped);
 		// Pipelined: the IB joins the batch the pipeline submits with one CS once it has taken every
 		// queued buffer (FlushBatch). One BO-list validation then covers them all.
 		if (m_pipelined) {
@@ -1031,6 +1045,10 @@ public:
 			             m_gpu_busy_s.load(std::memory_order_relaxed) * per, static_cast<unsigned long long>(ResidentMiB()));
 			std::fprintf(stderr, "native shadow: flip intervals: %u under 20 ms, %u 20-37 ms, %u longer\n", m_flip_hist[0],
 			             m_flip_hist[1], m_flip_hist[2]);
+			std::fprintf(stderr, "native shadow: pipeline per flip: translate %.2f ms, CS ioctl %.2f ms\n",
+			             (m_translate_ms_total - m_translate_mark) / m_flips, (m_cs_ms_total - m_cs_mark) / m_flips);
+			m_translate_mark = m_translate_ms_total;
+			m_cs_mark        = m_cs_ms_total;
 #if KYTY_GEM_BACKING_SUPPORTED
 			if (m_gem != nullptr) {
 				const auto [ext_n, ext_bytes] = m_gem->ExternalBuffers();
@@ -1243,8 +1261,10 @@ public:
 	bool AcbRings() const { return m_acb_rings; }
 	uint32_t ComputeRingMask() const { return m_compute_mask; }
 
-	// The ACB translator's tracker slot, one per compute ring (slot 0 is the gfx ring). Called on the
-	// label-pipeline thread before that queue is translated.
+	// The ACB translator's tracker slot, one per compute ring (slot 0 is the gfx ring), and its barrier
+	// fence, the slot's last dword. Compute rings run at once, and a barrier releases its own value into
+	// the fence and waits for exactly that value: a fence shared with another ring can be overwritten in
+	// between, and the wait never ends. Called on the label-pipeline thread before that queue is translated.
 	void UseAcbTracker(uint32_t slot) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_label_oracle == nullptr || m_submitter == nullptr || slot >= kTrackerSlots) {
@@ -1252,6 +1272,7 @@ public:
 		}
 		const uint64_t va = m_submitter->ScratchVa() + kTrackerOffset + static_cast<uint64_t>(slot) * kTrackerStride;
 		m_acb_translator.SetNativeLabels(m_label_oracle, va);
+		m_acb_translator.SetFenceAddress(va + 12);
 #else
 		(void)slot;
 #endif
@@ -1347,12 +1368,65 @@ public:
 		if (!m_disabled) {
 			std::fprintf(stderr, "native shadow: ring slot %u submission %llu TIMED OUT; disabling native path %s\n", slot,
 			             static_cast<unsigned long long>(fence.seq), m_submitter->QueueState({fence.ip_type, fence.ring}).c_str());
+			DumpHangLocked();
+			RunHangHook();
 			Disable("timeout");
 		}
 #else
 		(void)slot;
 #endif
 		return false;
+	}
+
+	// KYTY_NATIVE_GPU_HANG_DUMP=<dir>: on a ring timeout, writes each ring's submissions that have not
+	// signaled (the stuck one first) and each compute ring's last 32 as slot<S>_seq<N>[_done].bin, and the
+	// gfx ring's last ones, so a hang can be read with ib_dump.py without breadcrumbs slowing every frame.
+	void DumpHangLocked() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_hang_dump.empty() || m_submitter == nullptr) {
+			return;
+		}
+		for (uint32_t slot = 0; slot < kTrackerSlots; slot++) {
+			NativeSubmitter::RingTarget target;
+			if (slot != 0) {
+				target.ip_type = AMDGPU_HW_IP_COMPUTE;
+				target.ring    = slot - 1;
+			}
+			uint32_t written = 0;
+			const auto& kept = m_hang_kept[slot];
+			for (size_t k = 0; k < kept.size(); k++) {
+				const auto& [seq, ib] = kept[k];
+				const bool done = m_submitter->WaitSeq(seq, 0.0, target);
+				// Compute rings: also the last 32 that signaled (waves can outlive the fence that ends their
+				// submission), and up to 8 that did not.
+				const bool recent = k + 32 >= kept.size();
+				if ((done && slot != 0 && !recent) || written >= 40) {
+					continue;
+				}
+				const std::string path = m_hang_dump + "/slot" + std::to_string(slot) + "_seq" + std::to_string(seq) +
+				                         (done ? "_done" : "") + ".bin";
+				if (std::FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+					std::fwrite(ib.data(), 4, ib.size(), f);
+					std::fclose(f);
+					written++;
+				}
+			}
+			if (written != 0) {
+				std::fprintf(stderr, "native shadow: hang dump: %u submissions of slot %u in %s (tracker %u)\n", written, slot,
+				             m_hang_dump.c_str(), TrackerValue(slot));
+			}
+		}
+#endif
+	}
+
+	// KYTY_NATIVE_GPU_HANG_HOOK=<command>: run on a ring timeout before anything is released, so a
+	// capture (tools/bc250-runs/hang-capture-now.sh: CP state and waves) sees the GPU as it hung.
+	static void RunHangHook() {
+		if (const char* hook = std::getenv("KYTY_NATIVE_GPU_HANG_HOOK"); hook != nullptr && hook[0] != '\0') {
+			std::fprintf(stderr, "native shadow: running the hang hook: %s\n", hook);
+			const int r = std::system(hook);
+			std::fprintf(stderr, "native shadow: hang hook done (%d)\n", r);
+		}
 	}
 
 	// Blocks until `slot`'s latest fence signals or `timeout_sec` passes. A timeout does not disable
@@ -1584,6 +1658,15 @@ private:
 		}
 		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
 		NativeSubmitter::Result r       = m_submitter->Submit(batch, handles, m_timeout_sec, target);
+		if (!m_hang_dump.empty() && r.submitted && slot < kTrackerSlots) {
+			// Older submissions on the gfx ring are large and a hang there is caught early; a hung compute
+			// ring keeps receiving work behind the stuck one, so it keeps many more.
+			auto& kept = m_hang_kept[slot];
+			kept.emplace_back(r.seq, batch);
+			while (kept.size() > (slot == 0 ? 8u : 4096u)) {
+				kept.pop_front();
+			}
+		}
 		for (int retry = 0; !r.submitted && r.err == -ENOENT && retry < 3; retry++) {
 			handles = m_gem->CreatedHandles();
 			r       = m_submitter->Submit(batch, handles, m_timeout_sec, target);
@@ -1678,6 +1761,24 @@ private:
 	// any log reaches the disk, so before each submission the guest DCB, the IB about to run and a
 	// summary are written and synced: after a power cycle, last.txt names the submission that hung
 	// and dcb_<n>.bin / ib_<n>.bin (the last four, n = frame % 4) hold it.
+	// Control socket "crumbs N" (DemandedCrumbs): this buffer and its IB, while the count lasts.
+	static void WriteDemandedCrumb(bool acb, uint64_t frame, std::span<const uint32_t> dcb, std::span<const uint32_t> ib) {
+		if (uint32_t left = DemandedCrumbs().load(std::memory_order_relaxed);
+		    left != 0 && DemandedCrumbs().compare_exchange_strong(left, left - 1)) {
+			const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+			const std::string base = std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") + "/" +
+			                         (acb ? "acb" : "dcb") + std::to_string(frame);
+			if (std::FILE* f = std::fopen((base + ".dcb.bin").c_str(), "wb"); f != nullptr) {
+				std::fwrite(dcb.data(), 4, dcb.size(), f);
+				std::fclose(f);
+			}
+			if (std::FILE* f = std::fopen((base + ".ib.bin").c_str(), "wb"); f != nullptr) {
+				std::fwrite(ib.data(), 4, ib.size(), f);
+				std::fclose(f);
+			}
+	}
+	}
+
 	void WriteBreadcrumb(const std::string& prefix, uint64_t frame, std::span<const uint32_t> dcb,
 	                     const Pm4TranslateResult& result, std::span<const uint32_t> ib) const {
 		auto write_file = [&](const std::string& name, const void* data, size_t bytes) {
@@ -1740,7 +1841,7 @@ private:
 	// decode the descriptors around them: inline V#s in the user data, and V#/T# in the 0x200 bytes
 	// behind every user-data pointer, each with whether its base is mapped for the GPU.
 	void InspectDraw(uint64_t frame, const DrawSnapshot& snap) {
-		if (m_inspected++ >= 6) {
+		if (m_inspected++ >= 40) {
 			return;
 		}
 		auto mapped = [&](uint64_t a) { return a == 0 ? "null" : (m_gem->IsGpuMapped(a) ? "mapped" : "NOT MAPPED"); };
@@ -1766,6 +1867,13 @@ private:
 						std::fprintf(stderr, "    +0x%03zx: %08x %08x %08x %08x  as V# 0x%llx (%s) stride %u records %u | as T# 0x%llx (%s)\n",
 						             k * 4, t[k], t[k + 1], t[k + 2], t[k + 3], static_cast<unsigned long long>(vbase), mapped(vbase),
 						             (t[k + 1] >> 16u) & 0x3fffu, t[k + 2], static_cast<unsigned long long>(tbase), mapped(tbase));
+						// An image descriptor (TYPE 8 and up in word 3): its second half and fields.
+						if ((t[k + 3] >> 28u) >= 8u && k + 7 < n) {
+							std::fprintf(stderr, "      T# %08x %08x %08x %08x: %ux%u format %u swizzle %u dw6 0x%08x meta 0x%llx\n",
+							             t[k + 4], t[k + 5], t[k + 6], t[k + 7], ((t[k + 1] >> 30u) | ((t[k + 2] & 0x3fffu) << 2u)) + 1u,
+							             ((t[k + 2] >> 14u) & 0xffffu) + 1u, (t[k + 1] >> 20u) & 0x1ffu, (t[k + 3] >> 20u) & 0x1fu,
+							             t[k + 6], static_cast<unsigned long long>(((static_cast<uint64_t>(t[k + 7]) << 8u) | (t[k + 6] >> 24u)) << 8u));
+						}
 						// Small buffers (constants, exposure and other per-frame scalars): their first values.
 						const uint32_t stride = (t[k + 1] >> 16u) & 0x3fffu;
 						const uint64_t bytes  = static_cast<uint64_t>(t[k + 2]) * (stride != 0 ? stride : 1u);
@@ -1900,7 +2008,8 @@ private:
 	static constexpr uint32_t kItCopyData       = 0x40;
 	static constexpr uint32_t kTimestampOffset  = 512;
 	// Native labels: the 32-bit slot tracker points write and, 8 bytes on, the dword flush-only releases
-	// write (the fences are at 1024 and 1032). ACB rings give each ring its own pair, stride 16.
+	// write (the fences are at 1024 and 1032; with ACB rings each ring's is its slot's last dword). ACB
+	// rings give each ring its own slot, stride 16.
 	// Slot 0 is the gfx ring; slot n > 0 is compute ring n - 1. 33 slots fit in the scratch page.
 	static constexpr uint32_t kTrackerOffset    = 1040;
 	static constexpr uint32_t kTrackerStride    = 16;
@@ -2039,8 +2148,19 @@ private:
 			m_translator.SetTargetMask(static_cast<uint32_t>(std::strtoul(mask, nullptr, 0)));
 			std::fprintf(stderr, "native shadow: CB_TARGET_MASK limited to %s (experiment)\n", mask);
 		}
-		if (const char* ps = std::getenv("KYTY_NATIVE_GPU_INSPECT_PS"); ps != nullptr) {
-			m_translator.SetInspectedPixelShader(std::strtoull(ps, nullptr, 0));
+		// KYTY_NATIVE_GPU_INSPECT_PS=0xADDR[,0xADDR...]: pixel or compute shaders whose draws and dispatches
+		// InspectDraw logs.
+		if (const char* list = std::getenv("KYTY_NATIVE_GPU_INSPECT_PS"); list != nullptr) {
+			std::set<uint64_t> shaders;
+			for (const char* p = list; *p != '\0';) {
+				char* end = nullptr;
+				shaders.insert(std::strtoull(p, &end, 0));
+				if (end == p) {
+					break;
+				}
+				p = (*end == ',') ? end + 1 : end;
+			}
+			m_translator.SetInspectedShaders(shaders);
 		}
 		// KYTY_NATIVE_GPU_SKIP_PS=0xADDR[,0xADDR...]: leave draws with these pixel shaders out of the IB.
 		if (const char* list = std::getenv("KYTY_NATIVE_GPU_SKIP_PS"); list != nullptr) {
@@ -2085,6 +2205,10 @@ private:
 		}
 		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
 			StartWatchdog();
+		}
+		if (const char* dir = std::getenv("KYTY_NATIVE_GPU_HANG_DUMP"); dir != nullptr && dir[0] != '\0') {
+			m_hang_dump = dir;
+			std::fprintf(stderr, "native shadow: unfinished submissions are written to %s on a ring timeout\n", dir);
 		}
 		if (const char* dir = std::getenv("KYTY_NATIVE_GPU_BREADCRUMBS"); dir != nullptr && dir[0] != '\0') {
 			m_breadcrumbs = dir;
@@ -2395,6 +2519,8 @@ private:
 	uint32_t      m_stats_logged   = 0;
 	int64_t       m_dump_regs_frame = -1;
 	std::string   m_breadcrumbs; // KYTY_NATIVE_GPU_BREADCRUMBS directory, empty when off
+	std::string   m_hang_dump;   // KYTY_NATIVE_GPU_HANG_DUMP directory, empty when off
+	std::array<std::deque<std::pair<uint64_t, std::vector<uint32_t>>>, kTrackerSlots> m_hang_kept; // per tracker slot
 	bool          m_collect_targets = false;           // flip dumps compare render targets too
 	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
 	std::vector<FrameDraw>               m_frame_draws;   // KYTY_NATIVE_GPU_CTL: draws since the last flip
@@ -2411,6 +2537,8 @@ private:
 	uint64_t      m_flatten_failed = 0; // and could not
 	double        m_gpu_ms_total   = 0.0;
 	double        m_cs_ms_total    = 0.0;
+	double        m_cs_mark        = 0.0; // m_cs_ms_total at the last flip stats
+	double        m_translate_mark = 0.0;
 	double        m_gpu_only_ms_total = 0.0;
 	double        m_translate_ms_total = 0.0;
 	double        m_residency_ms_total = 0.0;
@@ -2831,6 +2959,35 @@ private:
 		return Release::No;
 	}
 
+	// KYTY_NATIVE_GPU_LOG_HOLDS=N: the first N releases of a hold with no known writer: who waited, on what,
+	// and what let it go (a writer that appeared in a later buffer, on which ring, or memory that changed
+	// with no writer the translator saw: the CPU, or a GPU write it does not track).
+	void LogHoldRelease(uint32_t queue, const Piece& p, Release how, int reason, uint64_t us) {
+		static const unsigned long limit = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_LOG_HOLDS");
+			return v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
+		}();
+		if (reason != 4 || us < 500 || m_holds_logged >= limit) {
+			return;
+		}
+		m_holds_logged++;
+		const WaitCond&  w  = p.seg.wait;
+		const RingWrite* rw = PendingRingWrite(w.addr);
+		char             writer[96] = "no writer";
+		if (rw != nullptr) {
+			std::snprintf(writer, sizeof(writer), "writer on slot %u (%s, gpu %d, value 0x%llx)", rw->slot,
+			              Submitted(*rw) ? "submitted" : "not submitted", rw->write.gpu ? 1 : 0,
+			              static_cast<unsigned long long>(rw->write.value));
+		}
+		std::fprintf(stderr,
+		             "hold: queue 0x%x (slot %u) %.2f ms on 0x%llx %s ref 0x%llx mask 0x%llx func %u: memory 0x%llx -> 0x%llx, "
+		             "released %s, %s, %zu pieces behind\n",
+		             queue, SlotOf(queue), static_cast<double>(us) / 1e3, static_cast<unsigned long long>(w.addr), w.wide ? "64" : "32",
+		             static_cast<unsigned long long>(w.ref), static_cast<unsigned long long>(w.mask), w.function,
+		             static_cast<unsigned long long>(m_hold_start_value[queue]), static_cast<unsigned long long>(ReadLabel(w)),
+		             how == Release::Native ? "as a GPU wait" : "on memory", writer, m_pending[queue].size() - 1);
+	}
+
 	// A piece held for more than 2 s: what it waits for and what memory holds (the first 16).
 	void NoteStaleHold(uint32_t queue, const Piece& p) {
 		const double now   = NowSecShadow();
@@ -2862,6 +3019,7 @@ private:
 					if (how == Release::No) {
 						if (m_hold_since.count(queue) == 0) {
 							m_hold_reason[queue] = m_last_hold_reason;
+							m_hold_start_value[queue] = ReadLabel(pieces.front().seg.wait);
 						}
 						NoteStaleHold(queue, pieces.front());
 						break;
@@ -2871,6 +3029,7 @@ private:
 						if (auto h = m_hold_since.find(queue); h != m_hold_since.end() && h->second > 0.0) {
 							const auto us = static_cast<uint64_t>((NowSecShadow() - h->second) * 1e6);
 							const int  r  = m_hold_reason[queue];
+							LogHoldRelease(queue, pieces.front(), how, r, us);
 							g_held_waited.fetch_add(1, std::memory_order_relaxed);
 							g_held_wait_us.fetch_add(us, std::memory_order_relaxed);
 							g_hold_reason_n[r].fetch_add(1, std::memory_order_relaxed);
@@ -3185,6 +3344,8 @@ private:
 	uint64_t                                m_batch = 1; // the batch being appended to (RingWrite::batch)
 	uint64_t                                m_released_native   = 0;
 	int                                     m_last_hold_reason  = 0;
+	std::map<uint32_t, uint64_t>            m_hold_start_value; // the label when the queue's current hold began
+	unsigned long                           m_holds_logged = 0; // KYTY_NATIVE_GPU_LOG_HOLDS
 	std::map<uint32_t, int>                 m_hold_reason; // queue -> why its front piece was first held
 	uint64_t                                m_released_observed = 0;
 	std::atomic<uint64_t>                   m_last_cs {0};
@@ -3241,6 +3402,13 @@ bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size) {
 	}
 	Shadow::Instance().AddDisplayRange(addr, size);
 	return true;
+}
+
+void ShadowSetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint64_t offchip_granularity,
+                                uint64_t offchip_buffering) {
+	// VGT_HS_OFFCHIP_PARAM: OFFCHIP_BUFFERING [8:0], OFFCHIP_GRANULARITY [10:9].
+	const auto param = static_cast<uint32_t>((offchip_buffering & 0x1ffu) | ((offchip_granularity & 0x3u) << 9u));
+	SetTessellationRings(tf_ring_base, tf_ring_bytes, param);
 }
 
 void ShadowFlipStats(double present_seconds) {

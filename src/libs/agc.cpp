@@ -5088,6 +5088,9 @@ int KYTY_SYSV_ABI AgcDriverSetTFRing(const volatile void* base, uint32_t size) {
 
 	g_tessellation_driver_state.tf_ring_base = reinterpret_cast<uint64_t>(base);
 	g_tessellation_driver_state.tf_ring_size = size;
+	Libs::Graphics::NativeGpu::ShadowSetTessellationRings(g_tessellation_driver_state.tf_ring_base, size,
+	                                                      g_tessellation_driver_state.hs_offchip_value0,
+	                                                      g_tessellation_driver_state.hs_offchip_value1);
 
 	LOGF("\t base = 0x%016" PRIx64 "\n"
 	     "\t size = 0x%08" PRIx32 "\n",
@@ -5102,6 +5105,9 @@ int KYTY_SYSV_ABI AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, u
 	g_tessellation_driver_state.hs_offchip_value0 = value0;
 	g_tessellation_driver_state.hs_offchip_value1 = value1;
 	g_tessellation_driver_state.hs_offchip_value2 = value2;
+	// value0 is the offchip granularity and value1 the buffering (My First Gran Turismo: 0, 0x1ff, 0x12).
+	Libs::Graphics::NativeGpu::ShadowSetTessellationRings(g_tessellation_driver_state.tf_ring_base,
+	                                                      g_tessellation_driver_state.tf_ring_size, value0, value1);
 
 	LOGF("\t value0 = 0x%016" PRIx64 "\n"
 	     "\t value1 = 0x%016" PRIx64 "\n"

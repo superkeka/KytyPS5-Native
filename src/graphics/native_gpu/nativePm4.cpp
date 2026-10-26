@@ -18,6 +18,7 @@ namespace {
 constexpr uint32_t IT_NOP                      = 0x10;
 constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_SET_BASE                 = 0x11;
+constexpr uint32_t IT_SET_PREDICATION          = 0x20;
 constexpr uint32_t IT_INDEX_BUFFER_SIZE        = 0x13;
 constexpr uint32_t IT_DISPATCH_DIRECT          = 0x15;
 constexpr uint32_t IT_DISPATCH_INDIRECT        = 0x16;
@@ -160,6 +161,10 @@ void EmitSet(std::vector<uint32_t>& ib, uint32_t op, uint32_t offset, uint32_t v
 // UCONFIG writes. On GFX9+ the CP keeps its own copy of VGT_PRIMITIVE_TYPE and VGT_INDEX_TYPE and
 // only updates it from SET_UCONFIG_REG_INDEX with index 1 / 2 (RADV: radeon_set_uconfig_reg_idx);
 // a plain SET_UCONFIG_REG leaves the draw engine with a stale primitive or index type.
+std::atomic<uint64_t> g_tf_ring_base {0};
+std::atomic<uint32_t> g_tf_ring_bytes {0};
+std::atomic<uint32_t> g_hs_offchip_param {0};
+
 void EmitSetUconfig(std::vector<uint32_t>& ib, uint32_t offset, uint32_t value) {
 	switch (offset) {
 		case 0x242: EmitSet(ib, IT_SET_UCONFIG_REG_INDEX, (1u << 28u) | offset, value, false); break;
@@ -454,6 +459,13 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 					return bad();
 				}
 				break;
+			// A guest WRITE_DATA to memory, write confirmed; on MEC from the micro engine.
+			case IT_WRITE_DATA:
+				if (size < 5 || !WriteDataToMemory(b[0]) || (b[0] & (1u << 20u)) == 0 ||
+				    (compute && ((header & 2u) == 0 || (b[0] >> 30u) != 0))) {
+					return bad();
+				}
+				break;
 			// Packets both rings run. On MEC the shader-type bit is set.
 			case IT_SET_BASE:
 			case IT_DISPATCH_DIRECT:
@@ -468,6 +480,7 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				break;
 			// Graphics-only. An illegal opcode on a compute ring.
 			case IT_CLEAR_STATE:
+			case IT_SET_PREDICATION:
 			case IT_INDEX_BUFFER_SIZE:
 			case IT_DRAW_INDIRECT:
 			case IT_DRAW_INDEX_INDIRECT:
@@ -595,6 +608,12 @@ bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>*
 		return false;
 	}
 	return true;
+}
+
+void SetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint32_t hs_offchip_param) {
+	g_tf_ring_base.store(tf_ring_base, std::memory_order_relaxed);
+	g_hs_offchip_param.store(hs_offchip_param, std::memory_order_relaxed);
+	g_tf_ring_bytes.store(tf_ring_bytes, std::memory_order_release);
 }
 
 uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings) {
@@ -749,6 +768,15 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 
 	ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
 	ib.push_back(0u);
+
+	// The title's tessellation rings (SetTessellationRings), in the *_UMD registers user mode drivers own.
+	if (const uint32_t tf_bytes = g_tf_ring_bytes.load(std::memory_order_acquire); tf_bytes != 0) {
+		const uint64_t tf_base = g_tf_ring_base.load(std::memory_order_relaxed);
+		EmitSetUconfig(ib, 0x24e, (tf_bytes / 4u) & 0xffffu);                           // VGT_TF_RING_SIZE_UMD
+		EmitSetUconfig(ib, 0x24f, g_hs_offchip_param.load(std::memory_order_relaxed)); // VGT_HS_OFFCHIP_PARAM_UMD
+		EmitSetUconfig(ib, 0x250, static_cast<uint32_t>(tf_base >> 8u));               // VGT_TF_MEMORY_BASE_UMD
+		EmitSetUconfig(ib, 0x261, static_cast<uint32_t>(tf_base >> 40u) & 0xffu);      // VGT_TF_MEMORY_BASE_HI_UMD
+	}
 
 	// libSceAgc puts PIXEL_PIPE_STAT_CONTROL (event 0x38, EVENT_INDEX 1) into the context start state
 	// once; the title then only sends PIXEL_PIPE_STAT_DUMP (0x39). The control word enables all 16 RB
@@ -1018,6 +1046,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (IsRenderTargetRegister(off)) {
 			rt_dirty = true;
 		}
+		// The guest wrote CB_COLORn_INFO itself: its value is the target's own, so fix_display_dcc must
+		// not give it back the DCC it took from a video-out buffer drawn before. A target with the
+		// display's format and no DCC (My First Gran Turismo's replay image) has exactly the cleared
+		// value and was turned into a DCC target with no metadata: black, and CB faults at address 0.
+		if (off >= kCbColor0Info && off < kCbColor0Info + 8 * kCbColorStride && (off - kCbColor0Info) % kCbColorStride == 0) {
+			m_display_dcc_off &= ~(1u << ((off - kCbColor0Info) / kCbColorStride));
+		}
 	};
 	auto reg = [](const RegFile& regs, uint32_t off) -> uint32_t {
 		const uint32_t* v = regs.Find(off);
@@ -1285,12 +1320,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 	auto collect_refs = [&]() {
-		// VGT_SHADER_STAGES_EN.HS_EN: the title tessellates. On PS5 the kernel places the tess factor ring;
-		// here the ring is whatever the last amdgpu client programmed (see the journal).
+		// VGT_SHADER_STAGES_EN.HS_EN: the title tessellates. The preamble programs its tess factor ring
+		// (SetTessellationRings), which the GE writes, so it must be resident.
 		if (static std::atomic<bool> tess_logged {false};
 		    !m_compute_ring && (reg(cx, 0x2d5u) & 0x4u) != 0 && !tess_logged.exchange(true)) {
 			std::fprintf(stderr, "native shadow: the title draws with tessellation (VGT_SHADER_STAGES_EN 0x%08x)\n",
 			             reg(cx, 0x2d5u));
+		}
+		if (!m_compute_ring && (reg(cx, 0x2d5u) & 0x4u) != 0) {
+			add_ref(g_tf_ring_base.load(std::memory_order_relaxed), g_tf_ring_bytes.load(std::memory_order_relaxed), false);
 		}
 		if (m_lod_scan) {
 			scan_lod_banks();
@@ -1381,6 +1419,57 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		add_ref(base40(kDbHtileDataBase, kDbHtileBaseHi), kMetadataSpan, false);
 		for (uint64_t addr: bound_targets) {
 			targets[addr].draws++;
+		}
+		// A surface the draw uses at GPU address 0: the CB or DB writes page 0 (CB/DB faults in the
+		// journal). Logged once per kind with the registers that locate it.
+		if (!m_compute_ring) {
+			static std::mutex           zero_mutex;
+			static std::set<std::string> zero_seen;
+			auto note_zero = [&](const std::string& what) {
+				std::lock_guard<std::mutex> lock(zero_mutex);
+				if (zero_seen.size() < 32 && zero_seen.insert(what).second) {
+					std::fprintf(stderr, "native shadow: draw uses %s at GPU address 0 (CB_TARGET_MASK 0x%08x, DB_Z_INFO 0x%08x, "
+					             "DB_DEPTH_CONTROL 0x%08x)\n",
+					             what.c_str(), reg(cx, kCbTargetMask), reg(cx, kDbZInfo), reg(cx, 0x200u));
+				}
+			};
+			const uint32_t mask = reg(cx, kCbTargetMask);
+			for (uint32_t i = 0; i < 8; i++) {
+				const uint32_t step = i * kCbColorStride;
+				const uint32_t info = reg(cx, kCbColor0Info + step);
+				if (((info >> 2u) & 0x1fu) == 0 || ((mask >> (4u * i)) & 0xfu) == 0) {
+					continue;
+				}
+				const std::string slot = "MRT" + std::to_string(i);
+				if (base40(kCbColor0Base + step, kCbColor0BaseExt + i) == 0) {
+					note_zero(slot + " color (INFO " + std::to_string(info) + ")");
+				}
+				if ((info & (1u << 28u)) != 0 && base40(kCbColor0DccBase + step, kCbColor0DccExt + i) == 0) {
+					char what[160];
+					std::snprintf(what, sizeof(what), "%s DCC (target 0x%llx, INFO 0x%08x, PS 0x%llx)", slot.c_str(),
+					              static_cast<unsigned long long>(base40(kCbColor0Base + step, kCbColor0BaseExt + i)), info,
+					              static_cast<unsigned long long>((static_cast<uint64_t>(reg(sh, 0x008u)) << 8u) |
+					                                              (static_cast<uint64_t>(reg(sh, 0x009u) & 0xffu) << 40u)));
+					note_zero(what);
+				}
+				if ((info & (1u << 13u)) != 0 && base40(kCbColor0Cmask + step, kCbColor0CmaskExt + i) == 0) {
+					note_zero(slot + " CMASK");
+				}
+			}
+			const uint32_t zinfo = reg(cx, kDbZInfo);
+			const uint32_t dctl  = reg(cx, 0x200u);
+			if ((zinfo & 3u) != 0 && (dctl & 6u) != 0) {
+				if (base40(kDbZReadBase, kDbZReadBaseHi) == 0 || base40(kDbZReadBase + 2, kDbZReadBaseHi + 2) == 0) {
+					note_zero("depth");
+				}
+				if ((zinfo & (1u << 29u)) != 0 && base40(kDbHtileDataBase, kDbHtileBaseHi) == 0) {
+					note_zero("HTILE");
+				}
+			}
+			if ((reg(cx, kDbStencilInfo) & 1u) != 0 && (dctl & 1u) != 0 &&
+			    (base40(kDbZReadBase + 1, kDbZReadBaseHi + 1) == 0 || base40(kDbZReadBase + 3, kDbZReadBaseHi + 3) == 0)) {
+				note_zero("stencil");
+			}
 		}
 	};
 
@@ -1519,7 +1608,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		fix_fmask();
 		fix_display_dcc();
 		const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
-		if (m_inspect_ps != 0 && ps == m_inspect_ps && r.inspected.size() < 4) {
+		if (!m_inspect.empty() && m_inspect.count(ps) != 0 && r.inspected.size() < 4) {
 			DrawSnapshot snap;
 			snap.ps = ps;
 			snap.es = (static_cast<uint64_t>(reg(sh, 0x0C8)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x0C9)) << 40u);
@@ -1758,6 +1847,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				case IT_DRAW_INDEX_AUTO:
 				case IT_INDEX_BASE:
 				case IT_INDEX_BUFFER_SIZE:
+				case IT_SET_PREDICATION:
 				case IT_CONTEXT_CONTROL:
 				case IT_CLEAR_STATE:
 				case IT_NUM_INSTANCES:
@@ -2280,18 +2370,24 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (n == 0 || dst == 0) {
 						break;
 					}
-					// Not as WRITE_DATA (never run natively in this form): each dword as a label release in
-					// the barrier's form, at the end of the pipe instead of when the micro engine gets there,
-					// which only makes it later; Kyty used to write it later still.
-					const bool gpu = engine <= 1 && n <= 16 && label_gpu(dst, bytes);
+					// As the guest's WRITE_DATA, in order: the micro engine writes it when it gets there, and a
+					// dispatch right after reads it (My First Gran Turismo builds a dispatch's constants with
+					// WRITE_DATA, then dispatches). As end-of-pipe releases the data landed after that dispatch
+					// had read it, and longer writes went to the tracker, after the whole segment. The write is
+					// confirmed before the engine moves on; a compute ring has only the micro engine.
+					const bool gpu = engine <= 1 && label_gpu(dst, bytes);
 					if (gpu) {
-						for (uint32_t i = 0; i < n; i++) {
-							EmitRelease32(body, one_addr ? dst : dst + 4u * i, bptr[3 + i], m_compute_ring);
+						const size_t at = body.size();
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						body[at + 1] |= 1u << 20u; // WR_CONFIRM
+						if (m_compute_ring) {
+							body[at] |= 2u;                 // SHADER_TYPE compute
+							body[at + 1] &= ~(3u << 30u);   // ENGINE_SEL micro engine
 						}
 						mirror_store(dst, std::vector<uint32_t>(bptr + 3, bptr + 3 + n), one_addr);
 						stats.labels_native++;
 						seg_effects = true;
-						NoteOnce(6, "WRITE_DATA label (GPU store, mirrored to the CPU)");
+						NoteOnce(6, "WRITE_DATA label (native WRITE_DATA, mirrored to the CPU)");
 					}
 					// Two dwords at an 8-aligned address are one 64-bit label as far as a later
 					// WAIT_REG_MEM_64 is concerned (Agc's WaitOnAddress after a 64-bit WriteData: Dead
@@ -2345,6 +2441,32 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					        static_cast<uint64_t>(bptr[0]) * 4u, false, true);
 				}
 				break;
+			case IT_SET_PREDICATION: {
+				// Draws that follow run or not by the result of an occlusion or primitive-count query at
+				// the address. libSceAgc writes the gfx10 form (flags, address low, address high) or the
+				// older one (address low, flags with address bits 39:32), as Kyty's CpOpSetPredication
+				// tells them apart; the native IB always gets the gfx10 form.
+				if (body_count < 2) {
+					return fail(op, dw);
+				}
+				constexpr uint32_t kFlagsMask = 0x00071100u; // PRED_BOOL, HINT, PRED_OP
+				uint32_t           flags      = 0;
+				uint64_t           addr       = 0;
+				if (body_count >= 3 && (bptr[0] & ~kFlagsMask) == 0 && bptr[2] <= 0xffffu) {
+					flags = bptr[0];
+					addr  = (static_cast<uint64_t>(bptr[2]) << 32u) | (bptr[1] & 0xfffffff0u);
+				} else {
+					flags = bptr[1] & kFlagsMask;
+					addr  = (bptr[0] & 0xfffffff0u) | (static_cast<uint64_t>(bptr[1] & 0xffu) << 32u);
+				}
+				body.push_back(Pkt3(IT_SET_PREDICATION, 3, false));
+				body.push_back(flags);
+				body.push_back(static_cast<uint32_t>(addr));
+				body.push_back(static_cast<uint32_t>(addr >> 32u));
+				add_ref(addr, 64u, false);
+				NoteOnce(18, "SET_PREDICATION (draws predicated on a query result)");
+				break;
+			}
 			case IT_INDEX_BASE: // the index buffer for draws that do not carry their own
 				if (body_count < 2) {
 					return fail(op, dw);
@@ -2516,6 +2638,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			case IT_DISPATCH_DIRECT:
 				log_draw(op, body_count >= 1 ? bptr[0] : 0, 0, true);
+				// KYTY_NATIVE_GPU_INSPECT_PS names a compute shader too: its user data, as for a draw.
+				if (const uint64_t cs = (static_cast<uint64_t>(reg(sh, 0x20Cu)) << 8u) |
+				                        (static_cast<uint64_t>(reg(sh, 0x20Du) & 0xffu) << 40u);
+				    !m_inspect.empty() && m_inspect.count(cs) != 0 && r.inspected.size() < 4) {
+					DrawSnapshot snap;
+					snap.ps = cs;
+					for (uint32_t i = 0; i < 16; i++) {
+						snap.ps_user_data[i] = reg(sh, 0x240u + i);
+					}
+					r.inspected.push_back(snap);
+				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				if (m_compute_ring) {
 					body[body.size() - size] |= 2u;

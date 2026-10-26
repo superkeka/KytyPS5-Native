@@ -223,7 +223,7 @@ struct RenderTargetInfo {
 	uint32_t draws   = 0; // draws in the DCB with this target bound
 };
 
-// User data of a draw whose pixel shader is under inspection (SetInspectedPixelShader).
+// User data of a draw or dispatch whose shader is under inspection (SetInspectedShaders).
 struct DrawSnapshot {
 	uint64_t ps = 0;
 	uint64_t es = 0;
@@ -364,6 +364,12 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 // AMDGPU_INFO_HW_IP_INFO bitmask. Returns one of its set bits; queues spread across the rings the
 // kernel exposes. No bit set: 0.
 uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings);
+
+// The tessellation rings the title gave libSceAgcDriver (sceAgcDriverSetTFRing and
+// sceAgcDriverSetHsOffchipParam), which the PS5 driver programs. Here every gfx IB's preamble writes
+// them: the registers are global, and other processes on this ring program their own in between.
+// Without them the GE writes tess factors at GPU address 0, faults, and the gfx ring hangs.
+void SetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint32_t hs_offchip_param);
 
 // The native GPU waits put into IBs most recently (EmitNativeWait), for draining the rings when the
 // process is told to stop: a ring stuck on a WAIT_REG_MEM whose writer will never be submitted cannot be
@@ -692,7 +698,7 @@ public:
 	}
 
 	// Draws with this pixel shader are reported in Pm4TranslateResult::inspected (0: none).
-	void SetInspectedPixelShader(uint64_t ps) { m_inspect_ps = ps; }
+	void SetInspectedShaders(std::set<uint64_t> shaders) { m_inspect = std::move(shaders); }
 
 	// UCONFIG registers the backend is allowed to write. Everything else is dropped, because one
 	// experiment writing other UCONFIG registers froze the whole board (see the probe README).
@@ -731,7 +737,7 @@ private:
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;
-	uint64_t                     m_inspect_ps = 0;
+	std::set<uint64_t>           m_inspect; // KYTY_NATIVE_GPU_INSPECT_PS: pixel or compute shaders
 	bool                         m_compact_refs = false;
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;

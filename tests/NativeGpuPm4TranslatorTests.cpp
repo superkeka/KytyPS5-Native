@@ -50,6 +50,7 @@ constexpr uint32_t IT_ACQUIRE_MEM              = 0x58;
 constexpr uint32_t IT_SET_SH_REG_INDIRECT      = 0x63;
 constexpr uint32_t IT_SET_UCONFIG_REG_INDIRECT = 0x64;
 constexpr uint32_t IT_SET_CONTEXT_REG          = 0x69;
+constexpr uint32_t IT_DRAW_INDEX_AUTO          = 0x2d;
 constexpr uint32_t IT_SET_SH_REG               = 0x76;
 constexpr uint32_t IT_SET_UCONFIG_REG          = 0x79;
 constexpr uint32_t IT_WRITE_DATA               = 0x37;
@@ -867,6 +868,59 @@ void AppendWait(std::vector<uint32_t>& dcb, uint64_t addr, uint32_t ref) {
 	       false);
 }
 
+void TestDisplayDccRestore() {
+	// A draw into a video-out buffer loses DCC; a later target with the same format that has no DCC
+	// of its own keeps its INFO as the guest wrote it.
+	Pm4Translator t;
+	t.AddDisplayRange(0x200000000ull, 0x2000000ull);
+	constexpr uint32_t kInfoDcc = 0x10008024u;
+	constexpr uint32_t kInfo    = 0x00008024u;
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x02000000u}, false); // CB_COLOR0_BASE: the display buffer
+	Append(dcb, IT_SET_CONTEXT_REG, {0x31cu, kInfoDcc}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x08eu, 0xfu}, false);
+	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x122f7a00u}, false); // another target, no DCC
+	Append(dcb, IT_SET_CONTEXT_REG, {0x31cu, kInfo}, false);
+	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+	const auto r = t.Translate(dcb);
+	std::vector<uint32_t> infos;
+	for (const auto& p: Decode(r.ib)) {
+		if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && (p.body[0] & 0xffffu) == 0x31cu) {
+			infos.push_back(p.body[1]);
+		}
+	}
+	Check(r.ok && !infos.empty() && infos.back() == kInfo, "the second target's own INFO is kept without DCC");
+	Check(std::find(infos.begin(), infos.end(), kInfoDcc) == infos.end(), "DCC is never turned on for it");
+}
+
+void TestSetPredication() {
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	Pm4Translator t;
+	// The gfx10 form passes as it is; the older one (address low, flags with address bits 39:32) is
+	// rewritten into it.
+	std::vector<uint32_t> dcb;
+	Append(dcb, 0x20u, {(2u << 16u) | (1u << 8u), 0x00345670u, 0x12u}, false);
+	Append(dcb, 0x20u, {0x00345680u, (3u << 16u) | 0x12u}, false);
+	const auto r = t.Translate(dcb);
+	std::vector<const Packet*> preds;
+	const auto                 pkts = Decode(r.ib);
+	for (const auto& p: pkts) {
+		if (p.op == 0x20u) {
+			preds.push_back(&p);
+		}
+	}
+	Check(r.ok && preds.size() == 2, "SET_PREDICATION translated");
+	Check(preds[0]->body == std::vector<uint32_t>({(2u << 16u) | (1u << 8u), 0x00345670u, 0x12u}), "gfx10 form kept");
+	Check(preds[1]->body == std::vector<uint32_t>({3u << 16u, 0x00345680u, 0x12u}), "older form rewritten");
+	Check(ValidateNativeIb(r.ib, false), "it passes the gfx packet check");
+	Pm4Translator c;
+	c.SetComputeRing(true);
+	std::vector<uint32_t> acb;
+	Append(acb, 0x20u, {2u << 16u, 0x1000u, 0u}, true);
+	Check(!c.Translate(acb).ok, "not on a compute ring");
+}
+
 void TestLabelsWriteData() {
 	Pm4Translator t;
 	TestOracle    o;
@@ -876,9 +930,11 @@ void TestLabelsWriteData() {
 	Append(dcb, IT_WRITE_DATA, {5u << 8u, 0x02000100u, 0x2u, 7u}, false);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.segments.size() == 1 && !r.segments[0].held, "one segment, not held");
-	const auto pkts = Decode(r.ib);
-	Check(FindFirst(pkts, IT_WRITE_DATA) == nullptr && HasLabelRelease(pkts, 0x202000100ull, 7u),
-	      "the label WRITE_DATA runs on the GPU as a release in the barrier's form");
+	const auto  pkts = Decode(r.ib);
+	const auto* wd   = FindFirst(pkts, IT_WRITE_DATA);
+	Check(wd != nullptr && wd->body.size() == 4 && wd->body[1] == 0x02000100u && wd->body[3] == 7u &&
+	          (wd->body[0] & (1u << 20u)) != 0,
+	      "the label WRITE_DATA runs on the GPU as the guest's WRITE_DATA, in order, write confirmed");
 	const auto& s = r.segments[0];
 	Check(s.points.size() == 2 && s.points[0].kind == TrackerPoint::Kind::CpuWrite && s.points[0].mirror &&
 	          s.points[0].data.size() == 1 && s.points[0].data[0] == 7u && s.points[1].kind == TrackerPoint::Kind::End &&
@@ -888,6 +944,29 @@ void TestLabelsWriteData() {
 	      "the write is reported as a GPU label write");
 	Check(s.begin == 0 && s.end == r.ib.size() && IbAligned(r.ib), "the segment spans the aligned IB");
 	Check(r.stats.labels_native == 1 && r.cpu_tail.empty(), "native label counted, nothing left for Kyty");
+
+	// A long WRITE_DATA (a dispatch's constants) stays one in-order GPU write, and on a compute ring
+	// it is a compute packet on the micro engine.
+	{
+		Pm4Translator tc;
+		TestOracle    oc;
+		tc.SetNativeLabels(&oc, kTrackerVa);
+		tc.SetComputeRing(true);
+		std::vector<uint32_t> body = {(5u << 8u) | (1u << 30u), 0x02000400u, 0x2u};
+		for (uint32_t i = 0; i < 40; i++) {
+			body.push_back(i);
+		}
+		std::vector<uint32_t> acb;
+		Append(acb, IT_WRITE_DATA, body, true);
+		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+		const auto rl    = tc.Translate(acb);
+		const auto pl    = Decode(rl.ib);
+		const auto* lw   = FindFirst(pl, IT_WRITE_DATA);
+		const auto* disp = FindFirst(pl, IT_DISPATCH_DIRECT);
+		Check(rl.ok && lw != nullptr && lw->compute && lw->body.size() == 43 && lw->body[42] == 39u &&
+		          (lw->body[0] >> 30u) == 0u && disp != nullptr && lw < disp,
+		      "a 40-dword WRITE_DATA on a compute ring is one ME WRITE_DATA ahead of the dispatch");
+	}
 
 	// Memory the GPU cannot write: the tracker writes it.
 	o.unwritable = 0x202000200ull;
@@ -1153,7 +1232,9 @@ void TestValidateNativeIb() {
 		o.plan = plan;
 		auto r = t.Translate(dcb);
 		Check(r.ok && ValidateNativeIb(r.ib, false), "the native-labels IB passes the packet check");
-		Check(FindFirst(Decode(r.ib), IT_WRITE_DATA) == nullptr && FindFirst(Decode(r.ib), 0x93u) == nullptr, "no guest forms in it");
+		const auto* wd = FindFirst(Decode(r.ib), IT_WRITE_DATA);
+		Check((wd == nullptr || (wd->body[0] & (1u << 20u)) != 0) && FindFirst(Decode(r.ib), 0x93u) == nullptr,
+		      "no guest forms in it but a write-confirmed WRITE_DATA");
 	}
 
 	auto rejects = [&](std::vector<uint32_t> ib, const char* what) {
@@ -1164,7 +1245,8 @@ void TestValidateNativeIb() {
 		Check(!ValidateNativeIb(ib, false, &bad) && bad == 0u, what);
 	};
 	rejects({0xc0079300u, 0x13u, 0u, 0u, 1u, 0u, ~0u, 0u, 4u}, "WAIT_REG_MEM_64 rejected");
-	rejects({0xc0033700u, 0x100200u, 0x1000u, 0u, 1u}, "WRITE_DATA rejected");
+	rejects({0xc0033700u, 0x200u, 0x1000u, 0u, 1u}, "WRITE_DATA without write confirm rejected");
+	rejects({0xc0033700u, 0x100000u, 0x1000u, 0u, 1u}, "WRITE_DATA to a register rejected");
 	rejects({0xc0064902u, kFlushEvent, 1u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "RELEASE_MEM with the compute bit rejected");
 	rejects({0xc0064900u, 0x528u, 2u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "a guest-form RELEASE_MEM rejected");
 	rejects({0xc0064900u, kFlushEvent, (1u << 29u) | (2u << 24u), 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM interrupt rejected");
@@ -1177,6 +1259,12 @@ void TestValidateNativeIb() {
 	Check(ValidateNativeIb(lod, true), "GET_LOD_STATS passes when enabled");
 	std::vector<uint32_t> gds = {0xc0064900u, 0x2fu | (6u << 8u), 5u << 29u, 0x1000u, 2u, 0xc64u, 0u, 0u};
 	Check(ValidateNativeIb(gds, false), "a GDS release as always run passes");
+	std::vector<uint32_t> wd = {0xc0033700u, 0x100500u, 0x1000u, 0u, 1u, 0xffff1000u, 0xffff1000u, 0xffff1000u};
+	Check(ValidateNativeIb(wd, false), "a write-confirmed WRITE_DATA to memory passes");
+	uint32_t bad = ~0u;
+	Check(!ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "on a compute ring it needs the compute bit");
+	wd[0] = 0xc0033702u;
+	Check(ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "with it, it passes there");
 }
 
 void TestComputeRingPackets() {
@@ -1695,6 +1783,8 @@ int main() {
 	TestUconfigIndexPassthrough();
 	TestUconfigIndexedRegisters();
 	TestWriteData();
+	TestSetPredication();
+	TestDisplayDccRestore();
 	TestPs5Defaults();
 	TestWaitRegMemDropped();
 	TestDmaData();
