@@ -49,8 +49,11 @@ public:
 		                         KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE |
 		                         KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
 		if (cu == 0 || cwsr == 0 || !q->Alloc(&q->m_ring, va, kRingBytes, gtt) || !q->Alloc(&q->m_ptrs, va + 0x100000, 4096, gtt) ||
+		    // The CP's fetcher reaches the EOP buffer with execute permission (an end-of-pipe RELEASE_MEM
+		    // without it is a permission fault on the queue's VMID).
 		    !q->Alloc(&q->m_eop, va + 0x200000, 4096,
-		              KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE) ||
+		              KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
+		                  KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE) ||
 		    !q->Alloc(&q->m_save, va + 0x1000000, save, gtt)) {
 			std::fprintf(stderr, "KfdQueue: buffers for a queue failed (%u CUs, cwsr %u)\n", cu, cwsr);
 			delete q;
