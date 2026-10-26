@@ -335,6 +335,10 @@ struct Pm4Segment {
 // Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
 void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len);
 
+// Cuts `ib` at packet boundaries into consecutive pieces (offset, length in dwords) of at most
+// `max_dw` dwords each. Empty when a single packet is longer than that.
+std::vector<std::pair<size_t, size_t>> SplitIbAtPackets(std::span<const uint32_t> ib, size_t max_dw);
+
 // Which ring an IB is about to be submitted to. Compute allows the same RELEASE_MEM / WAIT_REG_MEM
 // bodies as the gfx ring, with the shader-type bit set, and rejects graphics-only packets (a draw or
 // PFP_SYNC_ME on MEC is an illegal opcode).

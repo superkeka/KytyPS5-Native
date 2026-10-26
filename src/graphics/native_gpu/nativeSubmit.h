@@ -3,6 +3,7 @@
 
 #include "graphics/native_gpu/gemBacking.h" // KYTY_GEM_BACKING_SUPPORTED + amdgpu uAPI headers
 #include "graphics/native_gpu/nativeKfd.h"
+#include "graphics/native_gpu/nativePm4.h"
 
 // Submits a translated IB to the amdgpu gfx ring for the BC-250 native backend, on the same DRM
 // file whose GPU VM holds the guest memory bindings (GemBacking::DrmFd()). Only real Linux with the
@@ -214,19 +215,44 @@ public:
 	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
 	              double timeout_sec, RingTarget target = {}) {
 		Result res;
-		const uint32_t slot = m_async ? PickSlot(target) : 0;
-		if (ib.size() * 4 > (m_async ? kSlotSize : kIbSize - kScratchSize)) {
+		// An IB longer than a slot (a level load's DCB carries megabytes of inline data) is cut at
+		// packet boundaries into several IBs of one CS, each in a slot of its own and padded to 8
+		// dwords: the kernel runs a job's IBs back to back with the state carried over, which is what
+		// the CP does with the one buffer (an INDIRECT_BUFFER packet holds at most 2^20 dwords, so a
+		// long IB could not be one anyway).
+		const uint64_t                         room = m_async ? kSlotSize : kIbSize - kScratchSize;
+		std::vector<std::pair<size_t, size_t>> parts;
+		if (ib.size() * 4 <= room) {
+			parts.emplace_back(0, ib.size());
+		} else if (m_async) {
+			parts = SplitIbAtPackets(ib, room / 4 - 8);
+		}
+		if (parts.empty() || parts.size() > kSlots || (parts.size() > 1 && Queue(target) != nullptr)) {
 			res.err = -E2BIG;
 			return res;
 		}
-		if (m_async && m_slot[slot].seq != 0) {
-			if (!WaitSeq(m_slot[slot].seq, timeout_sec, m_slot[slot].target)) {
-				res.timed_out = true;
-				return res;
+		std::vector<uint32_t> slots;
+		uint32_t              taken = 0;
+		for (const auto& [at, len]: parts) {
+			const uint32_t slot = m_async ? PickSlot(target, taken) : 0;
+			taken |= 1u << slot;
+			if (m_async && m_slot[slot].seq != 0) {
+				if (!WaitSeq(m_slot[slot].seq, timeout_sec, m_slot[slot].target)) {
+					res.timed_out = true;
+					return res;
+				}
+				m_slot[slot].seq = 0;
 			}
-			m_slot[slot].seq = 0;
+			auto* dst = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize);
+			std::memcpy(dst, ib.data() + at, len * 4);
+			size_t padded = len;
+			while (parts.size() > 1 && (padded & 7u) != 0) {
+				dst[padded++] = 0xffff1000u;
+			}
+			slots.push_back(slot);
+			parts[slots.size() - 1].second = padded;
 		}
-		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
+		const uint32_t slot = slots[0];
 		__sync_synchronize();
 
 		if (std::getenv("KYTY_NATIVE_GPU_KFD_TRACE") != nullptr && m_trace_submits < 24) {
@@ -277,30 +303,36 @@ public:
 		list.bo_info_size = sizeof(entries[0]);
 		list.bo_info_ptr  = reinterpret_cast<uintptr_t>(entries.data());
 
-		struct drm_amdgpu_cs_chunk_ib ib_info;
-		std::memset(&ib_info, 0, sizeof(ib_info));
-		ib_info.va_start = m_ib_va + slot * kSlotSize;
-		ib_info.ib_bytes = static_cast<uint32_t>(ib.size() * 4);
-		ib_info.ip_type     = target.ip_type;
-		ib_info.ip_instance = 0;
-		ib_info.ring        = target.ring;
-
-		struct drm_amdgpu_cs_chunk chunks[2];
-		std::memset(chunks, 0, sizeof(chunks));
-		chunks[0].chunk_id   = AMDGPU_CHUNK_ID_IB;
-		chunks[0].length_dw  = sizeof(ib_info) / 4;
-		chunks[0].chunk_data = reinterpret_cast<uintptr_t>(&ib_info);
-		chunks[1].chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES;
-		chunks[1].length_dw  = sizeof(list) / 4;
-		chunks[1].chunk_data = reinterpret_cast<uintptr_t>(&list);
-		uint64_t chunk_ptrs[2] = {reinterpret_cast<uintptr_t>(&chunks[0]),
-		                          reinterpret_cast<uintptr_t>(&chunks[1])};
+		std::vector<drm_amdgpu_cs_chunk_ib> ib_infos(parts.size());
+		std::vector<drm_amdgpu_cs_chunk>    chunks(parts.size() + 1);
+		std::vector<uint64_t>               chunk_ptrs(parts.size() + 1);
+		for (size_t k = 0; k < parts.size(); k++) {
+			auto& info = ib_infos[k];
+			std::memset(&info, 0, sizeof(info));
+			info.va_start    = m_ib_va + slots[k] * kSlotSize;
+			info.ib_bytes    = static_cast<uint32_t>(parts[k].second * 4);
+			info.ip_type     = target.ip_type;
+			info.ip_instance = 0;
+			info.ring        = target.ring;
+			std::memset(&chunks[k], 0, sizeof(chunks[k]));
+			chunks[k].chunk_id   = AMDGPU_CHUNK_ID_IB;
+			chunks[k].length_dw  = sizeof(info) / 4;
+			chunks[k].chunk_data = reinterpret_cast<uintptr_t>(&info);
+		}
+		auto& bo_chunk = chunks.back();
+		std::memset(&bo_chunk, 0, sizeof(bo_chunk));
+		bo_chunk.chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES;
+		bo_chunk.length_dw  = sizeof(list) / 4;
+		bo_chunk.chunk_data = reinterpret_cast<uintptr_t>(&list);
+		for (size_t k = 0; k < chunks.size(); k++) {
+			chunk_ptrs[k] = reinterpret_cast<uintptr_t>(&chunks[k]);
+		}
 
 		union drm_amdgpu_cs cs;
 		std::memset(&cs, 0, sizeof(cs));
 		cs.in.ctx_id     = m_ctx;
-		cs.in.num_chunks = 2;
-		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs);
+		cs.in.num_chunks = static_cast<uint32_t>(chunks.size());
+		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs.data());
 
 		const double t0 = NowSec();
 		// userptr BOs (the external ranges outside direct memory) are revalidated against
@@ -325,9 +357,11 @@ public:
 		res.submitted      = true;
 		const uint64_t seq = cs.out.handle;
 		if (m_async) {
-			m_slot[slot].seq    = seq;
-			m_slot[slot].target = target;
-			m_slot[slot].order  = ++m_slot_order;
+			for (const uint32_t used: slots) {
+				m_slot[used].seq    = seq;
+				m_slot[used].target = target;
+				m_slot[used].order  = ++m_slot_order;
+			}
 			res.completed    = true;
 			res.seq          = seq;
 			res.seconds      = NowSec() - t0;
@@ -618,25 +652,29 @@ private:
 	// A free slot, or one whose submission has finished; failing that the oldest slot of `target`'s
 	// own ring, so a compute ring parked on a WAIT_REG_MEM never holds up the submission that would
 	// release it (with shared round-robin slots, that is a deadlock). Only then the oldest overall.
-	uint32_t PickSlot(RingTarget target) {
+	// Slots in the `taken` mask are skipped (the other IBs of the same CS).
+	uint32_t PickSlot(RingTarget target, uint32_t taken = 0) {
 		for (uint32_t i = 0; i < kSlots; i++) {
-			if (m_slot[i].seq == 0) {
+			if ((taken & (1u << i)) == 0 && m_slot[i].seq == 0) {
 				return i;
 			}
 		}
 		for (uint32_t i = 0; i < kSlots; i++) {
-			if (WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target)) {
+			if ((taken & (1u << i)) == 0 && WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target)) {
 				m_slot[i].seq = 0;
 				return i;
 			}
 		}
-		uint32_t own = kSlots, any = 0;
+		uint32_t own = kSlots, any = kSlots;
 		for (uint32_t i = 0; i < kSlots; i++) {
+			if ((taken & (1u << i)) != 0) {
+				continue;
+			}
 			const bool same = m_slot[i].target.ip_type == target.ip_type && m_slot[i].target.ring == target.ring;
 			if (same && (own == kSlots || m_slot[i].order < m_slot[own].order)) {
 				own = i;
 			}
-			if (m_slot[i].order < m_slot[any].order) {
+			if (any == kSlots || m_slot[i].order < m_slot[any].order) {
 				any = i;
 			}
 		}

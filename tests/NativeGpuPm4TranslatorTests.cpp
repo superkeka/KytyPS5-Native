@@ -1510,6 +1510,21 @@ void TestPlanRingWait() {
 	      "a gfx write that does not satisfy keeps the segment held");
 }
 
+void TestSplitIbAtPackets() {
+	using Libs::Graphics::NativeGpu::SplitIbAtPackets;
+	std::vector<uint32_t> ib;
+	Append(ib, IT_SET_CONTEXT_REG, {0x318u, 1u, 2u, 3u}, false); // 5 dwords
+	ib.push_back(0xffff1000u);                                   // 1-dword filler
+	Append(ib, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);              // 3 dwords
+	Append(ib, IT_SET_CONTEXT_REG, {0x31cu, 4u}, false);          // 3 dwords
+	const auto pieces = SplitIbAtPackets(ib, 5);
+	Check(pieces.size() == 3 && pieces[0] == std::make_pair<size_t, size_t>(0, 5) &&
+	          pieces[1] == std::make_pair<size_t, size_t>(5, 4) && pieces[2] == std::make_pair<size_t, size_t>(9, 3),
+	      "an IB is cut only between packets, fillers count as one dword");
+	Check(SplitIbAtPackets(ib, 64).size() == 1, "a short IB stays whole");
+	Check(SplitIbAtPackets(ib, 4).empty(), "a packet longer than a piece cannot be cut");
+}
+
 void TestComputeRingForQueue() {
 	Check(ComputeRingForQueue(0x20, 0x5u) == 0u && ComputeRingForQueue(0x21, 0x5u) == 2u &&
 	          ComputeRingForQueue(0x22, 0x5u) == 0u,
@@ -1829,6 +1844,7 @@ int main() {
 	TestGpuTimestamp();
 	TestPlanRingWait();
 	TestComputeRingForQueue();
+	TestSplitIbAtPackets();
 	TestFlattenIndirectBuffers();
 	TestLodBankScan();
 	TestLodUsageReport();

@@ -616,6 +616,29 @@ void SetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint32_
 	g_tf_ring_bytes.store(tf_ring_bytes, std::memory_order_release);
 }
 
+std::vector<std::pair<size_t, size_t>> SplitIbAtPackets(std::span<const uint32_t> ib, size_t max_dw) {
+	std::vector<std::pair<size_t, size_t>> pieces;
+	size_t                                 start = 0;
+	size_t                                 dw    = 0;
+	while (dw < ib.size()) {
+		const uint32_t h = ib[dw];
+		// A type-3 header with count 0x3fff is the one-dword filler NOP; type-2 packets are one dword.
+		const size_t len = (h >> 30u) == 3u && h != 0xffff1000u ? ((h >> 16u) & 0x3fffu) + 2u : 1u;
+		if (len > max_dw) {
+			return {};
+		}
+		if (dw + len - start > max_dw) {
+			pieces.emplace_back(start, dw - start);
+			start = dw;
+		}
+		dw += len;
+	}
+	if (dw > start) {
+		pieces.emplace_back(start, std::min(dw, ib.size()) - start);
+	}
+	return pieces;
+}
+
 uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings) {
 	uint32_t rings[32];
 	uint32_t n = 0;
