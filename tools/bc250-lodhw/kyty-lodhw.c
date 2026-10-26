@@ -26,6 +26,16 @@
 //      register afterwards (one entry) or how many entries changed (all). The old value is kept.
 //   op 8: restore golden entry `size` (all with 0xffffffff) to the value it had before op 7.
 //   op 9: golden entry `size`: status -ENOENT past the end; value = its register; `va` unused.
+//   Op 7 with `va` 1 also restores what it applied when this client disconnects.
+// Banked and masked writes for the PS5 per-VMID, per-pipe and per-queue state (ops 10-13). `sel` is
+// GRBM_GFX_CNTL's layout, PIPEID[1:0] MEID[3:2] VMID[7:4] QUEUEID[10:8], plus bit 11 to select at all:
+//   op 10 | sel << 8: register `size` = (reg & ~mask) | (value & mask), `va` = value | mask << 32, if
+//      kBanked (or, unselected, kWritable or the golden table) allows it for that selection; value =
+//      read back. The first old value per register and selection is kept and put back by op 11 or
+//      when the client disconnects.
+//   op 11 | sel << 8: restore register `size` (all of this client's with 0xffffffff); value = count.
+//   op 12 | sel << 8: read register `size` with that selection.
+//   op 13 | pasid << 8: value = the gfx VMID (1-7) the kernel last gave `pasid`; -ESRCH if none.
 // Build: cc -O2 -pthread -o kyty-lodhw kyty-lodhw.c. Run as root: kyty-lodhw [socket path] [socket group gid]
 
 #define _GNU_SOURCE
@@ -76,6 +86,35 @@ static const struct {
     {0x1260 + 0x20bf, "GDS_VMID15_SIZE"},
 };
 
+// Registers ops 10-12 select through GRBM_GFX_CNTL: what the PS5 kernel programs per VMID (the game's
+// VMIDs here: the gfx VMID amdgpu gives the VM, KFD's 8-15), per gfx pipe and per compute queue, and
+// the global ones that go with them.
+enum { kGlobal, kVmid, kGfxPipe, kHqd };
+enum { kSel = 1u << 11, kSavedMax = 256 };
+static const struct {
+	uint32_t    reg;
+	int         bank;
+	const char* name;
+} kBanked[] = {
+    {0x1260 + 0x100d, kGfxPipe, "GFX_PIPE_CONTROL"},
+    {0x1260 + 0x10aa, kVmid, "SH_MEM_BASES"},
+    {0x1260 + 0x11df, kVmid, "SPI_USER_ACCUM_VMID_CNTL"},
+    {0x1260 + 0x11ef, kGlobal, "SPI_CONFIG_CNTL_1"},
+    {0x1260 + 0x1fad, kHqd, "CP_HQD_PERSISTENT_STATE"},
+    {0x1260 + 0x1fba, kHqd, "CP_HQD_PQ_CONTROL"},
+    {0x1260 + 0x1fdb, kHqd, "CP_HQD_GDS_RESOURCE_STATE"},
+    // GWS and OA of KFD's VMIDs, which amdgpu leaves empty (the PS5 title's VMID has 32 and 8).
+    {0x1260 + 0x20c8, kGlobal, "GDS_GWS_VMID8"},  {0x1260 + 0x20c9, kGlobal, "GDS_GWS_VMID9"},
+    {0x1260 + 0x20ca, kGlobal, "GDS_GWS_VMID10"}, {0x1260 + 0x20cb, kGlobal, "GDS_GWS_VMID11"},
+    {0x1260 + 0x20cc, kGlobal, "GDS_GWS_VMID12"}, {0x1260 + 0x20cd, kGlobal, "GDS_GWS_VMID13"},
+    {0x1260 + 0x20ce, kGlobal, "GDS_GWS_VMID14"}, {0x1260 + 0x20cf, kGlobal, "GDS_GWS_VMID15"},
+    {0x1260 + 0x20d8, kGlobal, "GDS_OA_VMID8"},   {0x1260 + 0x20d9, kGlobal, "GDS_OA_VMID9"},
+    {0x1260 + 0x20da, kGlobal, "GDS_OA_VMID10"},  {0x1260 + 0x20db, kGlobal, "GDS_OA_VMID11"},
+    {0x1260 + 0x20dc, kGlobal, "GDS_OA_VMID12"},  {0x1260 + 0x20dd, kGlobal, "GDS_OA_VMID13"},
+    {0x1260 + 0x20de, kGlobal, "GDS_OA_VMID14"},  {0x1260 + 0x20df, kGlobal, "GDS_OA_VMID15"},
+};
+enum { kHqdActive = 0x1260 + 0x1fab, kHqdVmid = 0x1260 + 0x1fac };
+
 // CP jump table access (GC segment 1 is 0xA000): {address register, data register} per engine.
 static const uint32_t kJt[3][2] = {{0xA000 + 0x5814, 0xA000 + 0x5815}, {0xA000 + 0x5816, 0xA000 + 0x5817},
                                    {0xA000 + 0x5818, 0xA000 + 0x5819}};
@@ -84,6 +123,8 @@ static pthread_mutex_t g_hw = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t Rd(uint32_t reg);
 static int      Wr(uint32_t reg, uint32_t v);
+static uint32_t RdSel(uint32_t reg, uint32_t sel);
+static int      WrSel(uint32_t reg, uint32_t sel, uint32_t v);
 
 #define kGoldenPath "/etc/kyty/ps5-golden.conf"
 static struct Golden {
@@ -140,17 +181,31 @@ static void RestoreGolden(struct Golden* e) {
 
 static int g_regs = -1;
 
-static uint32_t Rd(uint32_t reg) {
+// amdgpu_regs takes a GRBM_GFX_CNTL selection in the file offset (bit 61; ME [33:24], PIPE [43:34],
+// QUEUE [53:44], VMID [58:54]), applies it under srbm_mutex and selects 0 again afterwards.
+static off_t Off(uint32_t reg, uint32_t sel) {
+	uint64_t o = (uint64_t)reg * 4;
+	if ((sel & kSel) != 0) {
+		o |= 1ull << 61 | (uint64_t)((sel >> 2) & 3u) << 24 | (uint64_t)(sel & 3u) << 34 | (uint64_t)((sel >> 8) & 7u) << 44 |
+		     (uint64_t)((sel >> 4) & 0xfu) << 54;
+	}
+	return (off_t)o;
+}
+
+static uint32_t RdSel(uint32_t reg, uint32_t sel) {
 	uint32_t v = 0;
-	if (pread(g_regs, &v, 4, (off_t)reg * 4) != 4) {
+	if (pread(g_regs, &v, 4, Off(reg, sel)) != 4) {
 		return 0xffffffffu;
 	}
 	return v;
 }
 
-static int Wr(uint32_t reg, uint32_t v) {
-	return pwrite(g_regs, &v, 4, (off_t)reg * 4) == 4 ? 0 : -errno;
+static int WrSel(uint32_t reg, uint32_t sel, uint32_t v) {
+	return pwrite(g_regs, &v, 4, Off(reg, sel)) == 4 ? 0 : -errno;
 }
+
+static uint32_t Rd(uint32_t reg) { return RdSel(reg, 0); }
+static int      Wr(uint32_t reg, uint32_t v) { return WrSel(reg, 0, v); }
 
 static double Now(void) {
 	struct timespec ts;
@@ -206,10 +261,56 @@ static const char* WritableName(uint32_t reg) {
 	return NULL;
 }
 
+// The name op 10 writes `reg` under for selection `sel`, or NULL when it may not: banked registers only
+// with a selection their bank has (a compute queue only while it is KFD's, active in VMID 8-15), the
+// others only unselected.
+static const char* BankedName(uint32_t reg, uint32_t sel) {
+	const uint32_t pipe = sel & 3u, me = (sel >> 2) & 3u, vmid = (sel >> 4) & 0xfu, queue = (sel >> 8) & 7u;
+	if (sel >= 2 * kSel) {
+		return NULL;
+	}
+	for (size_t i = 0; i < sizeof(kBanked) / sizeof(kBanked[0]); i++) {
+		if (kBanked[i].reg != reg) {
+			continue;
+		}
+		switch (kBanked[i].bank) {
+			case kGlobal: return sel == 0 ? kBanked[i].name : NULL;
+			case kVmid: return (sel & kSel) != 0 && pipe == 0 && me == 0 && queue == 0 && vmid != 0 ? kBanked[i].name : NULL;
+			case kGfxPipe: return (sel & kSel) != 0 && pipe < 2 && me == 0 && queue == 0 && vmid == 0 ? kBanked[i].name : NULL;
+			default:
+				return (sel & kSel) != 0 && (me == 1 || me == 2) && vmid == 0 && (RdSel(kHqdActive, sel) & 1u) != 0 &&
+				               (RdSel(kHqdVmid, sel) & 0xfu) >= 8
+				           ? kBanked[i].name
+				           : NULL;
+		}
+	}
+	return sel == 0 ? WritableName(reg) : NULL;
+}
+
+struct Saved {
+	uint32_t reg, sel, old, set;
+};
+
+// Puts one op 10 write back, unless it went to a compute queue that is no longer mapped (its next
+// mapping loads the queue's MQD anyway). The value found first shows whether something rewrote it.
+static void RestoreSaved(const struct Saved* e) {
+	const char*    name = BankedName(e->reg, e->sel);
+	const uint32_t cur  = RdSel(e->reg, e->sel);
+	if (name == NULL) {
+		fprintf(stderr, "kyty-lodhw: 0x%05x [sel 0x%03x] not restored (queue unmapped), reads 0x%08x\n", e->reg, e->sel, cur);
+		return;
+	}
+	WrSel(e->reg, e->sel, e->old);
+	fprintf(stderr, "kyty-lodhw: %s [sel 0x%03x] 0x%08x (set 0x%08x) restored to 0x%08x\n", name, e->sel, cur, e->set, e->old);
+}
+
 // One connected client. Only a client that issued reports leaves the reporter to be reset.
 static void* Client(void* arg) {
 	const int     c       = (int)(intptr_t)arg;
 	unsigned long reports = 0, failures = 0;
+	struct Saved* saved   = calloc(kSavedMax, sizeof(struct Saved));
+	uint32_t      nsaved  = 0;
+	int           golden  = 0; // op 7 asked to restore the golden table at disconnect
 	for (;;) {
 		struct {
 			uint32_t op, size;
@@ -275,6 +376,7 @@ static void* Client(void* arg) {
 				rep.value  = rep.status == 0 ? Rd(kJt[q.size][1]) : 0;
 			}
 		} else if (q.op == 7 || q.op == 8) {
+			golden |= q.op == 7 && q.va == 1;
 			if (q.size == 0xffffffffu) {
 				for (uint32_t i = 0; i < g_golden_count; i++) {
 					const uint32_t before = Rd(g_golden[i].reg);
@@ -297,6 +399,55 @@ static void* Client(void* arg) {
 		} else if (q.op == 9) {
 			rep.status = q.size < g_golden_count ? 0 : -ENOENT;
 			rep.value  = rep.status == 0 ? g_golden[q.size].reg : 0;
+		} else if ((q.op & 0xffu) == 10) {
+			const uint32_t sel  = q.op >> 8;
+			const uint32_t mask = (uint32_t)(q.va >> 32);
+			const char*    name = BankedName(q.size, sel);
+			uint32_t       i    = 0;
+			while (i < nsaved && (saved[i].reg != q.size || saved[i].sel != sel)) {
+				i++;
+			}
+			if (name == NULL || mask == 0) {
+				rep.status = name == NULL ? -EPERM : -EINVAL;
+			} else if (i == nsaved && (saved == NULL || nsaved == kSavedMax)) {
+				rep.status = -ENOSPC;
+			} else {
+				const uint32_t old  = RdSel(q.size, sel);
+				const uint32_t want = (old & ~mask) | ((uint32_t)q.va & mask);
+				if (i == nsaved) {
+					saved[nsaved++] = (struct Saved) {q.size, sel, old, want};
+				}
+				saved[i].set = want;
+				rep.status   = want != old ? WrSel(q.size, sel, want) : 0;
+				rep.value    = RdSel(q.size, sel);
+				if (want != old) {
+					fprintf(stderr, "kyty-lodhw: %s [sel 0x%03x] 0x%08x -> 0x%08x (reads 0x%08x)\n", name, sel, old, want, rep.value);
+				}
+			}
+		} else if ((q.op & 0xffu) == 11) {
+			const uint32_t sel = q.op >> 8;
+			for (uint32_t i = nsaved; i-- > 0;) {
+				if (q.size == 0xffffffffu || (saved[i].reg == q.size && saved[i].sel == sel)) {
+					RestoreSaved(&saved[i]);
+					memmove(&saved[i], &saved[i + 1], (nsaved - i - 1) * sizeof(saved[0]));
+					nsaved--;
+					rep.value++;
+				}
+			}
+		} else if ((q.op & 0xffu) == 12) {
+			const uint32_t sel = q.op >> 8;
+			rep.status         = q.size < kMmioDwords && sel < 2 * kSel ? 0 : -EINVAL;
+			rep.value          = rep.status == 0 ? RdSel(q.size, sel) : 0;
+		} else if ((q.op & 0xffu) == 13) {
+			const uint32_t pasid = q.op >> 8;
+			rep.status           = -ESRCH;
+			for (uint32_t v = 1; v < 8 && pasid != 0; v++) {
+				if (Rd(kIhVmidLut + v) == pasid) {
+					rep.value  = v;
+					rep.status = 0;
+					break;
+				}
+			}
 		} else {
 			rep.status = -EINVAL;
 		}
@@ -306,6 +457,18 @@ static void* Client(void* arg) {
 		}
 	}
 	close(c);
+	if (nsaved != 0 || golden) {
+		// The client is gone: what it changed goes back, last change first.
+		pthread_mutex_lock(&g_hw);
+		for (uint32_t i = nsaved; i-- > 0;) {
+			RestoreSaved(&saved[i]);
+		}
+		for (uint32_t i = 0; golden && i < g_golden_count; i++) {
+			RestoreGolden(&g_golden[i]);
+		}
+		pthread_mutex_unlock(&g_hw);
+	}
+	free(saved);
 	if (reports != 0 || failures != 0) {
 		// The client is gone: leave the reporter idle with no buffer behind it.
 		pthread_mutex_lock(&g_hw);
