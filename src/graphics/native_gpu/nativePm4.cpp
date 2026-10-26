@@ -1694,7 +1694,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 
 	uint32_t dw = 0;
+	uint32_t verbatim_run = 0;
+	auto     end_run      = [&]() {
+        if (verbatim_run != 0) {
+            stats.verbatim_runs++;
+            stats.run_hist[verbatim_run < 16 ? 0 : verbatim_run < 64 ? 1 : verbatim_run < 256 ? 2 : 3]++;
+            verbatim_run = 0;
+        }
+	};
+	stats.total_dw = static_cast<uint32_t>(dcb.size());
 	while (dw < dcb.size()) {
+		const size_t   body_before = body.size();
+		const size_t   segs_before = segs.size();
 		const uint32_t header = dcb[dw];
 		if ((header >> 30u) != 3u) {
 			return fail(0xffffffffu, dw); // not a type-3 packet
@@ -2613,9 +2624,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (IsWork(op)) {
 			seg_effects = true;
 		}
+		if (segs.size() == segs_before && body.size() - body_before == size &&
+		    std::memcmp(body.data() + body_before, dcb.data() + dw, size * 4u) == 0) {
+			stats.verbatim_dw += size;
+			verbatim_run += size;
+		} else {
+			end_run();
+			stats.changed_ops[op]++;
+		}
 
 		dw += size;
 	}
+	end_run();
 	if (!r.unknown_ops.empty()) {
 		const uint32_t first_op = r.unknown_op;
 		const uint32_t first_dw = r.unknown_dw;

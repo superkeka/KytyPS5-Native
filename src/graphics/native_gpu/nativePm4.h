@@ -124,6 +124,14 @@ private:
 
 struct Pm4TranslateStats {
 	uint32_t packets           = 0; // type-3 packets seen in the DCB
+	// Direct execution: the dwords that went into the IB exactly as the title wrote them (same packet,
+	// nothing inserted around it, no new segment), and the runs they form. A run is what an
+	// INDIRECT_BUFFER into guest memory could execute in place.
+	uint32_t verbatim_dw       = 0;
+	uint32_t total_dw          = 0;
+	uint32_t verbatim_runs     = 0;
+	std::array<uint32_t, 4> run_hist {}; // runs under 16, 64, 256 dwords, and longer
+	std::array<uint32_t, 256> changed_ops {}; // packets that did not go through verbatim, by opcode
 	uint32_t nops              = 0; // IT_NOP packets skipped (markers included)
 	uint32_t marker_flip       = 0; // IT_NOP R_FLIP
 	uint32_t marker_release    = 0; // IT_NOP R_RELEASE_MEM

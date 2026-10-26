@@ -473,6 +473,15 @@ public:
 		for (uint32_t i = 0; i < result.stats.event_type.size(); i++) {
 			m_event_type_hist[i] += result.stats.event_type[i];
 		}
+		m_verbatim_dw += result.stats.verbatim_dw;
+		m_total_dw += result.stats.total_dw;
+		m_verbatim_runs += result.stats.verbatim_runs;
+		for (size_t i = 0; i < m_changed_ops.size(); i++) {
+			m_changed_ops[i] += result.stats.changed_ops[i];
+		}
+		for (size_t i = 0; i < m_run_hist.size(); i++) {
+			m_run_hist[i] += result.stats.run_hist[i];
+		}
 		for (uint32_t i = 0; i < result.stats.event_index.size(); i++) {
 			m_event_index_hist[i] += result.stats.event_index[i];
 		}
@@ -1030,6 +1039,30 @@ public:
 			}
 #endif
 			m_flip_hist = {};
+			if (m_total_dw != 0) {
+				std::fprintf(stderr,
+				             "native shadow: verbatim (directly executable) %.1f%% of %llu dwords per flip, %.1f runs per flip "
+				             "(<16: %llu, <64: %llu, <256: %llu, longer: %llu)\n",
+				             100.0 * static_cast<double>(m_verbatim_dw) / static_cast<double>(m_total_dw),
+				             static_cast<unsigned long long>(m_total_dw / m_flips), static_cast<double>(m_verbatim_runs) / m_flips,
+				             static_cast<unsigned long long>(m_run_hist[0]), static_cast<unsigned long long>(m_run_hist[1]),
+				             static_cast<unsigned long long>(m_run_hist[2]), static_cast<unsigned long long>(m_run_hist[3]));
+				std::vector<std::pair<uint64_t, uint32_t>> ops;
+				for (uint32_t i = 0; i < m_changed_ops.size(); i++) {
+					if (m_changed_ops[i] != 0) {
+						ops.emplace_back(m_changed_ops[i], i);
+					}
+				}
+				std::sort(ops.rbegin(), ops.rend());
+				std::fprintf(stderr, "native shadow: changed packets per flip by op:");
+				for (size_t i = 0; i < ops.size() && i < 10; i++) {
+					std::fprintf(stderr, " 0x%02x:%.0f", ops[i].second, static_cast<double>(ops[i].first) / m_flips);
+				}
+				std::fprintf(stderr, "\n");
+				m_verbatim_dw = m_total_dw = m_verbatim_runs = 0;
+				m_run_hist    = {};
+				m_changed_ops = {};
+			}
 			const uint64_t held   = g_held_released.exchange(0, std::memory_order_relaxed);
 			const uint64_t waited = g_held_waited.exchange(0, std::memory_order_relaxed);
 			const uint64_t wait_us = g_held_wait_us.exchange(0, std::memory_order_relaxed);
@@ -2370,6 +2403,11 @@ private:
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
 	uint64_t      m_flattened      = 0; // buffers FlattenIndirectBuffers inlined
+	uint64_t                m_verbatim_dw   = 0; // Pm4TranslateStats::verbatim_dw over the flips being summed
+	uint64_t                m_total_dw      = 0;
+	uint64_t                m_verbatim_runs = 0;
+	std::array<uint64_t, 4> m_run_hist {};
+	std::array<uint64_t, 256> m_changed_ops {};
 	uint64_t      m_flatten_failed = 0; // and could not
 	double        m_gpu_ms_total   = 0.0;
 	double        m_cs_ms_total    = 0.0;
