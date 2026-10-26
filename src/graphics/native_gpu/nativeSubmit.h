@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -39,8 +40,11 @@ public:
 	// the extended-memory aperture is at 0x80000000000; the device's low VA range reaches
 	// 0x800000000000, so this sits clear of both).
 	static constexpr uint64_t kIbVa      = 0x400000000000ull;
-	static constexpr uint64_t kIbSize    = 32ull * 1024 * 1024; // 16 slots of ~2 MiB in async mode
-	static constexpr uint32_t kSlots     = 16;
+	// 128 slots of ~512 KiB in async mode: a KFD queue waiting on a label keeps the slots of its IBs, and
+	// a title with many compute queues (My First Gran Turismo has a dozen) must not leave the next gfx
+	// IB, the one that writes that label, without a slot. Longer IBs take several slots.
+	static constexpr uint64_t kIbSize    = 64ull * 1024 * 1024;
+	static constexpr uint32_t kSlots     = 128;
 	// The last bytes of the IB buffer are a scratch area the IB itself may write into (pipeline
 	// statistics samples); IBs must stay below it.
 	static constexpr uint64_t kScratchSize = 4096;
@@ -147,6 +151,8 @@ public:
 	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
 	// How many KFD queues EnableKfdQueues can give (ring indexes 0 .. this - 1).
 	static constexpr uint32_t MaxKfdQueues() { return kMaxKfdQueues; }
+	// How many KFD queues EnableKfdQueues created (indexes 0 .. this - 1).
+	[[nodiscard]] uint32_t KfdQueueCount() const { return m_kfd_count; }
 	// KFD's queue priority (0-15) for ring index `ring`'s queue, set before its first submission.
 	void SetKfdQueuePriority(uint32_t ring, uint32_t priority) {
 		if (ring < kMaxKfdQueues) {
@@ -167,6 +173,29 @@ public:
 			return false;
 		}
 		m_kfd_rings = rings & ((1u << kMaxKfdQueues) - 1u);
+		// Every queue is created now, before any work. Creating one later makes the firmware scheduler
+		// preempt the running queues to rebuild its runlist, and one busy with a title's work did not
+		// preempt on the BC-250 (My First Gran Turismo's eleventh queue: "Queue preemption failed", and
+		// every queue stopped). The PS5 kernel too sets a title's queues up once.
+		// KYTY_NATIVE_GPU_KFD_QUEUE_COUNT (default 16) of them; more guest queues than that share.
+		uint32_t count = 16;
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUE_COUNT"); v != nullptr && v[0] != '\0') {
+			count = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+		}
+		count       = std::clamp<uint32_t>(count, 1u, kMaxKfdQueues);
+		uint32_t made = 0;
+		for (uint32_t ring = 0; ring < count && (m_kfd_rings & (1u << ring)) != 0; ring++) {
+			EnsureKfdQueue({AMDGPU_HW_IP_COMPUTE, ring});
+			if (m_kfd_queue[ring] == nullptr) {
+				break;
+			}
+			made++;
+		}
+		m_kfd_rings = made == 0 ? 0u : (made >= 32 ? ~0u : (1u << made) - 1u);
+		m_kfd_count = made;
+		if (made == 0) {
+			return false;
+		}
 		// KYTY_NATIVE_GPU_KFD_TRACE=1: every 0.5 s, each KFD queue's pointers and each CS slot's latest
 		// submission, so a hang that takes the board down leaves its last picture in the log.
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_TRACE"); v != nullptr && v[0] == '1') {
@@ -235,10 +264,10 @@ public:
 			return res;
 		}
 		std::vector<uint32_t> slots;
-		uint32_t              taken = 0;
+		std::bitset<kSlots>   taken;
 		for (const auto& [at, len]: parts) {
 			const uint32_t slot = m_async ? PickSlot(target, taken) : 0;
-			taken |= 1u << slot;
+			taken.set(slot);
 			if (m_async && m_slot[slot].seq != 0) {
 				if (!WaitSeq(m_slot[slot].seq, timeout_sec, m_slot[slot].target)) {
 					res.timed_out = true;
@@ -266,7 +295,15 @@ public:
 		if (KfdQueue* q = Queue(target); q != nullptr && m_async) {
 			// The VM changed since the last KFD submission: its queues could still translate the old
 			// mappings (GemBacking::FlushKfdTlb).
-			if (const uint64_t changes = m_gem->VaChanges(); changes != m_kfd_va_changes) {
+			// Only with KYTY_NATIVE_GPU_KFD_TLB_FLUSH=1: the flush rebuilds the firmware scheduler's
+			// runlist, which preempts every KFD queue, and a busy one did not preempt on the BC-250
+			// ("Queue preemption failed", every queue stopped). The PS5 kernel never touches a title's
+			// queues while it runs either; without it My First Gran Turismo runs at 45 FPS.
+			static const bool flush = [] {
+				const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_TLB_FLUSH");
+				return v != nullptr && v[0] == '1';
+			}();
+			if (const uint64_t changes = m_gem->VaChanges(); flush && changes != m_kfd_va_changes) {
 				const double tf = NowSec();
 				const bool   ok = m_gem->FlushKfdTlb();
 				m_kfd_va_changes = changes;
@@ -461,7 +498,9 @@ public:
 	}
 
 private:
-	static constexpr uint32_t kMaxKfdQueues   = 8;
+	// A KFD queue per guest compute queue, up to the tracker's 32 slots less the gfx one (PS5 titles
+	// address 56; more than this share).
+	static constexpr uint32_t kMaxKfdQueues   = 31;
 	static constexpr uint64_t kKfdQueueVa     = 0x6e0000000000ull; // above GemBacking's KFD allocations
 	static constexpr uint64_t kKfdQueueStride = 0x10000000ull;
 
@@ -675,9 +714,14 @@ private:
 	uint64_t    m_ib_kfd_handle = 0;
 	KfdQueue*   m_kfd_queue[kMaxKfdQueues] {};
 	uint32_t    m_kfd_rings = 0;                     // ring indexes whose submissions go to KFD queues
+	uint32_t    m_kfd_count = 0;                     // KFD queues created (EnableKfdQueues)
 	uint64_t    m_kfd_va_changes = 0;                // GemBacking::VaChanges at the last KFD TLB flush
 	uint32_t    m_kfd_tlb_flushes = 0;
-	uint32_t    m_kfd_priority[kMaxKfdQueues] = {7, 7, 7, 7, 7, 7, 7, 7};
+	std::array<uint32_t, kMaxKfdQueues> m_kfd_priority = [] {
+		std::array<uint32_t, kMaxKfdQueues> a {};
+		a.fill(7);
+		return a;
+	}();
 	std::function<void(uint32_t)> m_kfd_queue_hook; // SetKfdQueueHook
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	struct SlotUse {
@@ -690,21 +734,21 @@ private:
 	// own ring, so a compute ring parked on a WAIT_REG_MEM never holds up the submission that would
 	// release it (with shared round-robin slots, that is a deadlock). Only then the oldest overall.
 	// Slots in the `taken` mask are skipped (the other IBs of the same CS).
-	uint32_t PickSlot(RingTarget target, uint32_t taken = 0) {
+	uint32_t PickSlot(RingTarget target, const std::bitset<kSlots>& taken = {}) {
 		for (uint32_t i = 0; i < kSlots; i++) {
-			if ((taken & (1u << i)) == 0 && m_slot[i].seq == 0) {
+			if (!taken[i] && m_slot[i].seq == 0) {
 				return i;
 			}
 		}
 		for (uint32_t i = 0; i < kSlots; i++) {
-			if ((taken & (1u << i)) == 0 && WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target)) {
+			if (!taken[i] && WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target)) {
 				m_slot[i].seq = 0;
 				return i;
 			}
 		}
 		uint32_t own = kSlots, any = kSlots;
 		for (uint32_t i = 0; i < kSlots; i++) {
-			if ((taken & (1u << i)) != 0) {
+			if (taken[i]) {
 				continue;
 			}
 			const bool same = m_slot[i].target.ip_type == target.ip_type && m_slot[i].target.ring == target.ring;

@@ -369,6 +369,7 @@ public:
 		EraseViewsUnlocked(vaddr, size);
 		m_views_generation++;
 		const bool ok = VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, size) == 0;
+		MarkVaStale();
 		MapPrtHolesUnlocked(vaddr, size);
 		return ok;
 	}
@@ -674,8 +675,11 @@ public:
 	// user-mode queues (KYTY_NATIVE_GPU_KFD_QUEUES) run in it. -1 / 0 when neither is on.
 	[[nodiscard]] int      KfdFd() const { return m_kfd_fd; }
 
-	// How many GEM_VA changes this VM has seen (FlushKfdTlb).
+	// How many times a GPU mapping the GPU may have cached was removed or replaced (FlushKfdTlb). A new
+	// mapping of an address nothing mapped needs no flush, and that is most of a title's mapping;
+	// counting every GEM_VA flushed (and with it preempted every KFD queue) all the time.
 	[[nodiscard]] uint64_t VaChanges() const { return m_va_changes.load(std::memory_order_acquire); }
+	void MarkVaStale() const { m_va_changes.fetch_add(1, std::memory_order_release); }
 
 	// KFD queues reach the VM through the KFD VMIDs' TLBs, which a render-node GEM_VA change does not
 	// flush: a CS flushes its own job's VMID, and nothing runs for a KFD queue (kfd_probe avremap: a
@@ -825,7 +829,6 @@ private:
 		v.offset_in_bo = offset_in_bo;
 		v.map_size     = size;
 		const int r    = Ioctl(DRM_IOCTL_AMDGPU_GEM_VA, &v);
-		m_va_changes.fetch_add(1, std::memory_order_release);
 		if (r != 0) {
 			std::fprintf(stderr, "GemBacking: GEM_VA op %u at 0x%llx (+0x%llx) failed: %s\n", op,
 			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
@@ -1420,6 +1423,7 @@ private:
 			VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, gpu_pieces[i].first, gpu_pieces[i].second, gpu_lengths[i]);
 		}
 		if (from_cpu != nullptr) {
+			MarkVaStale(); // the GPU mappings moved from a buffer the GPU used
 			::munmap(from_cpu, block.size);
 			CloseBo(block.bo);
 			block.bo = bo;
@@ -1586,6 +1590,7 @@ private:
 	}
 
 	void ClearExternalRangeUnlocked(uint64_t vaddr, uint64_t size) {
+		MarkVaStale();
 		const uint64_t end = vaddr + size;
 
 		std::vector<std::pair<uint64_t, External>> overlapping;

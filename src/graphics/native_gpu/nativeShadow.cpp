@@ -1308,6 +1308,7 @@ public:
 	uint32_t ComputeRingMask() const { return m_compute_mask; }
 	// Guest compute queues run on KFD user-mode queues of their own (EnableKfdQueues).
 	bool KfdQueuesOn() const { return m_kfd_queues; }
+	uint32_t KfdQueueCount() const { return std::max(m_submitter != nullptr ? m_submitter->KfdQueueCount() : 0u, 1u); }
 
 	// The per-VMID PS5 settings follow this VM's gfx VMID, which amdgpu may change between jobs: once
 	// per flip they move to the VMID it holds now and the one it left gets the Linux values back.
@@ -1640,8 +1641,8 @@ private:
 			return;
 		}
 		m_kfd_queues = true;
-		std::fprintf(stderr, "native shadow: ACBs on KFD user-mode queues, one per guest queue (indexes 0x%x, doorbell submission, GDS %u bytes)\n",
-		             rings, m_submitter->GdsSize());
+		std::fprintf(stderr, "native shadow: ACBs on %u KFD user-mode queues, one per guest queue (doorbell submission, GDS %u bytes)\n",
+		             m_submitter->KfdQueueCount(), m_submitter->GdsSize());
 		{
 			std::lock_guard<std::mutex> lock(m_ps5_mutex);
 			Ps5KfdRegs();
@@ -3112,7 +3113,7 @@ private:
 		if (!Shadow::Instance().KfdQueuesOn()) {
 			return ComputeRingForQueue(queue, m_compute_mask) + 1u;
 		}
-		auto [it, fresh] = m_queue_index.try_emplace(queue, static_cast<uint32_t>(m_queue_index.size()) % NativeSubmitter::MaxKfdQueues());
+		auto [it, fresh] = m_queue_index.try_emplace(queue, static_cast<uint32_t>(m_queue_index.size()) % Shadow::Instance().KfdQueueCount());
 		if (fresh) {
 			std::fprintf(stderr, "native shadow: guest compute queue 0x%x runs on KFD queue %u\n", queue, it->second);
 		}
