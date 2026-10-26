@@ -80,6 +80,12 @@ bool EnvOn(const char* name) {
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// True when `name` is set to exactly `value`.
+bool EnvIs(const char* name, const char* value) {
+	const char* v = std::getenv(name);
+	return v != nullptr && std::strcmp(v, value) == 0;
+}
+
 // KYTY_NATIVE_GPU_CTL=1: a debugging control socket, /tmp/kyty-ctl.sock (KYTY_NATIVE_GPU_CTL_SOCK
 // overrides it). One command per line, one reply line each:
 //   dump [N]  dump the next N flips (default 8) into KYTY_NATIVE_GPU_DUMP_DIR, render targets included
@@ -1203,7 +1209,9 @@ public:
 			return v == nullptr || v[0] != '0';
 		}();
 		m_compute_mask = m_submitter->ComputeRingMask();
-		m_acb_rings    = EnvOn("KYTY_NATIVE_GPU_ACB_RINGS");
+		// Primary mode puts ACBs on compute rings (KFD queues where KfdQueuesWanted) unless =0.
+		m_acb_rings = EnvOn("KYTY_NATIVE_GPU_ACB_RINGS") ||
+		              (EnvOn("KYTY_NATIVE_GPU_PRIMARY") && !EnvIs("KYTY_NATIVE_GPU_ACB_RINGS", "0"));
 		if (m_acb_rings && m_compute_mask == 0) {
 			std::fprintf(stderr, "native shadow: KYTY_NATIVE_GPU_ACB_RINGS set but the kernel exposes no compute ring; "
 			                     "ACBs stay on the gfx ring\n");
@@ -3220,10 +3228,14 @@ private:
 				    RingWrite {LabelWrite {w.addr + 4, w.value >> 32u, w.known, w.gpu, false}, m_seq, slot, m_batch};
 			}
 		}
-		if (m_ring.size() > 16384) {
+		// Forget writes that have landed once the map is large. The next sweep waits for it to double:
+		// writes of a queue that waits on the GPU for long (a KFD queue) stay, and sweeping all of them
+		// at every emit took most of this thread in ASTRO BOT's heavier levels.
+		if (m_ring.size() > m_ring_sweep_at) {
 			for (auto it = m_ring.begin(); it != m_ring.end();) {
 				it = Shadow::Instance().Reached(it->second.landed, it->second.slot) ? m_ring.erase(it) : std::next(it);
 			}
+			m_ring_sweep_at = std::max<size_t>(16384, m_ring.size() * 2);
 		}
 		if (!p.ib.empty()) {
 			// The translated IB passed the packet check; the patched one has to as well.
@@ -3528,7 +3540,8 @@ private:
 	bool                                    m_wake        = false; // the tracker moved; recheck held labels
 	uint64_t                                m_seq         = 0;
 	bool                                    m_appended    = false;
-	std::map<uint64_t, RingWrite>           m_ring; // label -> the latest write emitted into the ring
+	std::unordered_map<uint64_t, RingWrite> m_ring; // label -> the latest write emitted into the ring
+	size_t                                  m_ring_sweep_at = 16384; // m_ring size that triggers its next sweep
 	uint64_t                                m_batch = 1; // the batch being appended to (RingWrite::batch)
 	uint64_t                                m_released_native   = 0;
 	int                                     m_last_hold_reason  = 0;

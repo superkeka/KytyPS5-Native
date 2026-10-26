@@ -89,10 +89,26 @@ namespace Libs::Graphics::NativeGpu {
 // nativeKfd.h). A KFD queue reaches KFD memory and, in this VM, the always-valid blocks of map
 // residency; without those (partial residency, KYTY_NATIVE_GPU_ALWAYS_VALID=0) the blocks and the
 // external ranges become KFD buffers.
+// On by default in primary mode when amdgpu is the BC-250 build with the KFD TLB fixes (the stock
+// one hangs flushing the KFD VMIDs' TLBs through the KIQ under gfx load); =0 turns it off, =1 on.
 inline bool KfdQueuesWanted() {
 	static const bool on = [] {
-		const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUES");
-		return v != nullptr && v[0] == '1';
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUES"); v != nullptr && v[0] != '\0') {
+			return v[0] == '1';
+		}
+		const char* primary = std::getenv("KYTY_NATIVE_GPU_PRIMARY");
+		if (primary == nullptr || primary[0] == '\0' || primary[0] == '0') {
+			return false;
+		}
+		int   flush = 0;
+		FILE* f     = std::fopen("/sys/module/amdgpu/parameters/bc250_flush_by_runlist", "re");
+		if (f != nullptr) {
+			if (std::fscanf(f, "%d", &flush) != 1) {
+				flush = 0;
+			}
+			std::fclose(f);
+		}
+		return flush != 0;
 	}();
 	return on;
 }
