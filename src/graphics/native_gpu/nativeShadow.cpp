@@ -2769,7 +2769,7 @@ public:
 	Plan PlanWait(const WaitCond& wait) override {
 		auto decide = [&](const LabelWrite& w) -> std::optional<Plan> {
 			uint64_t  v = 0;
-			const int c = w.Covers(wait.addr, wait.wide, &v);
+			const int c = w.Covers(wait.addr, wait.wide, &v, wait.mask);
 			if (c == 0) {
 				return std::nullopt;
 			}
@@ -2979,7 +2979,7 @@ private:
 		bool            gfx_writer = false; // see PlanRingWait
 		if (const RingWrite* w = PendingRingWrite(wait.addr)) {
 			uint64_t v = 0;
-			cover = w->write.Covers(wait.addr, wait.wide, &v);
+			cover = w->write.Covers(wait.addr, wait.wide, &v, wait.mask);
 			if (cover == 1) {
 				satisfies = wait.Met(v);
 			}
@@ -2992,7 +2992,7 @@ private:
 			// queue would have seen it, even if the title has reset the label since (ASTRO BOT does that
 			// when a level loads, faster than a held piece is looked at again): the wait is met.
 			uint64_t v = 0;
-			if (last->second.first.Covers(wait.addr, wait.wide, &v) == 1 && wait.Met(v)) {
+			if (last->second.first.Covers(wait.addr, wait.wide, &v, wait.mask) == 1 && wait.Met(v)) {
 				return Release::Observed;
 			}
 		}

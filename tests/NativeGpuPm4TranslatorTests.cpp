@@ -1166,6 +1166,11 @@ void TestLabelWriteCovers() {
 	Check(w64.Covers(0x2004, false, &v) == 1 && v == 7, "64-bit write, high half");
 	Check(w64.Covers(0x2000, true, &v) == 1 && v == 0x0000000700000006ull, "64-bit write, 64-bit wait");
 	Check(w32.Covers(0x1008, false, &v) == 0, "unrelated");
+	// A 64-bit wait that masks off the high half reads only the low one.
+	Check(w32.Covers(0x1000, true, &v, 0xffffffffull) == 1 && v == 5, "32-bit write, 64-bit wait on the low half");
+	const LabelWrite high {0x1004, 9, true, true, false};
+	Check(high.Covers(0x1000, true, &v, 0xffffffffull) == 0, "a write to the masked-off high half does not decide it");
+	Check(high.Covers(0x1000, true, &v) == 2, "a write to the high half of a full 64-bit wait: unknown");
 }
 
 void TestLabelsWait64() {

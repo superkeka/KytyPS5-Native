@@ -292,7 +292,10 @@ struct LabelWrite {
 
 	// What a WAIT at `a` (64-bit when `wide_wait`) reads once this write has landed: 0 unrelated,
 	// 1 the value in `out`, 2 touched but unknown.
-	int Covers(uint64_t a, bool wide_wait, uint64_t* out) const;
+	// `wait_mask`: the wait's compare mask. A 64-bit wait that masks off the high half reads only the
+	// low one, so a 32-bit write there decides it (ASTRO BOT waits on 64-bit labels with mask
+	// 0xffffffff and writes them as two 32-bit halves).
+	int Covers(uint64_t a, bool wide_wait, uint64_t* out, uint64_t wait_mask = ~0ull) const;
 };
 
 struct TrackerPoint {

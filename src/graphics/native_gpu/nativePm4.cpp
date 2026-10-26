@@ -379,9 +379,10 @@ bool WaitCond::Met(uint64_t value) const {
 	return WaitConditionMet(function, value & mask, ref);
 }
 
-int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out) const {
+int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out, uint64_t wait_mask) const {
+	const bool low_only = wide_wait && (wait_mask >> 32u) == 0;
 	if (a == addr) {
-		if (wide_wait && !wide) {
+		if (wide_wait && !wide && !low_only) {
 			return 2; // half of what the wait reads
 		}
 		*out = wide_wait ? value : (value & 0xffffffffull);
@@ -392,7 +393,7 @@ int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out) const {
 		return known ? 1 : 2;
 	}
 	if (wide_wait && !wide && a + 4 == addr) {
-		return 2;
+		return low_only ? 0 : 2; // the high half, which the mask may leave out
 	}
 	return 0;
 }
@@ -2284,7 +2285,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					bool              decided = false;
 					for (auto it = local_writes.rbegin(); it != local_writes.rend() && !decided; ++it) {
 						uint64_t  v = 0;
-						const int c = it->Covers(addr, wide, &v);
+						const int c = it->Covers(addr, wide, &v, mask);
 						if (c != 0) {
 							decided = true;
 							plan    = c == 1 && w.Met(v) && it->gpu ? LabelOracle::Plan::Native : LabelOracle::Plan::Split;
