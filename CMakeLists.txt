@@ -543,6 +543,10 @@ add_executable(png_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PngEncTests.cpp
 target_link_libraries(png_enc_tests common fmt::fmt)
 target_include_directories(png_enc_tests PRIVATE ${inc_headers})
 
+add_executable(jpeg_dec_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegDecTests.cpp")
+target_link_libraries(jpeg_dec_tests common fmt::fmt)
+target_include_directories(jpeg_dec_tests PRIVATE ${inc_headers})
+
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
