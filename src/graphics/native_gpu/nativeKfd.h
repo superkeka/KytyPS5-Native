@@ -35,7 +35,8 @@ namespace Libs::Graphics::NativeGpu {
 class KfdQueue {
 public:
 	// `va` is a private GPU VA range of at least 64 MiB for the queue's own buffers.
-	static KfdQueue* Create(int kfd_fd, uint32_t gpu_id, int drm_fd, uint64_t va) {
+	// `priority` is KFD's queue priority, 0-15 (the CP_HQD_QUEUE_PRIORITY the scheduler gives it).
+	static KfdQueue* Create(int kfd_fd, uint32_t gpu_id, int drm_fd, uint64_t va, uint32_t priority = 7) {
 		auto* q    = new KfdQueue();
 		q->m_kfd   = kfd_fd;
 		q->m_gpu   = gpu_id;
@@ -69,7 +70,7 @@ public:
 		a.gpu_id                   = gpu_id;
 		a.queue_type               = KFD_IOC_QUEUE_TYPE_COMPUTE;
 		a.queue_percentage         = 100;
-		a.queue_priority           = 7;
+		a.queue_priority           = priority;
 		a.eop_buffer_address       = q->m_eop.va;
 		a.eop_buffer_size          = 4096;
 		a.ctx_save_restore_address = q->m_save.va;

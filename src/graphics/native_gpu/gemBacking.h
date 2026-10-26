@@ -86,8 +86,9 @@ namespace Libs::Graphics::NativeGpu {
 //
 // This class performs no command submission.
 // KYTY_NATIVE_GPU_KFD_QUEUES=1: asynchronous compute buffers run on KFD user-mode queues (see
-// nativeKfd.h). Everything such a queue reaches must be KFD memory, so this implies
-// KYTY_NATIVE_GPU_KFD_MEMORY and makes the external ranges KFD userptr buffers as well.
+// nativeKfd.h). A KFD queue reaches KFD memory and, in this VM, the always-valid blocks of map
+// residency; without those (partial residency, KYTY_NATIVE_GPU_ALWAYS_VALID=0) the blocks and the
+// external ranges become KFD buffers.
 inline bool KfdQueuesWanted() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUES");
@@ -167,7 +168,8 @@ public:
 	static bool AlwaysValidWanted() {
 		static const bool on = [] {
 			const char* v = std::getenv("KYTY_NATIVE_GPU_ALWAYS_VALID");
-			return ResidencyAtMap() && !KfdQueuesWanted() && (v == nullptr || v[0] != '0');
+			const char* kfd = std::getenv("KYTY_NATIVE_GPU_KFD_MEMORY");
+			return ResidencyAtMap() && (kfd == nullptr || kfd[0] != '1') && (v == nullptr || v[0] != '0');
 		}();
 		return on;
 	}
@@ -651,8 +653,8 @@ public:
 
 	// The DRM file whose GPU VM holds the bindings; command submission must use the same file.
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
-	// KYTY_NATIVE_GPU_KFD_MEMORY: blocks are KFD buffers in this VM, so KFD user-mode queues see guest
-	// memory too. -1 / 0 when off.
+	// The KFD process of this VM: with KYTY_NATIVE_GPU_KFD_MEMORY its blocks are KFD buffers, and KFD
+	// user-mode queues (KYTY_NATIVE_GPU_KFD_QUEUES) run in it. -1 / 0 when neither is on.
 	[[nodiscard]] int      KfdFd() const { return m_kfd_fd; }
 	[[nodiscard]] uint32_t KfdGpuId() const { return m_kfd_gpu; }
 
@@ -830,6 +832,12 @@ private:
 			m_kfd_gpu = 0;
 			return;
 		}
+		// KFD queues over always-valid blocks need the KFD process only (queues, the IB buffer).
+		m_kfd_memory = (v != nullptr && v[0] == '1') || !AlwaysValidWanted();
+		if (!m_kfd_memory) {
+			std::fprintf(stderr, "GemBacking: KFD process acquired for queues (gpu id %u); blocks stay always-valid buffers\n", m_kfd_gpu);
+			return;
+		}
 		// KYTY_NATIVE_GPU_KFD_USERPTR=0 keeps the external ranges render-node userptr buffers.
 		const char* up = std::getenv("KYTY_NATIVE_GPU_KFD_USERPTR");
 		m_kfd_userptr  = KfdQueuesWanted() && (up == nullptr || up[0] != '0');
@@ -893,7 +901,7 @@ private:
 
 	// A cached GTT buffer (TTM zeroes it) exported as a dma-buf for CPU mappings.
 	bool CreateBo(uint64_t size, Bo* out) const {
-		if (m_kfd_fd >= 0) {
+		if (m_kfd_memory) {
 			return CreateKfdBo(size, out);
 		}
 		union drm_amdgpu_gem_create c;
@@ -924,7 +932,7 @@ private:
 
 	// A block's buffer: always valid with AlwaysValidWanted() (no dma-buf), otherwise CreateBo.
 	bool CreateBlockBo(uint64_t size, Bo* out) const {
-		if (!AlwaysValidWanted() || m_kfd_fd >= 0) {
+		if (!AlwaysValidWanted() || m_kfd_memory) {
 			return CreateBo(size, out);
 		}
 		union drm_amdgpu_gem_create c;
@@ -1578,6 +1586,7 @@ private:
 	int                           m_kfd_fd  = -1; // KYTY_NATIVE_GPU_KFD_MEMORY: see InitKfd
 	uint32_t                      m_kfd_gpu = 0;
 	bool                          m_kfd_userptr = false; // KYTY_NATIVE_GPU_KFD_QUEUES: external ranges are KFD userptr buffers
+	bool                          m_kfd_memory  = false; // blocks are KFD buffers (InitKfd)
 	mutable uint64_t              m_kfd_va_next = 0x600000000000ull; // private VAs of the KFD allocations
 	uint8_t*                      m_alias  = nullptr;
 	uint64_t                      m_size   = 0;

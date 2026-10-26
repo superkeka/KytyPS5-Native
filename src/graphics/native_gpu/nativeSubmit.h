@@ -144,27 +144,25 @@ public:
 	// AMDGPU_INFO_HW_IP_INFO available_rings for compute, ip_instance 0. 0 when the kernel has none.
 	[[nodiscard]] uint32_t ComputeRingMask() const { return m_compute_rings; }
 	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
+	// How many KFD queues EnableKfdQueues can give (ring indexes 0 .. this - 1).
+	static constexpr uint32_t MaxKfdQueues() { return kMaxKfdQueues; }
+	// KFD's queue priority (0-15) for ring index `ring`'s queue, set before its first submission.
+	void SetKfdQueuePriority(uint32_t ring, uint32_t priority) {
+		if (ring < kMaxKfdQueues) {
+			m_kfd_priority[ring] = std::min(priority, 15u);
+		}
+	}
 
-	// KYTY_NATIVE_GPU_KFD_QUEUES: one KFD user-mode queue per compute ring in `rings`; submissions to
-	// those rings then go to the queue's doorbell instead of a CS ioctl. Needs the KFD IB buffer. False
-	// (and no queue) when a queue cannot be created.
+	// KYTY_NATIVE_GPU_KFD_QUEUES: compute submissions to the ring indexes in `rings` (bits below
+	// kMaxKfdQueues) go to KFD user-mode queues, one per index, rung by doorbell instead of a CS
+	// ioctl: a hardware queue each, as the PS5 gives each of a title's compute queues. A queue is
+	// created on its index's first submission, with the priority SetKfdQueuePriority gave it. Needs
+	// the KFD IB buffer; false without it.
 	bool EnableKfdQueues(uint32_t rings) {
 		if (m_ib_kfd_handle == 0) {
 			return false;
 		}
-		for (uint32_t ring = 0; ring < kMaxKfdQueues; ring++) {
-			if ((rings & (1u << ring)) == 0) {
-				continue;
-			}
-			m_kfd_queue[ring] = KfdQueue::Create(m_gem->KfdFd(), m_gem->KfdGpuId(), m_drm_fd, kKfdQueueVa + ring * kKfdQueueStride);
-			if (m_kfd_queue[ring] == nullptr) {
-				for (KfdQueue*& q: m_kfd_queue) {
-					delete q;
-					q = nullptr;
-				}
-				return false;
-			}
-		}
+		m_kfd_rings = rings & ((1u << kMaxKfdQueues) - 1u);
 		// KYTY_NATIVE_GPU_KFD_TRACE=1: every 0.5 s, each KFD queue's pointers and each CS slot's latest
 		// submission, so a hang that takes the board down leaves its last picture in the log.
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_TRACE"); v != nullptr && v[0] == '1') {
@@ -220,6 +218,7 @@ public:
 		// dwords: the kernel runs a job's IBs back to back with the state carried over, which is what
 		// the CP does with the one buffer (an INDIRECT_BUFFER packet holds at most 2^20 dwords, so a
 		// long IB could not be one anyway).
+		EnsureKfdQueue(target);
 		const uint64_t                         room = m_async ? kSlotSize : kIbSize - kScratchSize;
 		std::vector<std::pair<size_t, size_t>> parts;
 		if (ib.size() * 4 <= room) {
@@ -453,6 +452,22 @@ private:
 
 	NativeSubmitter() = default;
 
+	// Creates `target`'s KFD queue on its first submission (EnableKfdQueues). A queue that cannot be
+	// created leaves the index to the CS ring of that number.
+	void EnsureKfdQueue(RingTarget target) {
+		if (target.ip_type != AMDGPU_HW_IP_COMPUTE || target.ring >= kMaxKfdQueues || (m_kfd_rings & (1u << target.ring)) == 0 ||
+		    m_kfd_queue[target.ring] != nullptr) {
+			return;
+		}
+		m_kfd_queue[target.ring] = KfdQueue::Create(m_gem->KfdFd(), m_gem->KfdGpuId(), m_drm_fd,
+		                                            kKfdQueueVa + target.ring * kKfdQueueStride, m_kfd_priority[target.ring]);
+		std::fprintf(stderr, "NativeSubmitter: KFD queue for compute index %u (priority %u)%s\n", target.ring,
+		             m_kfd_priority[target.ring], m_kfd_queue[target.ring] != nullptr ? "" : " failed");
+		if (m_kfd_queue[target.ring] == nullptr) {
+			m_kfd_rings &= ~(1u << target.ring);
+		}
+	}
+
 	[[nodiscard]] KfdQueue* Queue(RingTarget target) const {
 		return target.ip_type == AMDGPU_HW_IP_COMPUTE && target.ring < kMaxKfdQueues ? m_kfd_queue[target.ring] : nullptr;
 	}
@@ -642,6 +657,8 @@ private:
 	uint64_t    m_ib_kfd_va     = 0;
 	uint64_t    m_ib_kfd_handle = 0;
 	KfdQueue*   m_kfd_queue[kMaxKfdQueues] {};
+	uint32_t    m_kfd_rings = 0;                     // ring indexes whose submissions go to KFD queues
+	uint32_t    m_kfd_priority[kMaxKfdQueues] = {7, 7, 7, 7, 7, 7, 7, 7};
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	struct SlotUse {
 		uint64_t   seq   = 0;

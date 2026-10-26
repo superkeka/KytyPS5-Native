@@ -1263,6 +1263,8 @@ public:
 
 	bool AcbRings() const { return m_acb_rings; }
 	uint32_t ComputeRingMask() const { return m_compute_mask; }
+	// Guest compute queues run on KFD user-mode queues of their own (EnableKfdQueues).
+	bool KfdQueuesOn() const { return m_kfd_queues; }
 
 	// The ACB translator's tracker slot, one per compute ring (slot 0 is the gfx ring), and its barrier
 	// fence, the slot's last dword. Compute rings run at once, and a barrier releases its own value into
@@ -1555,9 +1557,10 @@ private:
 				}
 			}
 		}
-		// KYTY_NATIVE_GPU_KFD_QUEUE_RINGS=<mask>: only these compute rings become KFD queues (0: none; the
-		// others stay CS rings).
-		uint32_t rings = m_compute_mask;
+		// Every guest compute queue gets a KFD queue of its own (LabelPipeline::SlotOf hands out the
+		// indexes). KYTY_NATIVE_GPU_KFD_QUEUE_RINGS=<mask>: only these indexes do (0: none; the others
+		// stay CS compute rings).
+		uint32_t rings = (1u << NativeSubmitter::MaxKfdQueues()) - 1u;
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUE_RINGS"); v != nullptr && v[0] != '\0') {
 			rings &= static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
 		}
@@ -1565,8 +1568,9 @@ private:
 			std::fprintf(stderr, "native shadow: KFD queues unavailable; ACBs stay on CS compute rings\n");
 			return;
 		}
-		std::fprintf(stderr, "native shadow: ACBs on KFD user-mode queues (rings 0x%x, doorbell submission, GDS %u bytes)\n",
-		             m_compute_mask, m_submitter->GdsSize());
+		m_kfd_queues = true;
+		std::fprintf(stderr, "native shadow: ACBs on KFD user-mode queues, one per guest queue (indexes 0x%x, doorbell submission, GDS %u bytes)\n",
+		             rings, m_submitter->GdsSize());
 		// The wave save area KFD gives a queue holds the CUs amdgpu counted at init; on a board with more
 		// CUs enabled after it (the BC-250's 40 of 24), a preempted queue would overflow it. ACBs stay on
 		// those CUs unless KYTY_NATIVE_GPU_KFD_CU_CLAMP=0.
@@ -2484,6 +2488,7 @@ private:
 	};
 	bool                  m_acb_rings    = false;
 	uint32_t              m_compute_mask = 0;
+	bool                  m_kfd_queues   = false; // EnableKfdQueues succeeded
 	LabelOracle*          m_label_oracle = nullptr;
 	std::vector<uint32_t> m_ring_batch[kTrackerSlots];
 	SlotFence             m_slot_fence[kTrackerSlots];
@@ -2839,12 +2844,22 @@ private:
 		std::thread([this] { Track(); }).detach();
 	}
 
-	// Slot 0 is the gfx ring. A guest compute queue (0x20 + n) maps onto a kernel compute ring.
+	// Slot 0 is the gfx ring. A guest compute queue (0x20 + n) maps onto a kernel compute ring, or,
+	// with KFD queues, onto a KFD queue of its own: the first queues seen take the free indexes in
+	// order, as the PS5 maps each of a title's compute queues onto one hardware queue (more queues
+	// than indexes share them).
 	uint32_t SlotOf(uint32_t queue) const {
 		if (!m_acb_rings || queue < 0x20u) {
 			return 0;
 		}
-		return ComputeRingForQueue(queue, m_compute_mask) + 1u;
+		if (!Shadow::Instance().KfdQueuesOn()) {
+			return ComputeRingForQueue(queue, m_compute_mask) + 1u;
+		}
+		auto [it, fresh] = m_queue_index.try_emplace(queue, static_cast<uint32_t>(m_queue_index.size()) % NativeSubmitter::MaxKfdQueues());
+		if (fresh) {
+			std::fprintf(stderr, "native shadow: guest compute queue 0x%x runs on KFD queue %u\n", queue, it->second);
+		}
+		return it->second + 1u;
 	}
 
 	static uint64_t ReadLabel(const WaitCond& w) {
@@ -2978,6 +2993,11 @@ private:
 		// no pending write about to replace it, is a barrier: the GPU never waits for a writer that
 		// will not be submitted.
 		const bool native = p.seg.wait_len != 0 && m_native_waits;
+		// A compute queue of its own (KFD) just waits, as on PS5: whatever writes the label later, on
+		// whichever queue, nothing can be stuck behind this one.
+		if (native && slot != 0 && Shadow::Instance().KfdQueuesOn()) {
+			return Release::Native;
+		}
 		switch (PlanRingWait(cover, satisfies, gpu, same, submitted, wait.Met(ReadLabel(wait)), native, gfx_writer)) {
 			case RingWaitRelease::GpuWait: return Release::Native;
 			case RingWaitRelease::Barrier: return Release::Observed;
@@ -3453,6 +3473,7 @@ private:
 	uint32_t                                m_pending_dumps = 0; // NoteStaleHold's queue dumps so far
 	std::unordered_map<uint64_t, std::pair<LabelWrite, uint64_t>> m_last_write; // label -> its last write emitted, and when
 	uint64_t                                m_emits = 0; // Emit calls so far
+	mutable std::map<uint32_t, uint32_t>    m_queue_index; // guest compute queue -> its KFD queue index (SlotOf)
 	std::array<LabelEvent, 1024>            m_label_trace {}; // KYTY_NATIVE_GPU_LABEL_TRACE ring
 	uint64_t                                m_label_trace_next = 0;
 	bool                                    m_wake        = false; // the tracker moved; recheck held labels
