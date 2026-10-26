@@ -260,6 +260,17 @@ public:
 			             Queue(target) != nullptr && m_async ? "KFD queue" : "CS");
 		}
 		if (KfdQueue* q = Queue(target); q != nullptr && m_async) {
+			// The VM changed since the last KFD submission: its queues could still translate the old
+			// mappings (GemBacking::FlushKfdTlb).
+			if (const uint64_t changes = m_gem->VaChanges(); changes != m_kfd_va_changes) {
+				const double tf = NowSec();
+				const bool   ok = m_gem->FlushKfdTlb();
+				m_kfd_va_changes = changes;
+				if (m_kfd_tlb_flushes++ < 8 || !ok) {
+					std::fprintf(stderr, "NativeSubmitter: KFD TLB flush after GEM_VA changes %s, %.1f ms\n", ok ? "done" : "FAILED",
+					             (NowSec() - tf) * 1e3);
+				}
+			}
 			const double t0 = NowSec();
 			uint64_t     seq = 0;
 			if (!q->Submit(m_ib_kfd_va + slot * kSlotSize, static_cast<uint32_t>(ib.size()), timeout_sec, &seq)) {
@@ -658,6 +669,8 @@ private:
 	uint64_t    m_ib_kfd_handle = 0;
 	KfdQueue*   m_kfd_queue[kMaxKfdQueues] {};
 	uint32_t    m_kfd_rings = 0;                     // ring indexes whose submissions go to KFD queues
+	uint64_t    m_kfd_va_changes = 0;                // GemBacking::VaChanges at the last KFD TLB flush
+	uint32_t    m_kfd_tlb_flushes = 0;
 	uint32_t    m_kfd_priority[kMaxKfdQueues] = {7, 7, 7, 7, 7, 7, 7, 7};
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	struct SlotUse {

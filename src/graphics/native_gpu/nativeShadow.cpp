@@ -3005,6 +3005,13 @@ private:
 		if (native && slot != 0 && Shadow::Instance().KfdQueuesOn()) {
 			return Release::Native;
 		}
+		// With independent queues the wait reads memory as on PS5: a label that already holds a
+		// satisfying value lets it through, even if a write to it is still on its way. Holding for that
+		// write (against a stale value) deadlocked the gfx ring against a KFD queue that waited for the
+		// gfx ring's later write.
+		if (native && Shadow::Instance().KfdQueuesOn() && wait.Met(ReadLabel(wait))) {
+			return Release::Native;
+		}
 		switch (PlanRingWait(cover, satisfies, gpu, same, submitted, wait.Met(ReadLabel(wait)), native, gfx_writer)) {
 			case RingWaitRelease::GpuWait: return Release::Native;
 			case RingWaitRelease::Barrier: return Release::Observed;
@@ -3254,10 +3261,19 @@ private:
 				}
 				m_track_cv.wait(lock, [this] { return !m_entries.empty(); });
 				busy_since = busy_since == 0.0 ? NowSecShadow() : busy_since;
-				while (!m_entries.empty() &&
-				       (!m_native || m_drain || Shadow::Instance().Reached(m_entries.front().seq, m_entries.front().slot))) {
-					ready.push_back(std::move(m_entries.front()));
-					m_entries.pop_front();
+				// In order within a ring, independently across rings: a compute queue waiting on the GPU
+				// for a label (a KFD queue does, as on PS5) must not hold up the gfx ring's points, whose
+				// end-of-frame events are what lets the title submit the buffer that writes that label.
+				uint64_t blocked = 0; // rings with a point not reached yet
+				for (auto it = m_entries.begin(); it != m_entries.end();) {
+					const uint64_t bit = 1ull << (it->slot & 63u);
+					if ((blocked & bit) == 0 && (!m_native || m_drain || Shadow::Instance().Reached(it->seq, it->slot))) {
+						ready.push_back(std::move(*it));
+						it = m_entries.erase(it);
+					} else {
+						blocked |= bit;
+						++it;
+					}
 				}
 			}
 			if (!ready.empty()) {
@@ -3288,6 +3304,20 @@ private:
 				std::fprintf(stderr, "native shadow: tracker stuck at %u (slot %u) for %.0f s; %s\n",
 				             Shadow::Instance().TrackerValue(stuck_slot), stuck_slot, now - stuck_since,
 				             idle ? "the ring is idle, running the next point" : "draining");
+				{
+					// Every ring's outstanding points: how many, the first one's sequence, and where its
+					// tracker is, so a stall shows which ring the rest wait behind.
+					std::lock_guard<std::mutex> lock(m_track_mutex);
+					std::map<uint32_t, std::pair<size_t, uint64_t>> per_slot;
+					for (const auto& e: m_entries) {
+						auto [it, fresh] = per_slot.try_emplace(e.slot, 0, e.seq);
+						it->second.first++;
+					}
+					for (const auto& [s, v]: per_slot) {
+						std::fprintf(stderr, "native shadow:   slot %u: %zu points outstanding, first seq %llu, tracker at %u\n", s, v.first,
+						             static_cast<unsigned long long>(v.second), Shadow::Instance().TrackerValue(s));
+					}
+				}
 				std::lock_guard<std::mutex> lock(m_track_mutex);
 				if (idle && !m_entries.empty()) {
 					m_entries.front().seq = Shadow::Instance().TrackerValue(m_entries.front().slot);
@@ -3297,22 +3327,27 @@ private:
 				stuck_since = 0.0;
 				continue;
 			}
-			// Block on this ring's fence. The 2 ms cap covers a tracker dword written before the CS
-			// ends, and a point whose CS has not been submitted yet. A timeout does not disable the
-			// path. If the fence was already signaled, WaitSeq returns at once: sleep so that case
-			// does not spin.
+			// Block on a ring's fence: the gfx ring's when it has points outstanding (compute queues may
+			// wait on labels for long), else the oldest point's. The 2 ms cap covers a tracker dword
+			// written before the CS ends, and a point whose CS has not been submitted yet. A timeout
+			// does not disable the path. If the fence was already signaled, WaitSeq returns at once:
+			// sleep so that case does not spin.
 			uint32_t slot = 0;
 			{
 				std::lock_guard<std::mutex> lock(m_track_mutex);
 				if (!m_entries.empty()) {
-					slot = m_entries.front().slot;
+					slot = std::any_of(m_entries.begin(), m_entries.end(), [](const Entry& e) { return e.slot == 0; })
+					           ? 0u
+					           : m_entries.front().slot;
 				}
 			}
 			Shadow::Instance().WaitSlotBrief(slot, 0.002);
 			bool pending = false;
 			{
 				std::lock_guard<std::mutex> lock(m_track_mutex);
-				pending = !m_entries.empty() && !Shadow::Instance().Reached(m_entries.front().seq, m_entries.front().slot);
+				pending = !m_entries.empty() && std::none_of(m_entries.begin(), m_entries.end(), [](const Entry& e) {
+					          return Shadow::Instance().Reached(e.seq, e.slot);
+				          });
 			}
 			if (pending) {
 				struct timespec nap = {0, 1000000};

@@ -247,6 +247,7 @@ public:
 			::munmap(m_dummy_cpu, BlockSize());
 		}
 		CloseBo(m_dummy);
+		CloseBo(m_tlb_bo);
 		if (m_kfd_fd >= 0) {
 			::close(m_kfd_fd);
 		}
@@ -656,6 +657,30 @@ public:
 	// The KFD process of this VM: with KYTY_NATIVE_GPU_KFD_MEMORY its blocks are KFD buffers, and KFD
 	// user-mode queues (KYTY_NATIVE_GPU_KFD_QUEUES) run in it. -1 / 0 when neither is on.
 	[[nodiscard]] int      KfdFd() const { return m_kfd_fd; }
+
+	// How many GEM_VA changes this VM has seen (FlushKfdTlb).
+	[[nodiscard]] uint64_t VaChanges() const { return m_va_changes.load(std::memory_order_acquire); }
+
+	// KFD queues reach the VM through the KFD VMIDs' TLBs, which a render-node GEM_VA change does not
+	// flush: a CS flushes its own job's VMID, and nothing runs for a KFD queue (kfd_probe avremap: a
+	// KFD write after a REPLACE, or a CLEAR and MAP, landed in the previous buffer half the time). The
+	// BC-250's patched amdgpu (bc250_flush_by_runlist) flushes them on a KFD map or unmap, so a small
+	// KFD buffer is unmapped and mapped again. False without the KFD process.
+	bool FlushKfdTlb() {
+		std::lock_guard<std::mutex> lock(m_lock);
+		if (m_kfd_fd < 0 || (m_tlb_bo.kfd_handle == 0 && !CreateKfdBo(4096, &m_tlb_bo))) {
+			return false;
+		}
+		struct kfd_ioctl_unmap_memory_from_gpu_args um {};
+		um.handle               = m_tlb_bo.kfd_handle;
+		um.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
+		um.n_devices            = 1;
+		struct kfd_ioctl_map_memory_to_gpu_args mp {};
+		mp.handle               = m_tlb_bo.kfd_handle;
+		mp.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
+		mp.n_devices            = 1;
+		return KfdIoctl(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &um) == 0 && KfdIoctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, &mp) == 0;
+	}
 	[[nodiscard]] uint32_t KfdGpuId() const { return m_kfd_gpu; }
 
 	// A KFD buffer for someone else's use (the submitter's IB buffer with KFD queues): imported into
@@ -768,6 +793,7 @@ private:
 		v.offset_in_bo = offset_in_bo;
 		v.map_size     = size;
 		const int r    = Ioctl(DRM_IOCTL_AMDGPU_GEM_VA, &v);
+		m_va_changes.fetch_add(1, std::memory_order_release);
 		if (r != 0) {
 			std::fprintf(stderr, "GemBacking: GEM_VA op %u at 0x%llx (+0x%llx) failed: %s\n", op,
 			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
@@ -1587,6 +1613,8 @@ private:
 	uint32_t                      m_kfd_gpu = 0;
 	bool                          m_kfd_userptr = false; // KYTY_NATIVE_GPU_KFD_QUEUES: external ranges are KFD userptr buffers
 	bool                          m_kfd_memory  = false; // blocks are KFD buffers (InitKfd)
+	Bo                            m_tlb_bo;              // FlushKfdTlb's buffer
+	mutable std::atomic<uint64_t> m_va_changes {0};      // VaOp calls (FlushKfdTlb)
 	mutable uint64_t              m_kfd_va_next = 0x600000000000ull; // private VAs of the KFD allocations
 	uint8_t*                      m_alias  = nullptr;
 	uint64_t                      m_size   = 0;
