@@ -244,6 +244,25 @@ void TestIndirectShComputeBit() {
 	}
 }
 
+void TestComputeCuClamp() {
+	Pm4Translator t;
+	t.SetComputeCuClamp({0x003f003fu, 0x003f003fu, 0u, 0u});
+	std::vector<uint32_t> dcb;
+	// COMPUTE_STATIC_THREAD_MGMT_SE0, SE1 and the reserved word between SE1 and SE2, all ones.
+	Append(dcb, IT_SET_SH_REG, {0x216u, 0xffffffffu, 0xffffffffu, 0xffffffffu}, true);
+	auto r = t.Translate(dcb);
+	Check(r.ok, "clamped DCB translates");
+	bool seen = false;
+	for (const auto& p: Decode(r.ib)) {
+		if (p.op == IT_SET_SH_REG && p.body.size() == 4 && p.body[0] == 0x216u) {
+			seen = true;
+			Check(p.body[1] == 0x003f003fu && p.body[2] == 0x003f003fu && p.body[3] == 0xffffffffu,
+			      "CU masks ANDed with the clamp, other registers untouched");
+		}
+	}
+	Check(seen, "the SET_SH_REG passes through");
+}
+
 void TestUconfigWhitelist() {
 	Pm4Translator t;
 	// 0x243 (VGT_INDEX_TYPE) is allowed; 0x300 is not.
@@ -1671,6 +1690,7 @@ int main() {
 	TestShaderDetection();
 	TestIndirectContextExpansion();
 	TestIndirectShComputeBit();
+	TestComputeCuClamp();
 	TestUconfigWhitelist();
 	TestUconfigIndexPassthrough();
 	TestUconfigIndexedRegisters();

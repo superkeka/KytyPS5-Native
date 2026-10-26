@@ -554,6 +554,19 @@ public:
 
 	// Experiment: render targets without DCC compression (CB_COLORn_INFO.DCC_ENABLE cleared).
 	void SetNoDcc(bool no_dcc) { m_no_dcc = no_dcc; }
+	// COMPUTE_STATIC_THREAD_MGMT_SE0..3 are ANDed with `masks` (0 for a word: left alone). KFD queues
+	// with KYTY_NATIVE_GPU_KFD_CU_CLAMP: the kernel sizes a queue's wave save area by the CUs it found
+	// at init (24 on the BC-250), and waves on the CUs enabled after it would overflow it.
+	void SetComputeCuClamp(const std::array<uint32_t, 4>& masks) { m_cu_clamp = masks; }
+	[[nodiscard]] uint32_t PatchSh(uint32_t offset, uint32_t value) const {
+		static constexpr uint32_t kSe[4] = {0x216, 0x217, 0x219, 0x21a};
+		for (uint32_t i = 0; i < 4; i++) {
+			if (offset == kSe[i] && m_cu_clamp[i] != 0) {
+				return value & m_cu_clamp[i];
+			}
+		}
+		return value;
+	}
 	// The registered video-out buffers: color targets there are drawn without DCC (DCC_ENABLE cleared
 	// before each draw, the guest's value back once the slot points elsewhere). The PS5 display engine
 	// scans DCC out; Kyty's presenter copies the buffer as plain memory, so it has to hold plain pixels.
@@ -692,6 +705,7 @@ private:
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 	bool                         m_no_dcc     = false;
+	std::array<uint32_t, 4>      m_cu_clamp {};
 	std::vector<std::pair<uint64_t, uint64_t>> m_display_ranges; // AddDisplayRange
 	uint32_t                     m_display_dcc_off = 0;           // MRT slots drawn with DCC cleared
 	std::array<uint32_t, 8>      m_display_dcc_info {};           // their guest CB_COLORn_INFO

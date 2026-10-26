@@ -1445,12 +1445,27 @@ private:
 				}
 			}
 		}
-		if (!m_submitter->EnableKfdQueues(m_compute_mask)) {
+		// KYTY_NATIVE_GPU_KFD_QUEUE_RINGS=<mask>: only these compute rings become KFD queues (0: none; the
+		// others stay CS rings).
+		uint32_t rings = m_compute_mask;
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUE_RINGS"); v != nullptr && v[0] != '\0') {
+			rings &= static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+		}
+		if (!m_submitter->EnableKfdQueues(rings)) {
 			std::fprintf(stderr, "native shadow: KFD queues unavailable; ACBs stay on CS compute rings\n");
 			return;
 		}
 		std::fprintf(stderr, "native shadow: ACBs on KFD user-mode queues (rings 0x%x, doorbell submission, GDS %u bytes)\n",
 		             m_compute_mask, m_submitter->GdsSize());
+		// The wave save area KFD gives a queue holds the CUs amdgpu counted at init; on a board with more
+		// CUs enabled after it (the BC-250's 40 of 24), a preempted queue would overflow it. ACBs stay on
+		// those CUs unless KYTY_NATIVE_GPU_KFD_CU_CLAMP=0.
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_CU_CLAMP"); v == nullptr || v[0] != '0') {
+			const auto masks = m_submitter->InitCuMasks();
+			m_acb_translator.SetComputeCuClamp(masks);
+			std::fprintf(stderr, "native shadow: ACB CU masks clamped to amdgpu's init CUs 0x%08x 0x%08x 0x%08x 0x%08x\n", masks[0],
+			             masks[1], masks[2], masks[3]);
+		}
 #endif
 	}
 

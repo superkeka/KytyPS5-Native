@@ -87,6 +87,13 @@ int main(int argc, char** argv) {
 	const int hold = argc > 2 && strcmp(argv[1], "hold") == 0 ? atoi(argv[2]) : 0;
 	const int gds  = argc > 1 && strcmp(argv[1], "gds") == 0;
 	const int view = argc > 1 && strcmp(argv[1], "view") == 0;
+	// "cross [N]": labels ping-pong N times between the KFD queue and the render node's gfx ring, each
+	// waiting (WAIT_REG_MEM) for the other's last write: what Kyty's ACBs and DCBs do with KFD queues.
+	const int cross = argc > 1 && strcmp(argv[1], "cross") == 0 ? (argc > 2 ? atoi(argv[2]) : 1000) : 0;
+	// "mapstorm [N]": with the queue alive, N KFD allocations of 16 MiB mapped to the GPU one after
+	// another (each MAP_MEMORY_TO_GPU of a process with a queue flushes its VMID's TLB through the KIQ),
+	// as Kyty's residency does while a title loads.
+	const int mapstorm = argc > 1 && strcmp(argv[1], "mapstorm") == 0 ? (argc > 2 ? atoi(argv[2]) : 300) : 0;
 	// The GPU node: the one with SIMDs.
 	char path[128];
 	for (int n = 0; n < 8 && gpu_id == 0; n++) {
@@ -354,6 +361,100 @@ int main(int argc, char** argv) {
 		printf("render-node CS listing the imported handle writes the view: CS %s, %s\n", r ? strerror(-r) : "ok",
 		       bc[(4 << 20) / 4 + 1] == 0xcafe000au ? "LANDED" : "not landed");
 		return 0;
+	}
+
+	if (mapstorm > 0) {
+		t0 = Now();
+		int done = 0;
+		for (int i = 0; i < mapstorm; i++) {
+			struct Mem m;
+			if (Alloc(&m, va + 0x100000000ull + (uint64_t)i * (16u << 20), 16u << 20, gtt) != 0) {
+				printf("mapstorm: allocation %d failed\n", i);
+				break;
+			}
+			done++;
+		}
+		printf("mapstorm: %d allocations mapped in %.1f ms\n", done, (Now() - t0) * 1e3);
+		WRITE(data.va + 28, 0xcafe000bu);
+		t0 = Now();
+		KICK();
+		while (d[7] != 0xcafe000bu && Now() - t0 < 2.0) {
+		}
+		printf("mapstorm: the queue still runs: %s\n", d[7] == 0xcafe000bu ? "YES" : "NO");
+		return d[7] == 0xcafe000bu ? 0 : 12;
+	}
+
+	if (cross > 0) {
+		volatile uint32_t* lab = d + 64; // A at +256 (KFD writes), B at +260 (gfx writes)
+		const uint64_t     a_va = data.va + 256, b_va = data.va + 260;
+		lab[0] = 0;
+		lab[1] = 0;
+		__sync_synchronize();
+		// The gfx side: one IB with every round, on a context of its own.
+		union drm_amdgpu_ctx c = {.in = {.op = AMDGPU_CTX_OP_ALLOC_CTX}};
+		r = Ioctl(drm, DRM_IOCTL_AMDGPU_CTX, &c);
+		const uint32_t ib_bytes = (uint32_t)((cross * 12 + 64) * 4 + 65535) & ~65535u;
+		union drm_amdgpu_gem_create ic = {.in = {.bo_size = ib_bytes, .alignment = 65536, .domains = AMDGPU_GEM_DOMAIN_GTT,
+		                                         .domain_flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED}};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_AMDGPU_GEM_CREATE, &ic);
+		const uint64_t ib_va = va + 0x5000000;
+		struct drm_amdgpu_gem_va iv = {.handle = ic.out.handle, .operation = AMDGPU_VA_OP_MAP,
+		                               .flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE, .va_address = ib_va, .map_size = ib_bytes};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_AMDGPU_GEM_VA, &iv);
+		union drm_amdgpu_gem_mmap im = {.in = {.handle = ic.out.handle}};
+		r = r ? r : Ioctl(drm, DRM_IOCTL_AMDGPU_GEM_MMAP, &im);
+		uint32_t* ib = r ? MAP_FAILED : mmap(NULL, ib_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, drm, im.out.addr_ptr);
+		if (ib == MAP_FAILED) {
+			printf("cross: CS setup: %s\n", strerror(-r));
+			return 10;
+		}
+#define G3(op, body) (0xc0000000u | (((body) - 1u) << 16) | ((op) << 8))
+		uint32_t n = 0;
+		for (int i = 1; i <= cross; i++) {
+			ib[n++] = G3(0x3c, 6); // WAIT_REG_MEM, ME, memory, equal
+			ib[n++] = 3u | (1u << 4);
+			ib[n++] = (uint32_t)a_va;
+			ib[n++] = (uint32_t)(a_va >> 32);
+			ib[n++] = (uint32_t)i;
+			ib[n++] = 0xffffffffu;
+			ib[n++] = 4u;
+			ib[n++] = G3(0x37, 4); // WRITE_DATA, ME, memory, write confirm
+			ib[n++] = (5u << 8) | (1u << 20);
+			ib[n++] = (uint32_t)b_va;
+			ib[n++] = (uint32_t)(b_va >> 32);
+			ib[n++] = (uint32_t)i;
+		}
+		while (n & 7) {
+			ib[n++] = 0xffff1000u;
+		}
+		// The KFD side: every round in the ring, kicked once.
+		for (int i = 1; i <= cross; i++) {
+			PUSH(Pkt3(0x3c, 6));
+			PUSH(3u | (1u << 4));
+			PUSH((uint32_t)b_va);
+			PUSH((uint32_t)(b_va >> 32));
+			PUSH((uint32_t)(i - 1));
+			PUSH(0xffffffffu);
+			PUSH(4u);
+			WRITE(a_va, (uint32_t)i);
+		}
+		struct drm_amdgpu_bo_list_entry e = {.bo_handle = ic.out.handle};
+		struct drm_amdgpu_bo_list_in list = {.operation = ~0u, .list_handle = ~0u, .bo_number = 1, .bo_info_size = sizeof(e),
+		                                     .bo_info_ptr = (uintptr_t)&e};
+		struct drm_amdgpu_cs_chunk_ib ci = {.va_start = ib_va, .ib_bytes = n * 4, .ip_type = AMDGPU_HW_IP_GFX};
+		struct drm_amdgpu_cs_chunk ch[2] = {{AMDGPU_CHUNK_ID_IB, sizeof(ci) / 4, (uintptr_t)&ci},
+		                                    {AMDGPU_CHUNK_ID_BO_HANDLES, sizeof(list) / 4, (uintptr_t)&list}};
+		uint64_t           cp[2] = {(uintptr_t)&ch[0], (uintptr_t)&ch[1]};
+		union drm_amdgpu_cs cs   = {.in = {.ctx_id = c.out.alloc.ctx_id, .num_chunks = 2, .chunks = (uintptr_t)cp}};
+		t0 = Now();
+		KICK();
+		r = Ioctl(drm, DRM_IOCTL_AMDGPU_CS, &cs);
+		while (r == 0 && (lab[0] != (uint32_t)cross || lab[1] != (uint32_t)cross) && Now() - t0 < 5.0) {
+		}
+		const int ok = r == 0 && lab[0] == (uint32_t)cross && lab[1] == (uint32_t)cross;
+		printf("cross: %d rounds KFD queue <-> gfx ring: CS %s, A %u B %u: %s after %.1f ms (%.1f us per round trip)\n", cross,
+		       r ? strerror(-r) : "ok", lab[0], lab[1], ok ? "DONE" : "STUCK", (Now() - t0) * 1e3, (Now() - t0) * 1e6 / cross);
+		return ok ? 0 : 11;
 	}
 
 	// 3. A GEM buffer of the render node, at a VA of the same VM.

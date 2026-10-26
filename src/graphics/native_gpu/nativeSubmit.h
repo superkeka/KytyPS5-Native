@@ -11,11 +11,13 @@
 #if KYTY_GEM_BACKING_SUPPORTED
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace Libs::Graphics::NativeGpu {
@@ -162,6 +164,26 @@ public:
 				return false;
 			}
 		}
+		// KYTY_NATIVE_GPU_KFD_TRACE=1: every 0.5 s, each KFD queue's pointers and each CS slot's latest
+		// submission, so a hang that takes the board down leaves its last picture in the log.
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_TRACE"); v != nullptr && v[0] == '1') {
+			std::thread([this] {
+				for (uint32_t tick = 0;; tick++) {
+					struct timespec nap = {0, 500000000};
+					nanosleep(&nap, nullptr);
+					std::string line = "kfd trace " + std::to_string(tick) + ":" + QueueState({});
+					for (uint32_t i = 0; i < kSlots; i++) {
+						const SlotUse s = m_slot[i];
+						if (s.seq != 0 && Queue(s.target) == nullptr) {
+							line += "\n  cs slot " + std::to_string(i) + " ip " + std::to_string(s.target.ip_type) + " ring " +
+							        std::to_string(s.target.ring) + " seq " + std::to_string(s.seq) +
+							        (WaitSeq(s.seq, 0.0, s.target) ? " done" : " pending");
+						}
+					}
+					std::fprintf(stderr, "%s\n", line.c_str());
+				}
+			}).detach();
+		}
 		return true;
 	}
 	[[nodiscard]] volatile uint8_t* ScratchCpu() const {
@@ -207,6 +229,11 @@ public:
 		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
 		__sync_synchronize();
 
+		if (std::getenv("KYTY_NATIVE_GPU_KFD_TRACE") != nullptr && m_trace_submits < 24) {
+			m_trace_submits++;
+			std::fprintf(stderr, "submit: ip %u ring %u, %zu dwords, slot %u, %s\n", target.ip_type, target.ring, ib.size(), slot,
+			             Queue(target) != nullptr && m_async ? "KFD queue" : "CS");
+		}
 		if (KfdQueue* q = Queue(target); q != nullptr && m_async) {
 			const double t0 = NowSec();
 			uint64_t     seq = 0;
@@ -333,6 +360,26 @@ public:
 	}
 
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
+
+	// COMPUTE_STATIC_THREAD_MGMT_SE0..3 masks of the CUs amdgpu found at init (AMDGPU_INFO_DEV_INFO
+	// cu_bitmap: SH0 in the low 16 bits, SH1 in the high ones); zeros when the query fails.
+	[[nodiscard]] std::array<uint32_t, 4> InitCuMasks() const {
+		std::array<uint32_t, 4>     masks {};
+		struct drm_amdgpu_info_device dev;
+		std::memset(&dev, 0, sizeof(dev));
+		struct drm_amdgpu_info request;
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer = reinterpret_cast<uintptr_t>(&dev);
+		request.return_size    = sizeof(dev);
+		request.query          = AMDGPU_INFO_DEV_INFO;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) != 0) {
+			return masks;
+		}
+		for (uint32_t se = 0; se < 4; se++) {
+			masks[se] = (dev.cu_bitmap[se][0] & 0xffffu) | ((dev.cu_bitmap[se][1] & 0xffffu) << 16u);
+		}
+		return masks;
+	}
 
 	// The KFD queues' state for a timeout report (every queue: a gfx wait may be stuck on one); empty
 	// without KFD queues.
@@ -561,6 +608,7 @@ private:
 	uint64_t    m_ib_kfd_va     = 0;
 	uint64_t    m_ib_kfd_handle = 0;
 	KfdQueue*   m_kfd_queue[kMaxKfdQueues] {};
+	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	struct SlotUse {
 		uint64_t   seq   = 0;
 		uint64_t   order = 0; // when it was last submitted

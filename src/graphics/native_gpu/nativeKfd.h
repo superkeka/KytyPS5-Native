@@ -44,13 +44,14 @@ public:
 		ReadTopology(gpu_id, &cu, &cwsr, &ctl);
 		const uint64_t debug = (static_cast<uint64_t>(cu) * 32 * 32 + 63) & ~63ull; // 32 waves per CU, 32 bytes each
 		const uint64_t save  = (cwsr + debug + 4095) & ~4095ull;
+		// The flags kfd_probe's queue runs with (cached, coherent GTT).
 		constexpr uint32_t gtt = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
-		                         KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
-		                         KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED;
+		                         KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE |
+		                         KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
 		if (cu == 0 || cwsr == 0 || !q->Alloc(&q->m_ring, va, kRingBytes, gtt) || !q->Alloc(&q->m_ptrs, va + 0x100000, 4096, gtt) ||
 		    !q->Alloc(&q->m_eop, va + 0x200000, 4096,
 		              KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE) ||
-		    !q->Alloc(&q->m_save, va + 0x1000000, save, gtt & ~KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED)) {
+		    !q->Alloc(&q->m_save, va + 0x1000000, save, gtt)) {
 			std::fprintf(stderr, "KfdQueue: buffers for a queue failed (%u CUs, cwsr %u)\n", cu, cwsr);
 			delete q;
 			return nullptr;
@@ -88,6 +89,23 @@ public:
 		}
 		q->m_db_page  = db;
 		q->m_doorbell = reinterpret_cast<volatile uint64_t*>(static_cast<uint8_t*>(db) + (a.doorbell_offset & (kSlice - 1)));
+		// A first packet right away (a fence write), as kfd_probe does: the queue is known to run before
+		// any work depends on it.
+		const uint64_t s = ++q->m_seq;
+		q->Push(Pkt3(0x37, 4)); // WRITE_DATA: memory, write confirm
+		q->Push((5u << 8u) | (1u << 20u));
+		q->Push(static_cast<uint32_t>(q->FenceVa()));
+		q->Push(static_cast<uint32_t>(q->FenceVa() >> 32u));
+		q->Push(static_cast<uint32_t>(s));
+		__sync_synchronize();
+		*reinterpret_cast<volatile uint64_t*>(q->m_ptrs.cpu) = q->m_wptr;
+		__sync_synchronize();
+		*q->m_doorbell = q->m_wptr;
+		if (!q->Wait(s, 1.0)) {
+			std::fprintf(stderr, "KfdQueue: queue %u does not run its first packet\n", q->m_queue_id);
+			delete q;
+			return nullptr;
+		}
 		return q;
 	}
 
@@ -181,7 +199,7 @@ public:
 	}
 
 private:
-	static constexpr uint32_t kRingBytes   = 256 * 1024;
+	static constexpr uint32_t kRingBytes   = 64 * 1024;
 	static constexpr uint32_t kRingDwords  = kRingBytes / 4;
 	static constexpr uint32_t kRptrOffset  = 64;
 	static constexpr uint32_t kFenceOffset = 128;

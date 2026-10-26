@@ -735,7 +735,7 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 		// MEC has no graphics context. CONTEXT_CONTROL, CLEAR_STATE, context and UCONFIG writes are
 		// illegal opcodes on a compute ring. SH state is replayed: other jobs share the ring.
 		for (const auto& [offset, value]: sh) {
-			EmitSet(ib, IT_SET_SH_REG, offset, value, true);
+			EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), true);
 			stats.preamble_sh++;
 		}
 		return;
@@ -806,7 +806,7 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
 	}
 	for (const auto& [offset, value]: sh) {
-		EmitSet(ib, IT_SET_SH_REG, offset, value, offset >= kShComputeBase);
+		EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), offset >= kShComputeBase);
 		stats.preamble_sh++;
 	}
 	for (const auto& [offset, value]: uc) {
@@ -1953,6 +1953,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (m_compute_ring) {
 					body[body.size() - size] |= 2u;
 				}
+				if (body_count >= 1) {
+					const size_t at = body.size() - size;
+					for (uint32_t i = 1; i < body_count; i++) {
+						body[at + 1 + i] = PatchSh(bptr[0] + (i - 1), bptr[i]);
+					}
+				}
 				stats.set_sh++;
 				break;
 			}
@@ -2070,7 +2076,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						sh[off] = value;
 						dirty_sh.push_back(off);
 						note_shader(off);
-						EmitSet(body, IT_SET_SH_REG, off, value, off >= kShComputeBase);
+						EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, value), off >= kShComputeBase);
 						stats.loaded_sh_regs++;
 					} else {
 						if (off == kUcNop) {
