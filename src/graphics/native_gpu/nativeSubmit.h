@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVESUBMIT_H_
 
 #include "graphics/native_gpu/gemBacking.h" // KYTY_GEM_BACKING_SUPPORTED + amdgpu uAPI headers
+#include "graphics/native_gpu/nativeKfd.h"
 
 // Submits a translated IB to the amdgpu gfx ring for the BC-250 native backend, on the same DRM
 // file whose GPU VM holds the guest memory bindings (GemBacking::DrmFd()). Only real Linux with the
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::NativeGpu {
@@ -56,8 +58,9 @@ public:
 		uint64_t seq       = 0;     // async mode: the submission to wait for
 	};
 
-	// Allocates a context and the IB buffer on `drm_fd`. Returns nullptr on failure.
-	static NativeSubmitter* Create(int drm_fd) {
+	// Allocates a context and the IB buffer on `drm_fd`. Returns nullptr on failure. With `gem` and
+	// KYTY_NATIVE_GPU_KFD_QUEUES=1 the IB buffer is a KFD buffer, so KFD queues can run IBs from it too.
+	static NativeSubmitter* Create(int drm_fd, GemBacking* gem = nullptr) {
 		union drm_amdgpu_ctx ctx;
 		std::memset(&ctx, 0, sizeof(ctx));
 		ctx.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
@@ -69,8 +72,12 @@ public:
 		auto* self     = new NativeSubmitter();
 		self->m_drm_fd = drm_fd;
 		self->m_ctx    = ctx.out.alloc.ctx_id;
+		self->m_gem    = gem;
 
-		if (!self->CreateIb()) {
+		// KYTY_NATIVE_GPU_KFD_IB=0 keeps the render-node IB buffer (and with it no KFD queue).
+		const char* kfd_ib  = std::getenv("KYTY_NATIVE_GPU_KFD_IB");
+		const bool  use_kfd = gem != nullptr && KfdQueuesWanted() && gem->KfdFd() >= 0 && (kfd_ib == nullptr || kfd_ib[0] != '0');
+		if (!(use_kfd ? self->CreateKfdIb() : self->CreateIb())) {
 			delete self;
 			return nullptr;
 		}
@@ -93,6 +100,10 @@ public:
 	}
 
 	~NativeSubmitter() {
+		for (KfdQueue*& q: m_kfd_queue) {
+			delete q;
+			q = nullptr;
+		}
 		for (uint32_t h: m_gds_handles) {
 			struct drm_gem_close c;
 			std::memset(&c, 0, sizeof(c));
@@ -105,7 +116,9 @@ public:
 		if (m_ib_cpu != nullptr) {
 			::munmap(m_ib_cpu, kIbSize);
 		}
-		if (m_ib_handle != 0) {
+		if (m_ib_kfd_handle != 0) {
+			m_gem->FreeKfdBuffer(m_ib_handle, m_ib_dmabuf, m_ib_kfd_handle);
+		} else if (m_ib_handle != 0) {
 			struct drm_gem_close c;
 			std::memset(&c, 0, sizeof(c));
 			c.handle = m_ib_handle;
@@ -128,6 +141,29 @@ public:
 	// AMDGPU_INFO_HW_IP_INFO available_rings for compute, ip_instance 0. 0 when the kernel has none.
 	[[nodiscard]] uint32_t ComputeRingMask() const { return m_compute_rings; }
 	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
+
+	// KYTY_NATIVE_GPU_KFD_QUEUES: one KFD user-mode queue per compute ring in `rings`; submissions to
+	// those rings then go to the queue's doorbell instead of a CS ioctl. Needs the KFD IB buffer. False
+	// (and no queue) when a queue cannot be created.
+	bool EnableKfdQueues(uint32_t rings) {
+		if (m_ib_kfd_handle == 0) {
+			return false;
+		}
+		for (uint32_t ring = 0; ring < kMaxKfdQueues; ring++) {
+			if ((rings & (1u << ring)) == 0) {
+				continue;
+			}
+			m_kfd_queue[ring] = KfdQueue::Create(m_gem->KfdFd(), m_gem->KfdGpuId(), m_drm_fd, kKfdQueueVa + ring * kKfdQueueStride);
+			if (m_kfd_queue[ring] == nullptr) {
+				for (KfdQueue*& q: m_kfd_queue) {
+					delete q;
+					q = nullptr;
+				}
+				return false;
+			}
+		}
+		return true;
+	}
 	[[nodiscard]] volatile uint8_t* ScratchCpu() const {
 		return static_cast<volatile uint8_t*>(m_ib_cpu) + kIbSize - kScratchSize;
 	}
@@ -170,6 +206,24 @@ public:
 		}
 		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
 		__sync_synchronize();
+
+		if (KfdQueue* q = Queue(target); q != nullptr && m_async) {
+			const double t0 = NowSec();
+			uint64_t     seq = 0;
+			if (!q->Submit(m_ib_kfd_va + slot * kSlotSize, static_cast<uint32_t>(ib.size()), timeout_sec, &seq)) {
+				res.timed_out = true;
+				return res;
+			}
+			m_slot[slot].seq    = seq;
+			m_slot[slot].target = target;
+			m_slot[slot].order  = ++m_slot_order;
+			res.submitted       = true;
+			res.completed       = true;
+			res.seq             = seq;
+			res.cs_seconds      = NowSec() - t0;
+			res.seconds         = res.cs_seconds;
+			return res;
+		}
 
 		std::vector<drm_amdgpu_bo_list_entry> entries;
 		entries.reserve(bo_handles.size() + 1);
@@ -280,7 +334,24 @@ public:
 
 	[[nodiscard]] int DrmFd() const { return m_drm_fd; }
 
+	// The KFD queues' state for a timeout report (every queue: a gfx wait may be stuck on one); empty
+	// without KFD queues.
+	[[nodiscard]] std::string QueueState(RingTarget /*target*/) const {
+		std::string out;
+		for (uint32_t ring = 0; ring < kMaxKfdQueues; ring++) {
+			if (m_kfd_queue[ring] != nullptr) {
+				char text[192];
+				m_kfd_queue[ring]->Describe(text, sizeof(text));
+				out += "\n  ring " + std::to_string(ring) + " " + text;
+			}
+		}
+		return out;
+	}
+
 	bool WaitSeq(uint64_t seq, double timeout_sec, RingTarget target = {}) {
+		if (const KfdQueue* q = Queue(target); q != nullptr) {
+			return q->Wait(seq, timeout_sec);
+		}
 		union drm_amdgpu_wait_cs w;
 		std::memset(&w, 0, sizeof(w));
 		struct timespec ts;
@@ -295,7 +366,38 @@ public:
 	}
 
 private:
+	static constexpr uint32_t kMaxKfdQueues   = 8;
+	static constexpr uint64_t kKfdQueueVa     = 0x6e0000000000ull; // above GemBacking's KFD allocations
+	static constexpr uint64_t kKfdQueueStride = 0x10000000ull;
+
 	NativeSubmitter() = default;
+
+	[[nodiscard]] KfdQueue* Queue(RingTarget target) const {
+		return target.ip_type == AMDGPU_HW_IP_COMPUTE && target.ring < kMaxKfdQueues ? m_kfd_queue[target.ring] : nullptr;
+	}
+
+	// The IB buffer as a KFD buffer (uncached on the GPU like CreateIb's), imported into m_drm_fd and
+	// mapped at kIbVa as well: CS jobs and KFD queues share the slots and the scratch area.
+	bool CreateKfdIb() {
+		if (!m_gem->CreateKfdBuffer(kIbSize, true, &m_ib_handle, &m_ib_dmabuf, &m_ib_kfd_va, &m_ib_kfd_handle)) {
+			std::fprintf(stderr, "NativeSubmitter: KFD IB buffer failed\n");
+			return false;
+		}
+		void* p = ::mmap(nullptr, kIbSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_ib_dmabuf, 0);
+		if (p == MAP_FAILED) {
+			std::fprintf(stderr, "NativeSubmitter: KFD IB mmap failed: %s\n", std::strerror(errno));
+			return false;
+		}
+		m_ib_cpu = p;
+		if (VaOp(AMDGPU_VA_OP_MAP, m_ib_handle, kIbVa) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: KFD IB GEM_VA at 0x%llx failed: %s\n", static_cast<unsigned long long>(kIbVa),
+			             std::strerror(errno));
+			return false;
+		}
+		m_ib_va = kIbVa;
+		std::fprintf(stderr, "NativeSubmitter: IB buffer is a KFD buffer (KFD VA 0x%llx)\n", static_cast<unsigned long long>(m_ib_kfd_va));
+		return true;
+	}
 
 	static int Ioctl(int fd, unsigned long request, void* arg) {
 		int r = -1;
@@ -454,6 +556,11 @@ private:
 	uint32_t m_ib_handle = 0;
 	void*    m_ib_cpu    = nullptr;
 	uint64_t m_ib_va     = 0;
+	GemBacking* m_gem           = nullptr;
+	int         m_ib_dmabuf     = -1; // CreateKfdIb
+	uint64_t    m_ib_kfd_va     = 0;
+	uint64_t    m_ib_kfd_handle = 0;
+	KfdQueue*   m_kfd_queue[kMaxKfdQueues] {};
 	struct SlotUse {
 		uint64_t   seq   = 0;
 		uint64_t   order = 0; // when it was last submitted

@@ -273,6 +273,12 @@ public:
 	// One report of `size` bytes at `va` in whichever VMID serves this VM now, finished when this
 	// returns 0. -ESRCH: the VM holds no VMID at the moment (nothing of it on the GPU).
 	int Report(uint64_t va, uint32_t size) { return Call(3u | (m_pasid << 8u), size, va, nullptr); }
+	// Writes a register the helper allows (op 5); 0 when it reads back `value`.
+	int WriteReg(uint32_t reg, uint32_t value) {
+		uint32_t back = 0;
+		const int r   = Call(5, reg, value, &back);
+		return r != 0 ? r : (back == value ? 0 : -EIO);
+	}
 
 private:
 	int Call(uint32_t op, uint32_t size, uint64_t va, uint32_t* value) {
@@ -1149,6 +1155,9 @@ public:
 			                     "ACBs stay on the gfx ring\n");
 			m_acb_rings = false;
 		}
+		if (m_acb_rings && KfdQueuesWanted()) {
+			EnableKfdQueues();
+		}
 		const uint64_t va      = m_submitter->ScratchVa() + kTrackerOffset;
 		const char*    native  = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
 		const bool     waits   = native == nullptr || native[0] != '0';
@@ -1303,8 +1312,8 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (!m_disabled) {
-			std::fprintf(stderr, "native shadow: ring slot %u submission %llu TIMED OUT; disabling native path\n", slot,
-			             static_cast<unsigned long long>(fence.seq));
+			std::fprintf(stderr, "native shadow: ring slot %u submission %llu TIMED OUT; disabling native path %s\n", slot,
+			             static_cast<unsigned long long>(fence.seq), m_submitter->QueueState({fence.ip_type, fence.ring}).c_str());
 			Disable("timeout");
 		}
 #else
@@ -1415,6 +1424,34 @@ private:
 		             idle ? "idle" : "STILL BUSY");
 #endif
 		::_exit(128 + sig);
+	}
+
+	// KYTY_NATIVE_GPU_KFD_QUEUES=1: the compute rings become KFD user-mode queues, rung by doorbell
+	// like the PS5's compute queues. Their VMIDs (8-15, KFD's) get the same GDS partition as the CS jobs
+	// (base 0), which amdgpu leaves empty there; the kyty-lodhw helper writes it, as the PS5 kernel
+	// gives the title's VMID a static one. Without the helper, GDS users stay on CS compute rings.
+	void EnableKfdQueues() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_submitter->HasGds()) {
+			if (!LodStatsHw::Instance().On()) {
+				LodStatsHw::Instance().Connect();
+			}
+			for (uint32_t vmid = 8; vmid < 16; vmid++) {
+				const uint32_t reg = 0x1260 + 0x20a0 + vmid * 2;
+				if (LodStatsHw::Instance().WriteReg(reg, 0) != 0 || LodStatsHw::Instance().WriteReg(reg + 1, m_submitter->GdsSize()) != 0) {
+					std::fprintf(stderr, "native shadow: GDS of the KFD VMIDs not writable (kyty-lodhw helper); ACBs stay on CS "
+					                     "compute rings\n");
+					return;
+				}
+			}
+		}
+		if (!m_submitter->EnableKfdQueues(m_compute_mask)) {
+			std::fprintf(stderr, "native shadow: KFD queues unavailable; ACBs stay on CS compute rings\n");
+			return;
+		}
+		std::fprintf(stderr, "native shadow: ACBs on KFD user-mode queues (rings 0x%x, doorbell submission, GDS %u bytes)\n",
+		             m_compute_mask, m_submitter->GdsSize());
+#endif
 	}
 
 	// GET_LOD_STATS through the GPU's own reporter when the kyty-lodhw helper runs (and the mode is
@@ -2027,7 +2064,7 @@ private:
 			std::fprintf(stderr, "native shadow: GEM backing unavailable; staying off.\n");
 			return;
 		}
-		m_submitter = NativeSubmitter::Create(m_gem->DrmFd());
+		m_submitter = NativeSubmitter::Create(m_gem->DrmFd(), m_gem);
 		if (m_submitter == nullptr) {
 			std::fprintf(stderr, "native shadow: submitter init failed; staying off.\n");
 			return;

@@ -84,6 +84,17 @@ namespace Libs::Graphics::NativeGpu {
 // in proportion to their size.
 //
 // This class performs no command submission.
+// KYTY_NATIVE_GPU_KFD_QUEUES=1: asynchronous compute buffers run on KFD user-mode queues (see
+// nativeKfd.h). Everything such a queue reaches must be KFD memory, so this implies
+// KYTY_NATIVE_GPU_KFD_MEMORY and makes the external ranges KFD userptr buffers as well.
+inline bool KfdQueuesWanted() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUES");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
 class GemBacking {
 public:
 	// Residency granularity. Every resident block is listed in every submission (a listed buffer
@@ -172,8 +183,7 @@ public:
 			m_mover.join();
 		}
 		for (const auto& [vaddr, ext]: m_external) {
-			VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, ext.end - vaddr);
-			GemClose(ext.handle);
+			CloseExternal(vaddr, ext);
 		}
 		if (m_alias != nullptr) {
 			::munmap(m_alias, m_size);
@@ -539,6 +549,30 @@ public:
 	[[nodiscard]] int      KfdFd() const { return m_kfd_fd; }
 	[[nodiscard]] uint32_t KfdGpuId() const { return m_kfd_gpu; }
 
+	// A KFD buffer for someone else's use (the submitter's IB buffer with KFD queues): imported into
+	// DrmFd() as `*handle`, CPU-mappable through `*dmabuf_fd`, and at `*kfd_va` in the GPU VM, where KFD
+	// keeps it valid. `uncached`: uncached on the GPU, like a render-node IB buffer. False without KFD
+	// memory. FreeKfdBuffer undoes it.
+	bool CreateKfdBuffer(uint64_t size, bool uncached, uint32_t* handle, int* dmabuf_fd, uint64_t* kfd_va, uint64_t* kfd_handle) {
+		std::lock_guard<std::mutex> lock(m_lock);
+		Bo                          bo;
+		if (m_kfd_fd < 0 ||
+		    !CreateKfdBo(size, &bo, uncached ? KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT : 0u, kfd_va)) {
+			return false;
+		}
+		*handle     = bo.handle;
+		*dmabuf_fd  = bo.dmabuf_fd;
+		*kfd_handle = bo.kfd_handle;
+		return true;
+	}
+	void FreeKfdBuffer(uint32_t handle, int dmabuf_fd, uint64_t kfd_handle) const {
+		Bo bo;
+		bo.handle     = handle;
+		bo.dmabuf_fd  = dmabuf_fd;
+		bo.kfd_handle = kfd_handle;
+		CloseBo(bo);
+	}
+
 	// Every GEM buffer a submission must list as resident: the resident blocks, the dummy and the
 	// external ranges. Grows as blocks are promoted.
 	[[nodiscard]] std::vector<uint32_t> CreatedHandles() const {
@@ -552,7 +586,9 @@ public:
 		}
 		handles.push_back(m_dummy.handle);
 		for (const auto& [vaddr, ext]: m_external) {
-			handles.push_back(ext.handle);
+			if (ext.handle != 0) {
+				handles.push_back(ext.handle);
+			}
 		}
 		return handles;
 	}
@@ -642,7 +678,7 @@ private:
 	// does not wait for a job that did not).
 	void InitKfd() {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_MEMORY");
-		if (v == nullptr || v[0] != '1') {
+		if ((v == nullptr || v[0] != '1') && !KfdQueuesWanted()) {
 			return;
 		}
 		struct stat st {};
@@ -685,7 +721,11 @@ private:
 			m_kfd_gpu = 0;
 			return;
 		}
-		std::fprintf(stderr, "GemBacking: blocks are KFD buffers (gpu id %u)\n", m_kfd_gpu);
+		// KYTY_NATIVE_GPU_KFD_USERPTR=0 keeps the external ranges render-node userptr buffers.
+		const char* up = std::getenv("KYTY_NATIVE_GPU_KFD_USERPTR");
+		m_kfd_userptr  = KfdQueuesWanted() && (up == nullptr || up[0] != '0');
+		std::fprintf(stderr, "GemBacking: blocks%s are KFD buffers (gpu id %u)\n", m_kfd_userptr ? " and external ranges" : "",
+		             m_kfd_gpu);
 	}
 
 	int KfdIoctl(unsigned long request, void* arg) const {
@@ -698,18 +738,21 @@ private:
 
 	// A KFD GTT buffer at a private VA of its own (KFD maps every allocation somewhere), exported as a
 	// dma-buf and imported into m_drm_fd, so it is used exactly like a render-node buffer.
-	bool CreateKfdBo(uint64_t size, Bo* out) const {
+	bool CreateKfdBo(uint64_t size, Bo* out, uint32_t extra_flags = 0, uint64_t* va = nullptr) const {
 		struct kfd_ioctl_alloc_memory_of_gpu_args a {};
 		a.va_addr = m_kfd_va_next;
 		a.size    = size;
 		a.gpu_id  = m_kfd_gpu;
 		a.flags   = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
-		          KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+		          KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | extra_flags;
 		int r = KfdIoctl(AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &a);
 		if (r != 0) {
 			std::fprintf(stderr, "GemBacking: KFD allocation of %llu MiB failed: %s\n",
 			             static_cast<unsigned long long>(size >> 20), std::strerror(-r));
 			return false;
+		}
+		if (va != nullptr) {
+			*va = a.va_addr;
 		}
 		m_kfd_va_next += (size + (2ull << 20) - 1) & ~((2ull << 20) - 1);
 		Bo bo;
@@ -1149,6 +1192,36 @@ private:
 	// at vaddr. `gpu_write` selects a writable or read-only buffer and page mapping. Caller holds
 	// m_lock and has already cleared any overlapping external binding.
 	bool RegisterExternalUnlocked(uint64_t vaddr, uint64_t size, bool gpu_write) {
+		if (m_kfd_userptr) {
+			// A KFD userptr buffer at its own guest VA: KFD keeps it valid (it stops its queues while the
+			// CPU pages change), so a KFD queue reaches it and a render-node CS need not list it.
+			struct kfd_ioctl_alloc_memory_of_gpu_args a {};
+			a.va_addr     = vaddr;
+			a.size        = size;
+			a.mmap_offset = vaddr;
+			a.gpu_id      = m_kfd_gpu;
+			a.flags       = KFD_IOC_ALLOC_MEM_FLAGS_USERPTR | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE |
+			          (gpu_write ? KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE : 0u);
+			int r = KfdIoctl(AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &a);
+			if (r == 0) {
+				struct kfd_ioctl_map_memory_to_gpu_args mp {};
+				mp.handle               = a.handle;
+				mp.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
+				mp.n_devices            = 1;
+				if ((r = KfdIoctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, &mp)) != 0) {
+					struct kfd_ioctl_free_memory_of_gpu_args fr {};
+					fr.handle = a.handle;
+					KfdIoctl(AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fr);
+				}
+			}
+			if (r != 0) {
+				std::fprintf(stderr, "GemBacking: KFD userptr 0x%llx (0x%llx, %s) failed: %s\n", static_cast<unsigned long long>(vaddr),
+				             static_cast<unsigned long long>(size), gpu_write ? "rw" : "ro", std::strerror(-r));
+				return false;
+			}
+			m_external.emplace(vaddr, External {vaddr + size, 0, gpu_write, a.handle});
+			return true;
+		}
 		struct drm_amdgpu_gem_userptr u;
 		std::memset(&u, 0, sizeof(u));
 		u.addr  = vaddr;
@@ -1198,8 +1271,7 @@ private:
 		}
 
 		for (const auto& [start, ext]: overlapping) {
-			VaOp(AMDGPU_VA_OP_CLEAR, 0, start, 0, ext.end - start);
-			GemClose(ext.handle);
+			CloseExternal(start, ext);
 			if (start < vaddr) {
 				RegisterExternalUnlocked(start, vaddr - start, ext.writable);
 			}
@@ -1210,15 +1282,33 @@ private:
 	}
 
 	struct External {
-		uint64_t end      = 0; // one past the last byte; start is the m_external key
-		uint32_t handle   = 0;
-		bool     writable = false;
+		uint64_t end        = 0; // one past the last byte; start is the m_external key
+		uint32_t handle     = 0; // the userptr GEM buffer; 0 for a KFD userptr buffer
+		bool     writable   = false;
+		uint64_t kfd_handle = 0;
 	};
+
+	void CloseExternal(uint64_t vaddr, const External& ext) const {
+		if (ext.kfd_handle != 0) {
+			struct kfd_ioctl_unmap_memory_from_gpu_args um {};
+			um.handle               = ext.kfd_handle;
+			um.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
+			um.n_devices            = 1;
+			KfdIoctl(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &um);
+			struct kfd_ioctl_free_memory_of_gpu_args fr {};
+			fr.handle = ext.kfd_handle;
+			KfdIoctl(AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fr);
+			return;
+		}
+		VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, ext.end - vaddr);
+		GemClose(ext.handle);
+	}
 
 	int                           m_drm_fd = -1;
 	int                           m_mem_fd = -1;
 	int                           m_kfd_fd  = -1; // KYTY_NATIVE_GPU_KFD_MEMORY: see InitKfd
 	uint32_t                      m_kfd_gpu = 0;
+	bool                          m_kfd_userptr = false; // KYTY_NATIVE_GPU_KFD_QUEUES: external ranges are KFD userptr buffers
 	mutable uint64_t              m_kfd_va_next = 0x600000000000ull; // private VAs of the KFD allocations
 	uint8_t*                      m_alias  = nullptr;
 	uint64_t                      m_size   = 0;
