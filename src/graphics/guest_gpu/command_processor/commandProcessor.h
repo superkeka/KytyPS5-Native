@@ -32,6 +32,14 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// The packet the processor stopped at (nullptr when done) and the dwords left from it.
+	[[nodiscard]] std::span<const uint32_t> Cursor() const noexcept {
+		if (m_buffer_stack.empty()) {
+			return {};
+		}
+		const auto& c = m_buffer_stack.back();
+		return c.offset_dw < c.commands.size() ? c.commands.subspan(c.offset_dw) : std::span<const uint32_t> {};
+	}
 
 private:
 	friend class CommandProcessor;

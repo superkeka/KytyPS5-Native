@@ -71,6 +71,8 @@ private:
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  flip_watermark    = UINT64_MAX; // NextFlipRequestId() at submission
+		uint64_t                  blocked_since_ms  = 0;          // first time Process left it unfinished
+		bool                      blocked_logged    = false;
 	};
 
 	void              Enqueue(Submission submission);

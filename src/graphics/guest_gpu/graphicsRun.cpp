@@ -21,6 +21,7 @@
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/timer.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -492,6 +493,25 @@ void GuestGpu::ThreadRun(void* data) {
 						break;
 					}
 				}
+				// A CPU flip waits behind a blocked gfx submission only in Kyty's own queue: on the PS5 the video
+				// out engine flips at a vblank whatever the GPU is doing. With native rendering the blocked
+				// submission is a frame's CPU tail (its GPU work is done), and its wait for a buffer to stop
+				// being displayed (AgcDcbWaitUntilSafeForRendering) can only end once a later flip is shown:
+				// the flip goes first. My First GT's quality mode stopped here for good.
+				if (selected_queue < 0 && NativeGpu::PrimaryRendering() && gpu->m_queues[0].size() > 1 &&
+				    gpu->m_queues[0].front().blocked) {
+					auto& gfx  = gpu->m_queues[0];
+					auto  flip = std::find_if(gfx.begin() + 1, gfx.end(),
+					                          [](const Submission& s) { return s.type == SubmissionType::FlipPreparation; });
+					if (flip != gfx.end()) {
+						submission = std::move(*flip);
+						gfx.erase(flip);
+						gpu->m_submission_count--;
+						gpu->m_processing = true;
+						has_submission    = true;
+						selected_queue    = 0;
+					}
+				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
@@ -505,13 +525,15 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 					continue;
 				}
-				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
-				submission  = std::move(queue.front());
-				queue.pop_front();
-				gpu->m_submission_count--;
-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
-				gpu->m_processing = true;
-				has_submission    = true;
+				if (!has_submission) {
+					auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+					submission  = std::move(queue.front());
+					queue.pop_front();
+					gpu->m_submission_count--;
+					gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+					gpu->m_processing = true;
+					has_submission    = true;
+				}
 			}
 		}
 		if (should_stop) {
@@ -538,6 +560,21 @@ void GuestGpu::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
+			// A submission that stays unfinished for seconds is a stuck wait: say which packet it waits at.
+			const auto now_ms = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
+			if (submission.blocked_since_ms == 0) {
+				submission.blocked_since_ms = now_ms;
+			} else if (!submission.blocked_logged && now_ms - submission.blocked_since_ms > 2000) {
+				submission.blocked_logged = true;
+				const auto at = submission.command_complete ? submission.constant_execution.Cursor()
+				                                            : submission.command_execution.Cursor();
+				std::fprintf(stderr, "guest gpu: queue %u submission (type %d) blocked for %llu ms at", submission.queue_id,
+				             static_cast<int>(submission.type), static_cast<unsigned long long>(now_ms - submission.blocked_since_ms));
+				for (size_t i = 0; i < at.size() && i < 10; i++) {
+					std::fprintf(stderr, " 0x%08x", at[i]);
+				}
+				std::fprintf(stderr, " (%zu dwords left)\n", at.size());
+			}
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;

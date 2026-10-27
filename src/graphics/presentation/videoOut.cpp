@@ -28,6 +28,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <fmt/format.h>
@@ -945,6 +946,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 // KYTY_LOG_FLIPS=1: every flip request through the queue (reserve, prepare, complete, present) and
 // each refusal of IsSafeForRendering, to find what holds a display buffer.
+// KYTY_LOG_FLIPS=1: each flip request's life and every refusal to render into a buffer, on stderr.
 static bool LogFlips() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_LOG_FLIPS");
@@ -1008,7 +1010,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	pending.push_back(r);
 	request_id = r.id;
 	if (LogFlips()) {
-		LOGF("flip %" PRIu64 ": reserved buffer %d from the %s (pending %d, current %d)\n", r.id, index,
+		std::fprintf(stderr, "flip %" PRIu64 ": reserved buffer %d from the %s (pending %d, current %d)\n", r.id, index,
 		     source == FlipRequestSource::GpuEop ? "GPU" : "CPU", cfg.flip_status.flipPendingNum + 1,
 		     cfg.flip_status.currentBuffer);
 	}
@@ -1075,7 +1077,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	if (LogFlips()) {
-		LOGF("flip %" PRIu64 ": prepare\n", request_id);
+		std::fprintf(stderr, "flip %" PRIu64 ": prepare\n", request_id);
 	}
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
@@ -1215,7 +1217,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 
 void FlipQueue::Complete(uint64_t request_id) {
 	if (LogFlips()) {
-		LOGF("flip %" PRIu64 ": recording complete\n", request_id);
+		std::fprintf(stderr, "flip %" PRIu64 ": recording complete\n", request_id);
 	}
 	m_mutex.Lock();
 	auto request = std::find_if(m_requests.begin(), m_requests.end(),
@@ -1284,10 +1286,10 @@ bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t befo
 		if (last_index != index || last_current != cfg.flip_status.currentBuffer) {
 			last_index   = index;
 			last_current = cfg.flip_status.currentBuffer;
-			LOGF("flip: buffer %d not safe for rendering (current %d)\n", index, cfg.flip_status.currentBuffer);
+			std::fprintf(stderr, "flip: buffer %d not safe for rendering (current %d)\n", index, cfg.flip_status.currentBuffer);
 			for (const auto* queue: {&m_requests, &m_cpu_requests}) {
 				for (const auto& r: *queue) {
-					LOGF("\t %s request %" PRIu64 ": buffer %d, state %d\n", queue == &m_requests ? "GPU-side" : "CPU",
+					std::fprintf(stderr, "\t %s request %" PRIu64 ": buffer %d, state %d\n", queue == &m_requests ? "GPU-side" : "CPU",
 					     r.id, r.index, static_cast<int>(r.state));
 				}
 			}
@@ -1384,7 +1386,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		r.cfg->flip_status.flipArg                  = r.flip_arg;
 		r.cfg->flip_status.currentBuffer            = r.index;
 		if (LogFlips()) {
-			LOGF("flip %" PRIu64 ": buffer %d displayed\n", r.id, r.index);
+			std::fprintf(stderr, "flip %" PRIu64 ": buffer %d displayed\n", r.id, r.index);
 		}
 		r.cfg->flip_status.flipPendingNum--;
 		r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
@@ -1489,6 +1491,9 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 
 	Common::LockGuard lock(ctx->mutex);
 	ctx->flip_rate = rate;
+	if (LogFlips()) {
+		std::fprintf(stderr, "flip: rate %d (a flip every %d vblanks)\n", rate, rate + 1);
+	}
 
 	return OK;
 }
