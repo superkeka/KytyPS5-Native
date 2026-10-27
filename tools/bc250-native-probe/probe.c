@@ -1304,6 +1304,101 @@ static void IbSetUconfig(Ib* ib, uint32_t reg, uint32_t value) {
 	IbPush(ib, value);
 }
 
+// The register-table packets libSceAgc writes (0x63 SH, 0x9F context, 0x64 UCONFIG), bit for bit AMD's
+// LOAD_SH_REG_INDEX / LOAD_CONTEXT_REG_INDEX / LOAD_UCONFIG_REG_INDEX: does the BC-250's microcode run
+// them? One packet on the gfx ring with a one-pair table {offset, value} into a harmless register,
+// read back with COPY_DATA, and the register put back with a plain SET. `which`: "sh", "ctx", "uc".
+// An opcode the microcode lacks stops the ring (with gpu_recovery=0 until a reboot).
+static bool DangerRegIndex(Device* d, Common* c, const char* which) {
+	struct Case {
+		const char* name;
+		uint32_t    op;
+		uint32_t    set_op;
+		uint32_t    base; // byte address of the register space
+		uint32_t    reg;  // byte address of the register
+		const char* reg_name;
+	};
+	static const struct Case cases[] = {
+	    {"sh", 0x63u, 0x76u, 0xb000u, 0xb030u, "SPI_SHADER_USER_DATA_PS_0"},
+	    {"ctx", 0x9fu, 0x69u, 0x28000u, 0x28030u, "PA_SC_SCREEN_SCISSOR_TL"},
+	    {"uc", 0x64u, 0x79u, 0x30000u, 0x30e0cu, "TEXTURE_GRADIENT_FACTORS"}, // a COPY_DATA read of VGT_OBJECT_ID stopped the ring
+	};
+	const struct Case* k = NULL;
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		if (strcmp(cases[i].name, which) == 0) {
+			k = &cases[i];
+		}
+	}
+	if (k == NULL) {
+		fprintf(stderr, "regindex case: sh, ctx or uc\n");
+		return false;
+	}
+	printf("== danger regindex-%s: packet 0x%02x (one pair into %s) on the gfx ring\n", k->name, k->op, k->reg_name);
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	m[0] = m[1] = m[2] = 0xeeeeeeeeu;
+
+	// Pass 1: the register's value now (a plain read).
+	Ib ib = {.n = 0};
+	IbCopyRegToMem(&ib, k->reg, mem.va);
+	IbPad(&ib);
+	uint64_t seq = 0;
+	r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+	int     w    = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 10.0) : r;
+	int64_t st   = ContextState(d);
+	if (w != 0 || st != 0) {
+		printf("  read: %s ctx 0x%" PRIx64 "\n", w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st);
+		BoDestroy(d, &mem);
+		return false;
+	}
+	const uint32_t orig  = m[0];
+	const uint32_t value = orig ^ 0x00a5005au;
+
+	// The table at +0x100: {offset from the register space, value}.
+	m[0x40] = (k->reg - k->base) / 4;
+	m[0x41] = value;
+	__sync_synchronize();
+	const uint64_t table = mem.va + 0x100;
+
+	// Pass 2: the table packet, read back, put the old value back, read again.
+	ib.n = 0;
+	IbPush(&ib, Pkt3(k->op, 4));
+	IbPush(&ib, (uint32_t)table & ~3u); // INDEX 0: direct address
+	IbPush(&ib, (uint32_t)(table >> 32));
+	IbPush(&ib, 0x80000000u);           // DATA_FORMAT offset_and_data, REG_OFFSET 0
+	IbPush(&ib, 1u);                    // one pair
+	IbCopyRegToMem(&ib, k->reg, mem.va + 4);
+	IbPush(&ib, Pkt3(k->set_op, 2));
+	IbPush(&ib, (k->reg - k->base) / 4);
+	IbPush(&ib, orig);
+	IbCopyRegToMem(&ib, k->reg, mem.va + 8);
+	IbPad(&ib);
+	r  = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+	w  = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 10.0) : r;
+	st = ContextState(d);
+	if (w != 0 || st != 0) {
+		printf("  packet 0x%02x: %s ctx 0x%" PRIx64 " (read 0x%08x before)\n", k->op, w == 1 ? "TIMEOUT" : ErrStr(w),
+		       (uint64_t)st, orig);
+		BoDestroy(d, &mem);
+		return false;
+	}
+	const char* verdict = m[1] == value ? "the table was loaded" : m[1] == orig ? "register unchanged" : "readback differs";
+	printf("  %s: before 0x%08x, after packet 0x%08x (want 0x%08x: %s), restored 0x%08x\n", k->reg_name, orig, m[1],
+	       value, verdict, m[2]);
+	BoDestroy(d, &mem);
+	return m[1] == value;
+}
+
 // UCONFIG registers that PS5 command buffers write (per KytyPS5's PM4 handlers) but RADV never
 // does, plus one RADV-written control per ring. Each register is read, written with its low bit
 // flipped, read back and restored within one IB, so other processes never see the change.
@@ -1511,6 +1606,7 @@ static void Usage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+	setvbuf(stdout, NULL, _IONBF, 0); // a danger case can stop the ring: what it printed must be out by then
 	const char* path        = "/dev/dri/renderD128";
 	uint64_t    max_alloc   = 4 * GiB;
 	const char* danger      = NULL;
@@ -1572,6 +1668,8 @@ int main(int argc, char** argv) {
 			ok = DangerCrossQueue(&d, &c);
 		} else if (strcmp(danger, "uconfig") == 0) {
 			ok = DangerUconfig(&d, &c);
+		} else if (strncmp(danger, "regindex-", 9) == 0) {
+			ok = DangerRegIndex(&d, &c, danger + 9);
 		} else {
 			fprintf(stderr, "unknown danger case '%s'\n", danger);
 			return 1;
