@@ -1182,8 +1182,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// the first one, since state carries over from earlier DCBs.
 	std::vector<GpuRef>   refs;
 	std::map<uint64_t, RenderTargetInfo> targets; // by address, for Pm4TranslateResult::render_targets
-	std::vector<uint64_t> bound_targets;          // addresses bound at the last state collection
-	std::vector<uint32_t> dirty_sh;
+	std::vector<RenderTargetInfo*> bound_targets; // bound at the last state collection (map nodes stay put)
+	// The user-data registers written since collect_refs last ran, each once (a bit per register), and
+	// only while references are collected: draws ran a sort of every SH write before (ASTRO BOT: most
+	// of the reference work, which was a quarter of the translation thread).
+	std::vector<uint32_t>                       dirty_sh;
+	std::array<uint64_t, RegFile::kDense / 64> dirty_sh_bits {};
+	auto mark_sh = [&](uint32_t off) {
+		if (!m_collect_refs || off >= RegFile::kDense || !IsUserDataRegister(off)) {
+			return;
+		}
+		const uint64_t bit = 1ull << (off % 64);
+		if ((dirty_sh_bits[off / 64] & bit) == 0) {
+			dirty_sh_bits[off / 64] |= bit;
+			dirty_sh.push_back(off);
+		}
+	};
 	// The value each user-data register had when collect_refs last took its references, within
 	// this DCB. Titles rewrite the same user data before every draw; an unchanged value names the
 	// same buckets, and a changed neighbour takes the pair itself.
@@ -1491,19 +1505,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		if (all_sh_dirty) {
 			for (const auto& [off, value]: sh) {
-				dirty_sh.push_back(off);
+				mark_sh(off);
 			}
 			all_sh_dirty = false;
 		}
-		if (!m_collect_refs) {
-			dirty_sh.clear(); // user data only matters for residency references
-		}
-		std::sort(dirty_sh.begin(), dirty_sh.end());
-		dirty_sh.erase(std::unique(dirty_sh.begin(), dirty_sh.end()), dirty_sh.end());
+		// User data only (shader programs come through shader_addrs, the rest is configuration).
 		for (uint32_t off: dirty_sh) {
-			if (!IsUserDataRegister(off)) {
-				continue; // shader programs come through shader_addrs, the rest is configuration
-			}
+			dirty_sh_bits[off / 64] &= ~(1ull << (off % 64));
 			const uint32_t value = reg(sh, off);
 			if (off < RegFile::kDense) {
 				const uint64_t bit = 1ull << (off % 64);
@@ -1523,8 +1531,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		dirty_sh.clear();
 		if (!rt_dirty) {
-			for (uint64_t addr: bound_targets) {
-				targets[addr].draws++;
+			for (RenderTargetInfo* t: bound_targets) {
+				t->draws++;
 			}
 			return;
 		}
@@ -1555,7 +1563,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				t.info    = reg(cx, kCbColor0Info + step);
 				t.attrib  = reg(cx, kCbColor0Attrib + step);
 				t.attrib3 = reg(cx, kCbColor0Attrib3 + i);
-				bound_targets.push_back(base);
+				bound_targets.push_back(&t);
 			}
 			add_ref(base40(kCbColor0Cmask + step, kCbColor0CmaskExt + i), kMetadataSpan, false);
 			add_ref(base40(kCbColor0Fmask + step, kCbColor0FmaskExt + i), kMetadataSpan, false);
@@ -1570,8 +1578,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			add_ref(base40(kDbZReadBase + i, kDbZReadBaseHi + i), dsize, false);
 		}
 		add_ref(base40(kDbHtileDataBase, kDbHtileBaseHi), kMetadataSpan, false);
-		for (uint64_t addr: bound_targets) {
-			targets[addr].draws++;
+		for (RenderTargetInfo* t: bound_targets) {
+			t->draws++;
 		}
 		// A surface the draw uses at GPU address 0: the CB or DB writes page 0 (CB/DB faults in the
 		// journal). Logged once per kind with the registers that locate it.
@@ -1978,10 +1986,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// SetDirectRuns: stretches of packets passed on as written, as (body offset, buffer dword, dwords).
 	// The long ones run from the guest's buffer as IB2s when the IB is assembled below; their guest
 	// memory is referenced so it is resident.
+	// A run's packets run in place (in_place) are not in body; it is kept whatever its length, and a
+	// short one is copied from the buffer when the IB is assembled.
 	struct DirectRun {
-		uint32_t body = 0;
-		uint32_t dw   = 0;
-		uint32_t len  = 0;
+		uint32_t body     = 0;
+		uint32_t body_len = 0;
+		uint32_t dw       = 0;
+		uint32_t len      = 0;
+		bool     in_place = false;
+		bool     ib2      = false; // runs from the title's buffer (else copied from the translated one)
 	};
 	std::vector<DirectRun>         direct_runs;
 	DirectRun                      direct_cur;
@@ -2000,24 +2013,32 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		*left = it->dw + it->len - at;
 		return it->va + 4ull * (at - it->dw);
 	};
+	// Whether every dword of buffer [dw, dw + len) has a known guest address.
+	auto source_covers = [&](uint32_t dw, uint32_t len) {
+		for (uint32_t done = 0; done < len;) {
+			uint32_t left = 0;
+			if (source_va(dw + done, &left) == 0) {
+				return false;
+			}
+			done += std::min(left, len - done);
+		}
+		return true;
+	};
 	auto end_direct = [&]() {
-		if (direct_cur.len >= m_direct_min_dw) {
+		if (direct_cur.len >= m_direct_min_dw && source_covers(direct_cur.dw, direct_cur.len)) {
 			for (uint32_t done = 0; done < direct_cur.len;) {
 				uint32_t       left = 0;
 				const uint64_t va   = source_va(direct_cur.dw + done, &left);
-				if (va == 0) {
-					direct_cur.len = 0;
-					break;
-				}
 				const uint32_t take = std::min(left, direct_cur.len - done);
 				add_ref(va, 4ull * take, false);
 				done += take;
 			}
-			if (direct_cur.len != 0) {
-				direct_runs.push_back(direct_cur);
-			}
+			direct_cur.ib2 = true;
+			direct_runs.push_back(direct_cur);
+		} else if (direct_cur.in_place) {
+			direct_runs.push_back(direct_cur);
 		}
-		direct_cur.len = 0;
+		direct_cur = {};
 	};
 	uint32_t cut_run = 0;
 	auto     end_cut_run = [&]() {
@@ -2030,6 +2051,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	while (dw < dcb.size()) {
 		const size_t   body_before = body.size();
 		const size_t   segs_before = segs.size();
+		bool           in_place    = false; // passed on as written without a copy in body (direct runs)
 		const uint32_t header = dcb[dw];
 		if ((header >> 30u) != 3u) {
 			return fail(0xffffffffu, dw); // not a type-3 packet
@@ -2285,7 +2307,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint32_t base = bptr[0];
 					for (uint32_t i = 1; i < body_count; i++) {
 						sh[base + (i - 1)] = bptr[i];
-						dirty_sh.push_back(base + (i - 1));
+						mark_sh(base + (i - 1));
 						note_shader(base + (i - 1));
 					}
 				}
@@ -2457,7 +2479,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							continue;
 						}
 						sh[off] = value;
-						dirty_sh.push_back(off);
+						mark_sh(off);
 						note_shader(off);
 						if (!verbatim) {
 							EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, value), off >= kShComputeBase);
@@ -2669,7 +2691,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// only write it after the whole segment. KYTY_NATIVE_GPU_TRACKER_WRITES=1 leaves it to
 					// the tracker as before.
 					const bool gpu = (engine <= 1 || !m_tracker_writes) && label_gpu(dst, bytes);
-					if (gpu) {
+					if (gpu && direct && (bptr[0] & (1u << 20u)) != 0 && engine <= 1) {
+						// The title's own packet is what the GPU gets: with direct runs it is not copied (half
+						// of ASTRO BOT's DCB dwords are such blocks), the IB runs it from the title's buffer.
+						in_place = true;
+					} else if (gpu) {
 						const size_t at = body.size();
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 						body[at + 1] |= 1u << 20u; // WR_CONFIRM
@@ -2679,6 +2705,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						if (m_compute_ring || engine > 1) {
 							body[at + 1] &= ~(3u << 30u);   // ENGINE_SEL micro engine
 						}
+					}
+					if (gpu) {
 						mirror_store(dst, std::span<const uint32_t>(bptr + 3, n), one_addr);
 						stats.labels_native++;
 						stats.write_data_dw += n;
@@ -3073,8 +3101,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			seg_effects = true;
 		}
 		const bool same_seg = segs.size() == segs_before;
-		const bool same     = same_seg && body.size() - body_before == size &&
-		                  std::memcmp(body.data() + body_before, dcb.data() + dw, size * 4u) == 0;
+		if (in_place && (!same_seg || body.size() != body_before)) {
+			return fail(op, dw); // a packet run in place has nothing of ours around it
+		}
+		const bool same = in_place || (same_seg && body.size() - body_before == size &&
+		                               std::memcmp(body.data() + body_before, dcb.data() + dw, size * 4u) == 0);
 		if (same) {
 			stats.verbatim_dw += size;
 			verbatim_run += size;
@@ -3082,13 +3113,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			end_run();
 			stats.changed_ops[op]++;
 		}
-		if (direct && same && direct_cur.len != 0 && direct_cur.body + direct_cur.len == body_before &&
+		const uint32_t copied = in_place ? 0u : size;
+		if (direct && same && direct_cur.len != 0 && direct_cur.body + direct_cur.body_len == body_before &&
 		    direct_cur.dw + direct_cur.len == dw) {
 			direct_cur.len += size;
+			direct_cur.body_len += copied;
+			direct_cur.in_place |= in_place;
 		} else if (direct) {
 			end_direct();
 			if (same) {
-				direct_cur = {static_cast<uint32_t>(body_before), dw, size};
+				direct_cur = {static_cast<uint32_t>(body_before), copied, dw, size, in_place};
 			}
 		}
 		if (same || (op == IT_NOP && same_seg && body.size() == body_before)) {
@@ -3134,18 +3168,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// Copies body[from, to) to the IB, each direct run in it as IB2s into the guest's buffer. Returns,
 	// per run, (body offset where it ends, dwords removed up to there) to move later body offsets.
 	size_t direct_next = 0;
-	auto   append_body = [&](uint32_t from, uint32_t to) {
+	auto   append_body = [&](uint32_t from, uint32_t to, bool last) {
 		std::vector<std::pair<uint32_t, int64_t>> removed;
 		int64_t                                   gone = 0;
 		uint32_t                                  at   = from;
 		while (direct_next < direct_runs.size() && direct_runs[direct_next].body < from) {
 			direct_next++; // in a dropped segment
 		}
-		for (; direct_next < direct_runs.size() && direct_runs[direct_next].body < to; direct_next++) {
+		for (; direct_next < direct_runs.size() && (direct_runs[direct_next].body < to || last); direct_next++) {
 			const DirectRun& run = direct_runs[direct_next];
 			r.ib.insert(r.ib.end(), body.begin() + at, body.begin() + run.body);
 			uint32_t emitted = 0;
-			for (uint32_t done = 0; done < run.len;) {
+			if (!run.ib2) { // short: its packets from the buffer, those run in place included
+				r.ib.insert(r.ib.end(), dcb.begin() + run.dw, dcb.begin() + run.dw + run.len);
+				emitted = run.len;
+			}
+			for (uint32_t done = 0; run.ib2 && done < run.len;) {
 				uint32_t       left = 0;
 				const uint64_t va   = source_va(run.dw + done, &left);
 				const uint32_t take = std::min({left, run.len - done, 0xfffffu});
@@ -3157,10 +3195,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				done += take;
 				stats.direct_ib2++;
 			}
-			stats.direct_dw += run.len;
-			gone += static_cast<int64_t>(run.len) - emitted;
-			removed.emplace_back(run.body + run.len, gone);
-			at = run.body + run.len;
+			stats.direct_dw += run.ib2 ? run.len : 0u;
+			gone += static_cast<int64_t>(run.body_len) - emitted;
+			removed.emplace_back(run.body + run.body_len, gone);
+			at = run.body + run.body_len;
 		}
 		r.ib.insert(r.ib.end(), body.begin() + at, body.begin() + to);
 		return removed;
@@ -3185,7 +3223,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			const uint32_t from  = seg_body[k];
 			const uint32_t to    = k + 1 < segs.size() ? seg_body[k + 1] : static_cast<uint32_t>(body.size());
 			const int64_t  shift   = static_cast<int64_t>(r.ib.size()) - static_cast<int64_t>(from);
-			const auto     removed = append_body(from, to);
+			const auto     removed = append_body(from, to, k + 1 == segs.size());
 			while ((r.ib.size() & 7u) != 0) {
 				r.ib.push_back(0xffff1000u);
 			}
@@ -3213,7 +3251,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	} else {
 		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
 		EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
-		append_body(0, static_cast<uint32_t>(body.size()));
+		append_body(0, static_cast<uint32_t>(body.size()), true);
 
 		// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
 		while ((r.ib.size() & 7u) != 0) {

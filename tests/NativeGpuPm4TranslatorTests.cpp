@@ -1649,6 +1649,59 @@ size_t IndexOf(const std::vector<Packet>& pkts, Pred pred) {
 	return pkts.size();
 }
 
+// Direct runs with native labels: WRITE_DATA blocks the title wrote write-confirmed by the micro engine
+// run in place without a copy; a long series becomes an IB2, a short one between packets of ours is
+// copied from the buffer at its place; the segment's points still sit at their tracker stores.
+void TestDirectRunsWriteData() {
+	alignas(8) static uint32_t mem[1024] = {};
+	const uint64_t             addr      = reinterpret_cast<uint64_t>(&mem[0]);
+	auto write_block = [&](std::vector<uint32_t>& dcb, uint32_t at, uint32_t dwords) {
+		std::vector<uint32_t> b = {(5u << 8u) | (1u << 20u), static_cast<uint32_t>(addr + 4u * at), static_cast<uint32_t>(addr >> 32u)};
+		for (uint32_t i = 0; i < dwords; i++) {
+			b.push_back(i);
+		}
+		Append(dcb, IT_WRITE_DATA, b, false);
+	};
+	std::vector<uint32_t> dcb;
+	for (uint32_t k = 0; k < 8; k++) {
+		write_block(dcb, 64u * k, 60u); // 8 x 63 dwords
+	}
+	const uint32_t series = static_cast<uint32_t>(dcb.size());
+	AppendReleaseMarker(dcb, 1, 2, addr + 4000u, 1, 0x21); // ours: a label with an interrupt
+	const uint32_t short_at = static_cast<uint32_t>(dcb.size());
+	write_block(dcb, 1000u, 2u);                            // 5 dwords between packets of ours
+	const uint32_t short_end = static_cast<uint32_t>(dcb.size());
+	AppendReleaseMarker(dcb, 1, 2, addr + 4008u, 2, 0x22);
+	constexpr uint64_t kVa = 0x123400000ull;
+	Pm4Translator      t;
+	TestOracle         o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetDirectRuns(256);
+	t.SetSource({{0u, static_cast<uint32_t>(dcb.size()), kVa}});
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.direct_ib2 == 1 && r.stats.direct_dw == series, "the series of blocks is one IB2");
+	bool ib2 = false;
+	for (size_t k = 0; k + 3 < r.ib.size(); k++) {
+		ib2 = ib2 || (r.ib[k] == 0xc0023f00u && r.ib[k + 1] == static_cast<uint32_t>(kVa) && r.ib[k + 3] == (series | (1u << 23u)));
+	}
+	Check(ib2, "the IB2 points at the series");
+	Check(std::search(r.ib.begin(), r.ib.end(), dcb.begin() + short_at, dcb.begin() + short_end) != r.ib.end(),
+	      "the short block is copied from the buffer");
+	const auto pkts  = Decode(r.ib);
+	const auto first = IndexOf(pkts, [&](const Packet& p) { return p.op == 0x49u && p.body[2] == static_cast<uint32_t>(addr + 4000u); });
+	const auto block = IndexOf(pkts, [&](const Packet& p) { return p.op == IT_WRITE_DATA && p.body[1] == static_cast<uint32_t>(addr + 4000u); });
+	const auto last  = IndexOf(pkts, [&](const Packet& p) { return p.op == 0x49u && p.body[2] == static_cast<uint32_t>(addr + 4008u); });
+	Check(first < block && block < last && last < pkts.size(), "the short block stays between the two labels");
+	for (const auto& seg: r.segments) {
+		for (const auto& p: seg.points) {
+			Check(IsTrackerPacket(r.ib, p.dw), "every point sits at a tracker store");
+		}
+	}
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the gfx check");
+}
+
+
 void TestLabelsGpuOnly() {
 	using Libs::Graphics::NativeGpu::ValidateNativeIb;
 	// A label the GPU can reach is written by the GPU alone, in stream order, as on PS5. A CPU store at
@@ -2111,6 +2164,7 @@ int main() {
 	TestLabelsWriteData();
 	TestLabelsWriteDataBlock();
 	TestDirectRuns();
+	TestDirectRunsWriteData();
 	TestLabelsReleaseMem();
 	TestLabelsLocalWait();
 	TestLabelsSplit();
