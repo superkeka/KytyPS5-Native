@@ -236,6 +236,7 @@ constexpr uint32_t kFiller         = 0xffff1000u; // the one-dword NOP IBs are p
 // each of them, about a thousand times a frame. Anything else, and KYTY_NATIVE_GPU_LABEL_FLUSH=full,
 // gets the barrier's form.
 constexpr uint32_t kGcrGlmWb        = 1u << 12u;
+constexpr uint32_t kGcrGlmInv       = 1u << 13u;
 constexpr uint32_t kGcrGl2Wb        = 1u << 21u;
 constexpr uint32_t kReleaseGcrMask  = 0x1fffu << 12u; // GCR_CNTL [24:12]
 constexpr uint32_t kReleasePolicy   = 0x3u << 25u;    // CACHE_POLICY
@@ -255,6 +256,18 @@ bool LabelWriteBack() {
 		return v == nullptr || v[0] != '0';
 	}();
 	return wb;
+}
+// KYTY_NATIVE_GPU_LABELS_VERBATIM: which label releases go as the title wrote them, by DATA_SEL: 1
+// 32-bit data, 2 64-bit, 4 the GPU clock, 8 none (cache actions alone); 0 rewrites every one (data to
+// memory, write-backs added, 64-bit data as two halves). 64-bit labels are left out by default: as
+// written, My First Gran Turismo drew black frames (a probe's 64-bit release in its event, 0x2d, also
+// stopped the gfx ring once, without --awake).
+bool LabelsVerbatim(uint32_t data_sel) {
+	static const uint32_t mask = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_LABELS_VERBATIM");
+		return v == nullptr ? 0xdu : static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+	}();
+	return data_sel <= 3 && (mask & (data_sel == 0 ? 8u : 1u << (data_sel - 1u))) != 0;
 }
 // The tracker's own stores (segment ends, points before a GPU wait): bottom of pipe, GLM and GL2
 // written back so the CPU sees the GPU's results by the time the tracker acts, nothing invalidated.
@@ -2267,6 +2280,23 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.unknown_detail = {bptr[0], bptr[1]};
 						return fail(op, dw);
 					}
+					// The guest's packet as written: a DCB release without an interrupt, in an end-of-pipe
+					// event the ring runs (LabelEventOk), with no data (cache actions alone) or data to memory
+					// (DST_SEL 0). libSceAgc sends labels to L2 (DST_SEL 1), which this board's CP firmware
+					// leaves there, where the CPU never sees them, whatever the page's MTYPE (ASTRO BOT drew
+					// black frames with them as written, also with its shared memory mapped C_RW_S as the PS5
+					// kernel maps it); writing them to memory in agc.cpp instead cost My First Gran Turismo
+					// its 60 fps in places. They keep the rewritten form. A data label goes as written only
+					// where the GPU may write it (label_gpu below).
+					// On this board GL2_WB does not write back the metadata cache, and GLM_INV without GLM_WB
+					// drops it: ASTRO BOT's frames stayed black with its end-of-pipe GL2 write-backs and full
+					// invalidates as written. Mesa never invalidates GLM without writing it back. Such a
+					// release takes the rewritten form, which adds GLM_WB.
+					const uint32_t dst_sel    = (bptr[1] >> 16u) & 0x3u;
+					const bool     glm_ok     = (bptr[0] & (kGcrGl2Wb | kGcrGlmInv)) == 0u || (bptr[0] & kGcrGlmWb) != 0u;
+					const bool     as_written = LabelsVerbatim(data_sel) && op == IT_RELEASE_MEM && !m_compute_queue && int_sel == 0 &&
+					                        glm_ok && LabelEventOk(bptr[0]) && (data_sel == 0 || (dst != 0 && dst_sel == 0));
+					auto write_as_written = [&] { body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size); };
 					TrackerPoint cpu;
 					bool         cpu_point = false;
 					if (sel == 3) {
@@ -2278,7 +2308,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1 keeps on the tracker.
 						const bool gpu_clock = !m_cpu_timestamps && (dst & 7ull) == 0 && label_gpu(dst, 8);
 						if (gpu_clock) {
-							EmitTimestampRelease(body, dst, m_compute_ring);
+							if (as_written) {
+								write_as_written();
+							} else {
+								EmitTimestampRelease(body, dst, m_compute_ring);
+							}
 							note_write({dst, 0, false, true, true});
 							stats.timestamps_native++;
 							stats.labels_native++;
@@ -2300,7 +2334,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						cpu_point = true;
 						sel       = 0;
 					}
-					// Not the guest's packet (an ACB's carried the compute shader-type bit, which stopped the
+					// Otherwise not the guest's packet (an ACB's carried the compute shader-type bit, which stopped the
 					// gfx ring with "Illegal opcode in command stream"): the label is written with the guest's
 					// event and cache actions plus write-backs (LabelEventCntl), 32-bit data to memory; a
 					// 64-bit one as two 32-bit writes, the high dword first. GDS data goes as the translator
@@ -2308,7 +2342,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// flushes caches becomes a flush into our scratch dword, unless a tracker point (also a
 					// flush) follows anyway.
 					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
-					if (sel == 1) {
+					if ((sel == 1 || sel == 2) && as_written) {
+						write_as_written();
+						mirror_store(dst, std::span<const uint32_t>(bptr + 4, sel), false);
+						NoteOnce(12, "RELEASE_MEM label as the title wrote it");
+					} else if (sel == 1) {
 						EmitRelease32(body, dst, bptr[4], m_compute_ring, LabelEventCntl(bptr[0]));
 						mirror_store(dst, std::span<const uint32_t>(bptr + 4, 1), false);
 						NoteOnce(0, m_tracker_writes ? "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)"
@@ -2326,6 +2364,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						for (uint32_t i = 2; i < 7; i++) {
 							body.push_back(i == 6 ? 0u : bptr[i]);
 						}
+					} else if (!interrupt && !cpu_point && data_sel == 0 && as_written) {
+						write_as_written(); // cache actions and the event alone
 					} else if (!interrupt && !cpu_point && ((bptr[0] >> 12u) & 0x1fffu) != 0) {
 						EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring, LabelEventCntl(bptr[0]));
 					}

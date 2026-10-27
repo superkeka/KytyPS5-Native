@@ -1151,6 +1151,50 @@ void TestLabelsWriteData() {
 	Check(sc.writes.size() == 1 && !sc.writes[0].gpu, "reported as a CPU write");
 }
 
+// libSceAgc's own RELEASE_MEM (agc.cpp writes the hardware packet), as ASTRO BOT sends it: CACHE_FLUSH_AND_INV_TS
+// at end of pipe, cache policy 3, data to memory (DST_SEL 0; `dst_sel` 1 is the PS5 library's L2).
+void AppendGuestRelease(std::vector<uint32_t>& dcb, uint32_t data_sel, uint32_t int_sel, uint64_t dst, uint64_t value,
+                        uint32_t dst_sel = 0, uint32_t event = 0x06000514u) {
+	Append(dcb, 0x49u,
+	       {event, (dst_sel << 16u) | (int_sel << 24u) | (data_sel << 29u), static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u),
+	        static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u), 0u},
+	       false);
+}
+
+void TestLabelsAsWritten() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	std::vector<uint32_t> dcb;
+	AppendGuestRelease(dcb, 1, 0, 0x202000300ull, 5);
+	AppendGuestRelease(dcb, 2, 0, 0x202000308ull, 0x0000000900000008ull);
+	AppendGuestRelease(dcb, 3, 0, 0x202000310ull, 0);
+	AppendGuestRelease(dcb, 0, 0, 0, 0);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.changed_ops[0x49] == 1 && r.stats.ops[0x49] == 4,
+	      "labels without an interrupt go as the title wrote them (32-bit, clock, cache only), 64-bit ones not by default");
+	const auto pkts = Decode(r.ib);
+	Check(HasLabelRelease(pkts, 0x20200030cull, 9u) && HasLabelRelease(pkts, 0x202000308ull, 8u), "the 64-bit label as two halves");
+
+	// Data to L2 (libSceAgc's labels) never reaches the CPU on this board: written to memory with write-backs.
+	std::vector<uint32_t> l2;
+	AppendGuestRelease(l2, 1, 0, 0x202000300ull, 5, 1);
+	auto rl = t.Translate(l2);
+	Check(rl.stats.changed_ops[0x49] == 1 && HasLabelRelease(Decode(rl.ib), 0x202000300ull, 5u), "a label sent to L2 is rewritten");
+
+	// GL2_WB without GLM_WB: rewritten with GLM_WB added.
+	std::vector<uint32_t> wb;
+	AppendGuestRelease(wb, 0, 0, 0, 0, 0, 0x00200528u);
+	auto rw = t.Translate(wb);
+	Check(rw.stats.changed_ops[0x49] == 1, "a GL2 write-back without GLM_WB is not passed as written");
+
+	// An interrupt stays the tracker's.
+	std::vector<uint32_t> irq;
+	AppendGuestRelease(irq, 1, 2, 0x202000300ull, 5);
+	auto ri = t.Translate(irq);
+	Check(ri.stats.changed_ops[0x49] == 1 && ri.stats.interrupts == 1, "a release with an interrupt is not passed as written");
+}
+
 void TestLabelsReleaseMem() {
 	Pm4Translator t;
 	TestOracle    o;
@@ -2198,6 +2242,7 @@ int main() {
 	TestDirectRuns();
 	TestDirectRunsWriteData();
 	TestLabelsReleaseMem();
+	TestLabelsAsWritten();
 	TestLabelsLocalWait();
 	TestLabelsSplit();
 	TestLabelsCpuTail();
