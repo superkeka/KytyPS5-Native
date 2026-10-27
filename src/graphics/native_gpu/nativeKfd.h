@@ -145,15 +145,17 @@ public:
 			::sched_yield();
 		}
 		const uint64_t s = ++m_seq;
-		// KYTY_NATIVE_GPU_KFD_IB_SYNC=1: what amdgpu puts before every IB of a CS (gfx_v10_0_emit_mem_sync),
-		// an ACQUIRE_MEM that writes back and invalidates GL2, GLM, GL1, GLV, GLK and GLI. Off by default:
-		// the PS5 runs an ACB as the title wrote it, and the title's own ACQUIRE_MEMs say what to
-		// invalidate.
-		static const bool ib_sync = [] {
-			const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_IB_SYNC");
-			return v != nullptr && v[0] == '1';
-		}();
-		if (ib_sync) {
+		// Before every IB, what amdgpu puts before every IB of a CS (gfx_v10_0_emit_mem_sync): an ACQUIRE_MEM
+		// that writes back and invalidates GL2, GLM, GL1, GLV, GLK and GLI. GL2 caches guest memory (GTT,
+		// MTYPE NC) and does not see the title's CPU stores, so without it a dispatch read descriptors the
+		// title had rewritten since (My First Gran Turismo: SQC faults at garbage addresses once tracker
+		// stores stopped invalidating GL2); on the PS5 memory shared with the GPU is coherent. Once per
+		// submitted ACB, not at every label. KYTY_NATIVE_GPU_KFD_IB_SYNC=0 leaves it out, =1 also ends the
+		// IB with amdgpu's fence form.
+		static const char* const ib_sync_env = std::getenv("KYTY_NATIVE_GPU_KFD_IB_SYNC");
+		static const bool        ib_acquire  = ib_sync_env == nullptr || ib_sync_env[0] != '0';
+		static const bool        ib_sync     = ib_sync_env != nullptr && ib_sync_env[0] == '1';
+		if (ib_acquire) {
 			Push(Pkt3(0x58, 7));
 			Push(0u);
 			Push(0xffffffffu);
