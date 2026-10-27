@@ -3112,13 +3112,12 @@ private:
 		std::thread([this] { Track(); }).detach();
 	}
 
-	// KYTY_NATIVE_GPU_ALL_GPU_WAITS=1 with KFD queues: PlanWait sends every wait to the GPU. Not yet the
-	// default: a label the GPU writes stays in GL2, unseen by the CPU, until a write-back, which today
-	// only the segment ends of split buffers bring; on PS5 the title maps its label memory CPU-coherent.
-	// Without the splits ASTRO BOT stopped before its first frame, the title waiting on the CPU for a
-	// label the GPU had written.
+	// With KFD queues every guest wait stays a GPU wait, as on the PS5: each guest queue has a hardware
+	// queue of its own, so a wait holds up only its queue. ASTRO BOT's white level: GPU busy 13.8 ms a
+	// frame instead of 33.4 with the CPU holds and the barriers. KYTY_NATIVE_GPU_ALL_GPU_WAITS=0 brings
+	// those back.
 	bool AllWaitsOnGpu() const {
-		static const bool on = EnvOn("KYTY_NATIVE_GPU_ALL_GPU_WAITS");
+		static const bool on = !EnvIs("KYTY_NATIVE_GPU_ALL_GPU_WAITS", "0");
 		return on && Shadow::Instance().KfdQueuesOn();
 	}
 
