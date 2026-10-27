@@ -30,6 +30,7 @@
 #endif
 #include <set>
 #include <tuple>
+#include <unordered_set>
 #if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -84,6 +85,36 @@ bool EnvOn(const char* name) {
 bool EnvIs(const char* name, const char* value) {
 	const char* v = std::getenv(name);
 	return v != nullptr && std::strcmp(v, value) == 0;
+}
+
+// The calling thread runs at the CPU's top clock: a utilization clamp of the whole range (uclamp_min
+// 1024, no privilege needed) on the native GPU workers. They run in bursts between waits, and under
+// schedutil the core one wakes on is often still at its lowest P-state (the BC-250: 1.55 GHz against
+// 3.49), which made the same DCB's translation take 1.5 ms or 4 in My First GT. A PS5 CPU runs at
+// a fixed clock. KYTY_NATIVE_GPU_UCLAMP=0 leaves the threads to the governor.
+void RunAtTopClock() {
+#if defined(__linux__)
+	if (EnvIs("KYTY_NATIVE_GPU_UCLAMP", "0")) {
+		return;
+	}
+	struct {
+		uint32_t size, policy;
+		uint64_t flags;
+		int32_t  nice;
+		uint32_t priority;
+		uint64_t runtime, deadline, period;
+		uint32_t util_min, util_max;
+	} attr {};
+	attr.size     = sizeof(attr);
+	attr.flags    = 0x18u | 0x20u; // SCHED_FLAG_KEEP_ALL | SCHED_FLAG_UTIL_CLAMP_MIN
+	attr.util_min = 1024;
+	if (syscall(SYS_sched_setattr, 0, &attr, 0) != 0) {
+		static std::atomic<bool> logged {false};
+		if (!logged.exchange(true)) {
+			std::fprintf(stderr, "native shadow: uclamp_min for the GPU workers refused (errno %d)\n", errno);
+		}
+	}
+#endif
 }
 
 // KYTY_NATIVE_GPU_CTL=1: a debugging control socket, /tmp/kyty-ctl.sock (KYTY_NATIVE_GPU_CTL_SOCK
@@ -552,11 +583,16 @@ public:
 #endif
 			tr.SetSource(pieces);
 		}
-		// KYTY_NATIVE_GPU_TRANSLATE_BENCH=1: every 120th large DCB is translated again from a copy of the
-		// translator in variants, to see what each part of the translation costs on the same buffer.
-		static const bool bench = EnvOn("KYTY_NATIVE_GPU_TRANSLATE_BENCH");
+		// KYTY_NATIVE_GPU_TRANSLATE_BENCH=1 (or =N, the least DCB size in dwords; 1 means 400000): every
+		// 120th DCB that large is translated again from a copy of the translator in variants, to see what
+		// each part of the translation costs on the same buffer.
+		static const size_t bench_min = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_TRANSLATE_BENCH");
+			const long  n = v == nullptr ? 0 : std::atol(v);
+			return n <= 0 ? 0 : (n == 1 ? 400000 : static_cast<size_t>(n));
+		}();
 		std::unique_ptr<Pm4Translator> bench_snap;
-		if (bench && !acb && out != nullptr && dcb.size() > 400000 && (m_bench_count++ % 120) == 0) {
+		if (bench_min != 0 && !acb && out != nullptr && dcb.size() >= bench_min && (m_bench_count++ % 120) == 0) {
 			bench_snap = tr.Clone();
 		}
 		Pm4TranslateResult result      = tr.Translate(dcb);
@@ -819,7 +855,7 @@ public:
 			// Only packet forms that have run on the board before go to the GPU; anything else and the
 			// buffer is Kyty's.
 			const NativeIbKind ib_kind = acb && m_acb_rings ? NativeIbKind::Compute : NativeIbKind::Gfx;
-			if (uint32_t bad = 0; m_validate && !ValidateNativeIb(result.ib, NativeLodStats(), &bad, ib_kind)) {
+			if (uint32_t bad = 0; m_validate != 0 && !ValidateNativeIb(result.ib, NativeLodStats(), &bad, ib_kind)) {
 				if (m_validate_refused++ < 16) {
 					std::fprintf(stderr,
 					             "native shadow: %s %llu left to Kyty by the packet check: op 0x%02x (header 0x%08x) at dw %u\n",
@@ -1422,7 +1458,7 @@ public:
 		}
 		m_validate = [] {
 			const char* v = std::getenv("KYTY_NATIVE_GPU_VALIDATE");
-			return v == nullptr || v[0] != '0';
+			return v == nullptr ? 1 : std::atoi(v);
 		}();
 		m_compute_mask = m_submitter->ComputeRingMask();
 		// Primary mode puts ACBs on compute rings (KFD queues where KfdQueuesWanted) unless =0.
@@ -1592,8 +1628,11 @@ public:
 #endif
 	}
 
-	// KYTY_NATIVE_GPU_VALIDATE (on unless 0): whether native-labels IBs go through ValidateNativeIb.
-	bool Validating() const { return m_validate; }
+	// KYTY_NATIVE_GPU_VALIDATE (1 unless set): 0 no packet check, 1 every translated IB goes through
+	// ValidateNativeIb, 2 also each segment again after LabelPipeline patched it. The patches are filler
+	// NOPs over the translator's own wait and barrier packets and sequence values in label data dwords,
+	// which keep a checked IB valid; checking twice took a tenth of the submit thread in My First GT.
+	bool ValidatingPatched() const { return m_validate >= 2; }
 	void DisableNow(const char* reason) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (!m_disabled) {
@@ -2990,7 +3029,7 @@ private:
 	uint64_t      m_last_seq         = 0;
 	bool          m_pipelined        = false;
 	bool          m_labels           = false;
-	bool          m_validate         = true;
+	int           m_validate         = 1;
 	uint32_t      m_validate_refused = 0;
 	uint64_t      m_labels_stats[8] = {}; // GPU labels, tracker labels, interrupts, native/cut/barrier waits, CPU timestamps, GPU timestamps
 	uint64_t      m_labels_mark[8]  = {}; // m_labels_stats at the previous flip report (per-flip deltas)
@@ -3132,7 +3171,7 @@ private:
 	uint32_t      m_dot2c_sites    = 0;
 	uint32_t      m_dot_ops = 0; // dot instructions other than v_dot2c_f32_f16 in scanned shaders
 	uint32_t      m_decode_stops   = 0;
-	std::set<uint64_t> m_seen_shaders;
+	std::unordered_set<uint64_t> m_seen_shaders;
 	std::set<uint32_t> m_skipped_uconfig;
 #if KYTY_GEM_BACKING_SUPPORTED
 	GemBacking*      m_gem       = nullptr;
@@ -3188,8 +3227,14 @@ private:
 
 	Pipeline() {
 		Shadow::Instance().SetPipelined();
-		std::thread([this] { Work(); }).detach();
-		std::thread([this] { Complete(); }).detach();
+		std::thread([this] {
+			RunAtTopClock();
+			Work();
+		}).detach();
+		std::thread([this] {
+			RunAtTopClock();
+			Complete();
+		}).detach();
 	}
 
 	// Takes every queued buffer, translates them into one batch and submits it with a single CS. Their
@@ -3412,8 +3457,14 @@ private:
 		m_acb_rings = Shadow::Instance().AcbRings();
 		m_compute_mask = Shadow::Instance().ComputeRingMask();
 		m_timeout = Shadow::Instance().TimeoutSec();
-		std::thread([this] { Work(); }).detach();
-		std::thread([this] { Track(); }).detach();
+		std::thread([this] {
+			RunAtTopClock();
+			Work();
+		}).detach();
+		std::thread([this] {
+			RunAtTopClock();
+			Track();
+		}).detach();
 	}
 
 	// With KFD queues every guest wait stays a GPU wait, as on the PS5: each guest queue has a hardware
@@ -3918,9 +3969,9 @@ private:
 			m_ring_sweep_at = std::max<size_t>(16384, m_ring.size() * 2);
 		}
 		if (!p.ib.empty()) {
-			// The translated IB passed the packet check; the patched one has to as well.
+			// The translated IB passed the packet check; KYTY_NATIVE_GPU_VALIDATE=2 checks the patched one too.
 			const NativeIbKind kind = Shadow::GfxSlot(slot) ? NativeIbKind::Gfx : NativeIbKind::Compute;
-			if (uint32_t bad = 0; Shadow::Instance().Validating() && !ValidateNativeIb(p.ib, NativeLodStats(), &bad, kind)) {
+			if (uint32_t bad = 0; Shadow::Instance().ValidatingPatched() && !ValidateNativeIb(p.ib, NativeLodStats(), &bad, kind)) {
 				std::fprintf(stderr, "native shadow: a patched segment fails the packet check at dw %u (0x%08x); disabling\n", bad,
 				             p.ib[bad]);
 				Shadow::Instance().DisableNow("packet check");

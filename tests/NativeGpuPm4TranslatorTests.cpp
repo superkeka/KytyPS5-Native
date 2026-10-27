@@ -1906,6 +1906,20 @@ void TestFlattenIndirectBuffers() {
 	}
 	Check(FlattenIndirectBuffers(chunks[0], &out) && out.size() == 40 && out[1] == 0u && out[39] == 19u,
 	      "a chain of 20 chunks is followed to its end");
+
+	// Where each stretch of the flattened buffer sits in memory: before the call, the call, after it.
+	buf = nop_a;
+	const auto call = ib(called, false);
+	buf.insert(buf.end(), call.begin(), call.end());
+	buf.insert(buf.end(), nop_b.begin(), nop_b.end());
+	buf.insert(buf.end(), nop_b.begin(), nop_b.end());
+	std::vector<Libs::Graphics::NativeGpu::SourcePiece> pieces;
+	const auto                                          va = [](const uint32_t* p) { return reinterpret_cast<uint64_t>(p); };
+	Check(FlattenIndirectBuffers(buf, &out, nullptr, &pieces) && out.size() == 8 && pieces.size() == 3 &&
+	          pieces[0].dw == 0 && pieces[0].len == 2 && pieces[0].va == va(buf.data()) && pieces[1].dw == 2 &&
+	          pieces[1].len == 2 && pieces[1].va == va(called.data()) && pieces[2].dw == 4 && pieces[2].len == 4 &&
+	          pieces[2].va == va(buf.data() + 6),
+	      "source pieces of a flattened call");
 }
 
 // Gfx10 T# that counts into `bank` (word5 bit 25, word6[7:0]). The other words only have to pass

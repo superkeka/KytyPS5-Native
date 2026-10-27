@@ -671,6 +671,31 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 	constexpr size_t   kMaxDwords = 4u << 20u;
 	int                changed    = 0;
 	uint32_t           hops       = 0; // chains taken: a chain replaces the buffer, it does not nest
+	// Packets go to `out` a run at a time, up to the next REWIND or INDIRECT_BUFFER; a top-level buffer
+	// without either is never copied (nothing to inline).
+	size_t run   = 0;
+	auto   flush = [&](size_t to) {
+		if (to == run) {
+			return true;
+		}
+		const auto len = static_cast<uint32_t>(to - run);
+		if (out->size() + len > kMaxDwords) {
+			return false;
+		}
+		if (pieces != nullptr) {
+			const uint64_t va = reinterpret_cast<uint64_t>(in.data() + run);
+			const auto     at = static_cast<uint32_t>(out->size());
+			if (!pieces->empty() && pieces->back().dw + pieces->back().len == at &&
+			    pieces->back().va + 4ull * pieces->back().len == va) {
+				pieces->back().len += len;
+			} else {
+				pieces->push_back({at, len, va});
+			}
+		}
+		out->insert(out->end(), in.begin() + static_cast<std::ptrdiff_t>(run), in.begin() + static_cast<std::ptrdiff_t>(to));
+		run = to;
+		return true;
+	};
 	for (size_t dw = 0; dw < in.size();) {
 		const uint32_t header = in[dw];
 		const uint32_t len    = (header >> 30u) == 3u ? ((header >> 16u) & 0x3fffu) + 2u : 1u;
@@ -682,13 +707,20 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if ((in[dw + 1] & 0x80000000u) == 0) {
 				return stop("REWIND not valid yet", dw);
 			}
+			if (!flush(dw)) {
+				return stop("too large", dw);
+			}
 			changed = 1;
 			dw += len;
+			run = dw;
 			continue;
 		}
 		if ((header >> 30u) == 3u && op == kIndirect) {
 			if (len != 4) {
 				return stop("INDIRECT_BUFFER of another form", dw);
+			}
+			if (!flush(dw)) {
+				return stop("too large", dw);
 			}
 			const uint32_t control = in[dw + 3];
 			const auto*    target  = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[dw + 2]) << 32u) | (in[dw + 1] & ~3u));
@@ -700,6 +732,7 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 					return changed;
 				}
 				dw += len;
+				run = dw;
 				continue;
 			}
 			if (target == nullptr || out->size() + size > kMaxDwords) {
@@ -709,8 +742,9 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 				if (++hops > 65536u) {
 					return stop("chain too long", dw);
 				}
-				in = {target, size};
-				dw = 0;
+				in  = {target, size};
+				dw  = 0;
+				run = 0;
 				continue;
 			}
 			if (depth >= 16) {
@@ -720,23 +754,13 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 				return -1;
 			}
 			dw += len;
+			run = dw;
 			continue;
 		}
-		if (out->size() + len > kMaxDwords) {
-			return stop("too large", dw);
-		}
-		if (pieces != nullptr) {
-			const uint64_t va = reinterpret_cast<uint64_t>(in.data() + dw);
-			const auto     at = static_cast<uint32_t>(out->size());
-			if (!pieces->empty() && pieces->back().dw + pieces->back().len == at &&
-			    pieces->back().va + 4ull * pieces->back().len == va) {
-				pieces->back().len += len;
-			} else {
-				pieces->push_back({at, len, va});
-			}
-		}
-		out->insert(out->end(), in.begin() + static_cast<std::ptrdiff_t>(dw), in.begin() + static_cast<std::ptrdiff_t>(dw + len));
 		dw += len;
+	}
+	if ((changed != 0 || depth > 0) && !flush(in.size())) {
+		return stop("too large", in.size());
 	}
 	return changed;
 }
@@ -1211,7 +1235,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			return;
 		}
 		uint64_t va = (static_cast<uint64_t>(*lo) << 8u) | (static_cast<uint64_t>(*hi) << 40u);
-		if (va != 0) {
+		if (va != 0 && (shaders.empty() || shaders.back() != va)) {
 			shaders.push_back(va);
 		}
 	};
@@ -3349,6 +3373,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	}
 
 	r.stats        = stats;
+	std::sort(shaders.begin(), shaders.end());
+	shaders.erase(std::unique(shaders.begin(), shaders.end()), shaders.end());
 	r.shader_addrs = std::move(shaders);
 	std::sort(refs.begin(), refs.end());
 	refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
