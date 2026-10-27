@@ -511,9 +511,12 @@ public:
 		const double       t_translate = NowSecShadow();
 		// Command buffers written in chunks (INDIRECT_BUFFER chains, REWIND) are translated as the CP
 		// fetches them.
-		std::vector<uint32_t> flat;
-		std::string           flat_why;
-		if (!FlattenIndirectBuffers(dcb, &flat, &flat_why) && !flat_why.empty() && m_flatten_failed++ < 8) {
+		std::vector<uint32_t>    flat;
+		std::string              flat_why;
+		std::vector<SourcePiece> pieces;
+		const bool               direct = m_direct_min_dw != 0 && !acb;
+		if (!FlattenIndirectBuffers(dcb, &flat, &flat_why, direct ? &pieces : nullptr) && !flat_why.empty() &&
+		    m_flatten_failed++ < 8) {
 			std::fprintf(stderr, "native shadow: %s %llu not inlined: %s\n", kind, static_cast<unsigned long long>(frame),
 			             flat_why.c_str());
 		}
@@ -523,6 +526,21 @@ public:
 				std::fprintf(stderr, "native shadow: INDIRECT_BUFFER chains and calls inlined (first in %s %llu)\n", kind,
 				             static_cast<unsigned long long>(frame));
 			}
+		}
+		if (direct) {
+			if (flat.empty()) {
+				pieces = {SourcePiece {0, static_cast<uint32_t>(dcb.size()), reinterpret_cast<uint64_t>(dcb.data())}};
+			}
+#if KYTY_GEM_BACKING_SUPPORTED
+			// Only stretches in memory the GPU VM maps (guest memory in the backing); a buffer elsewhere
+			// is copied as before.
+			std::erase_if(pieces, [&](const SourcePiece& piece) {
+				return m_gem == nullptr || !m_gem->IsGpuMapped(piece.va) || !m_gem->IsGpuMapped(piece.va + 4ull * piece.len - 4);
+			});
+#else
+			pieces.clear();
+#endif
+			tr.SetSource(std::move(pieces));
 		}
 		Pm4TranslateResult result      = tr.Translate(dcb);
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
@@ -534,6 +552,8 @@ public:
 		m_verbatim_runs += result.stats.verbatim_runs;
 		m_labels_native += result.stats.labels_native;
 		m_write_data_dw += result.stats.write_data_dw;
+		m_direct_ib2 += result.stats.direct_ib2;
+		m_direct_dw += result.stats.direct_dw;
 		for (size_t i = 0; i < m_changed_ops.size(); i++) {
 			m_changed_ops[i] += result.stats.changed_ops[i];
 		}
@@ -1165,6 +1185,11 @@ public:
 				             static_cast<double>(m_labels_native) / m_flips, static_cast<double>(m_write_data_dw) / m_flips);
 				m_verbatim_dw = m_total_dw = m_verbatim_runs = 0;
 				m_labels_native = m_write_data_dw = 0;
+				if (m_direct_min_dw != 0) {
+					std::fprintf(stderr, "native shadow: direct runs per flip: %.0f IB2 calls, %.0f dwords run in place\n",
+					             static_cast<double>(m_direct_ib2) / m_flips, static_cast<double>(m_direct_dw) / m_flips);
+				}
+				m_direct_ib2 = m_direct_dw = 0;
 				m_run_hist    = {};
 				m_changed_ops = {};
 			}
@@ -1317,6 +1342,17 @@ public:
 		if (m_acb_rings) {
 			// MEC packet forms. The gfx translator is unchanged.
 			m_acb_translator.SetComputeRing(true);
+		}
+		// KYTY_NATIVE_GPU_DIRECT_RUNS=1 (or a dword count, default 256): DCB stretches passed on as written
+		// run from the title's buffer as IB2s (Pm4Translator::SetDirectRuns). An IB2 costs the CP about
+		// 0.3 us (probe ib2), the dwords it saves copying and validating about 1 ns each.
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_DIRECT_RUNS"); v != nullptr && v[0] != '0') {
+			const unsigned long n = std::strtoul(v, nullptr, 0);
+			m_direct_min_dw       = n > 1 ? static_cast<uint32_t>(n) : 256u;
+			m_translator.SetDirectRuns(m_direct_min_dw);
+			m_submitter->SetGfxMemSync(true);
+			std::fprintf(stderr, "native shadow: direct runs: DCB stretches of %u+ dwords run from the title's buffer\n",
+			             m_direct_min_dw);
 		}
 		m_labels = true;
 		std::fprintf(stderr, "native shadow: native labels (the GPU writes labels, a tracker raises interrupts%s%s)\n",
@@ -2901,6 +2937,9 @@ private:
 	uint64_t                m_verbatim_runs = 0;
 	uint64_t                m_labels_native = 0; // Pm4TranslateStats::labels_native and write_data_dw, same flips
 	uint64_t                m_write_data_dw = 0;
+	uint64_t                m_direct_ib2    = 0; // Pm4TranslateStats::direct_ib2 and direct_dw, same flips
+	uint64_t                m_direct_dw     = 0;
+	uint32_t                m_direct_min_dw = 0; // KYTY_NATIVE_GPU_DIRECT_RUNS
 	std::array<uint64_t, 4> m_run_hist {};
 	std::array<uint64_t, 256> m_changed_ops {};
 	// Direct-execution view, [0] DCBs and [1] ACBs: dwords, stretches between cuts, replaced packets and

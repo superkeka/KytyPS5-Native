@@ -34,6 +34,9 @@ struct NativeRingTarget {
 	uint32_t ring    = 0;
 };
 
+// amdgpu_drm.h's AMDGPU_IB_FLAG_EMIT_MEM_SYNC (Linux 5.11), for older headers.
+constexpr uint32_t kIbFlagEmitMemSync = 1u << 6u;
+
 class NativeSubmitter {
 public:
 	// The IB lives at a GPU VA above every guest range (guest memory tops out well below this and
@@ -150,6 +153,9 @@ public:
 	[[nodiscard]] uint32_t ComputeRingMask() const { return m_compute_rings; }
 	[[nodiscard]] uint32_t GfxRingMask() const { return m_gfx_rings; }
 	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
+	// Each gfx IB starts with amdgpu's cache invalidate (AMDGPU_IB_FLAG_EMIT_MEM_SYNC): IBs that call
+	// into guest command buffers the CPU has rewritten (Pm4Translator::SetDirectRuns).
+	void SetGfxMemSync(bool on) { m_gfx_mem_sync = on; }
 	// How many KFD queues EnableKfdQueues can give (ring indexes 0 .. this - 1).
 	static constexpr uint32_t MaxKfdQueues() { return kMaxKfdQueues; }
 	// How many KFD queues EnableKfdQueues created (indexes 0 .. this - 1).
@@ -371,6 +377,9 @@ public:
 			info.ip_type     = target.ip_type;
 			info.ip_instance = 0;
 			info.ring        = target.ring;
+			if (m_gfx_mem_sync && target.ip_type == AMDGPU_HW_IP_GFX) {
+				info.flags |= kIbFlagEmitMemSync;
+			}
 			std::memset(&chunks[k], 0, sizeof(chunks[k]));
 			chunks[k].chunk_id   = AMDGPU_CHUNK_ID_IB;
 			chunks[k].length_dw  = sizeof(info) / 4;
@@ -777,6 +786,7 @@ private:
 		return own != kSlots ? own : any;
 	}
 	bool     m_async     = false;
+	bool     m_gfx_mem_sync = false;
 	uint64_t m_slot_order = 0;
 	SlotUse  m_slot[kSlots];
 	uint32_t m_compute_rings = 0; // bitmask from AMDGPU_INFO_HW_IP_INFO

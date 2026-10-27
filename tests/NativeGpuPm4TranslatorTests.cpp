@@ -930,6 +930,71 @@ void AppendWait(std::vector<uint32_t>& dcb, uint64_t addr, uint32_t ref) {
 	       false);
 }
 
+// SetDirectRuns: a long stretch passed on as written becomes an IB2 into the guest's buffer, split
+// where the buffer's guest memory is not contiguous; short stretches are copied; tracker points after
+// a run keep pointing at their packets.
+void TestDirectRuns() {
+	std::vector<uint32_t> dcb;
+	for (uint32_t i = 0; i < 100; i++) {
+		Append(dcb, IT_SET_CONTEXT_REG, {0x10u, 0x1000u + i}, false);
+	}
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	const uint32_t run_dw = static_cast<uint32_t>(dcb.size()); // the dispatch is passed on as written too
+	constexpr uint64_t kVa = 0x123400000ull;
+	auto has_ib2 = [](const std::vector<uint32_t>& ib, uint64_t va, uint32_t dwords) {
+		for (size_t k = 0; k + 3 < ib.size(); k++) {
+			if (ib[k] == 0xc0023f00u && ib[k + 1] == static_cast<uint32_t>(va) && ib[k + 2] == static_cast<uint32_t>(va >> 32u) &&
+			    ib[k + 3] == (dwords | (1u << 23u))) {
+				return true;
+			}
+		}
+		return false;
+	};
+	{
+		Pm4Translator t;
+		t.SetDirectRuns(64);
+		t.SetSource({{0u, static_cast<uint32_t>(dcb.size()), kVa}});
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.direct_ib2 == 1 && r.stats.direct_dw == run_dw, "one IB2 for the 305-dword stretch");
+		Check(has_ib2(r.ib, kVa, run_dw), "the IB2 points at the stretch in guest memory");
+		Check(r.ib.size() < dcb.size(), "the stretch is not copied");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "an IB with IB2s passes the gfx check");
+		Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "not on a compute ring");
+		// SetSource is for one buffer: the next one is copied.
+		auto r2 = t.Translate(dcb);
+		Check(r2.ok && r2.stats.direct_ib2 == 0, "without a source the next buffer is copied");
+	}
+	{
+		Pm4Translator t;
+		t.SetDirectRuns(1000);
+		t.SetSource({{0u, static_cast<uint32_t>(dcb.size()), kVa}});
+		Check(t.Translate(dcb).stats.direct_ib2 == 0, "a stretch under the minimum is copied");
+	}
+	{
+		// Two pieces: dwords [0, 150) at kVa, the rest at another address.
+		Pm4Translator t;
+		t.SetDirectRuns(64);
+		t.SetSource({{0u, 150u, kVa}, {150u, static_cast<uint32_t>(dcb.size()) - 150u, 0x200000000ull}});
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.direct_ib2 == 2 && has_ib2(r.ib, kVa, 150u) && has_ib2(r.ib, 0x200000000ull, run_dw - 150u),
+		      "the stretch is split where its guest memory is");
+	}
+	{
+		// Native labels: the segment's tracker store after the run still holds its points.
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetDirectRuns(64);
+		t.SetSource({{0u, static_cast<uint32_t>(dcb.size()), kVa}});
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.direct_ib2 == 1 && r.segments.size() == 1, "one segment with one IB2");
+		const auto& pts = r.segments[0].points;
+		Check(!pts.empty() && IsTrackerPacket(r.ib, pts.back().dw) && r.segments[0].end == r.ib.size() && IbAligned(r.ib),
+		      "the end point moves with the IB");
+	}
+}
+
 // A WRITE_DATA of a block of data is one write: a wait on a dword inside it that the block meets runs
 // on the GPU (the write is ahead of it in the ring); one it does not meet is not; the segment keeps the
 // block as touched, without the buffer's memory.
@@ -2045,6 +2110,7 @@ int main() {
 	TestAcquireFull();
 	TestLabelsWriteData();
 	TestLabelsWriteDataBlock();
+	TestDirectRuns();
 	TestLabelsReleaseMem();
 	TestLabelsLocalWait();
 	TestLabelsSplit();

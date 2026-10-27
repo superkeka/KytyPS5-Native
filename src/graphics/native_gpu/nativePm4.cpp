@@ -20,6 +20,7 @@ namespace {
 // Type-3 PM4 opcodes, mirroring src/graphics/guest_gpu/pm4.h (kept local so the translator has no
 // build dependency on the rest of Kyty and stays unit-testable off the board).
 constexpr uint32_t IT_NOP                      = 0x10;
+constexpr uint32_t IT_INDIRECT_BUFFER          = 0x3F;
 constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_SET_BASE                 = 0x11;
 constexpr uint32_t IT_SET_PREDICATION          = 0x20;
@@ -547,6 +548,13 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 					return bad();
 				}
 				break;
+			// The translator's IB2 into the guest's buffer (SetDirectRuns): a call, not a chain, on the gfx
+			// ring. Its packets are the ones the translator passed on as written.
+			case IT_INDIRECT_BUFFER:
+				if (compute || size != 4 || (b[2] & (1u << 20u)) != 0 || (b[2] & (1u << 23u)) == 0) {
+					return bad();
+				}
+				break;
 			// A guest WRITE_DATA to memory, write confirmed; on MEC from the micro engine.
 			case IT_WRITE_DATA:
 				if (size < 5 || !WriteDataToMemory(b[0]) || (b[0] & (1u << 20u)) == 0 ||
@@ -617,7 +625,8 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 
 namespace {
 // 1: inlined something, 0: nothing to inline, -1: cannot.
-int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int depth, std::string* why) {
+int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int depth, std::string* why,
+                std::vector<SourcePiece>* pieces) {
 	auto stop = [&](const char* what, size_t dw) {
 		if (why != nullptr && why->empty()) {
 			char text[160];
@@ -676,7 +685,7 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if (depth >= 16) {
 				return stop("calls nested too deep", dw);
 			}
-			if (FlattenInto({target, size}, out, depth + 1, why) < 0) {
+			if (FlattenInto({target, size}, out, depth + 1, why, pieces) < 0) {
 				return -1;
 			}
 			dw += len;
@@ -685,6 +694,16 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 		if (out->size() + len > kMaxDwords) {
 			return stop("too large", dw);
 		}
+		if (pieces != nullptr) {
+			const uint64_t va = reinterpret_cast<uint64_t>(in.data() + dw);
+			const auto     at = static_cast<uint32_t>(out->size());
+			if (!pieces->empty() && pieces->back().dw + pieces->back().len == at &&
+			    pieces->back().va + 4ull * pieces->back().len == va) {
+				pieces->back().len += len;
+			} else {
+				pieces->push_back({at, len, va});
+			}
+		}
 		out->insert(out->end(), in.begin() + static_cast<std::ptrdiff_t>(dw), in.begin() + static_cast<std::ptrdiff_t>(dw + len));
 		dw += len;
 	}
@@ -692,10 +711,17 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 }
 } // namespace
 
-bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why) {
+bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why,
+                            std::vector<SourcePiece>* pieces) {
 	out->clear();
-	if (FlattenInto(in, out, 0, why) <= 0) {
+	if (pieces != nullptr) {
+		pieces->clear();
+	}
+	if (FlattenInto(in, out, 0, why, pieces) <= 0) {
 		out->clear();
+		if (pieces != nullptr) {
+			pieces->clear();
+		}
 		return false;
 	}
 	return true;
@@ -1092,7 +1118,9 @@ LodStatsHandoff& LodStatsReports() {
 }
 
 Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
-	Pm4TranslateResult r;
+	Pm4TranslateResult             r;
+	const std::vector<SourcePiece> source = std::move(m_source); // SetSource is for this buffer only
+	m_source.clear();
 
 	// First pass: walk the DCB, refuse on anything unknown, and fold register writes into the
 	// shadow while collecting the body packets. Nothing is emitted until the pass succeeds, so a
@@ -1946,6 +1974,50 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
             stats.run_hist[verbatim_run < 16 ? 0 : verbatim_run < 64 ? 1 : verbatim_run < 256 ? 2 : 3]++;
             verbatim_run = 0;
         }
+	};
+	// SetDirectRuns: stretches of packets passed on as written, as (body offset, buffer dword, dwords).
+	// The long ones run from the guest's buffer as IB2s when the IB is assembled below; their guest
+	// memory is referenced so it is resident.
+	struct DirectRun {
+		uint32_t body = 0;
+		uint32_t dw   = 0;
+		uint32_t len  = 0;
+	};
+	std::vector<DirectRun>         direct_runs;
+	DirectRun                      direct_cur;
+	const bool direct = m_direct_min_dw != 0 && !m_compute_ring && !source.empty();
+	// The GPU VA of buffer dword `at`, and how many dwords from there sit contiguously; 0 when unknown.
+	auto source_va = [&](uint32_t at, uint32_t* left) -> uint64_t {
+		auto it = std::upper_bound(source.begin(), source.end(), at,
+		                           [](uint32_t v, const SourcePiece& piece) { return v < piece.dw; });
+		if (it == source.begin()) {
+			return 0;
+		}
+		--it;
+		if (at >= it->dw + it->len) {
+			return 0;
+		}
+		*left = it->dw + it->len - at;
+		return it->va + 4ull * (at - it->dw);
+	};
+	auto end_direct = [&]() {
+		if (direct_cur.len >= m_direct_min_dw) {
+			for (uint32_t done = 0; done < direct_cur.len;) {
+				uint32_t       left = 0;
+				const uint64_t va   = source_va(direct_cur.dw + done, &left);
+				if (va == 0) {
+					direct_cur.len = 0;
+					break;
+				}
+				const uint32_t take = std::min(left, direct_cur.len - done);
+				add_ref(va, 4ull * take, false);
+				done += take;
+			}
+			if (direct_cur.len != 0) {
+				direct_runs.push_back(direct_cur);
+			}
+		}
+		direct_cur.len = 0;
 	};
 	uint32_t cut_run = 0;
 	auto     end_cut_run = [&]() {
@@ -3010,6 +3082,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			end_run();
 			stats.changed_ops[op]++;
 		}
+		if (direct && same && direct_cur.len != 0 && direct_cur.body + direct_cur.len == body_before &&
+		    direct_cur.dw + direct_cur.len == dw) {
+			direct_cur.len += size;
+		} else if (direct) {
+			end_direct();
+			if (same) {
+				direct_cur = {static_cast<uint32_t>(body_before), dw, size};
+			}
+		}
 		if (same || (op == IT_NOP && same_seg && body.size() == body_before)) {
 			cut_run += size;
 		} else {
@@ -3027,6 +3108,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	}
 	end_run();
 	end_cut_run();
+	if (direct) {
+		end_direct();
+	}
 	if (!r.unknown_ops.empty()) {
 		const uint32_t first_op = r.unknown_op;
 		const uint32_t first_dw = r.unknown_dw;
@@ -3047,6 +3131,41 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	const Pm4CpDrawState cp_start = m_cp;
 	m_cp                          = cp;
 
+	// Copies body[from, to) to the IB, each direct run in it as IB2s into the guest's buffer. Returns,
+	// per run, (body offset where it ends, dwords removed up to there) to move later body offsets.
+	size_t direct_next = 0;
+	auto   append_body = [&](uint32_t from, uint32_t to) {
+		std::vector<std::pair<uint32_t, int64_t>> removed;
+		int64_t                                   gone = 0;
+		uint32_t                                  at   = from;
+		while (direct_next < direct_runs.size() && direct_runs[direct_next].body < from) {
+			direct_next++; // in a dropped segment
+		}
+		for (; direct_next < direct_runs.size() && direct_runs[direct_next].body < to; direct_next++) {
+			const DirectRun& run = direct_runs[direct_next];
+			r.ib.insert(r.ib.end(), body.begin() + at, body.begin() + run.body);
+			uint32_t emitted = 0;
+			for (uint32_t done = 0; done < run.len;) {
+				uint32_t       left = 0;
+				const uint64_t va   = source_va(run.dw + done, &left);
+				const uint32_t take = std::min({left, run.len - done, 0xfffffu});
+				r.ib.push_back(Pkt3(IT_INDIRECT_BUFFER, 3, false));
+				r.ib.push_back(static_cast<uint32_t>(va));
+				r.ib.push_back(static_cast<uint32_t>(va >> 32u));
+				r.ib.push_back(take | (1u << 23u)); // IB_SIZE, VALID
+				emitted += 4;
+				done += take;
+				stats.direct_ib2++;
+			}
+			stats.direct_dw += run.len;
+			gone += static_cast<int64_t>(run.len) - emitted;
+			removed.emplace_back(run.body + run.len, gone);
+			at = run.body + run.len;
+		}
+		r.ib.insert(r.ib.end(), body.begin() + at, body.begin() + to);
+		return removed;
+	};
+
 	if (labels) {
 		close_segment(true);
 		// Each kept segment: its preamble (the first one's from the committed shadow, as without native
@@ -3065,25 +3184,36 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			const uint32_t from  = seg_body[k];
 			const uint32_t to    = k + 1 < segs.size() ? seg_body[k + 1] : static_cast<uint32_t>(body.size());
-			const int64_t  shift = static_cast<int64_t>(r.ib.size()) - static_cast<int64_t>(from);
-			r.ib.insert(r.ib.end(), body.begin() + from, body.begin() + to);
+			const int64_t  shift   = static_cast<int64_t>(r.ib.size()) - static_cast<int64_t>(from);
+			const auto     removed = append_body(from, to);
 			while ((r.ib.size() & 7u) != 0) {
 				r.ib.push_back(0xffff1000u);
 			}
 			s.end = static_cast<uint32_t>(r.ib.size());
+			// Offsets are never inside a direct run: points, barriers and waits are packets of ours.
+			auto move = [&](uint32_t off) {
+				int64_t gone = 0;
+				for (const auto& [end, g]: removed) {
+					if (end > off) {
+						break;
+					}
+					gone = g;
+				}
+				return static_cast<uint32_t>(off + shift - gone);
+			};
 			for (auto& p: s.points) {
-				p.dw = static_cast<uint32_t>(p.dw + shift);
+				p.dw = move(p.dw);
 			}
 			if (s.held) {
-				s.barrier_dw = static_cast<uint32_t>(s.barrier_dw + shift);
-				s.wait_dw    = static_cast<uint32_t>(s.wait_dw + shift);
+				s.barrier_dw = move(s.barrier_dw);
+				s.wait_dw    = move(s.wait_dw);
 			}
 			r.segments.push_back(std::move(s));
 		}
 	} else {
 		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
 		EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
-		r.ib.insert(r.ib.end(), body.begin(), body.end());
+		append_body(0, static_cast<uint32_t>(body.size()));
 
 		// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
 		while ((r.ib.size() & 7u) != 0) {

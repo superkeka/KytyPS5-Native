@@ -154,6 +154,8 @@ struct Pm4TranslateStats {
 	uint32_t loaded_sh_regs    = 0; // offset/value pairs expanded from 0x63
 	uint32_t loaded_uc_regs    = 0; // offset/value pairs expanded from 0x64
 	uint32_t loads_verbatim    = 0; // 0x63/0x64/0x9F run by the CP as written (their pairs counted above too)
+	uint32_t direct_ib2        = 0; // SetDirectRuns: INDIRECT_BUFFER calls into the guest's buffer
+	uint32_t direct_dw         = 0; // ... and the dwords they run in place
 	uint32_t draws             = 0; // IT_DRAW_INDEX_2
 	uint32_t dispatches        = 0; // IT_DISPATCH_DIRECT / IT_DISPATCH_INDIRECT
 	uint32_t num_instances     = 0; // IT_NUM_INSTANCES passed through
@@ -416,7 +418,16 @@ uint64_t SatisfyingValue(const WaitCond& w, uint64_t current);
 // (`out` cleared) when there is nothing to inline, or something it cannot: a REWIND still waiting for
 // the CPU, another IB form, or a chain deeper than 16 or longer than 4M dwords.
 // `why`, when given, says what stopped it (empty when there was nothing to inline).
-bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr);
+// Where a stretch of a buffer sits in guest memory: `len` dwords from dword `dw` of the buffer at GPU
+// VA `va` (guest memory is mapped at the CPU address).
+struct SourcePiece {
+	uint32_t dw  = 0;
+	uint32_t len = 0;
+	uint64_t va  = 0;
+};
+// `pieces`, when given, gets where each stretch of `out` came from.
+bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
+                            std::vector<SourcePiece>* pieces = nullptr);
 
 // What the backend knows about labels beyond the buffer being translated.
 class LabelOracle {
@@ -671,6 +682,14 @@ public:
 	// shader bit. Graphics-only packets are refused.
 	void SetComputeRing(bool compute_ring) { m_compute_ring = compute_ring; }
 
+	// Direct execution (KYTY_NATIVE_GPU_DIRECT_RUNS): a stretch of at least `min_dw` dwords the
+	// translator passes on as written runs from the guest's buffer as an IB2 (INDIRECT_BUFFER) instead
+	// of being copied; `source` says where the next buffer's dwords sit in guest memory (empty: copy as
+	// before). The gfx ring only; the CP fetches the IB2 through GL2, so the IB needs a cache invalidate
+	// before it (amdgpu's AMDGPU_IB_FLAG_EMIT_MEM_SYNC).
+	void SetDirectRuns(uint32_t min_dw) { m_direct_min_dw = min_dw; }
+	void SetSource(std::vector<SourcePiece> source) { m_source = std::move(source); }
+
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
 	void SetGdsAvailable(bool available) { m_gds = available; }
@@ -767,6 +786,8 @@ private:
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
 	bool                         m_compute_ring   = false;
+	uint32_t                     m_direct_min_dw  = 0;
+	std::vector<SourcePiece>     m_source;
 	uint64_t                     m_fence_va       = 0;
 	LabelOracle*                 m_labels         = nullptr;
 	uint64_t                     m_tracker_va     = 0;
