@@ -83,7 +83,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `tag342` | libSceAgc's internal-data tags (`SET_UCONFIG_REG` of 0x342) on the gfx and a compute ring |
 | `regindex-sh`, `-ctx`, `-uc` | 0x63 / 0x9F / 0x64 (AMD's `LOAD_*_REG_INDEX`) with one pair, read back with `COPY_DATA` |
 | `regindex-uc342`, `-sh-nr`, `-ctx-nr` | the same packets without register reads, a `WRITE_DATA` after them as the proof |
-| `labelvis` | does the CPU see a `RELEASE_MEM` label written without cache write-back, per MTYPE (not run yet) |
+| `labelvis` | a `RELEASE_MEM` label without cache write-back seen by the CPU, then a `WAIT_REG_MEM` on a dword the CPU writes, per MTYPE (`LABELVIS_KIND=nc\|uc\|cc\|wc\|default`, one per run) |
 
 `--awake SEC` keeps one wave spinning on the compute ring while the case runs, so the graphics block
 never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of freeing buffers
@@ -104,6 +104,11 @@ never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of
 - **`ib2`:** an IB2 call costs the CP about 0.3 us (0.285 us at 16 dwords, 0.37 at 64 and 256), the same
   from cached and write-combined GTT; a 64-dword NOP stream runs as fast inline as in one IB2.
   Multi-dword NOPs (Kyty never sent any) are skipped as expected.
+- **`labelvis` (P5):** the CPU sees a GPU label written without write-back with every mapping (the label
+  itself goes past the caches). A GPU `WAIT_REG_MEM` on a dword the CPU writes later **never sees it
+  with the default mapping** (NC: the first poll caches the line in GL2; the ring stopped) and sees it
+  with UC or CC. CC streams as fast as NC (257 vs 232 GB/s), but ASTRO BOT with all guest memory CC
+  costs the GPU ~25% (19-20 ms instead of 15-17); UC everywhere doubles My First Gran Turismo's GPU time.
 - **`tag342`:** the gfx ring runs the DCB form (header 0xc0017904, bit 2 set); amdgpu's compute ring
   stops on `SET_UCONFIG_REG` of 0x342.
 

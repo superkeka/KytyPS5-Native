@@ -1663,8 +1663,12 @@ static bool DangerLabelVis(Device* d, Common* c) {
 	static const struct {
 		const char* name;
 		uint32_t    mtype;
-	} kinds[] = {{"default", 0}, {"nc", AMDGPU_VM_MTYPE_NC}, {"uc", AMDGPU_VM_MTYPE_UC}, {"wc", AMDGPU_VM_MTYPE_WC}};
+	} kinds[] = {{"default", 0}, {"nc", AMDGPU_VM_MTYPE_NC}, {"uc", AMDGPU_VM_MTYPE_UC}, {"wc", AMDGPU_VM_MTYPE_WC}, {"cc", AMDGPU_VM_MTYPE_CC}};
+	const char* only = getenv("LABELVIS_KIND"); // one mapping type per run: a wait that never sees the CPU stops the ring
 	for (size_t k = 0; k < ARRAY_SIZE(kinds); k++) {
+		if (only != NULL && strcmp(only, kinds[k].name) != 0) {
+			continue;
+		}
 		Bo  mem;
 		int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
 		if (r == 0) {
