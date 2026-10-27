@@ -27,6 +27,14 @@ against submit-to-label times. With the EOP log it checks that a title's context
 and compute ring 0 land in the log in order, with their ring. 2026-10-27, 7.2.7-valve2: gfx wakes 44 us after submit (label at 25 us),
 compute 73 us (label at 48 us), none lost in 300. The stock module wakes none.
 
+`scanout_probe` (`scanout-probe.sh [vram|gtt] [seconds]`, inside the gamescope session) shows two
+3840x2160 buffers laid out as the PS5's render targets (Prospero kRenderTarget, SW_64KB_R_X) through
+X11 DRI3/Present with the AMD modifier the display planes list for that layout (GFX10 64K_R_X,
+PIPE_XOR_BITS 4, `0x0200000000801b02`), one flip per vblank. 2026-10-28: the picture is right (the PS5
+layout is the display engine's 64K_R_X), Present completes every frame as FLIP (Xwayland passes the
+buffer to gamescope without a copy), 16.7 ms apart. gamescope composites it (the plane shows its own
+three framebuffers) rather than scanning it out directly; why is still open.
+
 `shaders.h` is generated from the `.s` files by `gen_shaders.sh` (LLVM `llvm-mc`, gfx1013).
 
 `--blob FILE [--vgprs N]` runs a raw shader binary as one wave64 group of 64 lanes (destination

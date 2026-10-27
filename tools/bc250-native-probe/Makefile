@@ -9,7 +9,10 @@ kfd_probe: kfd_probe.c
 eop_irq_probe: eop_irq_probe.c
 	$(CC) $(CFLAGS) -o $@ eop_irq_probe.c
 
+scanout_probe: scanout_probe.c
+	$(CC) $(CFLAGS) -o $@ scanout_probe.c -lxcb -lxcb-dri3 -lxcb-present
+
 clean:
-	rm -f bc250-native-probe kfd_probe eop_irq_probe
+	rm -f bc250-native-probe kfd_probe eop_irq_probe scanout_probe
 
 .PHONY: clean
