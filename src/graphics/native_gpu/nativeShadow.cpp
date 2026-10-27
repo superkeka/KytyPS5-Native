@@ -482,7 +482,10 @@ public:
 	// With `out` (native labels) the buffer is translated and made resident, and the result goes to
 	// the caller, who schedules its segments; false means it is not run natively (refused, or the
 	// native path is off) and Kyty has to run it.
-	bool Submit(std::span<const uint32_t> dcb, bool acb = false, Pm4TranslateResult* out = nullptr) {
+	// `source`: where `dcb`'s dwords sit in guest memory when it is not the guest's buffer itself (a chunk of
+	// one LabelPipeline flattened), for direct runs.
+	bool Submit(std::span<const uint32_t> dcb, bool acb = false, Pm4TranslateResult* out = nullptr,
+	            const std::vector<SourcePiece>* source = nullptr) {
 		const double                t_enter = NowSecShadow();
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double                t_locked = NowSecShadow();
@@ -533,7 +536,9 @@ public:
 			}
 		}
 		if (direct) {
-			if (flat.empty()) {
+			if (source != nullptr) {
+				pieces = *source;
+			} else if (flat.empty()) {
 				pieces = {SourcePiece {0, static_cast<uint32_t>(dcb.size()), reinterpret_cast<uint64_t>(dcb.data())}};
 			}
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -1102,10 +1107,14 @@ public:
 		m_chain_max_s = std::max(m_chain_max_s, latency);
 	}
 
-	// KYTY_NATIVE_GPU_FLIP_TRACE=1: one line per flip in flips.csv (the working directory) with what
-	// happened since the previous one, to see what the late frames have that the others do not.
+	// KYTY_NATIVE_GPU_FLIP_TRACE=1 (or =gpu, with GPU clocks): one line per flip in flips.csv (the working
+	// directory) with what happened since the previous one, to see what the late frames have that the
+	// others do not.
 	void FlipTrace(double now, double present_s) {
-		static const bool on = EnvOn("KYTY_NATIVE_GPU_FLIP_TRACE");
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_FLIP_TRACE");
+			return v != nullptr && (v[0] == '1' || std::strcmp(v, "gpu") == 0);
+		}();
 		if (!on) {
 			return;
 		}
@@ -1415,7 +1424,10 @@ public:
 			// MEC packet forms. The gfx translator is unchanged.
 			m_acb_translator.SetComputeRing(true);
 		}
-		if (EnvOn("KYTY_NATIVE_GPU_FLIP_TRACE")) {
+		// KYTY_NATIVE_GPU_FLIP_TRACE=gpu: the trace also takes GPU clocks around every gfx buffer and GPU
+		// wait. A clock read on an idle gfx ring stopped it (probe clock): this hung ASTRO BOT in a light
+		// scene, where the ring idles between buffers. Diagnostics only.
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_FLIP_TRACE"); v != nullptr && std::strcmp(v, "gpu") == 0) {
 			for (uint64_t i = kGpuTimesOffset; i < kGpuTimesOffset + 2 * 16ull * kGpuTimesPairs; i++) {
 				m_submitter->ScratchCpu()[i] = 0;
 			}
@@ -3311,6 +3323,14 @@ private:
 		double                enqueued = 0.0;
 		double                picked   = 0.0;
 	};
+	// KYTY_NATIVE_GPU_CHUNK_DW=N (experiment, off): graphics buffers longer than N dwords go to the GPU
+	// in chunks of about N (TranslateChunks). ASTRO BOT hung twice with it on the way into a level.
+	uint32_t m_chunk_dw = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_CHUNK_DW");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+	}();
+	uint64_t                   m_chunks         = 0;
+	uint32_t                   m_chunk_refused  = 0;
 	std::map<uint32_t, double> m_hold_since; // queue -> when its front piece was first found held
 	uint32_t                   m_stale_logged = 0;
 	struct Piece {
@@ -3452,6 +3472,10 @@ private:
 		if (m_acb_rings && job.queue >= 0x20u) {
 			Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
 		}
+		if (job.buffer != nullptr && m_native && job.queue == 0 && m_chunk_dw != 0 && job.size_dw > m_chunk_dw &&
+		    TranslateChunks(job, done, queue)) {
+			return;
+		}
 		if (job.buffer == nullptr || !m_native ||
 		    !Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.queue != 0, &r) ||
 		    r.segments.empty()) {
@@ -3460,6 +3484,11 @@ private:
 			return;
 		}
 		done->tail = std::move(r.cpu_tail);
+		PushPieces(r, done, queue);
+	}
+
+	// A translated buffer as pieces, one per segment; `done` (when given) on the last.
+	void PushPieces(Pm4TranslateResult& r, const std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
 		for (size_t k = 0; k < r.segments.size(); k++) {
 			Piece p;
 			p.made = m_emits;
@@ -3476,6 +3505,85 @@ private:
 			}
 			queue.push_back(std::move(p));
 		}
+	}
+
+	// Pumps the pieces ready so far to the GPU, as Work does after each round.
+	void PumpAndFlush() {
+		for (;;) {
+			Pump();
+			if (!m_appended) {
+				break;
+			}
+			Shadow::Instance().FlushBatch();
+			m_batch++;
+			m_last_cs.store(Shadow::Instance().TakeLastSeq(), std::memory_order_release);
+			m_appended = false;
+		}
+	}
+
+	// A large graphics buffer (ASTRO BOT's main DCB: ~900K dwords, ~10 ms to translate) goes to the GPU in
+	// chunks of about m_chunk_dw dwords as each is translated, instead of after the whole of it: the
+	// gfx ring otherwise idled until the end, and frames missed the display refresh whenever the
+	// translation ran long. Each chunk is translated like a buffer of its own (the shadow carries the
+	// state across, as between buffers); `then` comes after the last. A chunk never ends inside a
+	// COND_EXEC's range. False (nothing done) when the first chunk is refused: the buffer is Kyty's.
+	bool TranslateChunks(Job& job, std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
+		std::vector<uint32_t>     flat;
+		std::vector<SourcePiece> source;
+		std::span<const uint32_t> whole(job.buffer, job.size_dw);
+		if (FlattenIndirectBuffers(whole, &flat, nullptr, &source)) {
+			whole = flat;
+		} else {
+			source = {SourcePiece {0, job.size_dw, reinterpret_cast<uint64_t>(job.buffer)}};
+		}
+		std::vector<std::pair<uint32_t, uint32_t>> chunks; // [begin, end) at packet boundaries
+		uint32_t                                   begin = 0, cond_until = 0;
+		for (uint32_t dw = 0; dw < whole.size();) {
+			const uint32_t header = whole[dw];
+			const uint32_t size   = (header >> 30u) == 3u ? ((header >> 16u) & 0x3fffu) + 2u : 1u;
+			if ((header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x22u && size >= 5) { // COND_EXEC: EXEC_COUNT dwords follow
+				cond_until = std::max(cond_until, dw + size + (whole[dw + 4] & 0x3fffu));
+			}
+			dw += size;
+			if (dw - begin >= m_chunk_dw && dw >= cond_until && dw < whole.size()) {
+				chunks.emplace_back(begin, dw);
+				begin = dw;
+			}
+		}
+		chunks.emplace_back(begin, static_cast<uint32_t>(whole.size()));
+		if (chunks.size() < 2) {
+			return false;
+		}
+		for (size_t c = 0; c < chunks.size(); c++) {
+			const auto [cb, ce] = chunks[c];
+			std::vector<SourcePiece> part;
+			for (const SourcePiece& piece: source) {
+				const uint32_t lo = std::max(piece.dw, cb), hi = std::min(piece.dw + piece.len, ce);
+				if (lo < hi) {
+					part.push_back({lo - cb, hi - lo, piece.va + 4ull * (lo - piece.dw)});
+				}
+			}
+			Pm4TranslateResult r;
+			if (!Shadow::Instance().Submit(whole.subspan(cb, ce - cb), false, &r, &part) || r.segments.empty()) {
+				if (c == 0) {
+					return false;
+				}
+				// Earlier chunks are on the GPU already: the rest of this frame is lost.
+				if (m_chunk_refused++ < 8) {
+					std::fprintf(stderr, "native shadow: chunk %zu of %zu of a DCB refused; the rest of it is dropped\n", c,
+					             chunks.size());
+				}
+				queue.push_back(Piece {{}, {}, std::move(done)});
+				return true;
+			}
+			done->tail.insert(done->tail.end(), r.cpu_tail.begin(), r.cpu_tail.end());
+			PushPieces(r, c + 1 == chunks.size() ? done : nullptr, queue);
+			if (c + 1 < chunks.size()) {
+				PumpAndFlush(); // this chunk runs while the next is translated
+			}
+		}
+		m_chunks += chunks.size();
+		return true;
 	}
 
 	Release Ready(uint32_t queue, const Piece& p) {
