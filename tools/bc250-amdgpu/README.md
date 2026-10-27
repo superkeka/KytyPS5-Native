@@ -21,6 +21,7 @@ changes the kernel drops it (the board is stock again until it is rebuilt).
 | Wave save area for every CU the chip has | `kfd_queue.c` | amdgpu counts the 24 CUs enabled at init; `bc250-cu-live-manager` enables 40. A preempted queue with waves on all 40 overflowed the save area. Sized from `array_count x cu_per_simd_array` on the BC-250 only. |
 | Two gfx rings (`bc250_gfx_queues=2`) | `gfx_v10_0.c`, `amdgpu_gfx.c` | The PS5 gives a title gfx pipe 0 queue 0 (main ring) and queue 1 ("AGR" ring); amdgpu gives Navi1x one. The second ring is mapped the same way as the first (MQD through the KIQ), as `gfx_0.0.1`. Its EOP interrupt does not arrive as its own, so an EOP on pipe 0 checks the fences of both rings. |
 | Gfx ring index = gfx ring | `amdgpu_ctx.c` | With two rings of one priority amdgpu balanced a context's gfx work over both, and anything could land on ring 1. Ring index N is now ring N; everything that asks for ring 0 (every Vulkan program) stays on ring 0, and ring 1 is used only when asked for (Kyty, for a title's second graphics queue). |
+| `AMDGPU_VM_MTYPE_RW` maps MTYPE 4, C_RW_S (`bc250_mtype_rw`, read-only, 1) | `gmc_v10_0.c` | The PS5 kernel maps a title's shared memory (type 12) C_RW_S and its GPU-only memory (11) C_RW_US (NC); amdgpu has no gfx10 case for RW and mapped it NC. Kyty asks for it with `KYTY_NATIVE_GPU_COHERENT_TYPES=12`; nothing else does. |
 | Out-of-tree build fixes | `Makefile`, `amdgpu_trace.h` | The trace header is found next to its `.c` file. |
 
 ## Module options (written by the installer)

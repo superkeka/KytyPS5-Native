@@ -122,7 +122,7 @@
  			amdgpu_fence_process(&adev->gfx.gfx_ring[1]);
 --- a/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
 +++ b/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
-@@ -51,6 +51,18 @@
+@@ -51,6 +51,25 @@
  #include "athub_v2_0.h"
  #include "athub_v2_1.h"
  
@@ -138,10 +138,17 @@
 +module_param(bc250_tlb_flush_type, int, 0644);
 +MODULE_PARM_DESC(bc250_tlb_flush_type, "BC-250: TLB flush type for every GPU TLB flush (-1 = as requested, 0 = legacy)");
 +
++/* BC-250: AMDGPU_VM_MTYPE_RW maps MTYPE 4 (C_RW_S, cached and shared), the MTYPE the PS5 kernel gives
++ * its shared memory type (12, SCE_KERNEL_MTYPE_C_SHARED; its GPU-only type 11 is MTYPE 0, NC). amdgpu has
++ * no gfx10 case for it and mapped such a request NC. The parameter tells user space the case is here. */
++static int bc250_mtype_rw = 1;
++module_param(bc250_mtype_rw, int, 0444);
++MODULE_PARM_DESC(bc250_mtype_rw, "BC-250: AMDGPU_VM_MTYPE_RW maps MTYPE C_RW_S (1) or NC (0)");
++
  static int gmc_v10_0_ecc_interrupt_state(struct amdgpu_device *adev,
  					 struct amdgpu_irq_src *src,
  					 unsigned int type,
-@@ -237,7 +249,8 @@
+@@ -237,7 +256,8 @@
  {
  	bool use_semaphore = gmc_v10_0_use_invalidate_semaphore(adev, vmhub);
  	struct amdgpu_vmhub *hub = &adev->vmhub[vmhub];
@@ -151,7 +158,17 @@
  	/* Use register 17 for GART */
  	const unsigned int eng = 17;
  	unsigned char hub_ip = 0;
-@@ -964,7 +977,7 @@
+@@ -500,6 +520,9 @@
+ 	case AMDGPU_VM_MTYPE_UC:
+ 		*flags = AMDGPU_PTE_MTYPE_NV10(*flags, MTYPE_UC);
+ 		break;
++	case AMDGPU_VM_MTYPE_RW: /* BC-250 */
++		*flags = AMDGPU_PTE_MTYPE_NV10(*flags, bc250_mtype_rw ? MTYPE_C_RW_S : MTYPE_NC);
++		break;
+ 	}
+ 
+ 	if (vm_flags & AMDGPU_VM_PAGE_NOALLOC)
+@@ -964,7 +987,7 @@
  	struct amdgpu_device *adev = ip_block->adev;
  	int r;
  
