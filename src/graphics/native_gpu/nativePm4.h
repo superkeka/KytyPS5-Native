@@ -834,7 +834,7 @@ private:
 	bool                         m_compact_refs = false;
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
-	bool                         m_pfp_sync_indirect = true;
+	bool                         m_pfp_sync_indirect = false;
 	bool                         m_gds_dma_sync      = false;
 	bool                         m_acquire_full      = false;
 	uint32_t                     m_write_data_native = 0;

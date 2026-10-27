@@ -1868,8 +1868,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 
 	// Indirect arguments are often written by the CP itself just before (DMA_DATA copying a GDS counter,
-	// WRITE_DATA). On the gfx ring the PFP fetches them ahead of the ME that performs those writes,
-	// which a compute queue (one engine) never does: sync the PFP to the ME first, as RADV does.
+	// WRITE_DATA), and on the gfx ring the PFP can fetch them ahead of the ME. libSceAgc's indirect draws
+	// carry no sync of their own, and without one ASTRO BOT, My First GT and Dead Cells draw right: the
+	// title orders its writes itself. KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT=1 puts the RADV-style sync back.
 	auto pfp_sync_me = [&]() {
 		// A compute ring has one engine; the PFP race this closes exists only on the gfx ring, and
 		// PFP_SYNC_ME is illegal on MEC.

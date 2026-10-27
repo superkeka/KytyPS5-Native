@@ -2906,9 +2906,10 @@ private:
 			m_acb_translator.SetCompactRefs(true);
 		}
 		SyncCollectRefs();
-		if (const char* v = std::getenv("KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT"); v != nullptr && v[0] == '0') {
-			m_translator.SetPfpSyncIndirect(false);
-			m_acb_translator.SetPfpSyncIndirect(false);
+		if (EnvOn("KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT")) {
+			m_translator.SetPfpSyncIndirect(true);
+			m_acb_translator.SetPfpSyncIndirect(true);
+			std::fprintf(stderr, "native shadow: PFP_SYNC_ME before indirect draws and dispatches\n");
 		}
 		// KYTY_NATIVE_GPU_WRITE_DATA_NATIVE=1|2: WRITE_DATA also runs in the native IB (see SetWriteDataNative).
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_WRITE_DATA_NATIVE"); v != nullptr && v[0] != '0') {
