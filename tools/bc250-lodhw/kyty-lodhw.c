@@ -36,6 +36,9 @@
 //   op 11 | sel << 8: restore register `size` (all of this client's with 0xffffffff); value = count.
 //   op 12 | sel << 8: read register `size` with that selection.
 //   op 13 | pasid << 8: value = the gfx VMID (1-7) the kernel last gave `pasid`; -ESRCH if none.
+//   op 14 | vmids << 8: invalidate the gfx hub TLB of KFD's VMIDs (8-15) in the mask, the way the PS5
+//      kernel invalidates a title's VMID itself; status 0 once acknowledged (-ETIMEDOUT after 10 ms).
+//      KFD's own flushes go through ioctls that wait for every fence of the VM, a CS job among them.
 // Build: cc -O2 -pthread -o kyty-lodhw kyty-lodhw.c. Run as root: kyty-lodhw [socket path] [socket group gid]
 
 #define _GNU_SOURCE
@@ -61,6 +64,8 @@ enum {
 	kCpfStatus  = 0x1260 + 0x0e27,
 	kSpmMcCntl  = 0xA000 + 0x4c71,
 	kIhVmidLut  = 0x10A0, // IH_VMID_0_LUT (OSSSYS seg0 0x10A0): the PASID each gfx-hub VMID serves
+	kInvReq     = 0x28b3, // GCVM_INVALIDATE_ENG16_REQ: amdgpu gives its rings 0-13 and keeps 17
+	kInvAck     = 0x28c5, // GCVM_INVALIDATE_ENG16_ACK
 	kReport     = 1u << 19,
 	kCachePol   = 1u << 28,
 	kEnable     = 1u << 29, // always set by the PS5 kernel
@@ -447,6 +452,20 @@ static void* Client(void* arg) {
 					rep.status = 0;
 					break;
 				}
+			}
+		} else if ((q.op & 0xffu) == 14) {
+			// Legacy invalidation (L2 PTEs and PDEs, L1 PTEs) of KFD's VMIDs in the mask, on an
+			// engine amdgpu leaves free; the ACK bits clear on the request and are set once done.
+			const uint32_t mask = (q.op >> 8) & 0xffffu;
+			rep.status          = mask != 0 && (mask & 0xffu) == 0 ? 0 : -EINVAL;
+			if (rep.status == 0) {
+				Wr(kInvReq, 0x00f80000u | mask);
+				const double end = Now() + 0.01;
+				uint32_t     ack = 0;
+				while (((ack = Rd(kInvAck)) & mask) != mask && Now() < end) {
+				}
+				rep.value  = ack;
+				rep.status = (ack & mask) == mask ? 0 : -ETIMEDOUT;
 			}
 		} else {
 			rep.status = -EINVAL;

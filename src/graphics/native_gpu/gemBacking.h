@@ -683,23 +683,22 @@ public:
 
 	// KFD queues reach the VM through the KFD VMIDs' TLBs, which a render-node GEM_VA change does not
 	// flush: a CS flushes its own job's VMID, and nothing runs for a KFD queue (kfd_probe avremap: a
-	// KFD write after a REPLACE, or a CLEAR and MAP, landed in the previous buffer half the time). The
-	// BC-250's patched amdgpu (bc250_flush_by_runlist) flushes them on a KFD map or unmap, so a small
-	// KFD buffer is unmapped and mapped again. False without the KFD process.
+	// KFD write after a REPLACE, or a CLEAR and MAP, landed in the previous buffer half the time). A KFD
+	// map ioctl ends in a flush of the process's VMID (the BC-250's patched amdgpu: by VMID without
+	// HWS, a runlist rebuild with it), even for a buffer already mapped, so a small KFD buffer is
+	// mapped again. No unmap: that waits for every fence of the VM, a CS job among them, and one
+	// waiting on the GPU for the KFD work this flush comes before never finishes. False without the
+	// KFD process.
 	bool FlushKfdTlb() {
 		std::lock_guard<std::mutex> lock(m_lock);
 		if (m_kfd_fd < 0 || (m_tlb_bo.kfd_handle == 0 && !CreateKfdBo(4096, &m_tlb_bo))) {
 			return false;
 		}
-		struct kfd_ioctl_unmap_memory_from_gpu_args um {};
-		um.handle               = m_tlb_bo.kfd_handle;
-		um.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
-		um.n_devices            = 1;
 		struct kfd_ioctl_map_memory_to_gpu_args mp {};
 		mp.handle               = m_tlb_bo.kfd_handle;
 		mp.device_ids_array_ptr = reinterpret_cast<uintptr_t>(&m_kfd_gpu);
 		mp.n_devices            = 1;
-		return KfdIoctl(AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &um) == 0 && KfdIoctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, &mp) == 0;
+		return KfdIoctl(AMDKFD_IOC_MAP_MEMORY_TO_GPU, &mp) == 0;
 	}
 	[[nodiscard]] uint32_t KfdGpuId() const { return m_kfd_gpu; }
 
@@ -892,6 +891,28 @@ private:
 			m_kfd_fd  = -1;
 			m_kfd_gpu = 0;
 			return;
+		}
+		// libhsakmt's first call on a GPU: the process's memory policy, from which KFD programs its VMID's
+		// SH_MEM_CONFIG and apertures. Without it the KFD VMID ran with SH_MEM_BASES and SH_MEM_CONFIG 0.
+		struct kfd_ioctl_set_memory_policy_args policy {};
+		policy.gpu_id           = m_kfd_gpu;
+		policy.default_policy   = KFD_IOC_CACHE_POLICY_COHERENT;
+		policy.alternate_policy = KFD_IOC_CACHE_POLICY_COHERENT;
+		if (::ioctl(m_kfd_fd, AMDKFD_IOC_SET_MEMORY_POLICY, &policy) != 0) {
+			std::fprintf(stderr, "GemBacking: KFD SET_MEMORY_POLICY failed: %s\n", std::strerror(errno));
+		}
+		struct kfd_process_device_apertures ap[4] {};
+		struct kfd_ioctl_get_process_apertures_new_args apn {};
+		apn.kfd_process_device_apertures_ptr = reinterpret_cast<uintptr_t>(ap);
+		apn.num_of_nodes                     = 4;
+		if (::ioctl(m_kfd_fd, AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, &apn) == 0) {
+			for (uint32_t i = 0; i < apn.num_of_nodes && i < 4; i++) {
+				if (ap[i].gpu_id == m_kfd_gpu) {
+					std::fprintf(stderr, "GemBacking: KFD apertures: LDS 0x%llx, scratch 0x%llx, GPUVM 0x%llx-0x%llx\n",
+					             static_cast<unsigned long long>(ap[i].lds_base), static_cast<unsigned long long>(ap[i].scratch_base),
+					             static_cast<unsigned long long>(ap[i].gpuvm_base), static_cast<unsigned long long>(ap[i].gpuvm_limit));
+				}
+			}
 		}
 		// KFD queues over always-valid blocks need the KFD process only (queues, the IB buffer).
 		m_kfd_memory = (v != nullptr && v[0] == '1') || !AlwaysValidWanted();

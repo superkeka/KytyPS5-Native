@@ -243,11 +243,17 @@ public:
 		static LodStatsHw h;
 		return h;
 	}
-	// Connects to the helper; true when reports can go through it.
+	// Connects to the helper; true when reports can go through it. Without KYTY_LOD_HW_SOCK it tries
+	// /run/kyty-lodhw.sock, then /tmp/kyty-lodhw.sock (where the BC-250's service listens).
 	bool Connect() {
 		const char* path = std::getenv("KYTY_LOD_HW_SOCK");
-		path             = path != nullptr && path[0] != '\0' ? path : "/run/kyty-lodhw.sock";
-		const int fd     = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+		if (path != nullptr && path[0] != '\0') {
+			return Connect(path);
+		}
+		return Connect("/run/kyty-lodhw.sock") || Connect("/tmp/kyty-lodhw.sock");
+	}
+	bool Connect(const char* path) {
+		const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
 		if (fd < 0) {
 			return false;
 		}
@@ -304,6 +310,8 @@ public:
 	static constexpr uint32_t SelGfxPipe(uint32_t pipe) { return kSel | pipe; }
 	static constexpr uint32_t SelHqd(uint32_t me, uint32_t pipe, uint32_t queue) { return kSel | queue << 8u | me << 2u | pipe; }
 	int ReadReg(uint32_t reg, uint32_t sel, uint32_t* value) { return Call(12u | sel << 8u, reg, 0, value); }
+	// Invalidates the gfx hub TLB of KFD's VMIDs 8-15 (op 14); 0 once acknowledged.
+	int InvalidateKfdTlb() { return Call(14u | 0xff00u << 8u, 0, 0, nullptr); }
 	// reg = (reg & ~mask) | (value & mask) if the helper allows it; `now` is the register afterwards.
 	// The helper keeps the old value and puts it back on RestoreRegs or when this connection closes.
 	int WriteRegMasked(uint32_t reg, uint32_t sel, uint32_t value, uint32_t mask, uint32_t* now) {
@@ -1643,6 +1651,12 @@ private:
 		m_kfd_queues = true;
 		std::fprintf(stderr, "native shadow: ACBs on %u KFD user-mode queues, one per guest queue (doorbell submission, GDS %u bytes)\n",
 		             m_submitter->KfdQueueCount(), m_submitter->GdsSize());
+		if (LodStatsHw::Instance().On() && LodStatsHw::Instance().InvalidateKfdTlb() == 0) {
+			m_submitter->SetKfdTlbFlush([] { return LodStatsHw::Instance().InvalidateKfdTlb() == 0; });
+			std::fprintf(stderr, "native shadow: KFD TLB flushes by the kyty-lodhw helper after GEM_VA changes\n");
+		} else {
+			std::fprintf(stderr, "native shadow: no KFD TLB flush through kyty-lodhw (helper missing or older than op 14)\n");
+		}
 		{
 			std::lock_guard<std::mutex> lock(m_ps5_mutex);
 			Ps5KfdRegs();

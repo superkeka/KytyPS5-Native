@@ -162,6 +162,8 @@ public:
 	// Called with the ring index after each KFD queue is created (it is mapped to a hardware queue by
 	// then), on the submitting thread.
 	void SetKfdQueueHook(std::function<void(uint32_t)> hook) { m_kfd_queue_hook = std::move(hook); }
+	// Invalidates the KFD VMIDs' TLBs without a KFD ioctl; true once done.
+	void SetKfdTlbFlush(std::function<bool()> flush) { m_kfd_tlb_flush = std::move(flush); }
 
 	// KYTY_NATIVE_GPU_KFD_QUEUES: compute submissions to the ring indexes in `rings` (bits below
 	// kMaxKfdQueues) go to KFD user-mode queues, one per index, rung by doorbell instead of a CS
@@ -294,18 +296,21 @@ public:
 		}
 		if (KfdQueue* q = Queue(target); q != nullptr && m_async) {
 			// The VM changed since the last KFD submission: its queues could still translate the old
-			// mappings (GemBacking::FlushKfdTlb).
-			// Only with KYTY_NATIVE_GPU_KFD_TLB_FLUSH=1: the flush rebuilds the firmware scheduler's
-			// runlist, which preempts every KFD queue, and a busy one did not preempt on the BC-250
-			// ("Queue preemption failed", every queue stopped). The PS5 kernel never touches a title's
-			// queues while it runs either; without it My First Gran Turismo runs at 45 FPS.
-			static const bool flush = [] {
+			// mappings, and a wave fetching a shader through them runs garbage (ASTRO BOT: an illegal
+			// instruction, and KFD's trap handler halts the wave for good). SetKfdTlbFlush's flush (the
+			// kyty-lodhw helper writes the invalidation, as the PS5 kernel does) is on unless
+			// KYTY_NATIVE_GPU_KFD_TLB_FLUSH=0. Without it, GemBacking::FlushKfdTlb only with =1: a KFD
+			// ioctl waits for every fence of the VM, a CS job waiting on the GPU for this very
+			// submission among them, and under HWS it rebuilds the runlist, which preempts every KFD
+			// queue, and a busy one did not preempt on the BC-250.
+			static const int flush_env = [] {
 				const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_TLB_FLUSH");
-				return v != nullptr && v[0] == '1';
+				return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0);
 			}();
+			const bool flush = flush_env == 1 || (flush_env == -1 && m_kfd_tlb_flush);
 			if (const uint64_t changes = m_gem->VaChanges(); flush && changes != m_kfd_va_changes) {
 				const double tf = NowSec();
-				const bool   ok = m_gem->FlushKfdTlb();
+				const bool   ok = m_kfd_tlb_flush ? m_kfd_tlb_flush() : m_gem->FlushKfdTlb();
 				m_kfd_va_changes = changes;
 				if (m_kfd_tlb_flushes++ < 8 || !ok) {
 					std::fprintf(stderr, "NativeSubmitter: KFD TLB flush after GEM_VA changes %s, %.1f ms\n", ok ? "done" : "FAILED",
@@ -723,6 +728,7 @@ private:
 		return a;
 	}();
 	std::function<void(uint32_t)> m_kfd_queue_hook; // SetKfdQueueHook
+	std::function<bool()>         m_kfd_tlb_flush;  // SetKfdTlbFlush
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	struct SlotUse {
 		uint64_t   seq   = 0;
