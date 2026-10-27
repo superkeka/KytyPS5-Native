@@ -220,6 +220,7 @@ bool WriteDataToMemory(uint32_t control) {
 constexpr uint32_t kFlushEventCntl = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
                                      (1u << 20u) | (1u << 21u);
 constexpr uint32_t kData32Cntl     = 1u << 29u;
+constexpr uint32_t kIntSel2        = 2u << 24u; // RELEASE_MEM: interrupt once the data write is confirmed
 // DATA_SEL 3: the 64-bit GPU clock counter. amdgpu's gfx_v10_0_ring_emit_fence stores a
 // sequence with DATA_SEL 1 or 2 in this same packet (CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX
 // 5); Mesa's write-timestamp uses DATA_SEL 3 and ignores the data dwords. The event dword stays
@@ -570,10 +571,12 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				// The barrier's form (any address and data), a GPU-clock timestamp (DATA_SEL 3, data
 				// dwords zero, 8-byte address), or a GDS release as the translator has always run it
 				// (DATA_SEL 5, no interrupt). Compute rings use the same bodies with the shader bit.
-				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || b[6] != 0u) {
+				// A tracker release may raise the EOP interrupt (INT_SEL 2) with the tracker's KFD event as
+				// its context id (the pipeline sets both when it numbers the point).
+				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || (b[6] != 0u && b[1] != (kData32Cntl | kIntSel2))) {
 					return bad();
 				}
-				if ((b[0] == kFlushEventCntl || LabelEventOk(b[0])) && b[1] == kData32Cntl) {
+				if ((b[0] == kFlushEventCntl || LabelEventOk(b[0])) && (b[1] == kData32Cntl || b[1] == (kData32Cntl | kIntSel2))) {
 					break; // the barrier's form, or a label in the guest's event (LabelEventCntl)
 				}
 				if ((b[0] == kFlushEventCntl || (b[0] == kClockEopCntl && !compute)) && b[1] == kDataTimestampCntl &&

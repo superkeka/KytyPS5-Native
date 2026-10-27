@@ -366,6 +366,53 @@ private:
 	uint64_t          m_seq       = 0;
 };
 
+// The end-of-pipe interrupt of the tracker's releases: a KFD signal event whose id they carry as
+// their context id (INT_SEL 2), so the tracker sleeps until the GPU passes a point, woken by the
+// interrupt the way the PS5 kernel takes a title's EOP interrupts. Stock KFD drops EOP interrupts of
+// render-node submissions (their VMIDs are not KFD's); the patched amdgpu (tools/bc250-amdgpu,
+// bc250_gfx_eop_events=1) signals the event its context id names, from gfx rings, amdgpu compute
+// rings and KFD queues alike. The event resets as a wait takes it, so interrupts that land while
+// nobody waits leave it set for the next wait and none is lost.
+class KfdEopEvent {
+public:
+	// The event's id, 0 when the kernel would not deliver it (stock amdgpu, or no KFD process).
+	static uint32_t Create(int kfd_fd) {
+		int on = 0;
+		if (FILE* f = std::fopen("/sys/module/amdgpu/parameters/bc250_gfx_eop_events", "re"); f != nullptr) {
+			if (std::fscanf(f, "%d", &on) != 1) {
+				on = 0;
+			}
+			std::fclose(f);
+		}
+		if (on != 1 || kfd_fd < 0) {
+			return 0;
+		}
+		struct kfd_ioctl_create_event_args a {};
+		a.event_type = KFD_IOC_EVENT_SIGNAL;
+		a.auto_reset = 1;
+		if (::ioctl(kfd_fd, AMDKFD_IOC_CREATE_EVENT, &a) != 0) {
+			std::fprintf(stderr, "KfdEopEvent: CREATE_EVENT failed: %s\n", std::strerror(errno));
+			return 0;
+		}
+		return a.event_id;
+	}
+
+	// True when the event fired within `timeout_ms` (or had fired since the last wait).
+	static bool Wait(int kfd_fd, uint32_t id, uint32_t timeout_ms) {
+		struct kfd_event_data             ev {};
+		struct kfd_ioctl_wait_events_args w {};
+		ev.event_id  = id;
+		w.events_ptr = reinterpret_cast<uintptr_t>(&ev);
+		w.num_events = 1;
+		w.timeout    = timeout_ms;
+		int r        = 0;
+		do {
+			r = ::ioctl(kfd_fd, AMDKFD_IOC_WAIT_EVENTS, &w);
+		} while (r == -1 && errno == EINTR);
+		return r == 0 && w.wait_result == KFD_IOC_WAIT_RESULT_COMPLETE;
+	}
+};
+
 } // namespace Libs::Graphics::NativeGpu
 
 #endif // KYTY_GEM_BACKING_SUPPORTED

@@ -1479,7 +1479,13 @@ void TestValidateNativeIb() {
 	rejects({0xc0033700u, 0x100000u, 0x1000u, 0u, 1u}, "WRITE_DATA to a register rejected");
 	rejects({0xc0064902u, kFlushEvent, 1u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "RELEASE_MEM with the compute bit rejected");
 	rejects({0xc0064900u, 0x528u, 2u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "a guest-form RELEASE_MEM rejected");
-	rejects({0xc0064900u, kFlushEvent, (1u << 29u) | (2u << 24u), 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM interrupt rejected");
+	rejects({0xc0064900u, kFlushEvent, (1u << 29u) | (1u << 24u), 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM interrupt alone rejected");
+	rejects({0xc0064900u, kFlushEvent, 1u << 29u, 0x1000u, 0u, 1u, 0u, 5u}, "a context id without an interrupt rejected");
+	{
+		// The tracker's release with its EOP interrupt: INT_SEL 2, the KFD event's id as context id.
+		std::vector<uint32_t> ib = {0xc0064900u, kFlushEvent, (1u << 29u) | (2u << 24u), 0x1000u, 0u, 1u, 0u, 5u};
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "a tracker release raising the EOP interrupt passes");
+	}
 	rejects({0xc0053c00u, 0x4000003u, 0x1000u, 0u, 1u, ~0u, 0x19u}, "a WAIT_REG_MEM on a register rejected");
 	{
 		std::vector<uint32_t> ib = {0xc0053c00u, 0x4000013u, 0x1000u, 0u, 1u, ~0u, 0x19u, 0xffff1000u};

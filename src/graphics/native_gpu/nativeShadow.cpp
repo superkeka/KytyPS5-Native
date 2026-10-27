@@ -1477,6 +1477,11 @@ public:
 				for (uint32_t i = 0; i < 8; i++) {
 					m_labels_mark[i] = m_labels_stats[i];
 				}
+				if (m_irq_event != 0) {
+					std::fprintf(stderr, "native shadow: tracker interrupts so far: %llu waits woken, %llu ran out (10 ms)\n",
+					             static_cast<unsigned long long>(m_irq_wakes.load()),
+					             static_cast<unsigned long long>(m_irq_timeouts.load()));
+				}
 			}
 			std::lock_guard<std::mutex> chain_lock(m_chain_mutex);
 			if (m_chain_n > 0) {
@@ -1548,6 +1553,18 @@ public:
 		}
 		if (m_acb_rings && KfdQueuesWanted()) {
 			EnableKfdQueues();
+		}
+		// Tracker points as the PS5 takes a title's EOP interrupts: each tracker release raises one,
+		// and the tracker sleeps on it instead of polling its slots every millisecond. Needs the
+		// patched amdgpu; KYTY_NATIVE_GPU_IRQ=0 keeps the polling.
+		if (!EnvIs("KYTY_NATIVE_GPU_IRQ", "0")) {
+			m_irq_event = KfdEopEvent::Create(m_gem->KfdFd());
+			if (m_irq_event != 0) {
+				std::fprintf(stderr, "native shadow: tracker points raise the EOP interrupt (KFD event %u)\n", m_irq_event);
+			} else {
+				std::fprintf(stderr, "native shadow: no EOP interrupts for tracker points (needs KFD and the patched amdgpu, "
+				                     "bc250_gfx_eop_events=1); the tracker polls\n");
+			}
 		}
 		const uint64_t va      = m_submitter->ScratchVa() + kTrackerOffset;
 		const char*    native  = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
@@ -1632,6 +1649,20 @@ public:
 	uint32_t ComputeRingMask() const { return m_compute_mask; }
 	// Guest compute queues run on KFD user-mode queues of their own (EnableKfdQueues).
 	bool KfdQueuesOn() const { return m_kfd_queues; }
+	// The KFD event the tracker's releases raise (their context id, INT_SEL 2); 0 when they do not.
+	uint32_t IrqEvent() const { return m_irq_event; }
+	// Sleeps until the tracker's interrupt fires or `timeout_ms` passes.
+	void WaitIrq(uint32_t timeout_ms) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (KfdEopEvent::Wait(m_gem->KfdFd(), m_irq_event, timeout_ms)) {
+			m_irq_wakes++;
+		} else {
+			m_irq_timeouts++;
+		}
+#else
+		(void)timeout_ms;
+#endif
+	}
 	// Tracker slots: 0 is the gfx ring, kGfx1Slot the second gfx ring when amdgpu has one (the PS5's
 	// "AGR" ring: the BC-250's patched amdgpu with bc250_gfx_queues=2), any other n the compute ring or
 	// KFD queue n - 1 (KFD indexes stay below 31).
@@ -3148,6 +3179,9 @@ private:
 	bool                  m_acb_rings    = false;
 	uint32_t              m_compute_mask = 0;
 	bool                  m_kfd_queues   = false; // EnableKfdQueues succeeded
+	uint32_t              m_irq_event    = 0;     // KfdEopEvent of the tracker's releases (0: it polls)
+	std::atomic<uint64_t> m_irq_wakes {0};        // tracker waits the interrupt ended
+	std::atomic<uint64_t> m_irq_timeouts {0};     // and those that ran out instead
 	// KYTY_NATIVE_GPU_PS5_REGS (InitPs5Regs): its own helper connection, so closing it (exit, crash)
 	// puts the registers back, and the LOD statistics client is not turned on by it.
 	LodStatsHw            m_ps5_hw;
@@ -4039,6 +4073,11 @@ private:
 				packet         = point.dw;
 				p.ib[point.dw] = static_cast<uint32_t>(++m_seq);
 				m_slot_seq[slot] = m_seq;
+				if (const uint32_t irq = Shadow::Instance().IrqEvent(); irq != 0) {
+					// RELEASE_MEM: control 3 dwords before the data, context id 2 after it.
+					p.ib[point.dw - 3] |= 2u << 24u; // INT_SEL 2: interrupt once the write is confirmed
+					p.ib[point.dw + 2] = irq;
+				}
 			}
 			const bool last = &point == &p.seg.points.back();
 			entries.push_back(Entry {m_seq, queue, slot, std::move(point), last ? p.done : nullptr});
@@ -4182,6 +4221,13 @@ private:
 					m_drain = true;
 				}
 				stuck_since = 0.0;
+				continue;
+			}
+			// With EOP interrupts every tracker release raises one: sleep until the next. An interrupt that
+			// fired since the scan above left the event set, so this returns at once. The 10 ms cap is
+			// a backstop that also lets a point whose submission has not run yet be looked at again.
+			if (Shadow::Instance().IrqEvent() != 0) {
+				Shadow::Instance().WaitIrq(10);
 				continue;
 			}
 			// Block on a ring's fence: the gfx ring's when it has points outstanding (compute queues may
