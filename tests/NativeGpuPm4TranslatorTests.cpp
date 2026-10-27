@@ -1154,10 +1154,10 @@ void TestLabelsWriteData() {
 // libSceAgc's own RELEASE_MEM (agc.cpp writes the hardware packet), as ASTRO BOT sends it: CACHE_FLUSH_AND_INV_TS
 // at end of pipe, cache policy 3, data to memory (DST_SEL 0; `dst_sel` 1 is the PS5 library's L2).
 void AppendGuestRelease(std::vector<uint32_t>& dcb, uint32_t data_sel, uint32_t int_sel, uint64_t dst, uint64_t value,
-                        uint32_t dst_sel = 0, uint32_t event = 0x06000514u) {
+                        uint32_t dst_sel = 0, uint32_t event = 0x06000514u, uint32_t ctx = 0) {
 	Append(dcb, 0x49u,
 	       {event, (dst_sel << 16u) | (int_sel << 24u) | (data_sel << 29u), static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u),
-	        static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u), 0u},
+	        static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u), ctx},
 	       false);
 }
 
@@ -1193,6 +1193,46 @@ void TestLabelsAsWritten() {
 	AppendGuestRelease(irq, 1, 2, 0x202000300ull, 5);
 	auto ri = t.Translate(irq);
 	Check(ri.stats.changed_ops[0x49] == 1 && ri.stats.interrupts == 1, "a release with an interrupt is not passed as written");
+}
+
+// With the EOP log, the GPU raises a title's interrupts that carry a context id where they run.
+void TestGuestInterruptsOnGpu() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetGuestInterruptsOnGpu(true);
+	std::vector<uint32_t> dcb;
+	AppendGuestRelease(dcb, 0, 1, 0, 0, 1, 0x06000514u, 0xabcdu);         // the interrupt alone, ctx 0xabcd
+	AppendGuestRelease(dcb, 1, 2, 0x202000300ull, 5, 1, 0x06000514u, 0xa); // a label, then the interrupt
+	AppendGuestRelease(dcb, 2, 2, 0x202000308ull, 7, 1);                   // ctx 0: the tracker's
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.interrupts_gpu == 2 && r.stats.interrupts == 1, "context ids 0xabcd and 0xa on the GPU, ctx 0 on the tracker");
+	const auto pkts  = Decode(r.ib);
+	size_t     alone = pkts.size(), after = pkts.size(), label = pkts.size();
+	for (size_t i = 0; i < pkts.size(); i++) {
+		const auto& b = pkts[i].body;
+		if (pkts[i].op != 0x49u) {
+			continue;
+		}
+		alone = b[6] == 0xabcdu ? i : alone;
+		after = b[6] == 0xau ? i : after;
+		label = b[2] == 0x02000300u && b[4] == 5u ? i : label;
+	}
+	Check(alone < pkts.size() && ((pkts[alone].body[1] >> 24u) & 7u) == 1u && (pkts[alone].body[1] >> 29u) == 0u,
+	      "the interrupt alone goes as the title wrote it");
+	Check(after < pkts.size() && ((pkts[after].body[1] >> 24u) & 7u) == 2u &&
+	          pkts[after].body[2] == static_cast<uint32_t>(kTrackerVa + 8) && label < after,
+	      "after a label the interrupt follows it, into the scratch dword");
+	Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "and the packet check takes both");
+	const auto& pts = r.segments[0].points;
+	Check(std::count_if(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Interrupt; }) == 1,
+	      "one tracker interrupt point");
+
+	// Off by default.
+	Pm4Translator plain;
+	plain.SetNativeLabels(&o, kTrackerVa);
+	auto rp = plain.Translate(dcb);
+	Check(rp.stats.interrupts_gpu == 0 && rp.stats.interrupts == 3, "without it every interrupt is the tracker's");
 }
 
 void TestLabelsReleaseMem() {
@@ -2249,6 +2289,7 @@ int main() {
 	TestDirectRunsWriteData();
 	TestLabelsReleaseMem();
 	TestLabelsAsWritten();
+	TestGuestInterruptsOnGpu();
 	TestLabelsLocalWait();
 	TestLabelsSplit();
 	TestLabelsCpuTail();

@@ -451,6 +451,16 @@ void LogLodScan(const LodBankScan& scan) {
 	}
 }
 
+// The host side native labels signal (ShadowSetHost).
+struct Host {
+	std::function<void(int, uint32_t)> interrupt;
+	std::function<uint64_t()>          reference_clock;
+};
+Host& HostCallbacks() {
+	static Host host;
+	return host;
+}
+
 // Shadow-mode state, built lazily on the first DCB so it sees the final env and the created GEM
 // backing. One instance for the process; submit_dcb is driven from the guest graphics thread, but
 // a mutex keeps it safe if that ever changes.
@@ -871,6 +881,7 @@ public:
 			m_labels_stats[0] += result.stats.labels_native;
 			m_labels_stats[1] += result.stats.labels_cpu;
 			m_labels_stats[2] += result.stats.interrupts;
+			m_irq_gpu += result.stats.interrupts_gpu;
 			m_labels_stats[3] += result.stats.waits_native;
 			m_labels_stats[4] += result.stats.waits_split;
 			m_labels_stats[5] += result.stats.wait_barriers;
@@ -1482,6 +1493,15 @@ public:
 					             static_cast<unsigned long long>(m_irq_wakes.load()),
 					             static_cast<unsigned long long>(m_irq_timeouts.load()));
 				}
+#if KYTY_GEM_BACKING_SUPPORTED
+				if (m_eop_log_open) {
+					std::fprintf(stderr,
+					             "native shadow: title interrupts raised by the GPU so far: %llu emitted, %llu from the EOP log, "
+					             "%llu dropped by it, %llu from other rings\n",
+					             static_cast<unsigned long long>(m_irq_gpu.load()), static_cast<unsigned long long>(m_irq_logged.load()),
+					             static_cast<unsigned long long>(m_eop_log.Dropped()), static_cast<unsigned long long>(m_irq_stray.load()));
+				}
+#endif
 			}
 			std::lock_guard<std::mutex> chain_lock(m_chain_mutex);
 			if (m_chain_n > 0) {
@@ -1559,8 +1579,19 @@ public:
 		// patched amdgpu; KYTY_NATIVE_GPU_IRQ=0 keeps the polling.
 		if (!EnvIs("KYTY_NATIVE_GPU_IRQ", "0")) {
 			m_irq_event = KfdEopEvent::Create(m_gem->KfdFd());
+			// A title's interrupts with context ids reach it through the EOP log (patched amdgpu), raised
+			// by the GPU where its graphics queue's releases run. KYTY_NATIVE_GPU_GUEST_IRQ=0 keeps them
+			// tracker points.
+			if (m_irq_event != 0 && !EnvIs("KYTY_NATIVE_GPU_GUEST_IRQ", "0") && m_eop_log.Open(m_gem->KfdFd())) {
+				m_eop_log_open = true;
+				m_translator.SetGuestInterruptsOnGpu(true);
+				std::thread([this] { ReadEopLog(); }).detach();
+			}
+			m_irq_ctx = m_irq_event | (m_eop_log_open ? KfdEopLog::kEventBit : 0u);
 			if (m_irq_event != 0) {
-				std::fprintf(stderr, "native shadow: tracker points raise the EOP interrupt (KFD event %u)\n", m_irq_event);
+				std::fprintf(stderr, "native shadow: tracker points raise the EOP interrupt (KFD event %u)%s\n", m_irq_event,
+				             m_eop_log_open ? "; the graphics queue's interrupts with context ids are raised by the GPU (EOP log)"
+				                            : "");
 			} else {
 				std::fprintf(stderr, "native shadow: no EOP interrupts for tracker points (needs KFD and the patched amdgpu, "
 				                     "bc250_gfx_eop_events=1); the tracker polls\n");
@@ -1649,8 +1680,10 @@ public:
 	uint32_t ComputeRingMask() const { return m_compute_mask; }
 	// Guest compute queues run on KFD user-mode queues of their own (EnableKfdQueues).
 	bool KfdQueuesOn() const { return m_kfd_queues; }
-	// The KFD event the tracker's releases raise (their context id, INT_SEL 2); 0 when they do not.
+	// The KFD event the tracker's releases raise (INT_SEL 2); 0 when they do not.
 	uint32_t IrqEvent() const { return m_irq_event; }
+	// The context id that names it.
+	uint32_t IrqCtx() const { return m_irq_ctx; }
 	// Sleeps until the tracker's interrupt fires or `timeout_ms` passes.
 	void WaitIrq(uint32_t timeout_ms) {
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -1978,6 +2011,27 @@ private:
 			}
 			DrainAndExit(sig);
 		}).detach();
+#endif
+	}
+
+	// The EOP log's reader: each entry is a title's interrupt the GPU raised. The DCB translator only
+	// leaves those of guest queue 0 to the GPU, and that queue owns gfx ring 0 (LabelPipeline::SlotOf),
+	// so an entry from the gfx micro engine (me 0) is queue 0's.
+	void ReadEopLog() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul);
+		for (;;) {
+			m_eop_log.Drain(100, [this](uint32_t ctx, uint32_t source) {
+				if (((source >> 2u) & 0x3u) != 0u) {
+					m_irq_stray++;
+					return;
+				}
+				m_irq_logged++;
+				if (HostCallbacks().interrupt) {
+					HostCallbacks().interrupt(0, ctx);
+				}
+			});
+		}
 #endif
 	}
 
@@ -3180,6 +3234,14 @@ private:
 	uint32_t              m_compute_mask = 0;
 	bool                  m_kfd_queues   = false; // EnableKfdQueues succeeded
 	uint32_t              m_irq_event    = 0;     // KfdEopEvent of the tracker's releases (0: it polls)
+	uint32_t              m_irq_ctx      = 0;     // their context id: the event, with KfdEopLog::kEventBit once the log is open
+#if KYTY_GEM_BACKING_SUPPORTED
+	KfdEopLog             m_eop_log;              // a title's interrupts the GPU raises (SetGuestInterruptsOnGpu)
+#endif
+	bool                  m_eop_log_open = false;
+	std::atomic<uint64_t> m_irq_gpu {0};          // title interrupts the translator left to the GPU
+	std::atomic<uint64_t> m_irq_logged {0};       // and those the EOP log delivered
+	std::atomic<uint64_t> m_irq_stray {0};        // log entries from a ring with no guest queue here
 	std::atomic<uint64_t> m_irq_wakes {0};        // tracker waits the interrupt ended
 	std::atomic<uint64_t> m_irq_timeouts {0};     // and those that ran out instead
 	// KYTY_NATIVE_GPU_PS5_REGS (InitPs5Regs): its own helper connection, so closing it (exit, crash)
@@ -3446,16 +3508,6 @@ private:
 	uint64_t                m_waited_seq = 0;
 	double                  m_last_end   = 0.0;
 };
-
-// The host side native labels signal (ShadowSetHost).
-struct Host {
-	std::function<void(int, uint32_t)> interrupt;
-	std::function<uint64_t()>          reference_clock;
-};
-Host& HostCallbacks() {
-	static Host host;
-	return host;
-}
 
 // Native labels (KYTY_NATIVE_GPU_LABELS, on in primary mode with the pipeline): the GPU writes the
 // guest's labels and Kyty's command processor no longer reads the guest buffers. A worker translates
@@ -4073,10 +4125,10 @@ private:
 				packet         = point.dw;
 				p.ib[point.dw] = static_cast<uint32_t>(++m_seq);
 				m_slot_seq[slot] = m_seq;
-				if (const uint32_t irq = Shadow::Instance().IrqEvent(); irq != 0) {
+				if (Shadow::Instance().IrqEvent() != 0) {
 					// RELEASE_MEM: control 3 dwords before the data, context id 2 after it.
 					p.ib[point.dw - 3] |= 2u << 24u; // INT_SEL 2: interrupt once the write is confirmed
-					p.ib[point.dw + 2] = irq;
+					p.ib[point.dw + 2] = Shadow::Instance().IrqCtx();
 				}
 			}
 			const bool last = &point == &p.seg.points.back();

@@ -190,6 +190,7 @@ struct Pm4TranslateStats {
 	uint32_t timestamps        = 0; // native labels: timestamps the tracker still writes (CPU clock)
 	uint32_t timestamps_native = 0; // native labels: timestamps the GPU writes (DATA_SEL 3)
 	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
+	uint32_t interrupts_gpu    = 0; // and those the GPU raises where they run (SetGuestInterruptsOnGpu)
 	uint32_t waits_native      = 0; // native labels: guest waits passed through (an earlier GPU write satisfies them)
 	uint32_t waits_split       = 0; // native labels: guest waits the IB is cut at (no known writer yet)
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
@@ -670,6 +671,13 @@ public:
 	// Timestamps stay on the tracker (Kyty's host TSC scaled to 100 MHz) instead of the GPU clock.
 	// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1. The two clocks have the same unit and different zeros.
 	void SetCpuTimestamps(bool on) { m_cpu_timestamps = on; }
+	// With native labels on the graphics queue: a title's RELEASE_MEM interrupt with a context id
+	// (not 0, within libSceAgc's 27 bits) is raised by the GPU where the release runs, as on the PS5:
+	// the packet as written when it carries no data, else after the label (INT_SEL 2 into the scratch
+	// dword), and the patched amdgpu logs its context id for Kyty (KfdEopLog) instead of the tracker
+	// raising it at the end of the segment. Interrupts with context id 0 stay tracker points: amdgpu's
+	// own fences raise theirs with 0.
+	void SetGuestInterruptsOnGpu(bool on) { m_guest_irq = on; }
 	// The old split of label writes (KYTY_NATIVE_GPU_TRACKER_WRITES=1): the tracker also stores every
 	// label the GPU writes once the GPU passes the segment's end (a mirror), and a WRITE_DATA by the
 	// constant engine is written by the tracker alone. Off (the default), a label the GPU can reach is
@@ -832,6 +840,7 @@ private:
 	bool                         m_native_waits   = true;
 	bool                         m_cpu_timestamps = false;
 	bool                         m_tracker_writes = false;
+	bool                         m_guest_irq      = false;
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;

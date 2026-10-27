@@ -572,12 +572,17 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				// dwords zero, 8-byte address), or a GDS release as the translator has always run it
 				// (DATA_SEL 5, no interrupt). Compute rings use the same bodies with the shader bit.
 				// A tracker release may raise the EOP interrupt (INT_SEL 2) with the tracker's KFD event as
-				// its context id (the pipeline sets both when it numbers the point).
-				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || (b[6] != 0u && b[1] != (kData32Cntl | kIntSel2))) {
+				// its context id (the pipeline sets both when it numbers the point), and a title's interrupt
+				// keeps its context id: INT_SEL 2 after a label or into the scratch dword, or the title's
+				// interrupt alone as written (INT_SEL 1, no data, gfx ring).
+				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || (b[6] != 0u && ((b[1] >> 24u) & 0x7u) == 0u)) {
 					return bad();
 				}
 				if ((b[0] == kFlushEventCntl || LabelEventOk(b[0])) && (b[1] == kData32Cntl || b[1] == (kData32Cntl | kIntSel2))) {
 					break; // the barrier's form, or a label in the guest's event (LabelEventCntl)
+				}
+				if (!compute && LabelEventOk(b[0]) && (b[1] & ~(0x3u << 16u)) == (1u << 24u)) {
+					break; // a title's interrupt alone, as written
 				}
 				if ((b[0] == kFlushEventCntl || (b[0] == kClockEopCntl && !compute)) && b[1] == kDataTimestampCntl &&
 				    b[4] == 0u && b[5] == 0u && (b[2] & 7u) == 0u) {
@@ -2392,7 +2397,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						tracker_point(std::move(cpu));
 						stats.labels_cpu++;
 					}
-					if (interrupt) {
+					// A title's interrupt with a context id the GPU can raise itself (SetGuestInterruptsOnGpu): as
+					// written when it carries no data, else after the label, into the scratch dword.
+					const uint32_t guest_ctx  = bptr[6];
+					const bool     irq_on_gpu = interrupt && m_guest_irq && !m_compute_queue && op == IT_RELEASE_MEM && !cpu_point &&
+					                        guest_ctx != 0 && guest_ctx < (1u << 27u);
+					if (irq_on_gpu) {
+						if (int_sel == 1 && data_sel == 0 && glm_ok && LabelEventOk(bptr[0])) {
+							write_as_written();
+						} else {
+							EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring, LabelEventCntl(bptr[0]));
+							body[body.size() - 6] |= kIntSel2;
+							body.back() = guest_ctx;
+						}
+						stats.interrupts_gpu++;
+						NoteOnce(21, "RELEASE_MEM interrupt raised by the GPU (EOP log)");
+					} else if (interrupt) {
 						TrackerPoint irq;
 						irq.kind = TrackerPoint::Kind::Interrupt;
 						irq.ctx  = bptr[6] & 0x07ffffffu;

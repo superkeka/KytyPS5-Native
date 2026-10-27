@@ -413,6 +413,78 @@ public:
 	}
 };
 
+// The patched amdgpu's EOP log (kfd_bc250_eop_log): every end-of-pipe interrupt of this VM whose
+// context id is a title's (not 0, bit 27 clear) lands in a ring in the upper half of the KFD signal
+// page, with the ring it came from, and signals one event. This is how a title's interrupts reach its
+// event queue with their context ids, as the PS5 kernel hands them over. Context ids with bit 27 set
+// name a KFD event instead (KfdEopEvent, shifted by kEventBit once the log is open).
+class KfdEopLog {
+public:
+	static constexpr uint32_t kEventBit = 1u << 27u;
+
+	// True once the log is registered; false on a kernel without it (ENOTTY) or without KFD.
+	bool Open(int kfd_fd) {
+		struct kfd_ioctl_create_event_args a {};
+		a.event_type = KFD_IOC_EVENT_SIGNAL;
+		a.auto_reset = 1;
+		if (kfd_fd < 0 || ::ioctl(kfd_fd, AMDKFD_IOC_CREATE_EVENT, &a) != 0 || a.event_page_offset == 0) {
+			return false;
+		}
+		void* page = ::mmap(nullptr, kPageBytes, PROT_READ | PROT_WRITE, MAP_SHARED, kfd_fd, static_cast<off_t>(a.event_page_offset));
+		if (page == MAP_FAILED) {
+			std::fprintf(stderr, "KfdEopLog: signal page mmap failed: %s\n", std::strerror(errno));
+			return false;
+		}
+		struct {
+			uint32_t event_id;
+			uint32_t pad;
+		} reg {a.event_id, 0};
+		if (::ioctl(kfd_fd, _IOW('K', 0x80, reg), &reg) != 0) {
+			if (errno != ENOTTY) {
+				std::fprintf(stderr, "KfdEopLog: registering the log failed: %s\n", std::strerror(errno));
+			}
+			::munmap(page, kPageBytes);
+			return false;
+		}
+		m_fd    = kfd_fd;
+		m_event = a.event_id;
+		m_slots = static_cast<volatile uint64_t*>(page);
+		return true;
+	}
+
+	// Sleeps until the kernel signals the log or `timeout_ms` passes, then hands each new entry to
+	// `f(context id, source)` in arrival order; source is VMID << 8 | the IV ring id (me bits 3:2,
+	// pipe 1:0, queue 6:4). Returns how many it handed over.
+	template <class F>
+	uint32_t Drain(uint32_t timeout_ms, F f) {
+		KfdEopEvent::Wait(m_fd, m_event, timeout_ms);
+		const uint64_t head = m_slots[kHead];
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		uint64_t tail = m_slots[kTail];
+		uint32_t n    = 0;
+		for (; tail != head; tail++, n++) {
+			const uint64_t e = m_slots[kFirst + tail % kSize];
+			f(static_cast<uint32_t>(e), static_cast<uint32_t>(e >> 32u));
+		}
+		m_slots[kTail] = tail;
+		return n;
+	}
+
+	[[nodiscard]] uint64_t Dropped() const { return m_slots == nullptr ? 0 : m_slots[kDropped]; }
+
+private:
+	static constexpr size_t   kPageBytes = 4096 * 8; // KFD_SIGNAL_EVENT_LIMIT slots
+	static constexpr uint32_t kHead      = 2048;
+	static constexpr uint32_t kTail      = 2049;
+	static constexpr uint32_t kDropped   = 2050;
+	static constexpr uint32_t kFirst     = 3072;
+	static constexpr uint32_t kSize      = 1024;
+
+	int                m_fd    = -1;
+	uint32_t           m_event = 0;
+	volatile uint64_t* m_slots = nullptr;
+};
+
 } // namespace Libs::Graphics::NativeGpu
 
 #endif // KYTY_GEM_BACKING_SUPPORTED
