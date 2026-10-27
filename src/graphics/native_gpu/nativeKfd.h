@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -144,26 +145,36 @@ public:
 			::sched_yield();
 		}
 		const uint64_t s = ++m_seq;
-		// What amdgpu puts before every IB of a CS (gfx_v10_0_emit_mem_sync): an ACQUIRE_MEM that writes
-		// back and invalidates GL2, GLM, GL1, GLV, GLK and GLI, so the IB sees what the CPU and the other
-		// rings wrote.
-		Push(Pkt3(0x58, 7));
-		Push(0u);
-		Push(0xffffffffu);
-		Push(0x00ffffffu);
-		Push(0u);
-		Push(0u);
-		Push(0x0000000au);
-		Push(1u | (1u << 4u) | (1u << 5u) | (1u << 7u) | (1u << 8u) | (1u << 9u) | (1u << 14u) | (1u << 15u));
+		// KYTY_NATIVE_GPU_KFD_IB_SYNC=1: what amdgpu puts before every IB of a CS (gfx_v10_0_emit_mem_sync),
+		// an ACQUIRE_MEM that writes back and invalidates GL2, GLM, GL1, GLV, GLK and GLI. Off by default:
+		// the PS5 runs an ACB as the title wrote it, and the title's own ACQUIRE_MEMs say what to
+		// invalidate.
+		static const bool ib_sync = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_IB_SYNC");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (ib_sync) {
+			Push(Pkt3(0x58, 7));
+			Push(0u);
+			Push(0xffffffffu);
+			Push(0x00ffffffu);
+			Push(0u);
+			Push(0u);
+			Push(0x0000000au);
+			Push(1u | (1u << 4u) | (1u << 5u) | (1u << 7u) | (1u << 8u) | (1u << 9u) | (1u << 14u) | (1u << 15u));
+		}
 		// INDIRECT_BUFFER: address (dword aligned), size and VALID; the queue's own VMID runs it.
 		Push(Pkt3(0x3f, 3));
 		Push(static_cast<uint32_t>(ib_va) & ~3u);
 		Push(static_cast<uint32_t>(ib_va >> 32u));
 		Push(dwords | (1u << 23u));
-		// RELEASE_MEM end of pipe (CACHE_FLUSH_AND_INV_TS_EVENT), as amdgpu's fence: GLM and GL2 written back
-		// in sequence, the 32-bit data written past the caches.
+		// RELEASE_MEM end of pipe, the 32-bit data written past the caches: the queue's own sequence, which
+		// only says the IB finished (its slot can be reused). With KYTY_NATIVE_GPU_KFD_IB_SYNC=1 amdgpu's
+		// fence form (CACHE_FLUSH_AND_INV_TS_EVENT, GLM and GL2 written back in sequence); else bottom of
+		// pipe without cache actions, the title's releases make its results visible.
 		Push(Pkt3(0x49, 7));
-		Push(0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 21u) | (1u << 22u) | (3u << 25u));
+		Push(ib_sync ? 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 21u) | (1u << 22u) | (3u << 25u)
+		             : 0x28u | (5u << 8u) | (3u << 25u));
 		Push(1u << 29u);
 		Push(static_cast<uint32_t>(FenceVa()));
 		Push(static_cast<uint32_t>(FenceVa() >> 32u));

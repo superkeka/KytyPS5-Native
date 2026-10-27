@@ -4,6 +4,10 @@
 #include <cstring>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <tuple>
 #if defined(__linux__)
 #include <sys/uio.h>
 #include <unistd.h>
@@ -205,12 +209,12 @@ bool WriteDataToMemory(uint32_t control) {
 	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
 }
 
-// Native labels emit RELEASE_MEM and WAIT_REG_MEM only in the forms the barrier has run on the board
-// countless times (guest forms of them stopped the gfx ring with "Illegal opcode in command stream"):
-// RELEASE_MEM with CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX 5 (end of pipe), GCR_CNTL GLM_WB |
-// GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB, 32-bit data to memory and no interrupt; and
-// WAIT_REG_MEM EQUAL on memory by the micro engine, poll interval 4. ValidateNativeIb holds the IB to
-// that.
+// Native labels emit RELEASE_MEM and WAIT_REG_MEM only in forms ValidateNativeIb knows (an ACB's guest
+// packets, with the compute shader-type bit, stopped the gfx ring with "Illegal opcode in command
+// stream"). The barrier's form: RELEASE_MEM with CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX 5 (end of
+// pipe), GCR_CNTL GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB, 32-bit data to memory and no
+// interrupt; labels in the guest's event take LabelEventCntl's form instead. WAIT_REG_MEM is EQUAL on
+// memory by the micro engine, poll interval 4.
 constexpr uint32_t kFlushEventCntl = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
                                      (1u << 20u) | (1u << 21u);
 constexpr uint32_t kData32Cntl     = 1u << 29u;
@@ -223,9 +227,58 @@ constexpr uint32_t kWaitEqualMemMe = 3u | (1u << 4u);
 constexpr uint32_t kWaitPoll       = 4u;
 constexpr uint32_t kFiller         = 0xffff1000u; // the one-dword NOP IBs are padded with
 
-void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value, bool compute) {
+// A guest label release in the guest's own event (end-of-pipe events the PS5 driver uses: the CB/DB
+// flush-and-invalidate timestamps, bottom of pipe, CS and PS done; EVENT_INDEX 5 or 6) with the guest's
+// cache actions, plus GLM and GL2 write-back so the CPU sees the label in memory. ASTRO BOT's gfx ring
+// asks no cache action at all for ~95% of its labels; the barrier's form invalidated every cache at
+// each of them, about a thousand times a frame. Anything else, and KYTY_NATIVE_GPU_LABEL_FLUSH=full,
+// gets the barrier's form.
+constexpr uint32_t kGcrGlmWb        = 1u << 12u;
+constexpr uint32_t kGcrGl2Wb        = 1u << 21u;
+constexpr uint32_t kReleaseGcrMask  = 0x1fffu << 12u; // GCR_CNTL [24:12]
+constexpr uint32_t kReleasePolicy   = 0x3u << 25u;    // CACHE_POLICY
+bool LabelEventOk(uint32_t event) {
+	const uint32_t type  = event & 0x3fu;
+	const uint32_t index = (event >> 8u) & 0xfu;
+	const bool     known = type == 0x14u || type == 0x28u || type == 0x2bu || type == 0x2du || type == 0x2fu || type == 0x30u;
+	return known && (index == 5u || index == 6u) && (event & ~(0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) == 0u &&
+	       (event & (kGcrGlmWb | kGcrGl2Wb)) == (kGcrGlmWb | kGcrGl2Wb);
+}
+uint32_t LabelEventCntl(uint32_t guest_event) {
+	static const bool full = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_LABEL_FLUSH");
+		return v != nullptr && std::strcmp(v, "full") == 0;
+	}();
+	const uint32_t event = (guest_event & (0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) | kGcrGlmWb | kGcrGl2Wb;
+	return !full && LabelEventOk(event) ? event : kFlushEventCntl;
+}
+
+// KYTY_NATIVE_GPU_RELEASE_FORMS=1: each distinct guest RELEASE_MEM form (event dword, the select
+// dword without its data bits, queue kind) once, with how often it came, every 4096 releases.
+void NoteReleaseForm(uint32_t event, uint32_t control, bool compute) {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_RELEASE_FORMS");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (!on) {
+		return;
+	}
+	static std::mutex                             mutex;
+	static std::map<std::tuple<uint32_t, uint32_t, bool>, uint64_t> forms;
+	static uint64_t                               total = 0;
+	std::lock_guard<std::mutex>                   lock(mutex);
+	forms[{event, control & ~(0x7u << 29u), compute}]++;
+	if ((++total & 4095u) == 0) {
+		for (const auto& [k, n] : forms) {
+			std::fprintf(stderr, "release form: %s event 0x%08x control 0x%08x: %llu\n", std::get<2>(k) ? "acb" : "dcb", std::get<0>(k),
+			             std::get<1>(k), static_cast<unsigned long long>(n));
+		}
+	}
+}
+
+void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value, bool compute, uint32_t event = kFlushEventCntl) {
 	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, compute));
-	ib.push_back(kFlushEventCntl);
+	ib.push_back(event);
 	ib.push_back(kData32Cntl);
 	ib.push_back(static_cast<uint32_t>(addr));
 	ib.push_back(static_cast<uint32_t>(addr >> 32u));
@@ -439,8 +492,8 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || b[6] != 0u) {
 					return bad();
 				}
-				if (b[0] == kFlushEventCntl && b[1] == kData32Cntl) {
-					break;
+				if ((b[0] == kFlushEventCntl || LabelEventOk(b[0])) && b[1] == kData32Cntl) {
+					break; // the barrier's form, or a label in the guest's event (LabelEventCntl)
 				}
 				if (b[0] == kFlushEventCntl && b[1] == kDataTimestampCntl && b[4] == 0u && b[5] == 0u &&
 				    (b[2] & 7u) == 0u) {
@@ -1928,6 +1981,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint64_t value = static_cast<uint64_t>(bptr[4]) | (static_cast<uint64_t>(bptr[5]) << 32u);
 					const uint32_t data_sel = (bptr[1] >> 29u) & 0x7u;
 					const uint32_t int_sel  = (bptr[1] >> 24u) & 0x7u;
+					NoteReleaseForm(bptr[0], bptr[1], m_compute_queue);
 					r.label_writes.emplace_back(dst, value);
 					// What Kyty's command processor does with it (CpOpReleaseMem, WriteAtEndOfPipe): no data
 					// for INT_SEL 4, nor for INT_SEL 1 on the graphics queue (the interrupt alone); 32-bit
@@ -1977,21 +2031,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						cpu_point = true;
 						sel       = 0;
 					}
-					// Not the guest's packet: its event, cache actions and data forms stopped the gfx ring
-					// ("Illegal opcode in command stream"). The label is written in the barrier's form, which
-					// flushes more than any guest release asks for; a 64-bit one as two 32-bit writes, the
-					// high dword first. GDS data goes as the translator always ran it. A release that only
+					// Not the guest's packet (an ACB's carried the compute shader-type bit, which stopped the
+					// gfx ring with "Illegal opcode in command stream"): the label is written with the guest's
+					// event and cache actions plus write-backs (LabelEventCntl), 32-bit data to memory; a
+					// 64-bit one as two 32-bit writes, the high dword first. GDS data goes as the translator
+					// always ran it. A release that only
 					// flushes caches becomes a flush into our scratch dword, unless a tracker point (also a
 					// flush) follows anyway.
 					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
 					if (sel == 1) {
-						EmitRelease32(body, dst, bptr[4], m_compute_ring);
+						EmitRelease32(body, dst, bptr[4], m_compute_ring, LabelEventCntl(bptr[0]));
 						mirror_store(dst, {bptr[4]}, false);
 						NoteOnce(0, m_tracker_writes ? "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)"
 						                             : "RELEASE_MEM 32-bit label (GPU store only)");
 					} else if (sel == 2) {
-						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring);
-						EmitRelease32(body, dst, bptr[4], m_compute_ring);
+						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring, LabelEventCntl(bptr[0]));
+						EmitRelease32(body, dst, bptr[4], m_compute_ring, LabelEventCntl(bptr[0]));
 						mirror_store(dst, {bptr[4], bptr[5]}, false);
 						NoteOnce(1, m_tracker_writes ? "RELEASE_MEM 64-bit label (GPU store, mirrored to the CPU)"
 						                             : "RELEASE_MEM 64-bit label (GPU store only, two halves)");
