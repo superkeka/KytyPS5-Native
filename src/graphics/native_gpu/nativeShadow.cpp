@@ -1584,7 +1584,22 @@ public:
 	// Whether the GPU may write a label at `addr`. Called while translating (the lock is held).
 	bool GpuWritable(uint64_t addr) const {
 #if KYTY_GEM_BACKING_SUPPORTED
-		return m_gem != nullptr && m_gem->IsGpuWritable(addr);
+		// The range of the last answer, kept while the views stay the same: labels sit in a few views,
+		// and each asked the backing under its lock (~8000 a frame in ASTRO BOT).
+		if (m_gem == nullptr) {
+			return false;
+		}
+		const uint64_t gen = m_gem->ViewsGeneration();
+		if (gen == m_writable_gen && addr >= m_writable_lo && addr < m_writable_hi) {
+			return m_writable;
+		}
+		uint64_t lo = 0, hi = 0;
+		const bool writable = m_gem->GpuWritableRange(addr, &lo, &hi);
+		m_writable_gen      = gen;
+		m_writable_lo       = lo;
+		m_writable_hi       = hi;
+		m_writable          = writable;
+		return writable;
 #else
 		(void)addr;
 		return false;
@@ -2987,6 +3002,9 @@ private:
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
 	std::atomic<double> m_gpu_busy_s {0.0};
+	// GpuWritable's last answer (translation runs under m_mutex).
+	mutable uint64_t m_writable_gen = ~0ull, m_writable_lo = 0, m_writable_hi = 0;
+	mutable bool     m_writable     = false;
 	// KYTY_NATIVE_GPU_FLIP_TRACE=1: never-reset totals FlipTrace takes per-flip differences of.
 	double                  m_trace_busy_s = 0.0;
 	std::atomic<double>     m_trace_gpu_busy_s {0.0};

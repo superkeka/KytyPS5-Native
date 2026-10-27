@@ -2327,13 +2327,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 
 			case IT_SET_CONTEXT_REG: {
-				const size_t at = body.size();
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-				if (body_count >= 1) {
-					const uint32_t base = Normalize(bptr[0]);
+				// With direct runs a packet no value of which is patched runs in place, without a copy.
+				bool           unchanged = true;
+				const uint32_t base      = body_count >= 1 ? Normalize(bptr[0]) : 0u;
+				for (uint32_t i = 1; i < body_count; i++) {
+					cx[base + (i - 1)] = bptr[i];
+					mark_cx(base + (i - 1));
+					unchanged = unchanged && PatchContext(base + (i - 1), bptr[i]) == bptr[i];
+				}
+				if (direct && unchanged) {
+					in_place = true;
+				} else {
+					const size_t at = body.size();
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					for (uint32_t i = 1; i < body_count; i++) {
-						cx[base + (i - 1)] = bptr[i];
-						mark_cx(base + (i - 1));
 						body[at + 1 + i] = PatchContext(base + (i - 1), bptr[i]);
 					}
 				}
@@ -2342,22 +2349,35 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 
 			case IT_SET_SH_REG: {
+				// With direct runs a packet no value of which is patched runs in place, without a copy.
+				bool unchanged = !m_compute_ring;
 				if (body_count >= 1) {
 					const uint32_t base = bptr[0];
+					const uint32_t last = base + body_count - 2;
 					for (uint32_t i = 1; i < body_count; i++) {
 						sh[base + (i - 1)] = bptr[i];
 						mark_sh(base + (i - 1));
-						note_shader(base + (i - 1));
+						unchanged = unchanged && PatchSh(base + (i - 1), bptr[i]) == bptr[i];
+					}
+					// A shader address needs its PGM_LO and PGM_HI: once per range that touches either.
+					for (uint32_t lo: {0x8u, 0x88u, 0xC8u, 0x108u, 0x148u, 0x20Cu}) {
+						if (lo + 1 >= base && lo <= last) {
+							note_shader(lo);
+						}
 					}
 				}
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-				if (m_compute_ring) {
-					body[body.size() - size] |= 2u;
-				}
-				if (body_count >= 1) {
-					const size_t at = body.size() - size;
-					for (uint32_t i = 1; i < body_count; i++) {
-						body[at + 1 + i] = PatchSh(bptr[0] + (i - 1), bptr[i]);
+				if (direct && unchanged) {
+					in_place = true;
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (m_compute_ring) {
+						body[body.size() - size] |= 2u;
+					}
+					if (body_count >= 1) {
+						const size_t at = body.size() - size;
+						for (uint32_t i = 1; i < body_count; i++) {
+							body[at + 1 + i] = PatchSh(bptr[0] + (i - 1), bptr[i]);
+						}
 					}
 				}
 				stats.set_sh++;
@@ -3292,8 +3312,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				return static_cast<uint32_t>(off + shift - gone);
 			};
+			// Points come in IB order: one pass over the runs.
+			size_t  next_run = 0;
+			int64_t gone     = 0;
 			for (auto& p: s.points) {
-				p.dw = move(p.dw);
+				for (; next_run < removed.size() && removed[next_run].first <= p.dw; next_run++) {
+					gone = removed[next_run].second;
+				}
+				p.dw = static_cast<uint32_t>(p.dw + shift - gone);
 			}
 			if (s.held) {
 				s.barrier_dw = move(s.barrier_dw);

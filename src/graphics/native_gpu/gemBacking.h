@@ -351,6 +351,7 @@ public:
 		auto it = m_views.find(vaddr);
 		if (it != m_views.end() && it->second.size == size && it->second.offset == offset) {
 			it->second.gpu = true;
+			m_views_generation++; // GpuWritableRange answers change
 		} else {
 			EraseViewsUnlocked(vaddr, size);
 			m_views[vaddr] = View {size, offset, true};
@@ -531,6 +532,25 @@ public:
 		return it != m_external.begin() && vaddr < std::prev(it)->second.end && std::prev(it)->second.writable;
 	}
 
+	// IsGpuWritable, plus the range [*lo, *hi) holding `vaddr` that the answer holds for until
+	// ViewsGeneration changes (lo == hi when `vaddr` is in no range).
+	[[nodiscard]] bool GpuWritableRange(uint64_t vaddr, uint64_t* lo, uint64_t* hi) const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		*lo = *hi = 0;
+		if (auto v = FindViewUnlocked(vaddr); v != m_views.end()) {
+			*lo = v->first;
+			*hi = v->first + v->second.size;
+			return v->second.gpu;
+		}
+		auto it = m_external.upper_bound(vaddr);
+		if (it != m_external.begin() && vaddr < std::prev(it)->second.end) {
+			*lo = std::prev(it)->first;
+			*hi = std::prev(it)->second.end;
+			return std::prev(it)->second.writable;
+		}
+		return false;
+	}
+
 	// Copies up to `size` bytes of guest memory at `vaddr` (clipped to the view holding it) through
 	// the alias, which is always readable whatever the guest's own protection. Returns the bytes
 	// copied, 0 when `vaddr` is not backed.
@@ -577,10 +597,7 @@ public:
 	}
 
 	// Bumped whenever the set of views changes; a caller caching ViewRanges() refreshes on a change.
-	[[nodiscard]] uint64_t ViewsGeneration() const {
-		std::lock_guard<std::mutex> lock(m_lock);
-		return m_views_generation;
-	}
+	[[nodiscard]] uint64_t ViewsGeneration() const { return m_views_generation.load(std::memory_order_acquire); }
 
 	// The guest address ranges [start, end) covered by views, sorted and merged.
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> ViewRanges() const {
@@ -1552,6 +1569,7 @@ private:
 				return false;
 			}
 			m_external.emplace(vaddr, External {vaddr + size, 0, gpu_write, a.handle});
+			m_views_generation++;
 			return true;
 		}
 		struct drm_amdgpu_gem_userptr u;
@@ -1575,6 +1593,7 @@ private:
 			return false;
 		}
 		m_external.emplace(vaddr, External {vaddr + size, u.handle, gpu_write});
+		m_views_generation++;
 		return true;
 	}
 
@@ -1651,6 +1670,7 @@ private:
 			if (it->second.end > vaddr) {
 				overlapping.emplace_back(it->first, it->second);
 				it = m_external.erase(it);
+				m_views_generation++;
 			} else {
 				++it;
 			}
@@ -1707,7 +1727,7 @@ private:
 	uint64_t                      m_touched_bytes  = 0;
 	std::vector<Block>            m_blocks;
 	std::map<uint64_t, View>      m_views;     // guest VA -> view of the backing
-	uint64_t                      m_views_generation = 0;
+	std::atomic<uint64_t>         m_views_generation {0}; // changed under m_lock, read without it
 	Bo                            m_dummy;     // GPU target of every non-resident block
 	uint8_t*                      m_dummy_cpu = nullptr;
 	static inline std::atomic<uint32_t> s_promoting {0}; // blocks being moved right now
