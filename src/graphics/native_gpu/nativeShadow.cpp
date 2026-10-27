@@ -332,6 +332,12 @@ public:
 	int WriteRegMasked(uint32_t reg, uint32_t sel, uint32_t value, uint32_t mask, uint32_t* now) {
 		return Call(10u | sel << 8u, reg, static_cast<uint64_t>(mask) << 32u | value, now);
 	}
+	// RCIU CAM `entry` the way the PS5 kernel programs it (phase 0 = register | pipe enables, then mask
+	// and value); the helper puts the old entry back when this connection closes. 0 or -errno.
+	int SetRciu(uint32_t entry, uint32_t phase0, uint32_t mask, uint32_t value) {
+		uint32_t v = 0;
+		return Call(15u | entry << 8u, phase0, mask | static_cast<uint64_t>(value) << 32u, &v);
+	}
 	// Puts back what WriteRegMasked changed in `reg` (everything with 0xffffffff); how many registers.
 	int RestoreRegs(uint32_t reg = 0xffffffffu, uint32_t sel = 0) {
 		uint32_t  n = 0;
@@ -2919,9 +2925,20 @@ private:
 		// The PS5 kernel's RCIU CAM entry 19 (on in primary mode; KYTY_NATIVE_GPU_PS5_REG_OVERRIDES=0 off).
 		// Entry 18 (UCONFIG 0xc035 bit 0) and the per-process UCONFIG 0xc035..0xc03c are Oberon registers
 		// gfx1013 does not define, so nothing is written for them.
+		// With the kyty-lodhw helper (root) the CAM entry itself is programmed, as on the PS5, and register
+		// writes reach the CP as the title made them; without it the translator sets the bit in each write.
 		if (PrimaryFeature("KYTY_NATIVE_GPU_PS5_REG_OVERRIDES")) {
-			m_translator.SetPs5RegOverrides(true);
-			std::fprintf(stderr, "native shadow: PS5 register overrides (PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID)\n");
+			const int r = m_rciu_hw.Connect() ? m_rciu_hw.SetRciu(19, 0xa310u | 1u << 24u | 1u << 25u, 4u, 4u) : -ENOTCONN;
+			if (r == 0) {
+				std::fprintf(stderr, "native shadow: RCIU CAM entry 19 programmed as on the PS5 (PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID)\n");
+			} else {
+				m_rciu_hw.Disconnect();
+				m_translator.SetPs5RegOverrides(true);
+				std::fprintf(stderr,
+				             "native shadow: PS5 register overrides in the translator (PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID; "
+				             "RCIU CAM through kyty-lodhw: %s)\n",
+				             std::strerror(-r));
+			}
 		}
 		if (EnvOn("KYTY_NATIVE_GPU_ACQUIRE_FULL")) {
 			m_translator.SetAcquireFull(true);
@@ -3116,6 +3133,7 @@ private:
 	// KYTY_NATIVE_GPU_PS5_REGS (InitPs5Regs): its own helper connection, so closing it (exit, crash)
 	// puts the registers back, and the LOD statistics client is not turned on by it.
 	LodStatsHw            m_ps5_hw;
+	LodStatsHw            m_rciu_hw; // KYTY_NATIVE_GPU_PS5_REG_OVERRIDES: holds the RCIU CAM entry while Kyty runs
 	std::mutex            m_ps5_mutex;
 	uint32_t              m_ps5_regs     = 0; // kPs5* bits
 	uint32_t              m_ps5_pasid    = 0;

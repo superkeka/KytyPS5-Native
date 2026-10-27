@@ -39,6 +39,13 @@
 //   op 14 | vmids << 8: invalidate the gfx hub TLB of KFD's VMIDs (8-15) in the mask, the way the PS5
 //      kernel invalidates a title's VMID itself; status 0 once acknowledged (-ETIMEDOUT after 10 ms).
 //      KFD's own flushes go through ioctls that wait for every fence of the VM, a CS job among them.
+//   op 15 | entry << 8: RCIU CAM entry `entry` the way the PS5 kernel writes one (its 0x9edd55d0): the
+//      entry into CPG_RCIU_CAM_INDEX, then three CPG_RCIU_CAM_DATA writes, phase 0 = `size` (register |
+//      PIPE0_EN << 24 | PIPE1_EN << 25), phase 1 = mask (`va` low), phase 2 = value (`va` high). Only the
+//      entries kRciu lists, with their PS5 contents. The CP's register interface then forces those bits
+//      in every write of that register, from any packet. `size` 0xffffffff reads the entry instead
+//      (index, then three DATA reads): value = phase 0. What the entry held before goes back when the
+//      client disconnects.
 // Build: cc -O2 -pthread -o kyty-lodhw kyty-lodhw.c. Run as root: kyty-lodhw [socket path] [socket group gid]
 
 #define _GNU_SOURCE
@@ -120,6 +127,17 @@ static const struct {
 };
 enum { kHqdActive = 0x1260 + 0x1fab, kHqdVmid = 0x1260 + 0x1fac };
 
+// RCIU CAM (CPG_RCIU_CAM_INDEX / DATA) and the entries the PS5 kernel programs for Oberon C0.
+enum { kRciuIndex = 0x1260 + 0x1f44, kRciuData = 0x1260 + 0x1f45, kRciuEntries = 32 };
+static const struct {
+	uint32_t    entry, phase0, mask, value;
+	const char* name;
+} kRciu[] = {
+    // PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID always 1, on both gfx pipes.
+    {19, 0xa310u | 1u << 24 | 1u << 25, 4u, 4u, "PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID"},
+};
+
+
 // CP jump table access (GC segment 1 is 0xA000): {address register, data register} per engine.
 static const uint32_t kJt[3][2] = {{0xA000 + 0x5814, 0xA000 + 0x5815}, {0xA000 + 0x5816, 0xA000 + 0x5817},
                                    {0xA000 + 0x5818, 0xA000 + 0x5819}};
@@ -130,6 +148,20 @@ static uint32_t Rd(uint32_t reg);
 static int      Wr(uint32_t reg, uint32_t v);
 static uint32_t RdSel(uint32_t reg, uint32_t sel);
 static int      WrSel(uint32_t reg, uint32_t sel, uint32_t v);
+
+static void RciuWrite(uint32_t entry, const uint32_t phase[3]) {
+	Wr(kRciuIndex, entry);
+	for (int i = 0; i < 3; i++) {
+		Wr(kRciuData, phase[i]);
+	}
+}
+
+static void RciuRead(uint32_t entry, uint32_t phase[3]) {
+	Wr(kRciuIndex, entry);
+	for (int i = 0; i < 3; i++) {
+		phase[i] = Rd(kRciuData);
+	}
+}
 
 #define kGoldenPath "/etc/kyty/ps5-golden.conf"
 static struct Golden {
@@ -316,6 +348,8 @@ static void* Client(void* arg) {
 	struct Saved* saved   = calloc(kSavedMax, sizeof(struct Saved));
 	uint32_t      nsaved  = 0;
 	int           golden  = 0; // op 7 asked to restore the golden table at disconnect
+	uint32_t      rciu_old[kRciuEntries][3];
+	uint32_t      rciu_set = 0; // entries op 15 changed, put back at disconnect
 	for (;;) {
 		struct {
 			uint32_t op, size;
@@ -467,6 +501,34 @@ static void* Client(void* arg) {
 				rep.value  = ack;
 				rep.status = (ack & mask) == mask ? 0 : -ETIMEDOUT;
 			}
+		} else if ((q.op & 0xffu) == 15) {
+			const uint32_t entry = q.op >> 8;
+			size_t         k     = 0;
+			while (k < sizeof(kRciu) / sizeof(kRciu[0]) && kRciu[k].entry != entry) {
+				k++;
+			}
+			if (q.size == 0xffffffffu && entry < kRciuEntries) {
+				uint32_t phase[3];
+				RciuRead(entry, phase);
+				rep.value = phase[0];
+				fprintf(stderr, "kyty-lodhw: RCIU CAM %u reads 0x%08x 0x%08x 0x%08x\n", entry, phase[0], phase[1], phase[2]);
+			} else if (k == sizeof(kRciu) / sizeof(kRciu[0]) || q.size != kRciu[k].phase0 || (uint32_t)q.va != kRciu[k].mask ||
+			           (uint32_t)(q.va >> 32) != kRciu[k].value) {
+				rep.status = -EPERM;
+			} else {
+				if ((rciu_set & (1u << entry)) == 0) {
+					RciuRead(entry, rciu_old[entry]);
+					rciu_set |= 1u << entry;
+				}
+				const uint32_t phase[3] = {kRciu[k].phase0, kRciu[k].mask, kRciu[k].value};
+				RciuWrite(entry, phase);
+				uint32_t now[3];
+				RciuRead(entry, now);
+				rep.value = now[0];
+				fprintf(stderr, "kyty-lodhw: RCIU CAM %u (%s) 0x%08x 0x%08x 0x%08x -> 0x%08x 0x%08x 0x%08x (reads 0x%08x 0x%08x 0x%08x)\n",
+				        entry, kRciu[k].name, rciu_old[entry][0], rciu_old[entry][1], rciu_old[entry][2], phase[0], phase[1], phase[2],
+				        now[0], now[1], now[2]);
+			}
 		} else {
 			rep.status = -EINVAL;
 		}
@@ -476,6 +538,17 @@ static void* Client(void* arg) {
 		}
 	}
 	close(c);
+	if (rciu_set != 0) {
+		pthread_mutex_lock(&g_hw);
+		for (uint32_t e = 0; e < kRciuEntries; e++) {
+			if ((rciu_set & (1u << e)) != 0) {
+				RciuWrite(e, rciu_old[e]);
+				fprintf(stderr, "kyty-lodhw: RCIU CAM %u put back to 0x%08x 0x%08x 0x%08x\n", e, rciu_old[e][0], rciu_old[e][1],
+				        rciu_old[e][2]);
+			}
+		}
+		pthread_mutex_unlock(&g_hw);
+	}
 	if (nsaved != 0 || golden) {
 		// The client is gone: what it changed goes back, last change first.
 		pthread_mutex_lock(&g_hw);
