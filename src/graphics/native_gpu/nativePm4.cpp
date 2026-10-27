@@ -1548,25 +1548,35 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			all_sh_dirty = false;
 		}
-		// User data only (shader programs come through shader_addrs, the rest is configuration).
+		// User data only (shader programs come through shader_addrs, the rest is configuration). First
+		// the registers whose value changed since their references were taken (their bit stays set), then
+		// their references: a pair of neighbours is added once, by the lower one when it changed.
+		auto fresh = [&](uint32_t off) { return off < RegFile::kDense && (dirty_sh_bits[off / 64] >> (off % 64) & 1u) != 0; };
 		for (uint32_t off: dirty_sh) {
-			dirty_sh_bits[off / 64] &= ~(1ull << (off % 64));
 			const uint32_t value = reg(sh, off);
-			if (off < RegFile::kDense) {
-				const uint64_t bit = 1ull << (off % 64);
-				if ((ud_seen[off / 64] & bit) != 0 && ud_seen_value[off] == value) {
-					continue;
-				}
-				ud_seen[off / 64] |= bit;
-				ud_seen_value[off] = value;
+			const uint64_t bit   = 1ull << (off % 64);
+			if ((ud_seen[off / 64] & bit) != 0 && ud_seen_value[off] == value) {
+				dirty_sh_bits[off / 64] &= ~bit;
+				continue;
 			}
+			ud_seen[off / 64] |= bit;
+			ud_seen_value[off] = value;
+		}
+		for (uint32_t off: dirty_sh) {
+			if (!fresh(off)) {
+				continue;
+			}
+			const uint32_t value = reg(sh, off);
 			add_ref(static_cast<uint64_t>(value) << 8u, m_guess_span, false);
 			if (IsUserDataRegister(off + 1) && sh.count(off + 1) != 0) {
 				add_pair(value, reg(sh, off + 1));
 			}
-			if (off > 0 && IsUserDataRegister(off - 1) && sh.count(off - 1) != 0) {
+			if (off > 0 && !fresh(off - 1) && IsUserDataRegister(off - 1) && sh.count(off - 1) != 0) {
 				add_pair(reg(sh, off - 1), value);
 			}
+		}
+		for (uint32_t off: dirty_sh) {
+			dirty_sh_bits[off / 64] &= ~(1ull << (off % 64));
 		}
 		dirty_sh.clear();
 		if (!rt_dirty) {

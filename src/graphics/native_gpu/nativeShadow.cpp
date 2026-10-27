@@ -550,9 +550,41 @@ public:
 #else
 			pieces.clear();
 #endif
-			tr.SetSource(std::move(pieces));
+			tr.SetSource(pieces);
+		}
+		// KYTY_NATIVE_GPU_TRANSLATE_BENCH=1: every 120th large DCB is translated again from a copy of the
+		// translator in variants, to see what each part of the translation costs on the same buffer.
+		static const bool bench = EnvOn("KYTY_NATIVE_GPU_TRANSLATE_BENCH");
+		std::unique_ptr<Pm4Translator> bench_snap;
+		if (bench && !acb && out != nullptr && dcb.size() > 400000 && (m_bench_count++ % 120) == 0) {
+			bench_snap = tr.Clone();
 		}
 		Pm4TranslateResult result      = tr.Translate(dcb);
+		if (bench_snap != nullptr) {
+			auto run = [&](bool refs, bool direct_runs) {
+				double best = 1e9;
+				for (int k = 0; k < 3; k++) {
+					auto         t  = bench_snap->Clone();
+					const double t0 = NowSecShadow();
+					t->SetCollectRefs(refs);
+					if (direct_runs) {
+						t->SetSource(pieces);
+					} else {
+						t->SetDirectRuns(0);
+					}
+					(void)t->Translate(dcb);
+					best = std::min(best, (NowSecShadow() - t0) * 1e3);
+				}
+				return best;
+			};
+			const double t0 = NowSecShadow();
+			(void)bench_snap->Clone();
+			const double clone_ms = (NowSecShadow() - t0) * 1e3;
+			std::fprintf(stderr,
+			             "native bench: DCB of %zu dwords: translate %.2f ms, without references %.2f, without direct runs %.2f "
+			             "(a copy of the translator %.2f ms, included)\n",
+			             dcb.size(), run(m_collect_refs, true), run(false, true), run(m_collect_refs, false), clone_ms);
+		}
 		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
 		for (uint32_t i = 0; i < result.stats.event_type.size(); i++) {
 			m_event_type_hist[i] += result.stats.event_type[i];
@@ -3054,6 +3086,7 @@ private:
 	uint64_t                m_verbatim_runs = 0;
 	uint64_t                m_labels_native = 0; // Pm4TranslateStats::labels_native and write_data_dw, same flips
 	uint64_t                m_write_data_dw = 0;
+	uint64_t                m_bench_count   = 0; // KYTY_NATIVE_GPU_TRANSLATE_BENCH
 	uint64_t                m_direct_ib2    = 0; // Pm4TranslateStats::direct_ib2 and direct_dw, same flips
 	uint64_t                m_direct_dw     = 0;
 	uint32_t                m_direct_min_dw = 0; // KYTY_NATIVE_GPU_DIRECT_RUNS

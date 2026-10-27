@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_set>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -571,8 +572,10 @@ public:
 	Pm4Translator()  = default;
 	~Pm4Translator() = default;
 
-	Pm4Translator(const Pm4Translator&)            = delete;
 	Pm4Translator& operator=(const Pm4Translator&) = delete;
+	// A copy with the same shadow and settings, to translate a buffer again without touching this one
+	// (KYTY_NATIVE_GPU_TRANSLATE_BENCH).
+	[[nodiscard]] std::unique_ptr<Pm4Translator> Clone() const { return std::unique_ptr<Pm4Translator>(new Pm4Translator(*this)); }
 
 	// Translates one DCB. On an unknown packet the result's `ok` is false, `ib` is empty and the
 	// shadow is left untouched past the point of failure (the caller skips this DCB natively). The
@@ -798,6 +801,7 @@ private:
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
 	bool                         m_compute_ring   = false;
+	Pm4Translator(const Pm4Translator&) = default; // Clone
 	uint32_t                     m_direct_min_dw  = 0;
 	uint64_t                     m_time_span_va   = 0;
 	uint64_t                     m_time_wait_va   = 0;
