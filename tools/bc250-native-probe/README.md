@@ -84,7 +84,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `waitforms` | the guest's `WAIT_REG_MEM` / `WAIT_REG_MEM_64` forms (ME and PFP, EQUAL and GREATER_EQUAL, met and released by the CPU) on the gfx ring |
 | `regindex-sh`, `-ctx`, `-uc` | 0x63 / 0x9F / 0x64 (AMD's `LOAD_*_REG_INDEX`) with one pair, read back with `COPY_DATA` |
 | `regindex-uc342`, `-sh-nr`, `-ctx-nr` | the same packets without register reads, a `WRITE_DATA` after them as the proof |
-| `labelvis` | a `RELEASE_MEM` label without cache write-back seen by the CPU, then a `WAIT_REG_MEM` on a dword the CPU writes, per MTYPE (`LABELVIS_KIND=nc\|uc\|cc\|wc\|default`, one per run) |
+| `labelvis` | a `RELEASE_MEM` label without cache write-back seen by the CPU, then a `WAIT_REG_MEM` on a dword the CPU writes, per MTYPE (`LABELVIS_KIND=nc\|uc\|cc\|wc\|default`, one per run; `LABELVIS_DST=1` sends the label to L2, `LABELVIS_EVENT` sets the event dword) |
 
 `--awake SEC` keeps one wave spinning on the compute ring while the case runs, so the graphics block
 never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of freeing buffers

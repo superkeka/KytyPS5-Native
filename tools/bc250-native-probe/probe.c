@@ -1785,13 +1785,19 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		m[16] = 0;         // the CPU's go
 		__sync_synchronize();
 		Ib ib = {.n = 0};
+		// LABELVIS_EVENT: the event dword (default BOTTOM_OF_PIPE_TS, no GCR actions); LABELVIS_DST=1:
+		// the label to L2 (DST_SEL 1), as libSceAgc writes them, instead of memory.
+		const char* ev  = getenv("LABELVIS_EVENT");
+		const char* dst = getenv("LABELVIS_DST");
 		IbPush(&ib, Pkt3Gfx(0x49u, 7)); // RELEASE_MEM
-		IbPush(&ib, 0x28u | (5u << 8)); // BOTTOM_OF_PIPE_TS, no GCR actions
-		IbPush(&ib, 1u << 29);          // DATA_SEL 1 (32 bit), memory, no interrupt
+		IbPush(&ib, ev != NULL ? (uint32_t)strtoul(ev, NULL, 0) : 0x28u | (5u << 8));
+		// LABELVIS_WIDE=1: a 64-bit label (DATA_SEL 2), its high dword 0x5eed0000 + kind.
+		const bool wide = getenv("LABELVIS_WIDE") != NULL;
+		IbPush(&ib, ((wide ? 2u : 1u) << 29) | ((dst != NULL ? (uint32_t)strtoul(dst, NULL, 0) & 3u : 0u) << 16)); // no interrupt
 		IbPush(&ib, (uint32_t)mem.va);
 		IbPush(&ib, (uint32_t)(mem.va >> 32));
 		IbPush(&ib, 0x1abe1000u + (uint32_t)k);
-		IbPush(&ib, 0);
+		IbPush(&ib, wide ? 0x5eed0000u + (uint32_t)k : 0u);
 		IbPush(&ib, 0);
 		IbPush(&ib, Pkt3Gfx(0x3cu, 6)); // WAIT_REG_MEM: memory, equal, ME
 		IbPush(&ib, 3u | (1u << 4));
@@ -1821,8 +1827,8 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		int     w  = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0);
 		int64_t st = ContextState(d);
 		if (seen >= 0) {
-			printf("  %-7s: label seen by the CPU after %.1f us (job %s)\n", kinds[k].name, seen * 1e6,
-			       w == 1 ? "TIMEOUT" : ErrStr(w));
+			printf("  %-7s: label seen by the CPU after %.1f us (job %s), dwords 0x%08x 0x%08x\n", kinds[k].name, seen * 1e6,
+			       w == 1 ? "TIMEOUT" : ErrStr(w), m[0], m[1]);
 		} else {
 			printf("  %-7s: label NOT seen in 50 ms (job %s, after the fence 0x%08x)\n", kinds[k].name,
 			       w == 1 ? "TIMEOUT" : ErrStr(w), m[0]);
