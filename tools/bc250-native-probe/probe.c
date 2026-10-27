@@ -1653,6 +1653,106 @@ static bool DangerTag342(Device* d, Common* c) {
 	return ok;
 }
 
+// The guest's own GPU waits (libSceAgc's AgcDcbWaitRegMem: WAIT_REG_MEM and WAIT_REG_MEM_64, ENGINE_SEL ME
+// or PFP, any compare function) as written, on the gfx ring: whether the BC-250's CP runs them as the PS5's
+// does, so the translator can pass them through. Each step is one job, the wait then a WRITE_DATA marker;
+// the first one that does not finish stops the run. Memory is UC so a value the CPU writes later is seen.
+static bool DangerWaitForms(Device* d, Common* c) {
+	printf("== danger waitforms: guest WAIT_REG_MEM / WAIT_REG_MEM_64 forms on the gfx ring\n");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0710000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	// CONTROL as AgcDcbWaitRegMem builds it: function [2:0], MEM_SPACE memory (bit 4), ENGINE_SEL [9:8].
+	static const struct {
+		const char* name;
+		bool        wide;
+		uint32_t    control;
+		uint64_t    value, ref, mask;
+		int         release_ms; // the CPU writes `ref` into the label this long after submitting (0: already there)
+	} steps[] = {
+	    {"32-bit EQUAL, ME, met", false, 0x13u, 5, 5, 0xffffffffu, 0},
+	    {"32-bit EQUAL, PFP, met", false, 0x113u, 6, 6, 0xffffffffu, 0},
+	    {"32-bit GREATER_EQUAL, ME, met", false, 0x15u, 9, 7, 0xffffffffu, 0},
+	    {"64-bit EQUAL, ME, met", true, 0x13u, 0x100000005ull, 0x100000005ull, ~0ull, 0},
+	    {"64-bit GREATER_EQUAL, ME, met only in 64 bits", true, 0x15u, 0x100000000ull, 0xffffffffull, ~0ull, 0},
+	    {"64-bit EQUAL, PFP, met", true, 0x113u, 0x200000007ull, 0x200000007ull, ~0ull, 0},
+	    {"64-bit EQUAL, ME, released by the CPU after 100 ms", true, 0x13u, 0x300000000ull, 0x300000008ull, ~0ull, 100},
+	    {"32-bit EQUAL, PFP, released by the CPU after 100 ms", false, 0x113u, 0, 9, 0xffffffffu, 100},
+	};
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	bool               ok    = true;
+	const char*        one   = getenv("WAITFORMS_STEP"); // one step per run: a wait the CP does not finish stops the ring
+	for (size_t k = 0; k < ARRAY_SIZE(steps) && ok; k++) {
+		if (one != NULL && (size_t)atoi(one) != k) {
+			continue;
+		}
+		const uint64_t label  = mem.va + 0x100 + 0x40 * k;
+		const uint64_t marker = mem.va + 0x800 + 4 * k;
+		volatile uint64_t* lv = (volatile uint64_t*)((uint8_t*)mem.cpu + 0x100 + 0x40 * k);
+		*lv                   = steps[k].value;
+		m[(0x800 + 4 * k) / 4] = 0;
+		__sync_synchronize();
+		Ib ib = {.n = 0};
+		if (steps[k].wide) {
+			IbPush(&ib, Pkt3Gfx(0x93u, 8));
+			IbPush(&ib, steps[k].control);
+			IbPush(&ib, (uint32_t)label & ~7u);
+			IbPush(&ib, (uint32_t)(label >> 32) & 0x3ffffu);
+			IbPush(&ib, (uint32_t)steps[k].ref);
+			IbPush(&ib, (uint32_t)(steps[k].ref >> 32));
+			IbPush(&ib, (uint32_t)steps[k].mask);
+			IbPush(&ib, (uint32_t)(steps[k].mask >> 32));
+			IbPush(&ib, 4);
+		} else {
+			IbPush(&ib, Pkt3Gfx(0x3cu, 6));
+			IbPush(&ib, steps[k].control);
+			IbPush(&ib, (uint32_t)label & ~3u);
+			IbPush(&ib, (uint32_t)(label >> 32) & 0x3ffffu);
+			IbPush(&ib, (uint32_t)steps[k].ref);
+			IbPush(&ib, (uint32_t)steps[k].mask);
+			IbPush(&ib, 4);
+		}
+		IbPush(&ib, Pkt3Gfx(0x37u, 4)); // WRITE_DATA, memory, write confirm
+		IbPush(&ib, (5u << 8) | (1u << 20));
+		IbPush(&ib, (uint32_t)marker);
+		IbPush(&ib, (uint32_t)(marker >> 32));
+		IbPush(&ib, 0x3a170000u | (uint32_t)k);
+		IbPad(&ib);
+		uint64_t seq = 0;
+		r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+		if (r == 0 && steps[k].release_ms != 0) {
+			usleep((useconds_t)steps[k].release_ms * 1000u);
+			const uint32_t early = m[(0x800 + 4 * k) / 4];
+			*lv                  = steps[k].ref;
+			__sync_synchronize();
+			if (early != 0) {
+				printf("  %s: the marker landed before the CPU released the label\n", steps[k].name);
+				ok = false;
+			}
+		}
+		int     w  = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+		int64_t st = ContextState(d);
+		const bool landed = m[(0x800 + 4 * k) / 4] == (0x3a170000u | (uint32_t)k);
+		printf("  %s: %s, ctx 0x%" PRIx64 ", marker %s\n", steps[k].name, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st,
+		       landed ? "landed" : "missing");
+		fflush(stdout);
+		if (w != 0 || st != 0) {
+			_exit(3); // freeing buffers would wait on the stopped ring
+		}
+		ok = ok && landed;
+	}
+	BoDestroy(d, &mem);
+	return ok;
+}
+
 // P5 of the direct-execution plan: does the CPU see a label that a RELEASE_MEM wrote with only the
 // guest's own event (no GLM/GL2 write-back, which the translator adds today)? Per GPU mapping type of
 // cached GTT: the gfx ring writes the label (BOTTOM_OF_PIPE_TS, DATA_SEL 1, no cache actions), then
@@ -2190,6 +2290,8 @@ int main(int argc, char** argv) {
 			ok = DangerLabelVis(&d, &c);
 		} else if (strcmp(danger, "tag342") == 0) {
 			ok = DangerTag342(&d, &c);
+		} else if (strcmp(danger, "waitforms") == 0) {
+			ok = DangerWaitForms(&d, &c);
 		} else if (strcmp(danger, "regindex-uc342") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x64u, 0x342u, "SQ_THREAD_TRACE_USERDATA_2");
 		} else if (strcmp(danger, "regindex-sh-nr") == 0) {

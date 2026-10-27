@@ -760,6 +760,11 @@ public:
 	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
+	// Guest WAIT_REG_MEM / WAIT_REG_MEM_64 on the gfx ring as written: the BC-250's CP runs both, 64-bit
+	// compares, PFP waits and any compare function (probe waitforms). Off: our form (EQUAL on ME, a 64-bit
+	// wait as 32-bit ones, a PFP wait as ME and PFP_SYNC_ME, other functions held on the CPU). Off by
+	// default for now: My First GT stuttered more with it.
+	void SetWaitsVerbatim(bool on) { m_waits_verbatim = on; }
 	// DMA_DATA to or from GDS with CP_SYNC, and a CS_PARTIAL_FLUSH before a copy out of GDS, so the
 	// append counters are final and copied before an indirect dispatch reads them (experiment).
 	void SetGdsDmaSync(bool on) { m_gds_dma_sync = on; }
@@ -835,6 +840,7 @@ private:
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
 	bool                         m_pfp_sync_indirect = false;
+	bool                         m_waits_verbatim    = false;
 	bool                         m_gds_dma_sync      = false;
 	bool                         m_acquire_full      = false;
 	uint32_t                     m_write_data_native = 0;

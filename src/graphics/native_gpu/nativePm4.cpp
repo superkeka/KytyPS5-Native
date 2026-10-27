@@ -356,6 +356,14 @@ void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint3
 	ib.push_back(kWaitPoll);
 }
 
+// A guest wait's CONTROL the gfx CP runs as the PS5's (probe waitforms): on memory, wait only (OPERATION
+// 0), the micro engine or the prefetch parser, any compare function but the reserved 7.
+bool GuestWaitControlOk(uint32_t control) {
+	return (control & 0x7u) != 7u && ((control >> 4u) & 0x3u) == 1u && ((control >> 6u) & 0x3u) == 0u &&
+	       ((control >> 8u) & 0x3u) <= 1u;
+}
+
+
 // Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
 // on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
 // the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
@@ -564,7 +572,15 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				}
 				return bad();
 			case IT_WAIT_REG_MEM:
-				if (header != Pkt3(IT_WAIT_REG_MEM, 6, compute) || b[0] != kWaitEqualMemMe || b[5] != kWaitPoll) {
+				if (header == Pkt3(IT_WAIT_REG_MEM, 6, compute) && b[0] == kWaitEqualMemMe && b[5] == kWaitPoll) {
+					break; // the translator's own form, on either ring
+				}
+				if (compute || size != 7 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
+					return bad();
+				}
+				break; // a guest wait as written (gfx ring)
+			case IT_WAIT_REG_MEM_64:
+				if (compute || size != 9 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
 					return bad();
 				}
 				break;
@@ -2692,7 +2708,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (timed) {
 						EmitClockCopy(body, wait_pair);
 					}
-					const bool emitted = plan == LabelOracle::Plan::Native && EmitNativeWait(body, w, m_compute_ring);
+					// The guest's packet as written where the gfx CP runs it (SetWaitsVerbatim), else our form.
+					const bool as_written = plan == LabelOracle::Plan::Native && !m_compute_ring && m_waits_verbatim &&
+					                        GuestWaitControlOk(bptr[0]);
+					if (as_written) {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						NoteGpuWait(w);
+					}
+					const bool emitted = plan == LabelOracle::Plan::Native && (as_written || EmitNativeWait(body, w, m_compute_ring));
 					if (timed) {
 						EmitClockCopy(body, wait_pair + 8);
 						m_time_wait_info[m_time_waits % m_time_pairs] = {addr, ref, stats.draws, met};

@@ -1341,6 +1341,7 @@ void TestLabelsWait64() {
 	Pm4Translator t;
 	TestOracle    o;
 	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetWaitsVerbatim(true);
 	t.SetFenceAddress(kFenceVa);
 	static uint64_t label = 0;
 	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
@@ -1354,24 +1355,24 @@ void TestLabelsWait64() {
 	o.plan = LabelOracle::Plan::Native;
 	auto r = t.Translate(dcb);
 	const auto    pkts = Decode(r.ib);
-	const Packet* w32  = FindFirst(pkts, 0x3Cu);
-	Check(r.segments.size() == 1 && FindFirst(pkts, 0x93u) == nullptr && w32 != nullptr && w32->body[1] == static_cast<uint32_t>(addr) &&
-	          w32->body[3] == 1u && w32->body[4] == 0xffffffffu && w32->body[5] == 4u,
-	      "a native 64-bit wait with zero high halves becomes WAIT_REG_MEM (the gfx ring has no WAIT_REG_MEM_64)");
+	const Packet* w64  = FindFirst(pkts, 0x93u);
+	Check(r.segments.size() == 1 && w64 != nullptr && w64->body.size() == 8 && w64->body[1] == static_cast<uint32_t>(addr) &&
+	          w64->body[3] == 1u && w64->body[5] == 0xffffffffu && w64->body[7] == 4u && FindFirst(pkts, 0x3Cu) == nullptr,
+	      "a native 64-bit wait reaches the gfx ring as written (the CP compares all 64 bits, probe waitforms)");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a guest WAIT_REG_MEM_64 passes the gfx-ring check");
 
-	std::vector<uint32_t> both;
-	Append(both, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
-	wait64(both, 1);
-	auto       rb    = t.Translate(both);
-	const auto pkts2 = Decode(rb.ib);
-	uint32_t   halves = 0;
-	for (const auto& p: pkts2) {
-		if (p.op == 0x3Cu && (p.body[1] == static_cast<uint32_t>(addr) || p.body[1] == static_cast<uint32_t>(addr + 4u))) {
-			halves++;
-		}
-	}
-	Check(rb.segments.size() == 1 && FindFirst(pkts2, 0x93u) == nullptr && halves == 2,
-	      "one on both halves becomes a WAIT_REG_MEM per half");
+	// A PFP wait (ENGINE_SEL 1) as written too, without our PFP_SYNC_ME.
+	std::vector<uint32_t> pfp;
+	Append(pfp, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(pfp, 0x3Cu, {3u | (1u << 4u) | (1u << 8u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0xffffffffu, 10u},
+	       false);
+	auto       rp    = t.Translate(pfp);
+	const auto pkts3 = Decode(rp.ib);
+	const Packet* wp = FindFirst(pkts3, 0x3Cu);
+	Check(wp != nullptr && wp->body[0] == (3u | (1u << 4u) | (1u << 8u)) && wp->body[5] == 10u && FindFirst(pkts3, 0x42u) == nullptr,
+	      "a PFP wait reaches the gfx ring as written, no PFP_SYNC_ME");
+
 	o.plan  = LabelOracle::Plan::Split;
 	auto rs = t.Translate(dcb);
 	Check(rs.segments.size() == 2 && rs.segments[1].wait_len == 7, "a held 64-bit wait carries its 32-bit form");
@@ -1409,7 +1410,8 @@ void TestValidateNativeIb() {
 		const auto pkts = Decode(r.ib);
 		const auto* wd   = FindFirst(pkts, IT_WRITE_DATA);
 		Check(wd == nullptr || (wd->body[0] & (1u << 20u)) != 0, "a WRITE_DATA in it is write-confirmed");
-		Check(FindFirst(pkts, 0x93u) == nullptr, "no 64-bit guest wait in it");
+		Check(plan == LabelOracle::Plan::Native || FindFirst(pkts, 0x93u) == nullptr,
+		      "a 64-bit guest wait only where it runs on the GPU as written");
 	}
 
 	auto rejects = [&](std::vector<uint32_t> ib, const char* what) {
@@ -1419,13 +1421,26 @@ void TestValidateNativeIb() {
 		uint32_t bad = ~0u;
 		Check(!ValidateNativeIb(ib, false, &bad) && bad == 0u, what);
 	};
-	rejects({0xc0079300u, 0x13u, 0u, 0u, 1u, 0u, ~0u, 0u, 4u}, "WAIT_REG_MEM_64 rejected");
+	rejects({0xc0079300u, 0x03u, 0u, 0u, 1u, 0u, ~0u, 0u, 4u}, "WAIT_REG_MEM_64 on a register rejected");
+	rejects({0xc0079300u, 0x53u, 0u, 0u, 1u, 0u, ~0u, 0u, 4u}, "WAIT_REG_MEM_64 with an operation rejected");
+	{
+		std::vector<uint32_t> ib = {0xc0079300u, 0x113u, 0u, 0u, 1u, 0u, ~0u, 0u, 4u};
+		while ((ib.size() & 7u) != 0) {
+			ib.push_back(0xffff1000u);
+		}
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "a guest PFP WAIT_REG_MEM_64 on memory passes on gfx");
+		Check(!ValidateNativeIb(ib, false, nullptr, NativeIbKind::Compute), "and is rejected on a compute ring");
+	}
 	rejects({0xc0033700u, 0x200u, 0x1000u, 0u, 1u}, "WRITE_DATA without write confirm rejected");
 	rejects({0xc0033700u, 0x100000u, 0x1000u, 0u, 1u}, "WRITE_DATA to a register rejected");
 	rejects({0xc0064902u, kFlushEvent, 1u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "RELEASE_MEM with the compute bit rejected");
 	rejects({0xc0064900u, 0x528u, 2u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "a guest-form RELEASE_MEM rejected");
 	rejects({0xc0064900u, kFlushEvent, (1u << 29u) | (2u << 24u), 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM interrupt rejected");
-	rejects({0xc0053c00u, 0x4000013u, 0x1000u, 0u, 1u, ~0u, 0x19u}, "a guest-form WAIT_REG_MEM rejected");
+	rejects({0xc0053c00u, 0x4000003u, 0x1000u, 0u, 1u, ~0u, 0x19u}, "a WAIT_REG_MEM on a register rejected");
+	{
+		std::vector<uint32_t> ib = {0xc0053c00u, 0x4000013u, 0x1000u, 0u, 1u, ~0u, 0x19u, 0xffff1000u};
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "a guest-form WAIT_REG_MEM (cache policy, poll 0x19) passes on gfx");
+	}
 	rejects({0xc0053c02u, 0x13u, 0x1000u, 0u, 1u, ~0u, 4u}, "WAIT_REG_MEM with the compute bit rejected");
 	rejects({0xc0011000u, 0u, 0u}, "a NOP that is not a filler rejected");
 	rejects({0xc0028e00u, 64u, 0x1000u, 0u}, "GET_LOD_STATS rejected unless enabled");

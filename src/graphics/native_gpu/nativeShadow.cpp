@@ -2906,6 +2906,10 @@ private:
 			m_acb_translator.SetCompactRefs(true);
 		}
 		SyncCollectRefs();
+		if (EnvOn("KYTY_NATIVE_GPU_WAITS_VERBATIM")) {
+			m_translator.SetWaitsVerbatim(true);
+			std::fprintf(stderr, "native shadow: guest WAIT_REG_MEM / WAIT_REG_MEM_64 run as written on the gfx ring (experiment)\n");
+		}
 		if (EnvOn("KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT")) {
 			m_translator.SetPfpSyncIndirect(true);
 			m_acb_translator.SetPfpSyncIndirect(true);
