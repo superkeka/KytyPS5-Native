@@ -35,6 +35,9 @@ SCREEN=${SCREEN:-3840x2160}
 DISPLAY=:0 xprop -root -f GAMESCOPE_XWAYLAND_MODE_CONTROL 32c -set GAMESCOPE_XWAYLAND_MODE_CONTROL "1,${SCREEN%x*},${SCREEN#*x},1"
 restore() { DISPLAY=:0 xprop -root -f GAMESCOPECTRL_BASELAYER_APPID 32co -set GAMESCOPECTRL_BASELAYER_APPID 769; }
 trap restore EXIT
+# A run stopped from outside can leave the container half torn down ("creating temporary passwd file
+# ... no such file or directory"); a clean stop and start brings it back.
+distrobox enter shadps4-dev -- true >/dev/null 2>&1 || { podman stop -t 5 shadps4-dev; podman start shadps4-dev; } >/dev/null 2>&1
 (cd "$OUT" && distrobox enter shadps4-dev -- env DISPLAY=:1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 ${EXTRA_ENV:-} $ENVS timeout -s INT "$SECS" "$EMU" --game /home/deck/Games/$TITLE --screen-width ${SCREEN%x*} --screen-height ${SCREEN#*x} --fullscreen --no-splash --skip-notice-screen ${OVERLAY---perf-overlay} ${EXTRA_ARGS:-} > run.log 2>&1; echo "exit=$?" >> run.log) &
 EMUPID=$!
 WID=""

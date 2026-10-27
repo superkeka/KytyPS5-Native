@@ -1,0 +1,207 @@
+--- a/drivers/gpu/drm/amd/amdgpu/Makefile
++++ b/drivers/gpu/drm/amd/amdgpu/Makefile
+@@ -349,3 +349,6 @@
+ amdgpu-y += $(AMD_GPU_RAS_FILES)
+ 
+ obj-$(CONFIG_DRM_AMDGPU)+= amdgpu.o
++
++# Out-of-tree build: the trace header is found next to its .c file.
++CFLAGS_amdgpu_trace_points.o := -I$(src)
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_trace.h
+@@ -583,5 +583,5 @@
+ 
+ /* This part must be outside protection */
+ #undef TRACE_INCLUDE_PATH
+-#define TRACE_INCLUDE_PATH ../../drivers/gpu/drm/amd/amdgpu
++#define TRACE_INCLUDE_PATH .
+ #include <trace/define_trace.h>
+--- a/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c
+@@ -51,6 +51,18 @@
+ #include "athub_v2_0.h"
+ #include "athub_v2_1.h"
+ 
++static int bc250_flush_pasid_kiq = 1;
++module_param(bc250_flush_pasid_kiq, int, 0444);
++MODULE_PARM_DESC(bc250_flush_pasid_kiq, "BC-250: 0=flush_pasid_uses_kiq=false (ROCm#6313)");
++
++/* BC-250: a heavyweight invalidation (type 2) of a KFD VMID waits for the VMID's outstanding requests
++ * and did not complete while a KFD queue's GL2 flush was in flight: no ACK, the KIQ waiting for it
++ * stopped, and with it the GPU. It used to happen never, because the PASID flush found no VMID
++ * (ROCm#6313); without HWS KFD maps the PASID and it does. -1 keeps the caller's type. */
++static int bc250_tlb_flush_type = -1;
++module_param(bc250_tlb_flush_type, int, 0644);
++MODULE_PARM_DESC(bc250_tlb_flush_type, "BC-250: TLB flush type for every GPU TLB flush (-1 = as requested, 0 = legacy)");
++
+ static int gmc_v10_0_ecc_interrupt_state(struct amdgpu_device *adev,
+ 					 struct amdgpu_irq_src *src,
+ 					 unsigned int type,
+@@ -237,7 +249,8 @@
+ {
+ 	bool use_semaphore = gmc_v10_0_use_invalidate_semaphore(adev, vmhub);
+ 	struct amdgpu_vmhub *hub = &adev->vmhub[vmhub];
+-	u32 inv_req = hub->vmhub_funcs->get_invalidate_req(vmid, flush_type);
++	u32 inv_req = hub->vmhub_funcs->get_invalidate_req(vmid,
++		bc250_tlb_flush_type >= 0 ? (uint32_t)bc250_tlb_flush_type : flush_type); /* BC-250 */
+ 	/* Use register 17 for GART */
+ 	const unsigned int eng = 17;
+ 	unsigned char hub_ip = 0;
+@@ -964,7 +977,7 @@
+ 	struct amdgpu_device *adev = ip_block->adev;
+ 	int r;
+ 
+-	adev->gmc.flush_pasid_uses_kiq = !amdgpu_emu_mode;
++	adev->gmc.flush_pasid_uses_kiq = bc250_flush_pasid_kiq ? !amdgpu_emu_mode : false; /* BC-250 */
+ 
+ 	/* The sequence of these two function calls matters.*/
+ 	gmc_v10_0_init_golden_registers(adev);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c
+@@ -1374,6 +1374,9 @@
+ 		if (WARN_ON_ONCE(!peer_pdd))
+ 			continue;
+ 		kfd_flush_tlb(peer_pdd);
++		/* BC-250: stale invalid translations survive the broken PASID
++		 * sweep and fault on first touch of a fresh mapping (bc250 map-side flush (generic)) */
++		kfd_bc250_flush_by_runlist(peer_pdd->dev, 2);
+ 	}
+ 	kfree(devices_arr);
+ 
+@@ -1461,6 +1464,11 @@
+ 			continue;
+ 		if (flush_tlb)
+ 			kfd_flush_tlb(peer_pdd);
++		/* BC-250: rebuild the runlist so the firmware invalidates the
++		 * compute TLB (see kfd_device_queue_manager.c). Called here with
++		 * p->mutex held and dqm_lock free.
++		 */
++		kfd_bc250_flush_by_runlist(peer_pdd->dev, 1); /* bc250 map-side flush (generic) */
+ 
+ 		/* Remove dma mapping after tlb flush to avoid IO_PAGE_FAULT */
+ 		err = amdgpu_amdkfd_gpuvm_dmaunmap_mem(mem, peer_pdd->drm_priv);
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
+@@ -3971,3 +3971,62 @@
+ }
+ 
+ #endif
++
++/* BC-250/gfx1013: invalidate the compute TLB by rebuilding the runlist.
++ *
++ * On this board the compute TLB invalidation never happens: the PASID sweep
++ * in gmc_v10_0_flush_gpu_tlb_pasid() depends on mmATC_VMID*_PASID_MAPPING,
++ * which on gfx10 under HWS is never written, so it matches zero VMIDs.
++ * Forcing the invalidation via KIQ or direct MMIO is never acknowledged and
++ * stalls the translation unit. Consequence: hipFree unmaps, hipMalloc reuses
++ * the VA with a new physical address, the PTEs are correct in memory, and the
++ * GPU keeps translating through the previous mapping.
++ *
++ * An invalidation that works does exist: the hardware scheduler's runlist
++ * rebuild (queue preempt + VMID reassign) must invalidate, or a process would
++ * inherit the previous one's translations along with its VMID. This asks for
++ * that cycle on unmap so the stale entry never survives to be used.
++ *
++ * Port of GabriWar/bc250-rocm-working bc250-flush-tlb-by-runlist.patch for
++ * validation on kernel 7.1.5 (their measurement base was 7.0.12).
++ *
++ * Locking: takes dqm_lock. kfd_flush_tlb() must NOT call this --
++ * restore_process_queues_nocpsch() and allocate_vmid()/deallocate_vmid()
++ * already hold dqm_lock; a deadlock there hangs the machine. The only call
++ * site is the unmap ioctl (holds p->mutex, not dqm_lock; same order as
++ * pqm_create_queue).
++ */
++#define BC250_PCI_DEVICE_ID 0x13FE
++
++static int bc250_flush_by_runlist;
++module_param(bc250_flush_by_runlist, int, 0644);
++MODULE_PARM_DESC(bc250_flush_by_runlist,
++	"BC-250: bitmask, rebuild runlist to invalidate TLB: 1=on unmap, 2=on map (default 0)"); /* bc250 map-side flush (generic) */
++
++int kfd_bc250_flush_by_runlist(struct kfd_node *dev, int site)
++{
++	struct device_queue_manager *dqm;
++	int r;
++
++	if (!(bc250_flush_by_runlist & site) || !dev || !dev->adev || !dev->adev->pdev)
++		return 0;
++	if (dev->adev->pdev->device != BC250_PCI_DEVICE_ID)
++		return 0;
++
++	dqm = dev->dqm;
++	/* Only meaningful under hardware scheduling: the firmware reassigns
++	 * VMIDs when the runlist is rebuilt. Without HWS there is no runlist.
++	 */
++	if (!dqm || dqm->sched_policy == KFD_SCHED_POLICY_NO_HWS)
++		return 0;
++
++	dqm_lock(dqm);
++	r = execute_queues_cpsch(dqm, KFD_UNMAP_QUEUES_FILTER_DYNAMIC_QUEUES, 0,
++				 USE_DEFAULT_GRACE_PERIOD);
++	dqm_unlock(dqm);
++
++	if (r)
++		dev_err_ratelimited(dev->adev->dev,
++			"BC-250: runlist rebuild flush failed (%d)\n", r);
++	return r;
++}
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.h
+@@ -377,4 +377,11 @@
+ }
+ 
+ 
++
++/* BC-250: rebuild the runlist so the firmware invalidates the compute TLB.
++ * Full documentation in kfd_device_queue_manager.c above
++ * bc250_flush_by_runlist. Takes dqm_lock -- never call with it held.
++ */
++int kfd_bc250_flush_by_runlist(struct kfd_node *dev, int site); /* bc250 map-side flush (generic) */
++
+ #endif /* KFD_DEVICE_QUEUE_MANAGER_H_ */
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
+@@ -1562,6 +1562,15 @@
+ 	struct amdgpu_device *adev = pdd->dev->adev;
+ 	struct amdgpu_vm *vm = drm_priv_to_vm(pdd->drm_priv);
+ 
++	/* BC-250: the PASID flush does not find KFD's VMIDs (ROCm#6313). Without
++	 * HWS a process keeps one static VMID while it has queues: flush that one,
++	 * as amdgpu did before PASID flushes (bc250 no-HWS vmid flush).
++	 */
++	if (sched_policy == KFD_SCHED_POLICY_NO_HWS && pdd->qpd.vmid) {
++		amdgpu_gmc_flush_gpu_tlb(adev, pdd->qpd.vmid, AMDGPU_GFXHUB(0),
++					 TLB_FLUSH_LEGACY);
++		return;
++	}
+ 	amdgpu_vm_flush_compute_tlb(adev, vm, TLB_FLUSH_HEAVYWEIGHT,
+ 				    pdd->dev->xcc_mask);
+ }
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
+@@ -36,6 +36,7 @@
+ #include "amdgpu_reset.h"
+ #include "kfd_priv.h"
+ #include "kfd_svm.h"
++#include "kfd_device_queue_manager.h"
+ #include "kfd_migrate.h"
+ #include "kfd_smi_events.h"
+ 
+@@ -1430,6 +1431,8 @@
+ 				break;
+ 		}
+ 		kfd_flush_tlb(pdd);
++		/* BC-250: SVM unmap (bc250 map-side flush (generic)) */
++		kfd_bc250_flush_by_runlist(pdd->dev, 1);
+ 	}
+ 
+ 	return r;
+@@ -1581,6 +1584,8 @@
+ 		}
+ 
+ 		kfd_flush_tlb(pdd);
++		/* BC-250: rebuild on SVM map, the case that actually faults (bc250 map-side flush (generic)) */
++		kfd_bc250_flush_by_runlist(pdd->dev, 2);
+ 	}
+ 
+ 	return r;

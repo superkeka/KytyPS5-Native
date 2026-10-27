@@ -3,9 +3,10 @@
 # PS5 title with full residency needs. gamescope-session.target upholds steam-launcher.service, so the
 # unit is masked for the run (runtime only: gone after a reboot) and unmasked and started again after.
 # Usage: nosteam-run.sh <game-run.sh arguments>
+# In a unit of its own: stopping this script's unit kills every process in it, a restore too.
 restore() {
-	systemctl --user unmask --runtime steam-launcher.service
-	systemctl --user start steam-launcher.service
+	systemd-run --user --collect --quiet /bin/sh -c \
+		'systemctl --user unmask --runtime steam-launcher.service; systemctl --user start steam-launcher.service'
 }
 trap restore EXIT
 # Steam stopped while it is still starting (a previous run just brought it back) hangs in its stop:
