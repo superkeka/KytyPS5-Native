@@ -2225,9 +2225,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 		}
 		switch (op) {
+			case IT_RELEASE_MEM: // libSceAgc's, as agc.cpp writes it: the same body as Kyty's NOP marker
 			case IT_NOP: {
-				stats.nops++;
-				const uint32_t marker = (header >> 2u) & 0x3fu;
+				stats.nops += op == IT_NOP ? 1 : 0;
+				const uint32_t marker = op == IT_RELEASE_MEM ? R_RELEASE_MEM : (header >> 2u) & 0x3fu;
 				if (marker == R_FLIP) {
 					stats.marker_flip++;
 					if (labels) {

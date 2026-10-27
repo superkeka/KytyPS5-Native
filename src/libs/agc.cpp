@@ -2088,7 +2088,8 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 	const uint32_t packet_action      = static_cast<uint32_t>(action) & 0x3fu;
 	const uint32_t packet_event_index = (action >= 0x2fu ? 6u : 5u);
 
-	cmd[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM);
+	// A hardware RELEASE_MEM, as libSceAgc writes it (Kyty used to wrap the body in a NOP marker).
+	cmd[0] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u);
 	cmd[1] = packet_action | (packet_event_index << 8u) | ((packet_gcr_cntl & 0xfffu) << 12u) |
 	         ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
 	cmd[2] = ((static_cast<uint32_t>(dst) & 0x3u) << 16u) |

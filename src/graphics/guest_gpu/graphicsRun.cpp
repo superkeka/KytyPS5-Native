@@ -729,7 +729,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				     opcode, KYTY_PM4_R(packet_header), packet_dw,
 				     reinterpret_cast<uint64_t>(packet), packet_header);
 			}
-			if (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM &&
+			if (((opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM) || opcode == Pm4::IT_RELEASE_MEM) &&
 			    packet_dw >= 7) {
 				static std::atomic<uint32_t> log_count {0};
 				if (log_count.fetch_add(1) < 128) {

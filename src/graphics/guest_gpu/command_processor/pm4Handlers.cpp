@@ -2314,7 +2314,8 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
+	// Kyty's NOP marker or the hardware packet libSceAgc writes; the body is the same.
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060 && (cmd_id & 0xfffffffcu) != 0xc0064900);
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t eop_event_type     = buffer[0] & 0x3fu;

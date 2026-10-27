@@ -49557,7 +49557,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
               disabled_commands[5] == KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO) &&
               disabled_commands[6] == 0x123u &&
               release[0] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ZERO) &&
-              unpatched_commands[7] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM) &&
+              unpatched_commands[7] == KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u) &&
               Gen5::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
               Gen5::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
               Gen5::AgcGetPacketSize(release) == 8 &&
