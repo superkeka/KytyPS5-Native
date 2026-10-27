@@ -701,9 +701,19 @@ public:
 		m_time_span_va = span_va;
 		m_time_wait_va = wait_va;
 		m_time_pairs   = pairs;
+		m_time_wait_info.assign(pairs, {});
 	}
 	[[nodiscard]] uint64_t GpuSpansNext() const { return m_time_spans; }
 	[[nodiscard]] uint64_t GpuWaitsNext() const { return m_time_waits; }
+	// What the `i`th timed GPU wait waited for: the label, its reference, the draws of its DCB before
+	// it, and whether guest memory already held a satisfying value when the DCB was translated.
+	struct GpuWaitInfo {
+		uint64_t addr  = 0;
+		uint64_t ref   = 0;
+		uint32_t draws = 0;
+		bool     met   = false;
+	};
+	[[nodiscard]] const GpuWaitInfo& GpuWait(uint64_t i) const { return m_time_wait_info[i % m_time_pairs]; }
 
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
@@ -808,6 +818,7 @@ private:
 	uint32_t                     m_time_pairs     = 0;
 	uint64_t                     m_time_spans     = 0;
 	uint64_t                     m_time_waits     = 0;
+	std::vector<GpuWaitInfo>     m_time_wait_info;
 	std::vector<SourcePiece>     m_source;
 	uint64_t                     m_fence_va       = 0;
 	LabelOracle*                 m_labels         = nullptr;

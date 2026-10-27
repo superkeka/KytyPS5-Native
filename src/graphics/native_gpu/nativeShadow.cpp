@@ -851,6 +851,9 @@ public:
 				WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, result.ib);
 			}
 			WriteDemandedCrumb(acb, frame, dcb, result.ib);
+			if (m_trace_gpu) {
+				NoteLabelWriters(acb, result);
+			}
 			m_translate_ms_total += translate_ms;
 			m_labels_stats[0] += result.stats.labels_native;
 			m_labels_stats[1] += result.stats.labels_cpu;
@@ -1158,6 +1161,23 @@ public:
 		m_chain_max_s = std::max(m_chain_max_s, latency);
 	}
 
+	// KYTY_NATIVE_GPU_FLIP_TRACE=gpu: when each buffer writing a label was translated, and when each DCB
+	// whose GPU waits are timed was, to tell a GPU wait for compute work from one for our own latency.
+	void NoteLabelWriters(bool acb, const Pm4TranslateResult& result) {
+		const double now = NowSecShadow();
+		if (m_label_writer.size() > 262144) {
+			m_label_writer.clear();
+		}
+		for (const auto& [addr, value]: result.label_writes) {
+			m_label_writer[addr] = LabelWriter {now, acb};
+		}
+		if (!acb) {
+			for (; m_wait_stamped < m_translator.GpuWaitsNext(); m_wait_stamped++) {
+				m_wait_dcb_time[m_wait_stamped % kGpuTimesPairs] = now;
+			}
+		}
+	}
+
 	// KYTY_NATIVE_GPU_FLIP_TRACE=1 (or =gpu, with GPU clocks): one line per flip in flips.csv (the working
 	// directory) with what happened since the previous one, to see what the late frames have that the
 	// others do not.
@@ -1179,7 +1199,15 @@ public:
 		// GPU clock pairs finished since the last flip, in order; a pair without its begin (a dropped first
 		// segment) or long unfinished (a refused buffer) is skipped.
 		static uint64_t span_from = 0, wait_from = 0;
-		auto take = [&](uint64_t offset, uint64_t& from, uint64_t next, uint32_t* n) {
+		// GPU wait time by who writes the label (KYTY_NATIVE_GPU_FLIP_TRACE=gpu), printed every 600 flips:
+		// an ACB translated before the DCB that waits on it, one translated after it (by how long), the
+		// DCB itself, or nothing seen.
+		struct WaitAgg {
+			double   ms = 0, max_ms = 0, lag_ms = 0;
+			uint64_t n = 0, met = 0;
+		};
+		static std::map<std::string, WaitAgg> by_writer;
+		auto take = [&](uint64_t offset, uint64_t& from, uint64_t next, uint32_t* n, bool label_waits) {
 			double ms = 0;
 			for (; from < next; from++) {
 				auto* p = reinterpret_cast<volatile uint64_t*>(m_submitter->ScratchCpu() + offset + 16ull * (from % kGpuTimesPairs));
@@ -1188,8 +1216,35 @@ public:
 					break; // still on the GPU
 				}
 				if (b != 0 && e >= b) {
-					ms += static_cast<double>(e - b) * 1e-5; // 100 MHz
+					const double one = static_cast<double>(e - b) * 1e-5; // 100 MHz
+					ms += one;
 					(*n)++;
+					if (label_waits) {
+						const auto&  info = m_translator.GpuWait(from);
+						const double t    = m_wait_dcb_time[from % kGpuTimesPairs];
+						const auto   w    = m_label_writer.find(info.addr);
+						double       lag  = 0;
+						std::string  key  = "no writer seen";
+						if (w != m_label_writer.end()) {
+							lag = (w->second.t - t) * 1e3;
+							if (!w->second.acb) {
+								key = "the DCB (or another DCB)";
+							} else if (lag <= 0) {
+								key = "an ACB translated before the DCB";
+							} else {
+								key = lag < 1 ? "an ACB translated after the DCB, <1 ms"
+								      : lag < 4 ? "an ACB translated after the DCB, 1-4 ms"
+								      : lag < 10 ? "an ACB translated after the DCB, 4-10 ms"
+								                 : "an ACB translated after the DCB, 10+ ms";
+							}
+						}
+						WaitAgg& agg = by_writer[key];
+						agg.ms += one;
+						agg.max_ms = std::max(agg.max_ms, one);
+						agg.lag_ms += lag;
+						agg.n++;
+						agg.met += info.met ? 1 : 0;
+					}
 				}
 				p[0] = 0;
 				p[1] = 0;
@@ -1197,8 +1252,24 @@ public:
 			return ms;
 		};
 		uint32_t     spans = 0, waits = 0;
-		const double span_ms = take(kGpuTimesOffset, span_from, m_translator.GpuSpansNext(), &spans);
-		const double wait_ms = take(kGpuTimesOffset + 16ull * kGpuTimesPairs, wait_from, m_translator.GpuWaitsNext(), &waits);
+		const double span_ms = take(kGpuTimesOffset, span_from, m_translator.GpuSpansNext(), &spans, false);
+		const double wait_ms = take(kGpuTimesOffset + 16ull * kGpuTimesPairs, wait_from, m_translator.GpuWaitsNext(), &waits, true);
+		if (flip % 600 == 599 && !by_writer.empty()) {
+			double total = 0;
+			for (const auto& [key, agg]: by_writer) {
+				total += agg.ms;
+			}
+			std::fprintf(stderr, "native trace: gfx GPU waits over 600 flips: %.2f ms a flip, by the label's writer:\n", total / 600.0);
+			for (const auto& [key, agg]: by_writer) {
+				std::fprintf(stderr,
+				             "native trace:   %s: %.2f ms a flip, %.1f waits a flip, %.3f ms each (max %.2f), writer %+.2f ms after "
+				             "the DCB, met at translation %.0f%%\n",
+				             key.c_str(), agg.ms / 600.0, static_cast<double>(agg.n) / 600.0, agg.ms / static_cast<double>(agg.n),
+				             agg.max_ms, agg.lag_ms / static_cast<double>(agg.n),
+				             100.0 * static_cast<double>(agg.met) / static_cast<double>(agg.n));
+			}
+			by_writer.clear();
+		}
 		const Mark cur {now, m_translate_ms_total, m_trace_busy_s, m_trace_gpu_busy_s.load(std::memory_order_relaxed),
 		                m_frames, m_acbs, m_trace_dw[0], m_trace_dw[1], m_labels_stats[2], m_labels_stats[3], m_labels_stats[0]};
 		if (f == nullptr) {
@@ -1484,6 +1555,8 @@ public:
 			}
 			const uint64_t va = m_submitter->ScratchVa() + kGpuTimesOffset;
 			m_translator.SetGpuTimes(va, va + 16ull * kGpuTimesPairs, kGpuTimesPairs);
+			m_trace_gpu = true;
+			m_wait_dcb_time.assign(kGpuTimesPairs, 0.0);
 		}
 		// Direct runs: DCB stretches passed on as written run from the title's buffer as IB2s
 		// (Pm4Translator::SetDirectRuns), as the PS5's CP runs the title's own buffer. An IB2 costs the CP
@@ -3109,6 +3182,15 @@ private:
 	uint64_t                m_labels_native = 0; // Pm4TranslateStats::labels_native and write_data_dw, same flips
 	uint64_t                m_write_data_dw = 0;
 	uint64_t                m_bench_count   = 0; // KYTY_NATIVE_GPU_TRANSLATE_BENCH
+	// KYTY_NATIVE_GPU_FLIP_TRACE=gpu (NoteLabelWriters).
+	struct LabelWriter {
+		double t   = 0;
+		bool   acb = false;
+	};
+	bool                                      m_trace_gpu = false;
+	std::unordered_map<uint64_t, LabelWriter> m_label_writer;
+	std::vector<double>                       m_wait_dcb_time;
+	uint64_t                                  m_wait_stamped = 0;
 	uint64_t                m_direct_ib2    = 0; // Pm4TranslateStats::direct_ib2 and direct_dw, same flips
 	uint64_t                m_direct_dw     = 0;
 	uint32_t                m_direct_min_dw = 0; // KYTY_NATIVE_GPU_DIRECT_RUNS

@@ -2675,6 +2675,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const bool emitted = plan == LabelOracle::Plan::Native && EmitNativeWait(body, w, m_compute_ring);
 					if (timed) {
 						EmitClockCopy(body, wait_pair + 8);
+						m_time_wait_info[m_time_waits % m_time_pairs] = {addr, ref, stats.draws, met};
 						m_time_waits++;
 					}
 					if (plan == LabelOracle::Plan::Native && !emitted) {
