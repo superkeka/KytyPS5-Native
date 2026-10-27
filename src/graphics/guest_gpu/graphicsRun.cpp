@@ -157,6 +157,23 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	Enqueue(std::move(submission));
 }
 
+void GuestGpu::SubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
+	// Ahead of everything queued (a continuation still running there is pushed back in front of it
+	// only if it does not finish), outside any command buffer's processing.
+	Submission submission;
+	submission.type         = SubmissionType::EopFlip;
+	submission.queue_id     = 0;
+	submission.eop_flip[0]  = handle;
+	submission.eop_flip[1]  = index;
+	submission.eop_flip[2]  = flip_mode;
+	submission.eop_flip_arg = flip_arg;
+	Common::LockGuard lock(m_queue_mutex);
+	EXIT_IF(!m_accepting);
+	m_queues[0].push_front(std::move(submission));
+	m_submission_count++;
+	m_work_available.Signal();
+}
+
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	Submission submission;
 	submission.type            = SubmissionType::FlipPreparation;
@@ -434,9 +451,11 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
-	// BC-250 native pipeline: whatever reaches Kyty's queues (flip preparations, suspend points)
-	// stays in guest order behind the command buffers still being run natively.
-	if (NativeGpu::ShadowThreaded() && !NativeGpu::ShadowOnPipelineThread()) {
+	// BC-250 native pipeline: whatever reaches Kyty's queues (suspend points) stays in guest order
+	// behind the command buffers still being run natively. A CPU flip does not: on the PS5
+	// sceVideoOutSubmitFlip goes to the video out, which shows the buffer at the next vblank whatever
+	// the GPU is doing, so it does not wait for command buffers the title submitted before it.
+	if (NativeGpu::ShadowThreaded() && !NativeGpu::ShadowOnPipelineThread() && submission.type != SubmissionType::FlipPreparation) {
 		auto held = std::make_shared<Submission>(std::move(submission));
 		NativeGpu::ShadowEnqueue(nullptr, 0, 0, [this, held](std::span<const uint32_t>) { Enqueue(std::move(*held)); });
 		return;
@@ -596,7 +615,9 @@ bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
-	if (first_slice) {
+	// An end-of-pipe flip can go in front of a continuation that has started: it leaves the
+	// processor's state alone.
+	if (first_slice && submission.type != SubmissionType::EopFlip) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
@@ -661,6 +682,15 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
+		case SubmissionType::EopFlip: {
+			CommandProcessor::FlipInfo f;
+			f.handle    = submission.eop_flip[0];
+			f.index     = submission.eop_flip[1];
+			f.flip_mode = submission.eop_flip[2];
+			f.flip_arg  = submission.eop_flip_arg;
+			cp.EopFlip(f);
+			break;
+		}
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
@@ -1465,6 +1495,23 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		    renderer.TriggerInterrupt(event_id, 0);
 	    });
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::EopFlip(const FlipInfo& flip) {
+	if (g_current_processor != nullptr) {
+		EXIT("invalid graphics-thread end-of-pipe flip\n");
+	}
+	struct ProcessorScope {
+		explicit ProcessorScope(CommandProcessor& processor) { g_current_processor = &processor; }
+		~ProcessorScope() { g_current_processor = nullptr; }
+	};
+	ProcessorScope processor_scope(*this);
+
+	// A continuation it went ahead of may have set its own flip already.
+	const FlipInfo saved = m_flip;
+	SetFlip(flip);
+	Flip();
+	m_flip = saved;
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {

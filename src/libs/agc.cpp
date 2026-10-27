@@ -96,6 +96,9 @@ void Initialize() {
 	// BC-250 native labels raise EOP interrupts and write timestamps from their tracker thread.
 	NativeGpu::ShadowSetHost([](int event_id, uint32_t context_id) { g_renderer->TriggerInterrupt(event_id, context_id); },
 	                         [] { return Sync::ReadReferenceClock(); });
+	NativeGpu::ShadowSetFlipHost([](int handle, int index, int flip_mode, int64_t flip_arg) {
+		g_renderer->GetGpu().SubmitEopFlip(handle, index, flip_mode, flip_arg);
+	});
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(Gen5Driver::Initialize() != OK);
 	ShaderInit();

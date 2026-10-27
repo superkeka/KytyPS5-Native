@@ -41,6 +41,9 @@ public:
 	            uint64_t flip_watermark = UINT64_MAX);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
+	// A DCB's flip the GPU has just passed (native labels, from the tracker): prepared on the GPU
+	// thread ahead of queued submissions, as the PS5 kernel queues it from the end-of-pipe interrupt.
+	void SubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_arg);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
@@ -56,7 +59,7 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint, EopFlip };
 
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
@@ -70,6 +73,8 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		int                       eop_flip[3]       = {};   // EopFlip: handle, index, mode
+		int64_t                   eop_flip_arg      = 0;
 		uint64_t                  flip_watermark    = UINT64_MAX; // NextFlipRequestId() at submission
 		uint64_t                  blocked_since_ms  = 0;          // first time Process left it unfinished
 		bool                      blocked_logged    = false;

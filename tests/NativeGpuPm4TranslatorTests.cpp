@@ -1401,6 +1401,16 @@ void TestLabelsCpuTail() {
 	Check(r.segments.size() == 1 && r.segments[0].writes.size() == 1 && !r.segments[0].writes[0].gpu &&
 	          r.segments[0].writes[0].addr == 0x202000400ull,
 	      "the flip's label is a CPU write");
+
+	// SetFlipsAtEop: AgcDcbSetFlip's flip is a tracker point; the flip with a label stays Kyty's.
+	Pm4Translator e;
+	e.SetNativeLabels(&o, kTrackerVa);
+	e.SetFlipsAtEop(true);
+	auto re = e.Translate(dcb);
+	Check(re.ok && re.cpu_tail.size() == 5 && re.cpu_tail[0] == dcb[6], "the plain flip leaves the continuation");
+	const auto& pts  = re.segments[0].points;
+	const auto  flip = std::find_if(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Flip; });
+	Check(flip != pts.end() && flip->data == std::vector<uint32_t>({0u, 1u, 2u, 3u, 4u}), "and is a flip point with its five dwords");
 }
 
 void TestLabelWriteCovers() {

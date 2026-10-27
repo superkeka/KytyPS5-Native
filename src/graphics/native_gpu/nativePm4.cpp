@@ -2252,7 +2252,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const uint32_t marker = op == IT_RELEASE_MEM ? R_RELEASE_MEM : (header >> 2u) & 0x3fu;
 				if (marker == R_FLIP) {
 					stats.marker_flip++;
-					if (labels) {
+					if (labels && m_eop_flips && body_count >= 5) {
+						TrackerPoint flip;
+						flip.kind = TrackerPoint::Kind::Flip;
+						flip.data.assign(bptr, bptr + 5);
+						tracker_point(std::move(flip));
+						NoteOnce(22, "flip requested at the GPU's end of pipe (tracker point)");
+					} else if (labels) {
 						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					}
 				} else if (marker == R_ZERO && labels && body_count >= 1 && IsFlipMarker(bptr[0])) {

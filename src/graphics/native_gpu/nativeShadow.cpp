@@ -453,8 +453,9 @@ void LogLodScan(const LodBankScan& scan) {
 
 // The host side native labels signal (ShadowSetHost).
 struct Host {
-	std::function<void(int, uint32_t)> interrupt;
-	std::function<uint64_t()>          reference_clock;
+	std::function<void(int, uint32_t)>           interrupt;
+	std::function<uint64_t()>                    reference_clock;
+	std::function<void(int, int, int, int64_t)> flip; // ShadowSetFlipHost
 };
 Host& HostCallbacks() {
 	static Host host;
@@ -1606,6 +1607,9 @@ public:
 		const bool     mirrors = EnvOn("KYTY_NATIVE_GPU_TRACKER_WRITES");
 		m_label_oracle = oracle;
 		m_translator.SetNativeLabels(oracle, va);
+		// DCB flips at the end of pipe (tracker points); KYTY_NATIVE_GPU_EOP_FLIPS=0 leaves them to
+		// Kyty's continuation after the whole buffer.
+		m_translator.SetFlipsAtEop(HostCallbacks().flip != nullptr && !EnvIs("KYTY_NATIVE_GPU_EOP_FLIPS", "0"));
 		m_acb_translator.SetNativeLabels(oracle, va);
 		m_translator.SetNativeWaits(waits);
 		m_acb_translator.SetNativeWaits(waits);
@@ -4325,6 +4329,12 @@ private:
 	void Run(Entry& e) {
 		const TrackerPoint& p = e.point;
 		switch (p.kind) {
+			case TrackerPoint::Kind::Flip:
+				if (HostCallbacks().flip && p.data.size() == 5) {
+					HostCallbacks().flip(static_cast<int>(p.data[0]), static_cast<int>(p.data[1]), static_cast<int>(p.data[2]),
+					                     static_cast<int64_t>(p.data[3] | (static_cast<uint64_t>(p.data[4]) << 32u)));
+				}
+				break;
 			case TrackerPoint::Kind::Interrupt:
 				// The queue's EOP event: the graphics queue's is 0, an ACB's its guest queue number.
 				if (HostCallbacks().interrupt) {
@@ -4508,6 +4518,10 @@ private:
 bool ShadowNativeLabels() {
 	static const bool on = EnvOn("KYTY_NATIVE_GPU_PRIMARY") && ShadowThreaded() && PrimaryFeature("KYTY_NATIVE_GPU_LABELS");
 	return on;
+}
+
+void ShadowSetFlipHost(std::function<void(int, int, int, int64_t)> flip) {
+	HostCallbacks().flip = std::move(flip);
 }
 
 void ShadowSetHost(std::function<void(int, uint32_t)> interrupt, std::function<uint64_t()> reference_clock) {

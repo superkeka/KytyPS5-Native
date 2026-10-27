@@ -325,6 +325,7 @@ struct TrackerPoint {
 		Timestamp, // write the reference clock at `addr` (`size` bytes)
 		LodStats,  // fill `size` bytes at `addr` like Kyty's GET_LOD_STATS
 		Wake,      // the GPU has written the label at `addr`: wake a guest sleeping on it, store nothing
+		Flip,      // AgcDcbSetFlip: request the flip `data` holds (handle, index, mode, arg low, arg high)
 	};
 	Kind                  kind     = Kind::End;
 	uint32_t              dw       = 0; // the point's 32-bit sequence value in the IB (patched before submission)
@@ -678,6 +679,10 @@ public:
 	// raising it at the end of the segment. Interrupts with context id 0 stay tracker points: amdgpu's
 	// own fences raise theirs with 0.
 	void SetGuestInterruptsOnGpu(bool on) { m_guest_irq = on; }
+	// With native labels: a DCB's flip (AgcDcbSetFlip) is requested as soon as the GPU passes it, a
+	// tracker point (woken by the EOP interrupt), as the PS5 kernel queues a title's flip from the
+	// end-of-pipe interrupt; not in Kyty's continuation after the whole buffer.
+	void SetFlipsAtEop(bool on) { m_eop_flips = on; }
 	// The old split of label writes (KYTY_NATIVE_GPU_TRACKER_WRITES=1): the tracker also stores every
 	// label the GPU writes once the GPU passes the segment's end (a mirror), and a WRITE_DATA by the
 	// constant engine is written by the tracker alone. Off (the default), a label the GPU can reach is
@@ -841,6 +846,7 @@ private:
 	bool                         m_cpu_timestamps = false;
 	bool                         m_tracker_writes = false;
 	bool                         m_guest_irq      = false;
+	bool                         m_eop_flips      = false;
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;

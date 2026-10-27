@@ -54,6 +54,8 @@ bool ShadowNativeLabels();
 // guest compute queue) and the reference clock written for timestamp labels.
 void ShadowSetHost(std::function<void(int event_id, uint32_t context_id)> interrupt,
                    std::function<uint64_t()> reference_clock);
+// Requests a DCB's flip (AgcDcbSetFlip) once the GPU has passed it, from the tracker thread.
+void ShadowSetFlipHost(std::function<void(int handle, int index, int flip_mode, int64_t flip_arg)> flip);
 
 // Guest memory rendered natively, as pieces of exported GPU buffers (dma-buf fd, buffer size, offset,
 // length), so Kyty's presenter can copy a surface on the GPU instead of reading it on the CPU. False

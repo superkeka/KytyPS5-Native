@@ -111,6 +111,8 @@ public:
 	void FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action, void* dst_gpu_addr,
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
+	// GuestGpu::SubmitEopFlip on the GPU thread: the flip request and its recording, as Flip() does.
+	void EopFlip(const FlipInfo& flip);
 	void SynchronizeGpu();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
