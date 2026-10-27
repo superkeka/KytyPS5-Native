@@ -42,6 +42,7 @@ it prints the minimum `--vgprs` the patched blob needs.
 | `coherency` | a running wave polls a flag the CPU writes mid-job |
 | `dmabuf` | dma-buf export per memory kind |
 | `submit` | CS ioctl cost and round trip |
+| `ib2` | cost of `INDIRECT_BUFFER` calls from a user IB on the gfx ring; multi-dword NOPs inline and in an IB2 |
 | `dot2emu` | `v_dot2c_f32_f16` replacement (two `v_fma_mix_f32`) against a CPU reference |
 
 ## Results (2026-10-23, SteamOS kernel 6.18.50-valve2, firmware ME 99 / PFP 148 / MEC 144)
@@ -78,6 +79,33 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `gds` | GDS/GWS/OA allocation, then 64 lanes of GDS `ds_add_rtn_u32` |
 | `crossqueue` | `WAIT_REG_MEM` on compute ring 1 released by `WRITE_DATA` on ring 0 |
 | `uconfig` | **took the board down**, see below; do not rerun as is |
+| `clock` | GPU clock reads on the gfx ring: `COPY_DATA` SRC_SEL 9, `RELEASE_MEM` DATA_SEL 3 (two events) |
+| `tag342` | libSceAgc's internal-data tags (`SET_UCONFIG_REG` of 0x342) on the gfx and a compute ring |
+| `regindex-sh`, `-ctx`, `-uc` | 0x63 / 0x9F / 0x64 (AMD's `LOAD_*_REG_INDEX`) with one pair, read back with `COPY_DATA` |
+| `regindex-uc342`, `-sh-nr`, `-ctx-nr` | the same packets without register reads, a `WRITE_DATA` after them as the proof |
+| `labelvis` | does the CPU see a `RELEASE_MEM` label written without cache write-back, per MTYPE (not run yet) |
+
+`--awake SEC` keeps one wave spinning on the compute ring while the case runs, so the graphics block
+never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of freeing buffers
+(which waits on the stopped ring).
+
+### Direct-execution probes (2026-10-27, two gfx rings, `sched_policy=2`)
+
+- **GPU clock reads stop an idle gfx ring.** `COPY_DATA` SRC_SEL 9 and `RELEASE_MEM` DATA_SEL 3
+  stopped the ring each time from the probe, while Kyty's frames (GPU always busy) read the clock
+  hundreds of thousands of times. With `--awake` all three forms work. GFXOFF is on
+  (`ppfeaturemask` 0xfff7bfff has bit 0x8000). Earlier "this packet hangs" results from an idle
+  board are suspect.
+- **A `COPY_DATA` read of a UCONFIG register stops the ring** (VGT_OBJECT_ID, TEXTURE_GRADIENT_FACTORS,
+  awake or not), and so did a read of PA_SC_SCREEN_SCISSOR_TL (context). SH registers read fine.
+- **0x63, 0x64 and 0x9F all run** on the BC-250's microcode (`-nr` cases: the `WRITE_DATA` after them
+  lands, the ring stays healthy). 0x63 is verified by value: SPI_SHADER_USER_DATA_PS_0 took the
+  table's value and was restored. The older "0x63 stops the ring" result was not the packet.
+- **`ib2`:** an IB2 call costs the CP about 0.3 us (0.285 us at 16 dwords, 0.37 at 64 and 256), the same
+  from cached and write-combined GTT; a 64-dword NOP stream runs as fast inline as in one IB2.
+  Multi-dword NOPs (Kyty never sent any) are skipped as expected.
+- **`tag342`:** the gfx ring runs the DCB form (header 0xc0017904, bit 2 set); amdgpu's compute ring
+  stops on `SET_UCONFIG_REG` of 0x342.
 
 ### `vmfault` result (2026-10-23, run once with approval)
 

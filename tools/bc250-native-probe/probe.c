@@ -331,12 +331,9 @@ static void IbPad(Ib* ib) {
 	}
 }
 
-// Copies ib into ib_bo and submits it with the given buffers resident. Returns the fence seq.
-static int SubmitOn(Device* d, uint32_t ip, uint32_t ring, Bo* ib_bo, const Ib* ib, Bo* const* bos,
+// Submits `bytes` of commands at `va` (inside ib_bo) with the given buffers resident. Returns the fence seq.
+static int SubmitVa(Device* d, uint32_t ip, uint32_t ring, Bo* ib_bo, uint64_t va, uint32_t bytes, Bo* const* bos,
                     uint32_t num_bos, uint64_t* seq) {
-	memcpy(ib_bo->cpu, ib->dw, ib->n * 4u);
-	__sync_synchronize();
-
 	struct drm_amdgpu_bo_list_entry entries[16];
 	uint32_t                        n = 0;
 	entries[n].bo_handle              = ib_bo->handle;
@@ -355,8 +352,8 @@ static int SubmitOn(Device* d, uint32_t ip, uint32_t ring, Bo* ib_bo, const Ib* 
 
 	struct drm_amdgpu_cs_chunk_ib ib_info;
 	memset(&ib_info, 0, sizeof(ib_info));
-	ib_info.va_start = ib_bo->va;
-	ib_info.ib_bytes = ib->n * 4u;
+	ib_info.va_start = va;
+	ib_info.ib_bytes = bytes;
 	ib_info.ip_type  = ip;
 	ib_info.ring     = ring;
 
@@ -379,6 +376,14 @@ static int SubmitOn(Device* d, uint32_t ip, uint32_t ring, Bo* ib_bo, const Ib* 
 		*seq = cs.out.handle;
 	}
 	return r;
+}
+
+// Copies ib into ib_bo and submits it with the given buffers resident. Returns the fence seq.
+static int SubmitOn(Device* d, uint32_t ip, uint32_t ring, Bo* ib_bo, const Ib* ib, Bo* const* bos,
+                    uint32_t num_bos, uint64_t* seq) {
+	memcpy(ib_bo->cpu, ib->dw, ib->n * 4u);
+	__sync_synchronize();
+	return SubmitVa(d, ip, ring, ib_bo, ib_bo->va, ib->n * 4u, bos, num_bos, seq);
 }
 
 static int Submit(Device* d, Bo* ib_bo, const Ib* ib, Bo* const* bos, uint32_t num_bos, uint64_t* seq) {
@@ -927,6 +932,199 @@ static void ProbeSubmitLatency(Device* d, Common* c) {
 	       t_batch / n * 1e6, t_rt / 200 * 1e6);
 }
 
+// The gfx-ring form of a PM4 header (no compute shader-type bit).
+static uint32_t Pkt3Gfx(uint32_t op, uint32_t body_dw) {
+	return Pkt3(op, body_dw) & ~(1u << 1);
+}
+
+// INDIRECT_BUFFER from a user IB: the CP runs `dwords` at va as IB2 and comes back.
+static uint32_t* PutIb2(uint32_t* p, uint64_t va, uint32_t dwords) {
+	*p++ = Pkt3Gfx(0x3fu, 3);
+	*p++ = (uint32_t)va & ~3u;
+	*p++ = (uint32_t)(va >> 32);
+	*p++ = dwords | (1u << 23); // IB_SIZE, VALID
+	return p;
+}
+
+// P0 of the direct-execution plan: what an IB2 call costs the gfx CP. The same NOP stream (count
+// NOP packets of `size` dwords) runs inline in the IB1, as one IB2, and as `count` IB2 calls of one
+// packet each, timed by GPU clocks; the bodies sit in cached GTT (like guest command
+// buffers) or in write-combined GTT. A first job checks that an IB2 call runs at all.
+static void ProbeIb2(Device* d, Common* c) {
+	(void)c;
+	printf("== ib2: cost of INDIRECT_BUFFER calls from a user IB on the gfx ring (us per job, 20 jobs in flight)\n");
+	const uint32_t max_count = 4096;
+	Bo             cmd, body[2], ts;
+	memset(body, 0, sizeof(body));
+	int r = MemCreate(d, &cmd, MEM_GTT_USWC, 8u * MiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &cmd, 0x0090000000ull, 0);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &body[0], MEM_GTT, 4u * MiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &body[0], 0x00a0000000ull, 0);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &body[1], MEM_GTT_USWC, 4u * MiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &body[1], 0x00a1000000ull, 0);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &ts, MEM_GTT, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &ts, 0x00a2000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return;
+	}
+	Bo*                bos[] = {&body[0], &body[1], &ts};
+
+	// Sanity: one IB2 holding WRITE_DATA of a magic value.
+	uint32_t* b = (uint32_t*)body[0].cpu;
+	b[0]        = Pkt3Gfx(0x37u, 4); // WRITE_DATA, memory, write confirm
+	b[1]        = (5u << 8) | (1u << 20);
+	b[2]        = (uint32_t)(ts.va + 0x100);
+	b[3]        = (uint32_t)((ts.va + 0x100) >> 32);
+	b[4]        = 0x1b2c0de5u;
+	for (uint32_t i = 5; i < 8; i++) {
+		b[i] = 0xffff1000u;
+	}
+	((volatile uint32_t*)ts.cpu)[0x40] = 0;
+	uint32_t* p0 = (uint32_t*)cmd.cpu;
+	uint32_t* p  = PutIb2(p0, body[0].va, 8);
+	while (((p - p0) & 7) != 0) {
+		*p++ = 0xffff1000u;
+	}
+	__sync_synchronize();
+	uint64_t seq = 0;
+	r            = SubmitVa(d, AMDGPU_HW_IP_GFX, 0, &cmd, cmd.va, (uint32_t)(p - p0) * 4u, bos, 3, &seq);
+	int     w    = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 2.0) : r;
+	int64_t st   = ContextState(d);
+	uint32_t got = ((volatile uint32_t*)ts.cpu)[0x40];
+	printf("  one IB2 with WRITE_DATA: %s, ctx 0x%" PRIx64 ", wrote 0x%08x\n", w == 1 ? "TIMEOUT" : ErrStr(w),
+	       (uint64_t)st, got);
+	if (w != 0 || st != 0) {
+		_exit(3);
+	}
+	if (got != 0x1b2c0de5u) {
+		goto out;
+	}
+
+	// Multi-dword NOPs (Kyty never sends any) inline and in an IB2, stopping at the first stop of the ring.
+	static const struct {
+		const char* name;
+		uint32_t    nops;     // NOP packets
+		uint32_t    nop_dw;   // dwords per NOP packet (1: the single-dword 0xffff1000 form)
+		bool        in_ib2;   // in one IB2 instead of inline
+	} steps[] = {
+	    {"1 x 1 dw NOP inline", 1, 1, false},
+	    {"1 x 2 dw NOP inline", 1, 2, false}, {"1 x 16 dw NOP inline", 1, 16, false},
+	    {"1 x 16 dw NOP in IB2", 1, 16, true}, {"64 x 16 dw NOP in IB2", 64, 16, true},
+	};
+	for (size_t k = 0; k < ARRAY_SIZE(steps); k++) {
+		uint32_t* bb = (uint32_t*)body[0].cpu;
+		uint32_t  n  = 0;
+		for (uint32_t i = 0; i < steps[k].nops; i++) {
+			if (steps[k].nop_dw == 1) {
+				bb[n++] = 0xffff1000u;
+			} else {
+				bb[n++] = Pkt3Gfx(0x10u, steps[k].nop_dw - 1);
+				for (uint32_t j = 1; j < steps[k].nop_dw; j++) {
+					bb[n++] = 0;
+				}
+			}
+		}
+		while ((n & 7) != 0) {
+			bb[n++] = 0xffff1000u;
+		}
+		uint32_t* q = p0;
+		if (steps[k].in_ib2) {
+			q = PutIb2(q, body[0].va, n);
+		} else {
+			memcpy(q, bb, n * 4u);
+			q += n;
+		}
+		while (((q - p0) & 7) != 0) {
+			*q++ = 0xffff1000u;
+		}
+		__sync_synchronize();
+		r = SubmitVa(d, AMDGPU_HW_IP_GFX, 0, &cmd, cmd.va, (uint32_t)(q - p0) * 4u, bos, 3, &seq);
+		w = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+		printf("  step %s: %s", steps[k].name, w == 1 ? "TIMEOUT" : ErrStr(w));
+		printf("\n");
+		if (w != 0 || ContextState(d) != 0) {
+			_exit(3);
+		}
+	}
+
+	static const uint32_t sizes[] = {16, 64, 256};
+	for (size_t si = 0; si < ARRAY_SIZE(sizes); si++) {
+		const uint32_t size  = sizes[si];
+		const uint32_t count = size * max_count > (1u << 19) ? (1u << 19) / size : max_count; // IB_SIZE is 20 bits
+		for (int bk = 0; bk < 2; bk++) {
+			uint32_t* bb = (uint32_t*)body[bk].cpu;
+			for (uint32_t i = 0; i < count; i++) {
+				bb[i * size] = Pkt3Gfx(0x10u, size - 1);
+				memset(&bb[i * size + 1], 0, (size - 1) * 4u);
+			}
+		}
+		// mode 0: inline in the IB1, 1: one IB2 (cached), 2: count IB2 (cached), 3: count IB2 (WC)
+		double best[4];
+		static const int order[] = {1, 2, 3, 0};
+		for (int oi = 0; oi < 4; oi++) {
+			const int mode = order[oi];
+			best[mode]     = 1e9;
+			Bo*      src = mode == 3 ? &body[1] : &body[0];
+			uint32_t* q  = p0;
+			if (mode == 0) {
+				for (uint32_t i = 0; i < count; i++) {
+					*q++ = Pkt3Gfx(0x10u, size - 1);
+					memset(q, 0, (size - 1) * 4u);
+					q += size - 1;
+				}
+			} else if (mode == 1) {
+				q = PutIb2(q, src->va, count * size);
+			} else {
+				for (uint32_t i = 0; i < count; i++) {
+					q = PutIb2(q, src->va + (uint64_t)i * size * 4u, size);
+				}
+			}
+			while (((q - p0) & 7) != 0) {
+				*q++ = 0xffff1000u;
+			}
+			__sync_synchronize();
+			for (int rep = 0; rep < 4; rep++) {
+				const int jobs = 20;
+				double    t0   = NowSec();
+				for (int j = 0; j < jobs && r == 0; j++) {
+					r = SubmitVa(d, AMDGPU_HW_IP_GFX, 0, &cmd, cmd.va, (uint32_t)(q - p0) * 4u, bos, 3, &seq);
+				}
+				w = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+				if (w != 0 || ContextState(d) != 0) {
+					printf("  size %u mode %d (%u dw): %s\n", size, mode, (uint32_t)(q - p0), w == 1 ? "TIMEOUT" : ErrStr(w));
+					_exit(3); // freeing buffers would wait on the stopped ring
+				}
+				double us = (NowSec() - t0) / jobs * 1e6;
+				if (rep > 0 && us < best[mode]) {
+					best[mode] = us;
+				}
+			}
+		}
+		printf("  %4u x %3u dw NOP: inline %7.1f, one IB2 %7.1f, %u IB2 cached %7.1f (%.3f us each), WC %7.1f\n",
+		       count, size, best[0], best[1], count, best[2], (best[2] - best[1]) / count, best[3]);
+	}
+out:
+	BoDestroy(d, &ts);
+	BoDestroy(d, &body[1]);
+	BoDestroy(d, &body[0]);
+	BoDestroy(d, &cmd);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Dangerous cases: each one may fault, hang or reset the GPU. Never part of the default run;
 // each needs its own --danger NAME and the board owner's explicit approval.
@@ -1395,8 +1593,315 @@ static bool DangerRegIndex(Device* d, Common* c, const char* which) {
 	const char* verdict = m[1] == value ? "the table was loaded" : m[1] == orig ? "register unchanged" : "readback differs";
 	printf("  %s: before 0x%08x, after packet 0x%08x (want 0x%08x: %s), restored 0x%08x\n", k->reg_name, orig, m[1],
 	       value, verdict, m[2]);
+	const bool loaded = m[1] == value;
 	BoDestroy(d, &mem);
-	return m[1] == value;
+	return loaded;
+}
+
+// P2 of the direct-execution plan: libSceAgc's internal-data tags, SET_UCONFIG_REG of
+// SQ_THREAD_TRACE_USERDATA_2 (0x342) around waits and multi draws, as the CP would get them verbatim.
+// DCB form on the gfx ring (header 0xc0017904: bit 2 set), ACB form on a compute ring (0x342 and the
+// profiler's 0x343), each followed by a WRITE_DATA that shows the ring went on. No readback.
+// Result on BC-250: the gfx ring runs them; the compute ring (amdgpu's MEC queue) stops.
+static bool DangerTag342(Device* d, Common* c) {
+	printf("== danger tag342: SET_UCONFIG_REG of SQ_THREAD_TRACE_USERDATA_2/3 from user IBs\n");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	bool               ok    = true;
+	for (int k = 0; k < 2 && ok; k++) {
+		const bool     gfx    = k == 0;
+		const uint32_t ip     = gfx ? AMDGPU_HW_IP_GFX : AMDGPU_HW_IP_COMPUTE;
+		const uint32_t magic  = 0x7a690000u | (uint32_t)k;
+		const uint32_t header = gfx ? 0xc0017904u : Pkt3(0x79u, 2);
+		m[k]                  = 0;
+		__sync_synchronize();
+		Ib ib = {.n = 0};
+		IbPush(&ib, header);
+		IbPush(&ib, 0x342u);
+		IbPush(&ib, 0xc8010000u); // AGC_WAIT_USER_DATA_BEGIN_32_TAG
+		IbPush(&ib, header);
+		IbPush(&ib, gfx ? 0x342u : 0x343u);
+		IbPush(&ib, 0xc8000000u); // AGC_WAIT_USER_DATA_END_TAG
+		IbPush(&ib, gfx ? Pkt3Gfx(0x37u, 4) : Pkt3(0x37u, 4));
+		IbPush(&ib, (5u << 8) | (1u << 20));
+		IbPush(&ib, (uint32_t)(mem.va + 4u * k));
+		IbPush(&ib, (uint32_t)((mem.va + 4u * k) >> 32));
+		IbPush(&ib, magic);
+		IbPad(&ib);
+		uint64_t seq = 0;
+		r            = SubmitOn(d, ip, 0, &c->ib, &ib, bos, 1, &seq);
+		int     w    = r == 0 ? WaitOn(d, ip, 0, seq, 1.0) : r;
+		int64_t st   = ContextState(d);
+		printf("  %s ring: %s, ctx 0x%" PRIx64 ", WRITE_DATA after the tags %s\n", gfx ? "gfx" : "compute",
+		       w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st, m[k] == magic ? "landed" : "missing");
+		if (w != 0 || st != 0) {
+			_exit(3); // freeing buffers would wait on the stopped ring
+		}
+		ok = m[k] == magic;
+	}
+	BoDestroy(d, &mem);
+	return ok;
+}
+
+// P5 of the direct-execution plan: does the CPU see a label that a RELEASE_MEM wrote with only the
+// guest's own event (no GLM/GL2 write-back, which the translator adds today)? Per GPU mapping type of
+// cached GTT: the gfx ring writes the label (BOTTOM_OF_PIPE_TS, DATA_SEL 1, no cache actions), then
+// waits on a dword the CPU writes once it saw the label or gave up after 50 ms; the job's own fence
+// (which writes back GL2) comes only after that.
+static bool DangerLabelVis(Device* d, Common* c) {
+	printf("== danger labelvis: CPU visibility of a RELEASE_MEM label without cache write-back\n");
+	static const struct {
+		const char* name;
+		uint32_t    mtype;
+	} kinds[] = {{"default", 0}, {"nc", AMDGPU_VM_MTYPE_NC}, {"uc", AMDGPU_VM_MTYPE_UC}, {"wc", AMDGPU_VM_MTYPE_WC}};
+	for (size_t k = 0; k < ARRAY_SIZE(kinds); k++) {
+		Bo  mem;
+		int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+		if (r == 0) {
+			r = BoBind(d, &mem, 0x0700000000ull + k * 0x100000ull, kinds[k].mtype);
+		}
+		if (r != 0) {
+			printf("  %-7s: setup failed: %s\n", kinds[k].name, ErrStr(r));
+			BoDestroy(d, &mem);
+			continue;
+		}
+		volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+		Bo*                bos[] = {&mem};
+		m[0] = 0;          // the label
+		m[16] = 0;         // the CPU's go
+		__sync_synchronize();
+		Ib ib = {.n = 0};
+		IbPush(&ib, Pkt3Gfx(0x49u, 7)); // RELEASE_MEM
+		IbPush(&ib, 0x28u | (5u << 8)); // BOTTOM_OF_PIPE_TS, no GCR actions
+		IbPush(&ib, 1u << 29);          // DATA_SEL 1 (32 bit), memory, no interrupt
+		IbPush(&ib, (uint32_t)mem.va);
+		IbPush(&ib, (uint32_t)(mem.va >> 32));
+		IbPush(&ib, 0x1abe1000u + (uint32_t)k);
+		IbPush(&ib, 0);
+		IbPush(&ib, 0);
+		IbPush(&ib, Pkt3Gfx(0x3cu, 6)); // WAIT_REG_MEM: memory, equal, ME
+		IbPush(&ib, 3u | (1u << 4));
+		IbPush(&ib, (uint32_t)(mem.va + 64));
+		IbPush(&ib, (uint32_t)((mem.va + 64) >> 32));
+		IbPush(&ib, 1u);
+		IbPush(&ib, 0xffffffffu);
+		IbPush(&ib, 4u);
+		IbPad(&ib);
+		uint64_t seq = 0;
+		r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+		if (r != 0) {
+			printf("  %-7s: submit failed: %s\n", kinds[k].name, ErrStr(r));
+			BoDestroy(d, &mem);
+			continue;
+		}
+		const double t0   = NowSec();
+		double       seen = -1;
+		while (NowSec() - t0 < 0.05) {
+			if (m[0] == 0x1abe1000u + (uint32_t)k) {
+				seen = NowSec() - t0;
+				break;
+			}
+		}
+		m[16] = 1;
+		__sync_synchronize();
+		int     w  = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0);
+		int64_t st = ContextState(d);
+		if (seen >= 0) {
+			printf("  %-7s: label seen by the CPU after %.1f us (job %s)\n", kinds[k].name, seen * 1e6,
+			       w == 1 ? "TIMEOUT" : ErrStr(w));
+		} else {
+			printf("  %-7s: label NOT seen in 50 ms (job %s, after the fence 0x%08x)\n", kinds[k].name,
+			       w == 1 ? "TIMEOUT" : ErrStr(w), m[0]);
+		}
+		if (w != 0 || st != 0) {
+			_exit(3); // freeing buffers would wait on the stopped ring
+		}
+		BoDestroy(d, &mem);
+	}
+	return true;
+}
+
+// --awake SEC: one wave spins on the compute ring for SEC seconds (the `long` shader, in buffers of its
+// own) while a danger case runs, so the graphics block never idles into GFXOFF. Probe jobs that read
+// the GPU clock stopped the idle gfx ring, while Kyty's frames, with the GPU always busy, read it
+// thousands of times a second.
+typedef struct {
+	Bo       prog, code, ib;
+	uint64_t seq;
+	bool     on;
+} Awake;
+
+static bool AwakeStart(Device* d, Awake* a, double sec) {
+	memset(a, 0, sizeof(*a));
+	int r = MemCreate(d, &a->prog, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &a->prog, 0x0780000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &a->code, MEM_GTT_USWC, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &a->code, 0x0781000000ull, 0);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &a->ib, MEM_GTT_USWC, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &a->ib, 0x0782000000ull, 0);
+	}
+	if (r != 0) {
+		printf("awake: setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	memcpy(a->code.cpu, k_long_w64, sizeof(k_long_w64));
+	FlushCpu(a->code.cpu, sizeof(k_long_w64));
+	const uint32_t ticks = (uint32_t)(sec * d->info.gpu_counter_freq * 1000.0);
+	uint32_t       ud[3] = {(uint32_t)a->prog.va, (uint32_t)(a->prog.va >> 32), ticks};
+	Dispatch       p     = {a->code.va, 64, 8, 3, false, 64, 1, ud};
+	Ib             ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo* bos[] = {&a->prog, &a->code};
+	r         = SubmitOn(d, AMDGPU_HW_IP_COMPUTE, 0, &a->ib, &ib, bos, 2, &a->seq);
+	if (r != 0) {
+		printf("awake: submit failed: %s\n", ErrStr(r));
+		return false;
+	}
+	volatile uint32_t* pv = (volatile uint32_t*)a->prog.cpu;
+	const double       t0 = NowSec();
+	while (pv[0] == 0 && pv[1] == 0 && NowSec() - t0 < 1.0) {
+	}
+	printf("awake: a compute wave spins for %.1f s (%s)\n", sec, pv[0] || pv[1] ? "running" : "not seen running");
+	a->on = true;
+	return true;
+}
+
+static void AwakeStop(Device* d, Awake* a) {
+	if (!a->on) {
+		return;
+	}
+	Wait(d, a->seq, 20.0);
+	BoDestroy(d, &a->ib);
+	BoDestroy(d, &a->code);
+	BoDestroy(d, &a->prog);
+}
+
+// Reads the GPU clock on the gfx ring the two ways Kyty's frames do (COPY_DATA SRC_SEL 9; RELEASE_MEM
+// DATA_SEL 3 with CACHE_FLUSH_AND_INV_TS) and the probe's first try (RELEASE_MEM DATA_SEL 3 with
+// BOTTOM_OF_PIPE_TS). Each stopped the idle ring from the probe; run with and without --awake.
+static bool DangerClock(Device* d, Common* c) {
+	printf("== danger clock: GPU clock reads on the gfx ring\n");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	volatile uint64_t* t     = (volatile uint64_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	for (int k = 0; k < 3; k++) {
+		t[0] = t[1] = 0;
+		__sync_synchronize();
+		Ib ib = {.n = 0};
+		for (int i = 0; i < 2; i++) {
+			const uint64_t va = mem.va + 8u * i;
+			if (k == 0) {
+				IbPush(&ib, Pkt3Gfx(0x40u, 5));
+				IbPush(&ib, 9u | (5u << 8) | (1u << 16) | (1u << 20));
+				IbPush(&ib, 0);
+				IbPush(&ib, 0);
+			} else {
+				IbPush(&ib, Pkt3Gfx(0x49u, 7));
+				IbPush(&ib, k == 1 ? 0x14u | (5u << 8) | (1u << 12) | (1u << 13) | (1u << 14) | (1u << 15) | (1u << 21) |
+				                         (1u << 22) | (3u << 25)
+				                   : 0x28u | (5u << 8));
+				IbPush(&ib, 3u << 29);
+			}
+			IbPush(&ib, (uint32_t)va);
+			IbPush(&ib, (uint32_t)(va >> 32));
+			if (k != 0) {
+				IbPush(&ib, 0);
+				IbPush(&ib, 0);
+				IbPush(&ib, 0);
+			}
+		}
+		IbPad(&ib);
+		uint64_t seq = 0;
+		r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+		int w        = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+		static const char* names[] = {"COPY_DATA SRC_SEL 9", "RELEASE_MEM CACHE_FLUSH_AND_INV_TS DATA_SEL 3",
+		                              "RELEASE_MEM BOTTOM_OF_PIPE_TS DATA_SEL 3"};
+		printf("  %-46s: %s, clocks %" PRIu64 " %" PRIu64 "\n", names[k], w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)t[0],
+		       (uint64_t)t[1]);
+		if (w != 0 || ContextState(d) != 0) {
+			_exit(3); // freeing buffers would wait on the stopped ring
+		}
+	}
+	BoDestroy(d, &mem);
+	return true;
+}
+
+// The register-table packets without register reads: a COPY_DATA read of a UCONFIG register stops
+// the gfx ring from a user IB (VGT_OBJECT_ID, TEXTURE_GRADIENT_FACTORS; GFX kept awake or not), so a
+// one-pair table loads a register a user IB may write and a WRITE_DATA after the packet shows the CP
+// ran it and went on. "uc342": 0x64 into SQ_THREAD_TRACE_USERDATA_2 (written fine: --danger tag342);
+// "sh-nr": 0x63 into SPI_SHADER_USER_DATA_PS_0; "ctx-nr": 0x9F into PA_SC_SCREEN_SCISSOR_TL.
+// Result on BC-250: 0x64 runs, with or without --awake, and the ring stays healthy.
+static bool DangerRegIndexNoRead(Device* d, Common* c, uint32_t op, uint32_t offset, const char* reg_name) {
+	printf("== danger regindex no read: packet 0x%02x loading %s, then WRITE_DATA\n", op, reg_name);
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	m[0]                     = 0;
+	m[0x40]                  = offset;      // {offset from the register space, value}
+	m[0x41]                  = 0xc8010000u; // a libSceAgc tag, or any user data
+	__sync_synchronize();
+	const uint64_t table = mem.va + 0x100;
+	Ib             ib    = {.n = 0};
+	IbPush(&ib, Pkt3Gfx(op, 4));
+	IbPush(&ib, (uint32_t)table & ~3u); // INDEX 0: direct address
+	IbPush(&ib, (uint32_t)(table >> 32));
+	IbPush(&ib, 0x80000000u); // DATA_FORMAT offset_and_data, REG_OFFSET 0
+	IbPush(&ib, 1u);          // one pair
+	IbPush(&ib, Pkt3Gfx(0x37u, 4));
+	IbPush(&ib, (5u << 8) | (1u << 20));
+	IbPush(&ib, (uint32_t)mem.va);
+	IbPush(&ib, (uint32_t)(mem.va >> 32));
+	IbPush(&ib, 0x64646464u);
+	IbPad(&ib);
+	uint64_t seq = 0;
+	r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+	int     w    = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+	int64_t st   = ContextState(d);
+	printf("  packet 0x%02x: %s, ctx 0x%" PRIx64 ", WRITE_DATA after it %s\n", op, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st,
+	       m[0] == 0x64646464u ? "landed" : "missing");
+	if (w != 0 || st != 0) {
+		_exit(3); // freeing buffers would wait on the stopped ring
+	}
+	const bool ok = m[0] == 0x64646464u;
+	BoDestroy(d, &mem);
+	return ok;
 }
 
 // UCONFIG registers that PS5 command buffers write (per KytyPS5's PM4 handlers) but RADV never
@@ -1599,10 +2104,10 @@ static bool RunBlob(Device* d, Common* c, const char* path, uint32_t vgprs) {
 }
 
 static void Usage(const char* argv0) {
-	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE] [--blob FILE [--vgprs N]] [probe...]\n",
+	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
-	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig\n");
+	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
+	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
 }
 
 int main(int argc, char** argv) {
@@ -1610,6 +2115,7 @@ int main(int argc, char** argv) {
 	const char* path        = "/dev/dri/renderD128";
 	uint64_t    max_alloc   = 4 * GiB;
 	const char* danger      = NULL;
+	double      awake_sec   = 0;
 	const char* blob        = NULL;
 	uint32_t    blob_vgprs  = 16;
 	const char* selected[16];
@@ -1621,6 +2127,8 @@ int main(int argc, char** argv) {
 			max_alloc = strtoull(argv[++i], NULL, 10) * GiB;
 		} else if (strcmp(argv[i], "--danger") == 0 && i + 1 < argc) {
 			danger = argv[++i];
+		} else if (strcmp(argv[i], "--awake") == 0 && i + 1 < argc) {
+			awake_sec = strtod(argv[++i], NULL);
 		} else if (strcmp(argv[i], "--blob") == 0 && i + 1 < argc) {
 			blob = argv[++i];
 		} else if (strcmp(argv[i], "--vgprs") == 0 && i + 1 < argc) {
@@ -1651,7 +2159,11 @@ int main(int argc, char** argv) {
 		return ok ? 0 : 2;
 	}
 	if (danger != NULL) {
-		bool ok;
+		bool  ok;
+		Awake awake = {0};
+		if (awake_sec > 0 && !AwakeStart(&d, &awake, awake_sec)) {
+			return 1;
+		}
 		if (strcmp(danger, "vmfault") == 0) {
 			ok = DangerVmFault(&d, &c);
 		} else if (strcmp(danger, "long") == 0) {
@@ -1668,19 +2180,32 @@ int main(int argc, char** argv) {
 			ok = DangerCrossQueue(&d, &c);
 		} else if (strcmp(danger, "uconfig") == 0) {
 			ok = DangerUconfig(&d, &c);
+		} else if (strcmp(danger, "clock") == 0) {
+			ok = DangerClock(&d, &c);
+		} else if (strcmp(danger, "labelvis") == 0) {
+			ok = DangerLabelVis(&d, &c);
+		} else if (strcmp(danger, "tag342") == 0) {
+			ok = DangerTag342(&d, &c);
+		} else if (strcmp(danger, "regindex-uc342") == 0) {
+			ok = DangerRegIndexNoRead(&d, &c, 0x64u, 0x342u, "SQ_THREAD_TRACE_USERDATA_2");
+		} else if (strcmp(danger, "regindex-sh-nr") == 0) {
+			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb030u - 0xb000u) / 4, "SPI_SHADER_USER_DATA_PS_0");
+		} else if (strcmp(danger, "regindex-ctx-nr") == 0) {
+			ok = DangerRegIndexNoRead(&d, &c, 0x9fu, (0x28030u - 0x28000u) / 4, "PA_SC_SCREEN_SCISSOR_TL");
 		} else if (strncmp(danger, "regindex-", 9) == 0) {
 			ok = DangerRegIndex(&d, &c, danger + 9);
 		} else {
 			fprintf(stderr, "unknown danger case '%s'\n", danger);
 			return 1;
 		}
+		AwakeStop(&d, &awake);
 		BoDestroy(&d, &c.code);
 		BoDestroy(&d, &c.ib);
 		close(d.fd);
 		return ok ? 0 : 2;
 	}
 	static const char* const order[] = {"info",      "va",        "alloc",  "dispatch", "identity",
-	                                    "bandwidth", "coherency", "dmabuf", "submit",   "dot2emu"};
+	                                    "bandwidth", "coherency", "dmabuf", "submit",   "ib2", "dot2emu"};
 	for (size_t k = 0; k < ARRAY_SIZE(order); k++) {
 		const char* n    = order[k];
 		bool        want = num_selected == 0;
@@ -1708,6 +2233,8 @@ int main(int argc, char** argv) {
 			ProbeDmabuf(&d);
 		} else if (strcmp(n, "submit") == 0) {
 			ProbeSubmitLatency(&d, &c);
+		} else if (strcmp(n, "ib2") == 0) {
+			ProbeIb2(&d, &c);
 		} else if (strcmp(n, "dot2emu") == 0) {
 			ProbeDot2Emu(&d, &c);
 		}
