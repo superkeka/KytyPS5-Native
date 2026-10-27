@@ -23,7 +23,8 @@ distrobox enter bc250-mesa-dev -- make
 and on amdgpu compute ring 0 wakes the KFD event its context id names, with the patched amdgpu
 (`bc250_gfx_eop_events=1`, `tools/bc250-amdgpu`). It also checks that `INT_SEL 0` and another event's
 id do not wake it, and that 32 interrupts in one IB leave nothing hanging. It prints submit-to-wake
-against submit-to-label times. 2026-10-27, 7.2.7-valve2: gfx wakes 44 us after submit (label at 25 us),
+against submit-to-label times. With the EOP log it checks that a title's context ids from the gfx ring
+and compute ring 0 land in the log in order, with their ring. 2026-10-27, 7.2.7-valve2: gfx wakes 44 us after submit (label at 25 us),
 compute 73 us (label at 48 us), none lost in 300. The stock module wakes none.
 
 `shaders.h` is generated from the `.s` files by `gen_shaders.sh` (LLVM `llvm-mc`, gfx1013).

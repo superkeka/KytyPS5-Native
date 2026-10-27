@@ -1,12 +1,15 @@
 // End-of-pipe interrupt probe for the BC-250: does a RELEASE_MEM with INT_SEL 2 in a render-node
-// submission (gfx ring, amdgpu compute ring) wake the KFD event its context id names? Needs the
-// patched amdgpu (bc250_gfx_eop_events=1, tools/bc250-amdgpu): stock KFD drops EOP interrupts of
-// non-KFD VMIDs. This is how Kyty takes a title's EOP interrupts on the GPU, as the PS5 kernel does.
+// submission (gfx ring, amdgpu compute ring) wake the KFD event its context id names (bit 27 set),
+// and does one with a title's context id reach the EOP log? Needs the patched amdgpu
+// (bc250_gfx_eop_events=1, tools/bc250-amdgpu): stock KFD drops EOP interrupts of non-KFD VMIDs.
+// This is how Kyty takes a title's EOP interrupts on the GPU, as the PS5 kernel does.
 //   1. gfx ring: the event wakes, and how long after the label lands (busy-polled in a second pass);
 //   2. INT_SEL 0 with the same context id: no wake (a 50 ms wait times out);
 //   3. context id of event A, wait on event B: B does not wake, A does;
 //   4. amdgpu compute ring 0: the event wakes;
-//   5. one IB with 32 interrupting releases: the waits that follow see at least one wake, none hang.
+//   5. one IB with 32 interrupting releases: the waits that follow see at least one wake, none hang;
+//   6. EOP log (AMDKFD_IOC_BC250_EOP_LOG): a title's context ids from the gfx ring and compute ring 0
+//      land in the signal page's log in order, with their ring; a KFD event's id still wakes it alone.
 // Build: cc -O2 -o eop_irq_probe eop_irq_probe.c. Needs /dev/kfd (no root).
 #define _GNU_SOURCE
 #include <drm/amdgpu_drm.h>
@@ -24,6 +27,10 @@
 #include <unistd.h>
 
 static int      kfd = -1, drm = -1;
+static uint64_t event_page_offset;
+
+// A context id that names KFD event `id` (bit 27); a title's ids keep to 27 bits.
+static uint32_t EvCtx(uint32_t id) { return id | (1u << 27); }
 static uint32_t gpu_id, ctx_id;
 
 static int Ioctl(int fd, unsigned long req, void* arg) {
@@ -122,18 +129,27 @@ static int WaitCs(uint32_t ip, uint64_t seq) {
 	return r ? r : (w.out.status ? 1 : 0);
 }
 
-// RELEASE_MEM, bottom of pipe with GL2 written back: DATA_SEL 1 of `value` to the label, INT_SEL
-// `int_sel`, context id `ctx`. Returns the next dword index.
+// RELEASE_MEM, bottom of pipe with GL2 written back: DATA_SEL 1 of `value` to the label (DATA_SEL
+// 0 and no address with INT_SEL 1, the interrupt alone), INT_SEL `int_sel`, context id `ctx`.
+// Returns the next dword index.
 static uint32_t Release(uint32_t* d, uint32_t i, int compute, uint32_t value, uint32_t int_sel, uint32_t ctx) {
+	const int alone = int_sel == 1;
 	d[i++] = Pkt3(0x49, 7, compute);
 	d[i++] = (1u << 21) | (5u << 8) | 0x14u; // GL2_WB, EVENT_INDEX 5, CACHE_FLUSH_AND_INV_TS_EVENT
-	d[i++] = (1u << 29) | (int_sel << 24);
-	d[i++] = (uint32_t)label.va;
-	d[i++] = (uint32_t)(label.va >> 32);
-	d[i++] = value;
+	d[i++] = (alone ? 0u : 1u << 29) | (int_sel << 24);
+	d[i++] = alone ? 0u : (uint32_t)label.va;
+	d[i++] = alone ? 0u : (uint32_t)(label.va >> 32);
+	d[i++] = alone ? 0u : value;
 	d[i++] = 0;
 	d[i++] = ctx;
 	return i;
+}
+
+static uint32_t Pad(uint32_t n) {
+	while (n & 7u) {
+		((uint32_t*)ib.cpu)[n++] = 0xffff1000u;
+	}
+	return n;
 }
 
 static uint32_t CreateEvent(void) {
@@ -145,6 +161,9 @@ static uint32_t CreateEvent(void) {
 	if (r) {
 		fprintf(stderr, "CREATE_EVENT: %s\n", strerror(-r));
 		exit(3);
+	}
+	if (a.event_page_offset != 0) {
+		event_page_offset = a.event_page_offset;
 	}
 	return a.event_id;
 }
@@ -181,7 +200,7 @@ static int Latency(const char* name, uint32_t ip, uint32_t ev, int rounds) {
 	for (int pass = 0; pass < 2; pass++) {
 		for (int k = 0; k < rounds; k++) {
 			const uint32_t value = 0x1000u + (uint32_t)(pass * rounds + k);
-			uint32_t       n     = Release((uint32_t*)ib.cpu, 0, compute, value, pass == 0 ? 2u : 0u, ev);
+			uint32_t       n     = Release((uint32_t*)ib.cpu, 0, compute, value, pass == 0 ? 2u : 0u, EvCtx(ev));
 			while (n & 7u) {
 				((uint32_t*)ib.cpu)[n++] = 0xffff1000u;
 			}
@@ -275,7 +294,7 @@ int main(void) {
 
 	// 2. INT_SEL 0: no wake.
 	{
-		uint32_t n = Release((uint32_t*)ib.cpu, 0, 0, 7, 0, a);
+		uint32_t n = Release((uint32_t*)ib.cpu, 0, 0, 7, 0, EvCtx(a));
 		while (n & 7u) {
 			((uint32_t*)ib.cpu)[n++] = 0xffff1000u;
 		}
@@ -289,7 +308,7 @@ int main(void) {
 
 	// 3. Event A's context id, wait on B, then on A.
 	{
-		uint32_t n = Release((uint32_t*)ib.cpu, 0, 0, 8, 2, a);
+		uint32_t n = Release((uint32_t*)ib.cpu, 0, 0, 8, 2, EvCtx(a));
 		while (n & 7u) {
 			((uint32_t*)ib.cpu)[n++] = 0xffff1000u;
 		}
@@ -310,7 +329,7 @@ int main(void) {
 	{
 		uint32_t n = 0;
 		for (uint32_t k = 0; k < 32; k++) {
-			n = Release((uint32_t*)ib.cpu, n, 0, 100 + k, 2, a);
+			n = Release((uint32_t*)ib.cpu, n, 0, 100 + k, 2, EvCtx(a));
 		}
 		while (n & 7u) {
 			((uint32_t*)ib.cpu)[n++] = 0xffff1000u;
@@ -325,6 +344,61 @@ int main(void) {
 		printf("32 interrupts in one IB: IB %s, label %u, %d wakes after it\n", done == 0 ? "done" : "NOT DONE", *(volatile uint32_t*)label.cpu,
 		       wakes);
 		bad += done != 0 || wakes == 0;
+	}
+
+	// 6. The EOP log.
+	{
+		const uint32_t log = CreateEvent();
+		volatile uint64_t* page =
+		    event_page_offset ? mmap(NULL, 4096 * 8, PROT_READ | PROT_WRITE, MAP_SHARED, kfd, (off_t)event_page_offset) : MAP_FAILED;
+		struct {
+			uint32_t event_id, pad;
+		} reg     = {log, 0};
+		const int rr = page == MAP_FAILED ? -1 : Ioctl(kfd, _IOW('K', 0x80, reg), &reg);
+		printf("EOP log: event %u, signal page %s, register %s\n", log, page == MAP_FAILED ? "NOT MAPPED" : "mapped",
+		       rr == 0 ? "ok" : strerror(-rr));
+		if (rr != 0) {
+			bad++;
+		} else {
+			volatile uint64_t* head = page + 2048;
+			volatile uint64_t* tail = page + 2049;
+			volatile uint64_t* drop = page + 2050;
+			volatile uint64_t* ring = page + 3072;
+			static const uint32_t kIds[] = {0xabcd, 1, 2, 3, 0x5555, 0x7ffffff};
+			uint32_t              n      = 0;
+			for (uint32_t k = 0; k < 6; k++) {
+				n = Release((uint32_t*)ib.cpu, n, 0, 200 + k, k == 4 ? 2u : 1u, kIds[k]);
+			}
+			n = Release((uint32_t*)ib.cpu, n, 0, 300, 2, EvCtx(a)); // Kyty's: the event alone
+			uint64_t seq = 0;
+			Submit(AMDGPU_HW_IP_GFX, Pad(n), &seq);
+			WaitCs(AMDGPU_HW_IP_GFX, seq);
+			const int woke = WaitEvent(log, 100) == 0;
+			const int woke_a = WaitEvent(a, 50) == 0;
+			n = Release((uint32_t*)ib.cpu, 0, 1, 400, 1, 0xa);
+			Submit(AMDGPU_HW_IP_COMPUTE, Pad(n), &seq);
+			WaitCs(AMDGPU_HW_IP_COMPUTE, seq);
+			// The log's event may still be set from the gfx entries: wait for the compute one itself.
+			int woke_c = 0;
+			for (int k = 0; k < 10 && *head - *tail < 7; k++) {
+				woke_c |= WaitEvent(log, 20) == 0;
+			}
+			woke_c |= *head - *tail == 7;
+			const uint64_t h = *head, t = *tail;
+			printf("log: woke %d (gfx) %d (compute), event %u woke %d; head %llu tail %llu dropped %llu\n", woke, woke_c, a, woke_a,
+			       (unsigned long long)h, (unsigned long long)t, (unsigned long long)*drop);
+			int order_ok = h - t == 7;
+			for (uint64_t i = t; i < h; i++) {
+				const uint64_t e = ring[i % 1024];
+				printf("  ctx 0x%x vmid %u ring id 0x%02x (me %u pipe %u queue %u)\n", (uint32_t)e, (uint32_t)(e >> 40) & 0xf,
+				       (uint32_t)(e >> 32) & 0xff, (uint32_t)(e >> 34) & 3, (uint32_t)(e >> 32) & 3, (uint32_t)(e >> 36) & 7);
+				const uint32_t want = i - t < 6 ? kIds[i - t] : 0xa;
+				order_ok &= (uint32_t)e == want;
+			}
+			*tail = h;
+			printf("log %s\n", order_ok ? "in order, all there (right)" : "WRONG");
+			bad += !woke || !woke_c || !woke_a || !order_ok;
+		}
 	}
 	printf("%s\n", bad ? "FAILED" : "all as expected");
 	return bad ? 4 : 0;
