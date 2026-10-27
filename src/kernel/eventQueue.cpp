@@ -1,4 +1,5 @@
 #include "kernel/eventQueue.h"
+#include "kernel/longWait.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -397,6 +398,25 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
 	PRINT_NAME();
+
+	struct Returned {
+		const KernelEvent* ev;
+		const int*         out;
+	} returned {ev, out};
+	LongWait long_wait("equeue", reinterpret_cast<const void*>(eq), __builtin_return_address(0),
+	                   timo == nullptr ? ~0ull : static_cast<uint64_t>(*timo));
+	long_wait.SetDescribe(
+	    [](const void* arg, char* text, size_t size) {
+		    const auto* r = static_cast<const Returned*>(arg);
+		    const int   n = r->out == nullptr || r->ev == nullptr ? 0 : *r->out;
+		    int         w = std::snprintf(text, size, "events %d:", n);
+		    for (int i = 0; i < n && i < 3 && w > 0 && static_cast<size_t>(w) < size; i++) {
+			    w += std::snprintf(text + w, size - w, " filter %d ident 0x%llx", r->ev[i].filter,
+			                       static_cast<unsigned long long>(r->ev[i].ident));
+		    }
+		    return w;
+	    },
+	    &returned);
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {

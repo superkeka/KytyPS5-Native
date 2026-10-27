@@ -1,4 +1,5 @@
 #include "kernel/pthread.h"
+#include "kernel/longWait.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1010,6 +1011,7 @@ void PthreadInitSelfForMainThread() {
 	}
 #endif
 
+	Common::Thread::RunAtTopClock("KYTY_UCLAMP");
 	g_pthread_self = new PthreadPrivate {};
 	PthreadAttrInit(&g_pthread_self->attr);
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
@@ -1758,6 +1760,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	LongWait long_wait("mutex_lock", mutex, __builtin_return_address(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -1838,6 +1841,7 @@ int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec
 }
 
 int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex) {
+	LongWait::NoteSignal("mutex_unlock", mutex, __builtin_return_address(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2731,6 +2735,7 @@ int KYTY_SYSV_ABI PthreadCondattrSetclock(PthreadCondattr* attr, KernelClockid c
 }
 
 int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
+	LongWait::NoteSignal("cond_broadcast", cond, __builtin_return_address(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2821,6 +2826,7 @@ int KYTY_SYSV_ABI PthreadCondInit(PthreadCond* cond, const PthreadCondattr* attr
 }
 
 int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
+	LongWait::NoteSignal("cond_signal", cond, __builtin_return_address(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2840,6 +2846,7 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 }
 
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
+	LongWait::NoteSignal("cond_signalto", cond, __builtin_return_address(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2860,6 +2867,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	LongWait long_wait("cond_timedwait", cond, __builtin_return_address(0), usec);
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2944,6 +2952,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	LongWait long_wait("cond_timedwait_abs", cond, __builtin_return_address(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3025,6 +3034,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	LongWait long_wait("cond_wait", cond, __builtin_return_address(0));
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3219,6 +3229,8 @@ static void* RunThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 	void* ret    = nullptr;
 
+	// Guest threads run at the top CPU clock, as on the PS5 (KYTY_UCLAMP=0: left to the governor).
+	Common::Thread::RunAtTopClock("KYTY_UCLAMP");
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
 	g_pthread_self = thread;
@@ -3878,6 +3890,7 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
+	LongWait long_wait("usleep", nullptr, __builtin_return_address(0), microseconds);
 	SleepMicroWithSignalPoll(microseconds);
 	return OK;
 }
@@ -3888,6 +3901,7 @@ unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
 }
 
 int KYTY_SYSV_ABI KernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+	LongWait long_wait("nanosleep", nullptr, __builtin_return_address(0));
 	if (rqtp == nullptr) {
 		return KERNEL_ERROR_EFAULT;
 	}

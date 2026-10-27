@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "kernel/longWait.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -287,6 +288,7 @@ int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
 }
 
 int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
+	LongWait long_wait("sema", sem, __builtin_return_address(0), static_cast<uint64_t>(need));
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}

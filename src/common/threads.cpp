@@ -14,9 +14,16 @@
 #include <ctime>
 #endif
 
+#include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <thread>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -233,6 +240,28 @@ void Thread::SleepNano(uint64_t nanos) {
 
 bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
+}
+
+bool Thread::RunAtTopClock(const char* off_env) {
+	if (const char* v = std::getenv(off_env); v != nullptr && std::strcmp(v, "0") == 0) {
+		return true;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	struct {
+		uint32_t size, policy;
+		uint64_t flags;
+		int32_t  nice;
+		uint32_t priority;
+		uint64_t runtime, deadline, period;
+		uint32_t util_min, util_max;
+	} attr {};
+	attr.size     = sizeof(attr);
+	attr.flags    = 0x18u | 0x20u; // SCHED_FLAG_KEEP_ALL | SCHED_FLAG_UTIL_CLAMP_MIN
+	attr.util_min = 1024;
+	return syscall(SYS_sched_setattr, 0, &attr, 0) == 0;
+#else
+	return true;
+#endif
 }
 
 std::string Thread::GetId() const {

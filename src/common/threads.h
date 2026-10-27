@@ -35,6 +35,13 @@ public:
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
 
+	// The calling thread runs at the CPU's top clock (Linux: a utilization clamp of the whole range,
+	// uclamp_min 1024, which needs no privilege). A PS5 CPU runs at a fixed clock; under schedutil a
+	// thread that runs in bursts between waits wakes on cores still at their lowest P-state (the BC-250:
+	// 1.55 GHz against 3.49) and does the same work up to twice as slowly. Nothing when `off_env` is set
+	// to 0; false when the kernel refused it.
+	static bool RunAtTopClock(const char* off_env);
+
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.
 	static std::string GetThreadId();

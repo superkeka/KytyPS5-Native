@@ -1,4 +1,5 @@
 #include "kernel/eventFlag.h"
+#include "kernel/longWait.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -286,6 +287,7 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
+	LongWait long_wait("event_flag", ef, __builtin_return_address(0), bit_pattern);
 	PRINT_NAME();
 
 	if (ef == nullptr) {

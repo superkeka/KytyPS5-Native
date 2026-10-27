@@ -4,6 +4,7 @@
 #include "graphics/native_gpu/nativeSubmit.h" // KYTY_GEM_BACKING_SUPPORTED + NativeSubmitter
 #include "graphics/native_gpu/shaderPatcher.h"
 
+#include "common/threads.h"
 #include "kernel/memory.h"
 #include "kernel/syncOnAddress.h"
 #include "libs/agc.h"
@@ -87,34 +88,16 @@ bool EnvIs(const char* name, const char* value) {
 	return v != nullptr && std::strcmp(v, value) == 0;
 }
 
-// The calling thread runs at the CPU's top clock: a utilization clamp of the whole range (uclamp_min
-// 1024, no privilege needed) on the native GPU workers. They run in bursts between waits, and under
-// schedutil the core one wakes on is often still at its lowest P-state (the BC-250: 1.55 GHz against
-// 3.49), which made the same DCB's translation take 1.5 ms or 4 in My First GT. A PS5 CPU runs at
-// a fixed clock. KYTY_NATIVE_GPU_UCLAMP=0 leaves the threads to the governor.
+// The native GPU workers run at the CPU's top clock (Common::Thread::RunAtTopClock): the same DCB of
+// My First GT took 1.5 ms or 4 to translate as the worker woke on a fast or a slow core.
+// KYTY_NATIVE_GPU_UCLAMP=0 leaves them to the governor.
 void RunAtTopClock() {
-#if defined(__linux__)
-	if (EnvIs("KYTY_NATIVE_GPU_UCLAMP", "0")) {
-		return;
-	}
-	struct {
-		uint32_t size, policy;
-		uint64_t flags;
-		int32_t  nice;
-		uint32_t priority;
-		uint64_t runtime, deadline, period;
-		uint32_t util_min, util_max;
-	} attr {};
-	attr.size     = sizeof(attr);
-	attr.flags    = 0x18u | 0x20u; // SCHED_FLAG_KEEP_ALL | SCHED_FLAG_UTIL_CLAMP_MIN
-	attr.util_min = 1024;
-	if (syscall(SYS_sched_setattr, 0, &attr, 0) != 0) {
+	if (!Common::Thread::RunAtTopClock("KYTY_NATIVE_GPU_UCLAMP")) {
 		static std::atomic<bool> logged {false};
 		if (!logged.exchange(true)) {
 			std::fprintf(stderr, "native shadow: uclamp_min for the GPU workers refused (errno %d)\n", errno);
 		}
 	}
-#endif
 }
 
 // KYTY_NATIVE_GPU_CTL=1: a debugging control socket, /tmp/kyty-ctl.sock (KYTY_NATIVE_GPU_CTL_SOCK

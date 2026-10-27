@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "kernel/longWait.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -2106,12 +2107,14 @@ static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* f
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
                                           const uint32_t* timeout_micros) {
+	LibKernel::LongWait long_wait("sync_on_address", const_cast<const uint32_t*>(address), __builtin_return_address(0), expected);
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
 	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected,
                                             const uint32_t* timeout_micros) {
+	LibKernel::LongWait long_wait("sync_on_address32", const_cast<const uint32_t*>(address), __builtin_return_address(0), expected);
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait32");
 	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
@@ -2120,6 +2123,7 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t expected,
                                             const uint32_t* timeout_micros) {
+	LibKernel::LongWait long_wait("sync_on_address64", const_cast<const uint64_t*>(address), __builtin_return_address(0), expected);
 	static std::atomic_bool logged {false};
 	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait64");
 	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros,
