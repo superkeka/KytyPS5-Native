@@ -532,6 +532,8 @@ public:
 		m_verbatim_dw += result.stats.verbatim_dw;
 		m_total_dw += result.stats.total_dw;
 		m_verbatim_runs += result.stats.verbatim_runs;
+		m_labels_native += result.stats.labels_native;
+		m_write_data_dw += result.stats.write_data_dw;
 		for (size_t i = 0; i < m_changed_ops.size(); i++) {
 			m_changed_ops[i] += result.stats.changed_ops[i];
 		}
@@ -1159,7 +1161,10 @@ public:
 					std::fprintf(stderr, "\n");
 					c = {};
 				}
+				std::fprintf(stderr, "native shadow: GPU label writes per flip: %.0f, %.0f dwords of WRITE_DATA\n",
+				             static_cast<double>(m_labels_native) / m_flips, static_cast<double>(m_write_data_dw) / m_flips);
 				m_verbatim_dw = m_total_dw = m_verbatim_runs = 0;
+				m_labels_native = m_write_data_dw = 0;
 				m_run_hist    = {};
 				m_changed_ops = {};
 			}
@@ -2894,6 +2899,8 @@ private:
 	uint64_t                m_verbatim_dw   = 0; // Pm4TranslateStats::verbatim_dw over the flips being summed
 	uint64_t                m_total_dw      = 0;
 	uint64_t                m_verbatim_runs = 0;
+	uint64_t                m_labels_native = 0; // Pm4TranslateStats::labels_native and write_data_dw, same flips
+	uint64_t                m_write_data_dw = 0;
 	std::array<uint64_t, 4> m_run_hist {};
 	std::array<uint64_t, 256> m_changed_ops {};
 	// Direct-execution view, [0] DCBs and [1] ACBs: dwords, stretches between cuts, replaced packets and
@@ -3604,6 +3611,12 @@ private:
 				continue;
 			}
 			m_last_write[w.addr] = {w, m_emits};
+			if (w.span_dw > 2) { // a block of data: each dword touched, its value unknown here
+				for (uint32_t i = 0; i < std::min<uint32_t>(w.span_dw, 64u); i++) {
+					m_ring[w.addr + 4ull * i] = RingWrite {LabelWrite {w.addr + 4ull * i, 0, false, w.gpu, false}, m_seq, slot, m_batch};
+				}
+				continue;
+			}
 			m_ring[w.addr] = RingWrite {w, m_seq, slot, m_batch};
 			if (w.wide) {
 				m_ring[w.addr + 4] =

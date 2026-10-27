@@ -153,6 +153,7 @@ struct Pm4TranslateStats {
 	uint32_t loaded_cx_regs    = 0; // offset/value pairs expanded from 0x9F
 	uint32_t loaded_sh_regs    = 0; // offset/value pairs expanded from 0x63
 	uint32_t loaded_uc_regs    = 0; // offset/value pairs expanded from 0x64
+	uint32_t loads_verbatim    = 0; // 0x63/0x64/0x9F run by the CP as written (their pairs counted above too)
 	uint32_t draws             = 0; // IT_DRAW_INDEX_2
 	uint32_t dispatches        = 0; // IT_DISPATCH_DIRECT / IT_DISPATCH_INDIRECT
 	uint32_t num_instances     = 0; // IT_NUM_INSTANCES passed through
@@ -179,6 +180,7 @@ struct Pm4TranslateStats {
 	uint32_t write_data_native  = 0; // IT_WRITE_DATA to memory also kept in the IB (SetWriteDataNative)
 	uint32_t gds_dma_synced     = 0; // DMA_DATA with GDS given CP_SYNC (SetGdsDmaSync)
 	uint32_t labels_native     = 0; // native labels: WRITE_DATA / RELEASE_MEM label writes run on the GPU
+	uint32_t write_data_dw     = 0; // native labels: data dwords of the WRITE_DATA run on the GPU
 	uint32_t labels_cpu        = 0; // native labels: label writes the tracker performs on the CPU (unreachable, or with
 	                                // SetTrackerWrites a mirror of a GPU store)
 	uint32_t timestamps        = 0; // native labels: timestamps the tracker still writes (CPU clock)
@@ -295,6 +297,11 @@ struct LabelWrite {
 	bool     known = true;  // false: the value is not known when translating (GDS data, timestamps)
 	bool     gpu   = true;  // written by the GPU (false: by the tracker or Kyty on the CPU)
 	bool     wide  = false; // 64 bits
+	// A WRITE_DATA of more than two dwords (titles build blocks of data with it, ASTRO BOT ~450000
+	// dwords a frame) is one write of `span_dw` dwords. `data` points at them while the buffer is being
+	// translated; a segment keeps the write without it, as touched but unknown.
+	uint32_t        span_dw = 0;
+	const uint32_t* data    = nullptr;
 
 	// What a WAIT at `a` (64-bit when `wide_wait`) reads once this write has landed: 0 unrelated,
 	// 1 the value in `out`, 2 touched but unknown.

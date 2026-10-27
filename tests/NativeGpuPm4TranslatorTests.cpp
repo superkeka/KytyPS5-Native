@@ -111,10 +111,12 @@ void Append(std::vector<uint32_t>& dcb, uint32_t op, const std::vector<uint32_t>
 }
 
 // An indirect register-load packet pointing at offset/value pairs (which the test owns).
-void AppendIndirect(std::vector<uint32_t>& dcb, uint32_t op, const std::vector<uint32_t>& pairs) {
+// data_format: dword 3 of the packet; libSceAgc (agc.cpp) writes 0x80000000 (offset and data pairs).
+void AppendIndirect(std::vector<uint32_t>& dcb, uint32_t op, const std::vector<uint32_t>& pairs,
+                    uint32_t data_format = 0u) {
 	const auto     addr = reinterpret_cast<uint64_t>(pairs.data());
 	const uint32_t num  = static_cast<uint32_t>(pairs.size() / 2);
-	std::vector<uint32_t> body = {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 0u,
+	std::vector<uint32_t> body = {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), data_format,
 	                              num};
 	dcb.push_back(Pkt3(op, 4, false));
 	for (uint32_t v: body) {
@@ -229,6 +231,44 @@ void TestIndirectContextExpansion() {
 	Check(sets == 4, "expanded context regs present in preamble and body");
 }
 
+// Register tables in libSceAgc's form reach the gfx CP as written when every pair would be emitted
+// unchanged; the shadow copy still takes their values. A stub entry, a patched value or
+// VGT_PRIMITIVE_TYPE keeps the expansion.
+void TestIndirectTablesVerbatim() {
+	Pm4Translator         t;
+	std::vector<uint32_t> cx_pairs = {0x10u, 0x1111u, 0x20u, 0x2222u};
+	std::vector<uint32_t> sh_pairs = {0x0Cu, 0x5555u}; // SPI_SHADER_USER_DATA_PS_0
+	std::vector<uint32_t> uc_pairs = {0x25Bu, 0x8040u};
+	std::vector<uint32_t> dcb;
+	AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, cx_pairs, 0x80000000u);
+	AppendIndirect(dcb, IT_SET_SH_REG_INDIRECT, sh_pairs, 0x80000000u);
+	AppendIndirect(dcb, IT_SET_UCONFIG_REG_INDIRECT, uc_pairs, 0x80000000u);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.loads_verbatim == 3, "three tables run as written");
+	Check(std::search(r.ib.begin(), r.ib.end(), dcb.begin(), dcb.end()) != r.ib.end(), "the packets are in the IB unchanged");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a gfx IB with tables passes the check");
+	// The shadow took the values: the next buffer's preamble replays them.
+	std::vector<uint32_t> next;
+	Append(next, IT_SET_CONTEXT_REG, {0x30u, 0x3u}, false);
+	auto     r2   = t.Translate(next);
+	uint32_t seen = 0;
+	for (const auto& p: Decode(r2.ib)) {
+		seen += p.op == IT_SET_CONTEXT_REG && p.body.size() == 2 && p.body[0] == 0x10u && p.body[1] == 0x1111u ? 1u : 0u;
+	}
+	Check(r2.ok && seen == 1, "table values replayed from the shadow");
+
+	std::vector<uint32_t> stub_pairs = {0xffffffffu, 0u, 0x25Bu, 0x8040u};
+	std::vector<uint32_t> prim_pairs = {0x242u, 0x4u};
+	std::vector<uint32_t> held;
+	AppendIndirect(held, IT_SET_UCONFIG_REG_INDIRECT, stub_pairs, 0x80000000u);
+	AppendIndirect(held, IT_SET_UCONFIG_REG_INDIRECT, prim_pairs, 0x80000000u);
+	AppendIndirect(held, IT_SET_CONTEXT_REG_INDIRECT, cx_pairs); // another data format
+	auto r3 = t.Translate(held);
+	Check(r3.ok && r3.stats.loads_verbatim == 0 && r3.stats.loaded_uc_regs == 2 && r3.stats.loaded_cx_regs == 2,
+	      "stub entries, VGT_PRIMITIVE_TYPE and other data formats are expanded");
+}
+
 void TestIndirectShComputeBit() {
 	Pm4Translator t;
 	std::vector<uint32_t> pairs = {0x20Cu, 0xdeadu, 0x20Du, 0x0012u}; // COMPUTE_PGM_LO/HI
@@ -286,6 +326,20 @@ void TestUconfigWhitelist() {
 	          Pm4Translator::UconfigAllowed(0x25Fu),
 	      "per-draw GE registers (index offset, primitive restart, stereo) allowed");
 	Check(!Pm4Translator::UconfigAllowed(0x342u), "unknown UCONFIG 0x342 stays dropped");
+}
+
+// libSceAgc's internal-data tags (SET_UCONFIG_REG of 0x342, header bit 2 set in DCBs) reach the gfx
+// CP as written; the other trace registers stay dropped.
+void TestAgcTagsVerbatim() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb = {0xc0017904u, 0x342u, 0xc8010000u, 0xc0017904u, 0x342u, 0xc8000000u};
+	Append(dcb, IT_SET_UCONFIG_REG, {0x343u, 0x22u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.uconfig_skipped == 1 && r.skipped_uconfig.count(0x343u) == 1, "0x343 still dropped on gfx");
+	Check(r.ib.size() >= 6 && std::search(r.ib.begin(), r.ib.end(), dcb.begin(), dcb.begin() + 6) != r.ib.end(),
+	      "the two 0x342 tags are in the gfx IB as written");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a tagged IB passes the gfx-ring check");
 }
 
 // GFX9+ only updates the CP's copy of VGT_PRIMITIVE_TYPE / VGT_INDEX_TYPE through
@@ -820,17 +874,25 @@ constexpr uint64_t kFenceVa   = 0x400000fff400ull;
 // The barrier's RELEASE_MEM event (CACHE_FLUSH_AND_INV_TS, end of pipe, full GCR): the only form
 // native labels use.
 constexpr uint32_t kFlushEvent = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) | (1u << 20u) | (1u << 21u);
+// The tracker's stores: bottom of pipe, GLM and GL2 written back, nothing invalidated.
+constexpr uint32_t kTrackerEvent = 0x28u | (5u << 8u) | (1u << 12u) | (1u << 21u);
+// A label release: the guest's event and cache actions plus GLM and GL2 write-back (LabelEventCntl),
+// or the barrier's form.
+bool IsLabelEvent(uint32_t event) {
+	constexpr uint32_t wb = (1u << 12u) | (1u << 21u);
+	return event == kFlushEvent || (event & wb) == wb;
+}
 
 // The tracker RELEASE_MEM a point's sequence value sits in.
 bool IsTrackerPacket(const std::vector<uint32_t>& ib, uint32_t dw) {
-	return dw >= 5 && dw + 2 < ib.size() && ib[dw - 5] == 0xc0064900u && ib[dw - 4] == kFlushEvent && ib[dw - 3] == (1u << 29u) &&
+	return dw >= 5 && dw + 2 < ib.size() && ib[dw - 5] == 0xc0064900u && ib[dw - 4] == kTrackerEvent && ib[dw - 3] == (1u << 29u) &&
 	       ib[dw - 2] == static_cast<uint32_t>(kTrackerVa) && ib[dw - 1] == static_cast<uint32_t>(kTrackerVa >> 32u);
 }
 
-// A label release in the barrier's form writing `value` at `addr`.
+// A label release writing `value` at `addr`.
 bool HasLabelRelease(const std::vector<Packet>& pkts, uint64_t addr, uint32_t value) {
 	for (const auto& p: pkts) {
-		if (p.op == 0x49u && p.body[0] == kFlushEvent && p.body[1] == (1u << 29u) && p.body[2] == static_cast<uint32_t>(addr) &&
+		if (p.op == 0x49u && IsLabelEvent(p.body[0]) && p.body[1] == (1u << 29u) && p.body[2] == static_cast<uint32_t>(addr) &&
 		    p.body[3] == static_cast<uint32_t>(addr >> 32u) && p.body[4] == value) {
 			return true;
 		}
@@ -866,6 +928,40 @@ void AppendReleaseMarker(std::vector<uint32_t>& dcb, uint32_t data_sel, uint32_t
 void AppendWait(std::vector<uint32_t>& dcb, uint64_t addr, uint32_t ref) {
 	Append(dcb, 0x3Cu, {3u | (1u << 4u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), ref, 0xffffffffu, 4u},
 	       false);
+}
+
+// A WRITE_DATA of a block of data is one write: a wait on a dword inside it that the block meets runs
+// on the GPU (the write is ahead of it in the ring); one it does not meet is not; the segment keeps the
+// block as touched, without the buffer's memory.
+void TestLabelsWriteDataBlock() {
+	alignas(8) static uint32_t mem[8] = {};
+	const uint64_t             addr   = reinterpret_cast<uint64_t>(&mem[0]);
+	for (uint32_t ref: {7u, 9u}) {
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		Append(dcb, IT_WRITE_DATA,
+		       {5u << 8u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 2u, 7u, 4u}, false);
+		AppendWait(dcb, addr + 8u, ref);
+		Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+		Pm4Translator t;
+		TestOracle    o;
+		o.plan = LabelOracle::Plan::Native;
+		t.SetNativeLabels(&o, kTrackerVa);
+		auto r = t.Translate(dcb);
+		Check(r.ok && o.asked == 0, "the block decides the wait inside it, the backend is not asked");
+		if (ref == 7u) {
+			Check(r.stats.waits_native == 1, "a wait the block meets runs on the GPU");
+		} else {
+			Check(r.stats.waits_native == 0, "a wait the block does not meet stays off the GPU");
+		}
+		Check(r.stats.write_data_dw == 4, "four data dwords counted");
+		const auto& w = r.segments[0].writes;
+		Check(w.size() == 1 && w[0].addr == addr && w[0].span_dw == 4 && w[0].data == nullptr,
+		      "one block write, kept without the buffer's memory");
+		uint64_t v = 0;
+		Check(w[0].Covers(addr + 8u, false, &v) == 2 && w[0].Covers(addr + 16u, false, &v) == 0,
+		      "afterwards the block is touched but unknown, and ends where it ends");
+	}
 }
 
 void TestDisplayDccRestore() {
@@ -1314,7 +1410,7 @@ void TestComputeRingPackets() {
 	bool release_cs = false;
 	bool wait_cs    = false;
 	for (const auto& p: pkts) {
-		release_cs = release_cs || (p.op == 0x49u && p.compute && p.body[0] == kFlushEvent);
+		release_cs = release_cs || (p.op == 0x49u && p.compute && IsLabelEvent(p.body[0]));
 		wait_cs    = wait_cs || (p.op == 0x3Cu && p.compute && p.body[1] == static_cast<uint32_t>(addr));
 	}
 	Check(release_cs && wait_cs && r.stats.waits_native == 1, "label release and the guest wait use the compute shader bit");
@@ -1516,12 +1612,12 @@ void TestLabelsGpuOnly() {
 	      "three GPU label writes, none by the tracker");
 	const auto pkts = Decode(r.ib);
 	const auto first = IndexOf(pkts, [&](const Packet& p) {
-		return p.op == 0x49u && p.body[0] == kFlushEvent && p.body[1] == (1u << 29u) && p.body[2] == lo && p.body[4] == 1u;
+		return p.op == 0x49u && IsLabelEvent(p.body[0]) && p.body[1] == (1u << 29u) && p.body[2] == lo && p.body[4] == 1u;
 	});
 	const auto reset = IndexOf(pkts, [&](const Packet& p) { return p.op == IT_WRITE_DATA && p.body[1] == lo; });
 	const auto wait  = IndexOf(pkts, [&](const Packet& p) { return p.op == 0x3Cu && p.body[1] == lo; });
 	const auto last  = IndexOf(pkts, [&](const Packet& p) {
-		return p.op == 0x49u && p.body[0] == kFlushEvent && p.body[1] == (1u << 29u) && p.body[2] == lo && p.body[4] == 2u;
+		return p.op == 0x49u && IsLabelEvent(p.body[0]) && p.body[1] == (1u << 29u) && p.body[2] == lo && p.body[4] == 2u;
 	});
 	Check(first < reset && reset < wait && wait < last && last < pkts.size(), "the GPU writes the label in stream order");
 	Check((pkts[reset].body[0] >> 30u) == 0u && (pkts[reset].body[0] & (1u << 20u)) != 0 && pkts[reset].body[3] == 0u,
@@ -1534,7 +1630,8 @@ void TestLabelsGpuOnly() {
 		wakes += p.kind == TrackerPoint::Kind::Wake && p.addr == addr ? 1u : 0u;
 		irqs += p.kind == TrackerPoint::Kind::Interrupt && p.ctx == 0x21 ? 1u : 0u;
 		cpu = cpu || p.kind == TrackerPoint::Kind::CpuWrite || !p.data.empty();
-		Check(p.dw == pts.back().dw, "every point shares the end's tracker packet");
+		// Points ahead of a GPU wait are flushed by a tracker store before it, the rest at the end.
+		Check(IsTrackerPacket(r.ib, p.dw), "every point sits at a tracker store");
 	}
 	Check(!cpu && wakes == 3 && irqs == 1 && pts.back().kind == TrackerPoint::Kind::End,
 	      "the tracker wakes the label and raises the interrupt, and stores nothing");
@@ -1922,6 +2019,8 @@ int main() {
 	TestIndirectShComputeBit();
 	TestComputeCuClamp();
 	TestUconfigWhitelist();
+	TestIndirectTablesVerbatim();
+	TestAgcTagsVerbatim();
 	TestUconfigIndexPassthrough();
 	TestUconfigIndexedRegisters();
 	TestWriteData();
@@ -1945,6 +2044,7 @@ int main() {
 	TestPs5RegOverrides();
 	TestAcquireFull();
 	TestLabelsWriteData();
+	TestLabelsWriteDataBlock();
 	TestLabelsReleaseMem();
 	TestLabelsLocalWait();
 	TestLabelsSplit();

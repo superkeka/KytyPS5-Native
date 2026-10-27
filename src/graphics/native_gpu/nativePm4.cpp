@@ -455,6 +455,19 @@ bool WaitCond::Met(uint64_t value) const {
 
 int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out, uint64_t wait_mask) const {
 	const bool low_only = wide_wait && (wait_mask >> 32u) == 0;
+	if (span_dw > 2) {
+		const uint64_t need = wide_wait && !low_only ? 8u : 4u;
+		const uint64_t end  = addr + 4ull * span_dw;
+		if (a + need <= addr || a >= end) {
+			return 0;
+		}
+		if (data == nullptr || !known || (a & 3u) != 0 || a < addr || a + need > end) {
+			return 2;
+		}
+		const uint64_t i = (a - addr) / 4u;
+		*out             = need == 8u ? (data[i] | (static_cast<uint64_t>(data[i + 1]) << 32u)) : data[i];
+		return 1;
+	}
 	if (a == addr) {
 		if (wide_wait && !wide && !low_only) {
 			return 2; // half of what the wait reads
@@ -568,6 +581,9 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			case IT_SET_CONTEXT_REG:
 			case IT_SET_UCONFIG_REG:
 			case IT_SET_UCONFIG_REG_INDEX:
+			case IT_SET_CONTEXT_REG_INDIRECT: // the guest's register tables, checked by the translator
+			case IT_SET_SH_REG_INDIRECT:
+			case IT_SET_UCONFIG_REG_INDIRECT:
 				if (compute) {
 					return bad();
 				}
@@ -1096,7 +1112,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// Memory this DCB writes with WRITE_DATA / DMA_DATA before the GPU gets further. The CP reads an
 	// indirect register table when it runs the packet; the translator reads it now, so a table written
 	// earlier in the same DCB would be read before it is written.
+	// A table the CP runs as written (TABLES_VERBATIM) is read when it runs, so only the expanded ones
+	// are checked, within the bounds of everything written and against the last 256 writes (a full
+	// scan per load was most of the translation in ASTRO BOT's heavy views: thousands of loads against
+	// thousands of writes).
 	std::vector<std::pair<uint64_t, uint64_t>> gpu_written;
+	uint64_t                                   gpu_written_lo = ~0ull;
+	uint64_t                                   gpu_written_hi = 0;
+	auto note_gpu_written = [&](uint64_t lo, uint64_t hi) {
+		gpu_written.emplace_back(lo, hi);
+		gpu_written_lo = std::min(gpu_written_lo, lo);
+		gpu_written_hi = std::max(gpu_written_hi, hi);
+	};
 
 	std::vector<uint64_t> shaders;
 
@@ -1800,7 +1827,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// already replaced is left alone, and a store the GPU made visible is not written again. That
 	// test cannot see a label that went back to its translate-time value in between: the mirror
 	// then overwrites the newer write.
-	auto mirror_store = [&](uint64_t addr, std::vector<uint32_t> words, bool one_addr) {
+	auto mirror_store = [&](uint64_t addr, std::span<const uint32_t> words, bool one_addr) {
 		if (words.empty() || addr == 0) {
 			return;
 		}
@@ -1816,7 +1843,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		cpu.mirror   = true;
 		cpu.addr     = addr;
 		cpu.one_addr = one_addr;
-		cpu.data     = std::move(words);
+		cpu.data.assign(words.begin(), words.end());
 		const uint32_t samples = one_addr ? 1u : static_cast<uint32_t>(cpu.data.size());
 		cpu.prior.resize(samples);
 		bool sampled = m_labels != nullptr;
@@ -1836,6 +1863,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	auto note_write = [&](const LabelWrite& w) {
 		segs.back().writes.push_back(w);
+		segs.back().writes.back().data = nullptr; // the buffer's memory is the title's again after this
 		local_writes.push_back(w);
 	};
 	// The points queued so far (EOP interrupts, wakes, labels the CPU writes) as a tracker store here,
@@ -2085,13 +2113,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
 					if (sel == 1) {
 						EmitRelease32(body, dst, bptr[4], m_compute_ring, LabelEventCntl(bptr[0]));
-						mirror_store(dst, {bptr[4]}, false);
+						mirror_store(dst, std::span<const uint32_t>(bptr + 4, 1), false);
 						NoteOnce(0, m_tracker_writes ? "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)"
 						                             : "RELEASE_MEM 32-bit label (GPU store only)");
 					} else if (sel == 2) {
 						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring, LabelEventCntl(bptr[0]));
 						EmitRelease32(body, dst, bptr[4], m_compute_ring, LabelEventCntl(bptr[0]));
-						mirror_store(dst, {bptr[4], bptr[5]}, false);
+						mirror_store(dst, std::span<const uint32_t>(bptr + 4, 2), false);
 						NoteOnce(1, m_tracker_writes ? "RELEASE_MEM 64-bit label (GPU store, mirrored to the CPU)"
 						                             : "RELEASE_MEM 64-bit label (GPU store only, two halves)");
 					} else if (sel == 5) {
@@ -2208,8 +2236,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// Pass through only whitelisted UCONFIG registers; drop the rest for board safety.
 				// On a compute ring the whitelist is geometry-engine state (no GE on MEC), so it
 				// refuses the buffer. SQ_THREAD_TRACE_USERDATA_0..7 (0x340..0x347) and every other
-				// non-whitelisted offset are dropped, same as the gfx path. Refusing the opcode
-				// refused every ACB: they write 0x342 and 0x343 as profiler markers.
+				// non-whitelisted offset are dropped (a compute ring stops on 0x342, probe --danger tag342).
+				// Refusing the opcode refused every ACB: they write 0x342 and 0x343 as profiler markers.
 				if (m_compute_ring && body_count >= 1) {
 					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
 					                                                        : Normalize(bptr[0]);
@@ -2227,6 +2255,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.unknown_ops.insert(op);
 						break;
 					}
+				}
+				// libSceAgc's internal-data tags (SQ_THREAD_TRACE_USERDATA_2, around waits and multi draws) go
+				// to the gfx CP as written: a user IB writes them there (probe --danger tag342), while a
+				// compute ring stops on the same packet.
+				if (!m_compute_ring && op == IT_SET_UCONFIG_REG && body_count == 2 && Normalize(bptr[0]) == 0x342u) {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					stats.set_uconfig++;
+					break;
 				}
 				bool allowed = body_count >= 1;
 				if (allowed) {
@@ -2283,7 +2319,41 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (num == 0 || addr == 0) {
 					break;
 				}
-				for (const auto& [lo, hi]: gpu_written) {
+				const auto* pairs = reinterpret_cast<const uint32_t*>(addr);
+				// The gfx CP runs these packets itself (AMD's LOAD_CONTEXT/SH/UCONFIG_REG_INDEX, bit for bit;
+				// probe --danger regindex-*: the table is loaded). The packet goes as written when every pair
+				// is one the translator would emit unchanged: no stub entries (the CP would write them),
+				// no patched values, UCONFIG only whitelisted and not VGT_PRIMITIVE_TYPE/INDEX_TYPE (those
+				// need SET_UCONFIG_REG_INDEX), SH only of the header's shader type. The shadow copy is kept
+				// from the same pairs. KYTY_NATIVE_GPU_TABLES_VERBATIM=0 expands every table as before.
+				static const bool tables_verbatim = [] {
+					const char* v = std::getenv("KYTY_NATIVE_GPU_TABLES_VERBATIM");
+					return v == nullptr || v[0] != '0';
+				}();
+				bool verbatim = tables_verbatim && !m_compute_ring && bptr[2] == 0x80000000u && (bptr[0] & 3u) == 0;
+				const bool compute_sh = (dcb[dw] & 2u) != 0;
+				for (uint32_t i = 0; i < num && verbatim; i++) {
+					const uint32_t raw   = pairs[2 * i];
+					const uint32_t value = pairs[2 * i + 1];
+					const uint32_t off   = Normalize(raw);
+					if (raw != off) {
+						verbatim = false; // also the 0xffffffff stub
+					} else if (op == IT_SET_CONTEXT_REG_INDIRECT) {
+						verbatim = PatchContext(off, value) == value;
+					} else if (op == IT_SET_SH_REG_INDIRECT) {
+						verbatim = off != kShNop && (off >= kShComputeBase) == compute_sh && PatchSh(off, value) == value;
+					} else {
+						verbatim = off != kUcNop && off != 0x242u && off != 0x243u && UconfigAllowed(off);
+					}
+				}
+				if (verbatim) {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					add_ref(addr, 8ull * num, false); // the CP reads the table
+					stats.loads_verbatim++;
+				}
+				const bool check_written = !verbatim && addr < gpu_written_hi && gpu_written_lo < addr + 8ull * num;
+				for (size_t k = gpu_written.size(); check_written && k > 0 && gpu_written.size() - k < 256; k--) {
+					const auto [lo, hi] = gpu_written[k - 1];
 					if (addr < hi && lo < addr + 8ull * num) {
 						stats.load_gpu_written++;
 						if (static std::atomic<uint32_t> logged {0}; logged++ < 8) {
@@ -2296,7 +2366,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						break;
 					}
 				}
-				const auto* pairs = reinterpret_cast<const uint32_t*>(addr);
 				for (uint32_t i = 0; i < num; i++) {
 					const uint32_t raw   = pairs[2 * i];
 					const uint32_t value = pairs[2 * i + 1];
@@ -2307,7 +2376,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (op == IT_SET_CONTEXT_REG_INDIRECT) {
 						cx[off] = value;
 						mark_cx(off);
-						EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
+						if (!verbatim) {
+							EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
+						}
 						stats.loaded_cx_regs++;
 					} else if (op == IT_SET_SH_REG_INDIRECT) {
 						if (off == kShNop) {
@@ -2316,7 +2387,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						sh[off] = value;
 						dirty_sh.push_back(off);
 						note_shader(off);
-						EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, value), off >= kShComputeBase);
+						if (!verbatim) {
+							EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, value), off >= kShComputeBase);
+						}
 						stats.loaded_sh_regs++;
 					} else {
 						if (off == kUcNop) {
@@ -2336,7 +2409,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							continue;
 						}
 						uc[off] = value;
-						EmitSetUconfig(body, off, value);
+						if (!verbatim) {
+							EmitSetUconfig(body, off, value);
+						}
 						stats.loaded_uc_regs++;
 					}
 				}
@@ -2482,7 +2557,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (dst_sel != 1u) {
 						const uint64_t dst = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
 						add_ref(dst, bytes, false);
-						gpu_written.emplace_back(dst, dst + bytes);
+						note_gpu_written(dst, dst + bytes);
 					}
 				}
 				break;
@@ -2498,7 +2573,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				{
 					const uint64_t dst = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
 					const uint64_t n   = ((bptr[0] >> 16u) & 1u) != 0 ? 1u : body_count - 3u;
-					gpu_written.emplace_back(dst, dst + 4u * n);
+					note_gpu_written(dst, dst + 4u * n);
 				}
 				if (labels) {
 					// Native labels: Kyty no longer reads the buffer once it is translated, so the GPU writes
@@ -2532,8 +2607,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						if (m_compute_ring || engine > 1) {
 							body[at + 1] &= ~(3u << 30u);   // ENGINE_SEL micro engine
 						}
-						mirror_store(dst, std::vector<uint32_t>(bptr + 3, bptr + 3 + n), one_addr);
+						mirror_store(dst, std::span<const uint32_t>(bptr + 3, n), one_addr);
 						stats.labels_native++;
+						stats.write_data_dw += n;
 						seg_effects = true;
 						NoteOnce(6, m_tracker_writes ? "WRITE_DATA label (native WRITE_DATA, mirrored to the CPU)"
 						                             : "WRITE_DATA label (native WRITE_DATA only)");
@@ -2545,7 +2621,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// WAIT_REG_MEM_64 is concerned (Agc's WaitOnAddress after a 64-bit WriteData: Dead
 					// Cells). Recorded as two 32-bit writes, the wait reads them as unknown and is held on
 					// the CPU although the write ahead of it in the ring satisfies it.
-					for (uint32_t i = 0; i < std::min<uint32_t>(n, 64);) {
+					if (!one_addr && n > 2) {
+						LabelWrite block {dst, 0, true, gpu, false};
+						block.span_dw = n;
+						block.data    = bptr + 3;
+						note_write(block);
+					}
+					for (uint32_t i = 0; (one_addr || n <= 2) && i < std::min<uint32_t>(n, 64);) {
 						const uint64_t at = one_addr ? dst : dst + 4u * i;
 						if (!one_addr && i + 1 < n && (at & 7u) == 0) {
 							note_write({at, bptr[3 + i] | (static_cast<uint64_t>(bptr[4 + i]) << 32u), true, gpu, true});
