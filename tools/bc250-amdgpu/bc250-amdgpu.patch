@@ -280,6 +280,46 @@
 +int kfd_bc250_flush_by_runlist(struct kfd_node *dev, int site); /* bc250 map-side flush (generic) */
 +
  #endif /* KFD_DEVICE_QUEUE_MANAGER_H_ */
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v10.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v10.c
+@@ -25,6 +25,18 @@
+ #include "soc15_int.h"
+ #include "kfd_device_queue_manager.h"
+ 
++/* BC-250: an end-of-pipe interrupt raised by a submission of the render node (a gfx or amdgpu
++ * compute ring, VMIDs below KFD's) whose context id is not 0 signals the KFD event of that id in the
++ * process sharing the VM (AMDKFD_IOC_ACQUIRE_VM gives it the same PASID). Every EOP interrupt names
++ * its event by the context id alone: the RELEASE_MEM need not write the event's mailbox slot. The
++ * PS5 kernel takes a title's EOP interrupts from its graphics and compute queues alike; Kyty
++ * waits on these events for them. amdgpu's own fences raise theirs with context id 0.
++ */
++static int bc250_gfx_eop_events = 1;
++module_param(bc250_gfx_eop_events, int, 0444);
++MODULE_PARM_DESC(bc250_gfx_eop_events,
++		 "EOP interrupts of render-node submissions signal the KFD event named by their context id (1 = on, 0 = off)");
++
+ /*
+  * GFX10 SQ Interrupts
+  *
+@@ -143,6 +155,9 @@
+ 	/* Only handle interrupts from KFD VMIDs */
+ 	vmid = SOC15_VMID_FROM_IH_ENTRY(ih_ring_entry);
+ 	if (!KFD_IRQ_IS_FENCE(client_id, source_id) &&
++	    !(bc250_gfx_eop_events && client_id == SOC15_IH_CLIENTID_GRBM_CP &&
++	      source_id == SOC15_INTSRC_CP_END_OF_PIPE &&
++	      SOC15_CONTEXT_ID0_FROM_IH_ENTRY(ih_ring_entry) != 0) &&
+ 	   (vmid < dev->vm_info.first_vmid_kfd ||
+ 	    vmid > dev->vm_info.last_vmid_kfd))
+ 		return false;
+@@ -211,7 +226,7 @@
+ 	    client_id == SOC15_IH_CLIENTID_SE2SH ||
+ 	    client_id == SOC15_IH_CLIENTID_SE3SH) {
+ 		if (source_id == SOC15_INTSRC_CP_END_OF_PIPE)
+-			kfd_signal_event_interrupt(pasid, context_id0, 32, true);
++			kfd_signal_event_interrupt(pasid, context_id0, 32, !bc250_gfx_eop_events);
+ 		else if (source_id == SOC15_INTSRC_SQ_INTERRUPT_MSG) {
+ 			encoding = REG_GET_FIELD(context_id1,
+ 						SQ_INTERRUPT_WORD_WAVE_CTXID1, ENCODING);
 --- a/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
 +++ b/drivers/gpu/drm/amd/amdkfd/kfd_priv.h
 @@ -1562,6 +1562,15 @@
