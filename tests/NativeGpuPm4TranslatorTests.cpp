@@ -232,8 +232,8 @@ void TestIndirectContextExpansion() {
 }
 
 // Register tables in libSceAgc's form reach the gfx CP as written when every pair would be emitted
-// unchanged; the shadow copy still takes their values. A stub entry, a patched value or
-// VGT_PRIMITIVE_TYPE keeps the expansion.
+// unchanged; the shadow copy still takes their values. VGT_PRIMITIVE_TYPE in a table runs as written
+// too (AgcCreatePrimState's); a stub entry or a patched value keeps the expansion.
 void TestIndirectTablesVerbatim() {
 	Pm4Translator         t;
 	std::vector<uint32_t> cx_pairs = {0x10u, 0x1111u, 0x20u, 0x2222u};
@@ -265,8 +265,8 @@ void TestIndirectTablesVerbatim() {
 	AppendIndirect(held, IT_SET_UCONFIG_REG_INDIRECT, prim_pairs, 0x80000000u);
 	AppendIndirect(held, IT_SET_CONTEXT_REG_INDIRECT, cx_pairs); // another data format
 	auto r3 = t.Translate(held);
-	Check(r3.ok && r3.stats.loads_verbatim == 0 && r3.stats.loaded_uc_regs == 2 && r3.stats.loaded_cx_regs == 2,
-	      "stub entries, VGT_PRIMITIVE_TYPE and other data formats are expanded");
+	Check(r3.ok && r3.stats.loads_verbatim == 1 && r3.stats.loaded_uc_regs == 2 && r3.stats.loaded_cx_regs == 2,
+	      "stub entries and other data formats are expanded, a primitive-type table runs as written");
 }
 
 void TestIndirectShComputeBit() {
@@ -326,6 +326,9 @@ void TestUconfigWhitelist() {
 	          Pm4Translator::UconfigAllowed(0x25Fu),
 	      "per-draw GE registers (index offset, primitive restart, stereo) allowed");
 	Check(!Pm4Translator::UconfigAllowed(0x342u), "unknown UCONFIG 0x342 stays dropped");
+	Check(Pm4Translator::UconfigAllowed(0x248u) && Pm4Translator::UconfigAllowed(0x383u) &&
+	          Pm4Translator::UconfigAllowed(0x384u),
+	      "AgcCreatePrimState's VGT_OBJECT_ID and TEXTURE_GRADIENT_FACTORS/CONTROL allowed");
 }
 
 // libSceAgc's internal-data tags (SET_UCONFIG_REG of 0x342, header bit 2 set in DCBs) reach the gfx

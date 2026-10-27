@@ -9,6 +9,7 @@
 #include "kernel/syncOnAddress.h"
 #include "libs/agc.h"
 #include "libs/controller.h"
+#include "libs/libs.h"
 
 #include <algorithm>
 #include <atomic>
@@ -615,8 +616,9 @@ public:
 		m_write_data_dw += result.stats.write_data_dw;
 		m_direct_ib2 += result.stats.direct_ib2;
 		m_direct_dw += result.stats.direct_dw;
-		for (size_t i = 0; i < m_changed_ops.size(); i++) {
-			m_changed_ops[i] += result.stats.changed_ops[i];
+		for (size_t i = 0; i < 256; i++) {
+			m_changed_ops[acb ? 1 : 0][i] += result.stats.changed_ops[i];
+			m_ops[acb ? 1 : 0][i] += result.stats.ops[i];
 		}
 		for (size_t i = 0; i < m_run_hist.size(); i++) {
 			m_run_hist[i] += result.stats.run_hist[i];
@@ -1345,18 +1347,27 @@ public:
 				             static_cast<unsigned long long>(m_total_dw / m_flips), static_cast<double>(m_verbatim_runs) / m_flips,
 				             static_cast<unsigned long long>(m_run_hist[0]), static_cast<unsigned long long>(m_run_hist[1]),
 				             static_cast<unsigned long long>(m_run_hist[2]), static_cast<unsigned long long>(m_run_hist[3]));
-				std::vector<std::pair<uint64_t, uint32_t>> ops;
-				for (uint32_t i = 0; i < m_changed_ops.size(); i++) {
-					if (m_changed_ops[i] != 0) {
-						ops.emplace_back(m_changed_ops[i], i);
+				// Per opcode, DCB and ACB apart: packets per flip and how many of them did not go through as
+				// written, by the number changed.
+				for (uint32_t k = 0; k < 2; k++) {
+					std::vector<std::tuple<uint64_t, uint64_t, uint32_t>> ops; // changed, all, opcode
+					for (uint32_t i = 0; i < 256; i++) {
+						if (m_ops[k][i] != 0) {
+							ops.emplace_back(m_changed_ops[k][i], m_ops[k][i], i);
+						}
 					}
+					std::sort(ops.rbegin(), ops.rend());
+					std::fprintf(stderr, "native shadow: %s packets per flip by op (changed/all):", k == 0 ? "DCB" : "ACB");
+					for (size_t i = 0; i < ops.size() && i < 14; i++) {
+						const uint32_t op = std::get<2>(ops[i]);
+						std::fprintf(stderr, " 0x%02x:%.0f/%.0f", op, static_cast<double>(m_changed_ops[k][op]) / m_flips,
+						             static_cast<double>(m_ops[k][op]) / m_flips);
+					}
+					std::fprintf(stderr, "\n");
 				}
-				std::sort(ops.rbegin(), ops.rend());
-				std::fprintf(stderr, "native shadow: changed packets per flip by op:");
-				for (size_t i = 0; i < ops.size() && i < 10; i++) {
-					std::fprintf(stderr, " 0x%02x:%.0f", ops[i].second, static_cast<double>(ops[i].first) / m_flips);
+				if (Libs::CountHleList() != nullptr) {
+					Libs::DumpHleCounts(stderr, static_cast<double>(m_flips), 48);
 				}
-				std::fprintf(stderr, "\n");
 				for (uint32_t k = 0; k < 2; k++) {
 					CutStats& c = m_cut_stats[k];
 					if (c.total_dw == 0) {
@@ -1395,6 +1406,7 @@ public:
 				m_direct_ib2 = m_direct_dw = 0;
 				m_run_hist    = {};
 				m_changed_ops = {};
+				m_ops         = {};
 			}
 			const uint64_t held   = g_held_released.exchange(0, std::memory_order_relaxed);
 			const uint64_t waited = g_held_waited.exchange(0, std::memory_order_relaxed);
@@ -3195,7 +3207,8 @@ private:
 	uint64_t                m_direct_dw     = 0;
 	uint32_t                m_direct_min_dw = 0; // KYTY_NATIVE_GPU_DIRECT_RUNS
 	std::array<uint64_t, 4> m_run_hist {};
-	std::array<uint64_t, 256> m_changed_ops {};
+	std::array<std::array<uint64_t, 256>, 2> m_changed_ops {}; // DCB, ACB
+	std::array<std::array<uint64_t, 256>, 2> m_ops {};
 	// Direct-execution view, [0] DCBs and [1] ACBs: dwords, stretches between cuts, replaced packets and
 	// packets with an insertion of ours before them (Pm4TranslateStats::cut_*).
 	struct CutStats {

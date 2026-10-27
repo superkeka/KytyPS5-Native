@@ -870,6 +870,18 @@ bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
 		case 0x262: // GE_USER_VGPR_EN
 			// Per-draw geometry-engine state; radeonsi writes all of these on gfx10 itself.
 			return true;
+		case 0x248: // VGT_OBJECT_ID
+		case 0x383: // TEXTURE_GRADIENT_FACTORS
+		case 0x384: // TEXTURE_GRADIENT_CONTROL
+		{
+			// What AgcCreatePrimState tables carry besides the GE registers (My First GT: in nearly every
+			// one); left out before, so the GPU never had them. KYTY_NATIVE_GPU_TABLES_PRIM=0 leaves them out.
+			static const bool extra = [] {
+				const char* v = std::getenv("KYTY_NATIVE_GPU_TABLES_PRIM");
+				return v == nullptr || v[0] != '0';
+			}();
+			return extra;
+		}
 		default: return false;
 	}
 }
@@ -2517,6 +2529,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const char* v = std::getenv("KYTY_NATIVE_GPU_TABLES_VERBATIM");
 					return v == nullptr || v[0] != '0';
 				}();
+				// VGT_PRIMITIVE_TYPE/INDEX_TYPE in a UCONFIG table go as written too: the CP takes them from the
+				// table as the PS5's does (AgcCreatePrimState puts the primitive type in every such table; My First
+				// GT, ASTRO BOT and Dead Cells draw right). KYTY_NATIVE_GPU_TABLES_PRIM=0 expands those tables.
+				static const bool tables_prim = [] {
+					const char* v = std::getenv("KYTY_NATIVE_GPU_TABLES_PRIM");
+					return v == nullptr || v[0] != '0';
+				}();
 				bool verbatim = tables_verbatim && !m_compute_ring && bptr[2] == 0x80000000u && (bptr[0] & 3u) == 0;
 				const bool compute_sh = (dcb[dw] & 2u) != 0;
 				for (uint32_t i = 0; i < num && verbatim; i++) {
@@ -2530,7 +2549,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					} else if (op == IT_SET_SH_REG_INDIRECT) {
 						verbatim = off != kShNop && (off >= kShComputeBase) == compute_sh && PatchSh(off, value) == value;
 					} else {
-						verbatim = off != kUcNop && off != 0x242u && off != 0x243u && UconfigAllowed(off);
+						verbatim = off != kUcNop && (tables_prim || (off != 0x242u && off != 0x243u)) && UconfigAllowed(off);
 					}
 				}
 				if (verbatim) {
@@ -3210,6 +3229,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		const bool same = in_place || (same_seg && body.size() - body_before == size &&
 		                               std::memcmp(body.data() + body_before, dcb.data() + dw, size * 4u) == 0);
+		stats.ops[op]++;
 		if (same) {
 			stats.verbatim_dw += size;
 			verbatim_run += size;
