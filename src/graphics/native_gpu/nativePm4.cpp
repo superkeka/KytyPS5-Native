@@ -2971,25 +2971,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.index_state++;
 				break;
 			case IT_DRAW_INDEX_OFFSET_2: { // MAX_SIZE, INDEX_OFFSET, INDEX_COUNT, DRAW_INITIATOR
-				// The PS5 command processor takes MAX_SIZE as the indices left from INDEX_OFFSET (games
-				// send offsets past it); the BC-250's amdgpu microcode takes it as the whole buffer, and
-				// such a draw hung the GPU (ASTRO BOT). Issue it as DRAW_INDEX_2 at the offset's address
-				// instead, as Kyty's own command processor does.
+				// The PS5's CP firmware has its own handler for this packet (PFP and ME); MAX_SIZE is the
+				// indices left from INDEX_OFFSET, and games send offsets past it. The BC-250's amdgpu
+				// firmware draws nothing for it: ASTRO BOT was black with the packet as written, with
+				// MAX_SIZE as the end of the range, with INDEX_BASE or INDEX_BUFFER_SIZE resent before
+				// it, and with the base moved to the offset and INDEX_OFFSET 0 (no hang in any). So the
+				// translator does the firmware's part: DRAW_INDEX_2 at the offset's address, as Kyty's
+				// own command processor does.
 				if (body_count < 4) {
 					return fail(op, dw);
 				}
 				log_draw(op, bptr[2], 0, false);
-				// KYTY_NATIVE_GPU_OFFSET_DRAW_VERBATIM=1 (experiment): the packet as the title wrote it, now that
-				// libSceAgc (agc.cpp) writes MAX_SIZE as the end of the drawn range, which both semantics accept.
-				// ASTRO BOT with it: no hang, but a black screen (index fetch differs; INDEX_BUFFER_SIZE?).
-				static const bool offset_draw_verbatim = [] {
-					const char* v = std::getenv("KYTY_NATIVE_GPU_OFFSET_DRAW_VERBATIM");
-					return v != nullptr && v[0] == '1';
-				}();
 				if (skip_draw()) {
 					stats.draws_skipped++;
-				} else if (offset_draw_verbatim && bptr[0] >= bptr[1] + bptr[2]) {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				} else {
 					const uint32_t index_type  = reg(uc, 0x243u) & 0x3u; // VGT_INDEX_TYPE: 0 16-bit, 1 32-bit, 2 8-bit
 					const uint64_t index_bytes = index_type == 1u ? 4u : (index_type == 2u ? 1u : 2u);

@@ -2709,9 +2709,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	cmd[0] = KYTY_PM4(5, Pm4::IT_DRAW_INDEX_OFFSET_2, 0u);
-	// MAX_SIZE: the PS5's CP takes it as the indices left from INDEX_OFFSET, AMD's microcode as the whole
-	// buffer (a draw past it hung the BC-250); the end of the drawn range satisfies both.
-	cmd[1] = index_offset + (index_count == 0 ? 1u : index_count);
+	cmd[1] = (index_count == 0 ? 1u : index_count); // MAX_SIZE: the indices left from INDEX_OFFSET
 	cmd[2] = index_offset;
 	cmd[3] = index_count;
 	cmd[4] = decode_draw_index_initiator(modifier);
