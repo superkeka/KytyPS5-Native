@@ -16,7 +16,7 @@ steamos-readonly disable
 install -D -m 644 "$SRC" "$DST"
 cat > /etc/modprobe.d/bc250-amdgpu.conf <<'EOF'
 # BC-250 TLB flush fixes (patched amdgpu in updates/, see /home/deck/dev/amdgpu-bc250)
-options amdgpu sched_policy=2 bc250_tlb_flush_type=0 bc250_flush_pasid_kiq=0 bc250_flush_by_runlist=3 gpu_recovery=0
+options amdgpu sched_policy=2 bc250_tlb_flush_type=0 bc250_gfx_queues=2 vm_update_mode=0 bc250_flush_pasid_kiq=0 bc250_flush_by_runlist=3 gpu_recovery=0
 EOF
 depmod "$KVER"
 modinfo -n amdgpu | grep -q /updates/ || { echo "depmod does not pick the patched module"; exit 1; }

@@ -728,9 +728,20 @@ public:
 
 	// Every GEM buffer a submission must list as resident: the resident blocks (unless always valid),
 	// the dummy and the external ranges. Grows as blocks are promoted.
+	// While another thread holds m_lock (a GEM_VA can wait in the kernel for the GPU work that maps
+	// the old range, and that work may be waiting for the very submission asking here: My First Gran
+	// Turismo deadlocked so), the last list is returned. A block promoted meanwhile is listed by the
+	// next submission; always-valid blocks are never listed.
 	[[nodiscard]] std::vector<uint32_t> CreatedHandles() const {
-		std::lock_guard<std::mutex> lock(m_lock);
-		std::vector<uint32_t>       handles;
+		std::unique_lock<std::mutex> lock(m_lock, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			std::lock_guard<std::mutex> last(m_handles_mutex);
+			if (!m_last_handles.empty()) {
+				return m_last_handles;
+			}
+			lock.lock();
+		}
+		std::vector<uint32_t> handles;
 		handles.reserve(m_blocks.size() + m_external.size() + 1);
 		for (const auto& block: m_blocks) {
 			if (block.resident && !block.bo.always_valid) {
@@ -742,6 +753,10 @@ public:
 			if (ext.handle != 0) {
 				handles.push_back(ext.handle);
 			}
+		}
+		{
+			std::lock_guard<std::mutex> last(m_handles_mutex);
+			m_last_handles = handles;
 		}
 		return handles;
 	}
@@ -1672,6 +1687,8 @@ private:
 	bool                          m_kfd_userptr = false; // KYTY_NATIVE_GPU_KFD_QUEUES: external ranges are KFD userptr buffers
 	bool                          m_kfd_memory  = false; // blocks are KFD buffers (InitKfd)
 	Bo                            m_tlb_bo;              // FlushKfdTlb's buffer
+	mutable std::mutex            m_handles_mutex;       // m_last_handles
+	mutable std::vector<uint32_t> m_last_handles;        // CreatedHandles' last list
 	mutable std::atomic<uint64_t> m_va_changes {0};      // VaOp calls (FlushKfdTlb)
 	mutable uint64_t              m_kfd_va_next = 0x600000000000ull; // private VAs of the KFD allocations
 	uint8_t*                      m_alias  = nullptr;

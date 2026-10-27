@@ -1316,6 +1316,39 @@ public:
 	uint32_t ComputeRingMask() const { return m_compute_mask; }
 	// Guest compute queues run on KFD user-mode queues of their own (EnableKfdQueues).
 	bool KfdQueuesOn() const { return m_kfd_queues; }
+	// Tracker slots: 0 is the gfx ring, kGfx1Slot the second gfx ring when amdgpu has one (the PS5's
+	// "AGR" ring: the BC-250's patched amdgpu with bc250_gfx_queues=2), any other n the compute ring or
+	// KFD queue n - 1 (KFD indexes stay below 31).
+	static constexpr uint32_t kGfx1Slot = 32;
+	// A guest graphics queue's waits go to the GPU (while each has a gfx ring of its own) when amdgpu
+	// updates compute VMs' page tables with SDMA (amdgpu.vm_update_mode=0). With its default on this
+	// board, the CPU writes them and first waits for every fence of the VM: a guest GEM_VA then sat in
+	// the kernel behind a gfx job waiting on the GPU for an ACB, holding GemBacking's lock that ACB's
+	// submission needed (My First Gran Turismo stopped at once). KYTY_NATIVE_GPU_GFX_GPU_WAITS=1/0
+	// decides instead.
+	bool GfxQueueWaitsOnGpu() const {
+		static const bool on = [] {
+			if (const char* v = std::getenv("KYTY_NATIVE_GPU_GFX_GPU_WAITS"); v != nullptr && v[0] != '\0') {
+				return v[0] == '1';
+			}
+			FILE* f    = std::fopen("/sys/module/amdgpu/parameters/vm_update_mode", "re");
+			int   mode = -1;
+			if (f != nullptr) {
+				mode = std::fscanf(f, "%d", &mode) == 1 ? mode : -1;
+				std::fclose(f);
+			}
+			return mode == 0;
+		}();
+		return on && m_acb_rings;
+	}
+	static bool GfxSlot(uint32_t slot) { return slot == 0 || slot == kGfx1Slot; }
+	bool SecondGfxRing() const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return m_submitter != nullptr && (m_submitter->GfxRingMask() & 2u) != 0;
+#else
+		return false;
+#endif
+	}
 	uint32_t KfdQueueCount() const { return std::max(m_submitter != nullptr ? m_submitter->KfdQueueCount() : 0u, 1u); }
 
 	// The per-VMID PS5 settings follow this VM's gfx VMID, which amdgpu may change between jobs: once
@@ -1467,11 +1500,7 @@ public:
 			return;
 		}
 		for (uint32_t slot = 0; slot < kTrackerSlots; slot++) {
-			NativeSubmitter::RingTarget target;
-			if (slot != 0) {
-				target.ip_type = AMDGPU_HW_IP_COMPUTE;
-				target.ring    = slot - 1;
-			}
+			const NativeSubmitter::RingTarget target = SlotTarget(slot);
 			uint32_t written = 0;
 			const auto& kept = m_hang_kept[slot];
 			for (size_t k = 0; k < kept.size(); k++) {
@@ -1480,7 +1509,7 @@ public:
 				// Compute rings: also the last 32 that signaled (waves can outlive the fence that ends their
 				// submission), and up to 8 that did not.
 				const bool recent = k + 32 >= kept.size();
-				if ((done && slot != 0 && !recent) || written >= 40) {
+				if ((done && !GfxSlot(slot) && !recent) || written >= 40) {
 					continue;
 				}
 				const std::string path = m_hang_dump + "/slot" + std::to_string(slot) + "_seq" + std::to_string(seq) +
@@ -1602,6 +1631,12 @@ private:
 					continue;
 				}
 				const uint64_t v = SatisfyingValue(w, cur);
+				if (round == 0) {
+					std::fprintf(stderr, "native shadow: pending GPU wait on 0x%llx (%s, func %u, ref 0x%llx, mask 0x%llx): holds 0x%llx\n",
+					             static_cast<unsigned long long>(w.addr), w.wide ? "64-bit" : "32-bit", w.function,
+					             static_cast<unsigned long long>(w.ref), static_cast<unsigned long long>(w.mask),
+					             static_cast<unsigned long long>(cur));
+				}
 				m_gem->WriteGuest(w.addr, &v, w.wide ? 8 : 4);
 				released++;
 			}
@@ -1904,18 +1939,27 @@ private:
 
 	void SubmitBatchLocked() { SubmitBufferLocked(m_batch, 0); }
 
+#if KYTY_GEM_BACKING_SUPPORTED
+	// Slot 0 is the gfx ring, kGfx1Slot the second gfx ring, any other slot the compute ring `slot - 1`.
+	static NativeSubmitter::RingTarget SlotTarget(uint32_t slot) {
+		NativeSubmitter::RingTarget target;
+		if (slot == kGfx1Slot) {
+			target.ring = 1;
+		} else if (slot != 0) {
+			target.ip_type = AMDGPU_HW_IP_COMPUTE;
+			target.ring    = slot - 1;
+		}
+		return target;
+	}
+#endif
+
 	void SubmitBufferLocked(std::vector<uint32_t>& batch, uint32_t slot) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (batch.empty() || m_disabled || m_submitter == nullptr) {
 			batch.clear();
 			return;
 		}
-		// Slot 0 is the gfx ring. Any other slot is the compute ring `slot - 1`.
-		NativeSubmitter::RingTarget target;
-		if (slot != 0) {
-			target.ip_type = AMDGPU_HW_IP_COMPUTE;
-			target.ring    = slot - 1;
-		}
+		const NativeSubmitter::RingTarget target = SlotTarget(slot);
 		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
 		NativeSubmitter::Result r       = m_submitter->Submit(batch, handles, m_timeout_sec, target);
 		if (!m_hang_dump.empty() && r.submitted && slot < kTrackerSlots) {
@@ -1923,7 +1967,7 @@ private:
 			// ring keeps receiving work behind the stuck one, so it keeps many more.
 			auto& kept = m_hang_kept[slot];
 			kept.emplace_back(r.seq, batch);
-			while (kept.size() > (slot == 0 ? 8u : 4096u)) {
+			while (kept.size() > (GfxSlot(slot) ? 8u : 4096u)) {
 				kept.pop_front();
 			}
 		}
@@ -3023,12 +3067,14 @@ public:
 	// landed yet, then guest memory.
 	Plan PlanWait(const WaitCond& wait) override {
 		// A guest compute queue has a hardware queue of its own (KFD): its wait is what the title wrote,
-		// run by the GPU as on PS5, and holds up nothing but that queue. The gfx ring is one in-order
-		// ring for every guest graphics queue (the PS5 has more), so a gfx wait whose writer is not known
-		// to be ahead stays on the CPU, or another guest queue's writer behind it never runs (My First
-		// Gran Turismo stopped at once); one memory already meets runs as itself, not as a barrier.
+		// run by the GPU as on PS5, and holds up nothing but that queue. So does a guest graphics queue
+		// while each has a gfx ring of its own (two with the BC-250's patched amdgpu, as on the PS5).
+		// When guest graphics queues share an in-order ring, a gfx wait whose writer is not known to be
+		// ahead stays on the CPU, or another guest queue's writer behind it never runs (My First Gran
+		// Turismo stopped at once); one memory already meets runs as itself, not as a barrier.
 		const bool gpu_waits = AllWaitsOnGpu();
-		if (gpu_waits && SlotOf(m_translating) != 0) {
+		const uint32_t slot = SlotOf(m_translating);
+		if (gpu_waits && (!Shadow::GfxSlot(slot) || !m_gfx_shared)) {
 			return Plan::Native;
 		}
 		const Plan plan = PlanWaitHeld(wait);
@@ -3135,7 +3181,20 @@ private:
 	// order, as the PS5 maps each of a title's compute queues onto one hardware queue (more queues
 	// than indexes share them).
 	uint32_t SlotOf(uint32_t queue) const {
-		if (!m_acb_rings || queue < 0x20u) {
+		if (queue < 0x20u || queue >= 0x58u) {
+			// Guest graphics queues take the gfx rings in the order they appear, as the PS5 gives a title
+			// its main ring and its "AGR" ring; a further one shares the first ring.
+			auto [it, fresh] = m_gfx_index.try_emplace(queue, static_cast<uint32_t>(m_gfx_index.size()));
+			const bool own = it->second == 0 || (it->second == 1 && m_acb_rings && Shadow::Instance().SecondGfxRing());
+			if (fresh) {
+				// Decided when the first one appears: by then the submitter knows the gfx rings.
+				m_gfx_shared = it->second == 0 ? !Shadow::Instance().GfxQueueWaitsOnGpu() : (m_gfx_shared || !own);
+				std::fprintf(stderr, "native shadow: guest graphics queue 0x%x runs on gfx ring %u%s\n", queue, own ? it->second : 0u,
+				             m_gfx_shared ? " (gfx waits with no known writer ahead stay held on the CPU)" : " (gfx waits on the GPU)");
+			}
+			return own && it->second == 1 ? Shadow::kGfx1Slot : 0;
+		}
+		if (!m_acb_rings) {
 			return 0;
 		}
 		if (!Shadow::Instance().KfdQueuesOn()) {
@@ -3265,7 +3324,7 @@ private:
 			gpu        = w->write.gpu;
 			same       = w->slot == slot;
 			submitted  = Submitted(*w);
-			gfx_writer = m_early_waits && slot != 0 && w->slot == 0;
+			gfx_writer = m_early_waits && !Shadow::GfxSlot(slot) && Shadow::GfxSlot(w->slot);
 		} else if (auto last = m_last_write.find(wait.addr); last != m_last_write.end() && last->second.second > p.made) {
 			// A write emitted after this waiter was translated has already landed. On PS5 the waiting
 			// queue would have seen it, even if the title has reset the label since (ASTRO BOT does that
@@ -3281,7 +3340,7 @@ private:
 		const bool native = p.seg.wait_len != 0 && m_native_waits;
 		// A compute queue of its own (KFD) just waits, as on PS5: whatever writes the label later, on
 		// whichever queue, nothing can be stuck behind this one.
-		if (native && slot != 0 && Shadow::Instance().KfdQueuesOn()) {
+		if (native && (!Shadow::GfxSlot(slot) || !m_gfx_shared) && Shadow::Instance().KfdQueuesOn()) {
 			return Release::Native;
 		}
 		// With independent queues the wait reads memory as on PS5: a label that already holds a
@@ -3510,7 +3569,7 @@ private:
 		}
 		if (!p.ib.empty()) {
 			// The translated IB passed the packet check; the patched one has to as well.
-			const NativeIbKind kind = slot == 0 ? NativeIbKind::Gfx : NativeIbKind::Compute;
+			const NativeIbKind kind = Shadow::GfxSlot(slot) ? NativeIbKind::Gfx : NativeIbKind::Compute;
 			if (uint32_t bad = 0; Shadow::Instance().Validating() && !ValidateNativeIb(p.ib, NativeLodStats(), &bad, kind)) {
 				std::fprintf(stderr, "native shadow: a patched segment fails the packet check at dw %u (0x%08x); disabling\n", bad,
 				             p.ib[bad]);
@@ -3806,6 +3865,8 @@ private:
 	std::unordered_map<uint64_t, std::pair<LabelWrite, uint64_t>> m_last_write; // label -> its last write emitted, and when
 	uint64_t                                m_emits = 0; // Emit calls so far
 	mutable std::map<uint32_t, uint32_t>    m_queue_index; // guest compute queue -> its KFD queue index (SlotOf)
+	mutable std::map<uint32_t, uint32_t>    m_gfx_index;   // guest graphics queue -> the order it appeared in (SlotOf)
+	mutable bool                            m_gfx_shared = true; // gfx waits with no known writer ahead held (SlotOf decides)
 	std::array<LabelEvent, 1024>            m_label_trace {}; // KYTY_NATIVE_GPU_LABEL_TRACE ring
 	uint64_t                                m_label_trace_next = 0;
 	bool                                    m_wake        = false; // the tracker moved; recheck held labels
@@ -3856,7 +3917,7 @@ void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, uint32_t que
 		LabelPipeline::Instance().Enqueue(buffer, size_in_dwords, queue, std::move(then));
 		return;
 	}
-	Pipeline::Instance().Enqueue(buffer, size_in_dwords, queue != 0,
+	Pipeline::Instance().Enqueue(buffer, size_in_dwords, queue >= 0x20u && queue < 0x58u,
 	                             [then = std::move(then), buffer, size_in_dwords] {
 		                             then(std::span<const uint32_t>(buffer, size_in_dwords));
 	                             });

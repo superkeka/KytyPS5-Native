@@ -148,6 +148,7 @@ public:
 	[[nodiscard]] bool HasGds() const { return m_gds_size != 0; }
 	// AMDGPU_INFO_HW_IP_INFO available_rings for compute, ip_instance 0. 0 when the kernel has none.
 	[[nodiscard]] uint32_t ComputeRingMask() const { return m_compute_rings; }
+	[[nodiscard]] uint32_t GfxRingMask() const { return m_gfx_rings; }
 	[[nodiscard]] uint32_t GdsSize() const { return m_gds_size; }
 	// How many KFD queues EnableKfdQueues can give (ring indexes 0 .. this - 1).
 	static constexpr uint32_t MaxKfdQueues() { return kMaxKfdQueues; }
@@ -598,6 +599,14 @@ private:
 		}
 		m_compute_rings = ip.available_rings;
 		std::fprintf(stderr, "NativeSubmitter: compute rings mask 0x%x\n", m_compute_rings);
+		// Graphics rings: one on stock amdgpu for Navi1x, two with the BC-250's patched one
+		// (bc250_gfx_queues=2: gfx pipe 0 queues 0 and 1, the PS5's main ring and its "AGR" ring).
+		std::memset(&ip, 0, sizeof(ip));
+		request.query_hw_ip.type = AMDGPU_HW_IP_GFX;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) == 0) {
+			m_gfx_rings = ip.available_rings;
+			std::fprintf(stderr, "NativeSubmitter: gfx rings mask 0x%x\n", m_gfx_rings);
+		}
 	}
 
 	bool CreateIb() {
@@ -771,6 +780,7 @@ private:
 	uint64_t m_slot_order = 0;
 	SlotUse  m_slot[kSlots];
 	uint32_t m_compute_rings = 0; // bitmask from AMDGPU_INFO_HW_IP_INFO
+	uint32_t m_gfx_rings     = 1; // the same for the graphics rings
 	std::vector<uint32_t> m_gds_handles; // GDS, GWS and OA buffers listed in every submission
 	uint32_t              m_gds_size = 0;
 };

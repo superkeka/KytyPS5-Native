@@ -4840,7 +4840,9 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
-static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+// `queue`: the guest graphics queue (0 when the call names none); the native path gives each one a gfx
+// ring of its own while amdgpu has rings for them, as the PS5 does a title's main and AGR rings.
+static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords, uint32_t queue = 0) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
@@ -4848,7 +4850,7 @@ static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 		// runs after the DCB's GPU work, when the title may already have requested the next flips: its
 		// waits for a flip count only the requests made before this submission.
 		const uint64_t flip_watermark = g_renderer->GetVideoOut().NextFlipRequestId();
-		Libs::Graphics::NativeGpu::ShadowEnqueue(dcb, size_in_dwords, 0, [flip_watermark](std::span<const uint32_t> commands) {
+		Libs::Graphics::NativeGpu::ShadowEnqueue(dcb, size_in_dwords, queue, [flip_watermark](std::span<const uint32_t> commands) {
 			g_renderer->GetGpu().Submit(commands, {}, flip_watermark);
 		});
 		return;
@@ -4942,7 +4944,7 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 	if (queue >= 0x20 && queue < 0x58) {
 		submit_acb(queue, commands, size_in_dwords);
 	} else {
-		submit_dcb(commands, size_in_dwords);
+		submit_dcb(commands, size_in_dwords, queue);
 	}
 }
 

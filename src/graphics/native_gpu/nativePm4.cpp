@@ -1817,6 +1817,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		segs.back().writes.push_back(w);
 		local_writes.push_back(w);
 	};
+	// The points queued so far (EOP interrupts, wakes, labels the CPU writes) as a tracker store here,
+	// before a GPU wait: on the PS5 an interrupt fires where its release runs, and a title may submit
+	// the writer of what it waits for only once it has seen that interrupt (My First Gran Turismo
+	// stopped when its interrupts waited for the end of a segment its own wait held up).
+	auto flush_points = [&]() {
+		if (queued_points.empty()) {
+			return;
+		}
+		const uint32_t dw = static_cast<uint32_t>(body.size()) + 5u;
+		EmitRelease32(body, m_tracker_va, 0u, m_compute_ring);
+		for (auto& p: queued_points) {
+			p.dw = dw;
+			segs.back().points.push_back(std::move(p));
+		}
+		queued_points.clear();
+	};
 	// Ends the current segment with its End point; a first segment that does nothing is dropped (the
 	// next segment's preamble holds its register writes).
 	auto close_segment = [&](bool last) {
@@ -2357,6 +2373,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// memory, and the barrier is the only GPU wait.
 					if (plan == LabelOracle::Plan::Native && !label_gpu(addr, 4)) {
 						plan = LabelOracle::Plan::Split;
+					}
+					if (plan == LabelOracle::Plan::Native) {
+						flush_points();
 					}
 					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, w, m_compute_ring)) {
 						plan = LabelOracle::Plan::Split;
