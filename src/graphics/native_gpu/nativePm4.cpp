@@ -1919,6 +1919,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
             verbatim_run = 0;
         }
 	};
+	uint32_t cut_run = 0;
+	auto     end_cut_run = [&]() {
+		if (cut_run != 0) {
+			stats.cut_runs++;
+			cut_run = 0;
+		}
+	};
 	stats.total_dw = static_cast<uint32_t>(dcb.size());
 	while (dw < dcb.size()) {
 		const size_t   body_before = body.size();
@@ -2902,18 +2909,33 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (IsWork(op)) {
 			seg_effects = true;
 		}
-		if (segs.size() == segs_before && body.size() - body_before == size &&
-		    std::memcmp(body.data() + body_before, dcb.data() + dw, size * 4u) == 0) {
+		const bool same_seg = segs.size() == segs_before;
+		const bool same     = same_seg && body.size() - body_before == size &&
+		                  std::memcmp(body.data() + body_before, dcb.data() + dw, size * 4u) == 0;
+		if (same) {
 			stats.verbatim_dw += size;
 			verbatim_run += size;
 		} else {
 			end_run();
 			stats.changed_ops[op]++;
 		}
+		if (same || (op == IT_NOP && same_seg && body.size() == body_before)) {
+			cut_run += size;
+		} else {
+			end_cut_run();
+			const bool tail = same_seg && body.size() - body_before > size &&
+			                  std::memcmp(body.data() + body.size() - size, dcb.data() + dw, size * 4u) == 0;
+			if (tail) {
+				stats.inserted_ops[op]++;
+			} else {
+				stats.cut_ops[op]++;
+			}
+		}
 
 		dw += size;
 	}
 	end_run();
+	end_cut_run();
 	if (!r.unknown_ops.empty()) {
 		const uint32_t first_op = r.unknown_op;
 		const uint32_t first_dw = r.unknown_dw;

@@ -1329,6 +1329,9 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
 			break;
+		// ZPASS_DONE (0x15): the same counter dump in the form the BC-250's DB writes; libSceAgc's
+		// AgcDcbEventWrite issues it instead of PIXEL_PIPE_STAT_DUMP when the native path draws.
+		case 0x00000015:
 		case 0x00000039: {
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64

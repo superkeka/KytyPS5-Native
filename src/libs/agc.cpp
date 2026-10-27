@@ -2708,7 +2708,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	cmd[0] = KYTY_PM4(5, Pm4::IT_DRAW_INDEX_OFFSET_2, 0u);
-	cmd[1] = (index_count == 0 ? 1u : index_count);
+	// MAX_SIZE: the PS5's CP takes it as the indices left from INDEX_OFFSET, AMD's microcode as the whole
+	// buffer (a draw past it hung the BC-250); the end of the drawn range satisfies both.
+	cmd[1] = index_offset + (index_count == 0 ? 1u : index_count);
 	cmd[2] = index_offset;
 	cmd[3] = index_count;
 	cmd[4] = decode_draw_index_initiator(modifier);
@@ -2963,7 +2965,11 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	} else if (addressed_event) {
 		auto addr = reinterpret_cast<uint64_t>(address);
 
-		cmd[1] = 0x100u | event_type;
+		// PIXEL_PIPE_STAT_DUMP (0x39) leaves memory untouched on the BC-250's DB; ZPASS_DONE (0x15) writes
+		// the same counters. When the native path draws, the packet goes in that form, so the GPU runs
+		// it as written instead of the translator replacing ~13000 of them a frame (ASTRO BOT).
+		const uint8_t type = event_type == 0x39u && Libs::Graphics::NativeGpu::PrimaryRendering() ? 0x15u : event_type;
+		cmd[1] = 0x100u | type;
 		cmd[2] = static_cast<uint32_t>(addr) & 0xfffffff8u;
 		cmd[3] = static_cast<uint32_t>(addr >> 32u);
 	} else {

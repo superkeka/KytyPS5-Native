@@ -1840,7 +1840,7 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	uint32_t   event_type     = (buffer[0]) & 0x3fu;
 	uint64_t   event_address  = 0;
 
-	if (event_type == 0x39u) {
+	if (event_type == 0x39u || (event_type == 0x15u && packet_size_dw == 4u)) {
 		EXIT_NOT_IMPLEMENTED(packet_size_dw != 4u);
 		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
 	}

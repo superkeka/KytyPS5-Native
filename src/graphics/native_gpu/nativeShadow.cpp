@@ -538,6 +538,15 @@ public:
 		for (size_t i = 0; i < m_run_hist.size(); i++) {
 			m_run_hist[i] += result.stats.run_hist[i];
 		}
+		{
+			CutStats& c = m_cut_stats[acb ? 1 : 0];
+			c.total_dw += result.stats.total_dw;
+			c.cut_runs += result.stats.cut_runs;
+			for (size_t i = 0; i < c.cut_ops.size(); i++) {
+				c.cut_ops[i] += result.stats.cut_ops[i];
+				c.inserted_ops[i] += result.stats.inserted_ops[i];
+			}
+		}
 		for (uint32_t i = 0; i < result.stats.event_index.size(); i++) {
 			m_event_index_hist[i] += result.stats.event_index[i];
 		}
@@ -1123,6 +1132,33 @@ public:
 					std::fprintf(stderr, " 0x%02x:%.0f", ops[i].second, static_cast<double>(ops[i].first) / m_flips);
 				}
 				std::fprintf(stderr, "\n");
+				for (uint32_t k = 0; k < 2; k++) {
+					CutStats& c = m_cut_stats[k];
+					if (c.total_dw == 0) {
+						continue;
+					}
+					auto top = [&](const std::array<uint64_t, 256>& a, const char* what) {
+						std::vector<std::pair<uint64_t, uint32_t>> v;
+						for (uint32_t i = 0; i < a.size(); i++) {
+							if (a[i] != 0) {
+								v.emplace_back(a[i], i);
+							}
+						}
+						std::sort(v.rbegin(), v.rend());
+						std::fprintf(stderr, " %s", what);
+						for (size_t i = 0; i < v.size() && i < 8; i++) {
+							std::fprintf(stderr, " 0x%02x:%.0f", v[i].second, static_cast<double>(v[i].first) / m_flips);
+						}
+					};
+					std::fprintf(stderr, "native shadow: direct execution, %s: %llu dwords and %.0f cuts per flip;",
+					             k == 0 ? "DCBs" : "ACBs", static_cast<unsigned long long>(c.total_dw / m_flips),
+					             static_cast<double>(c.cut_runs) / m_flips);
+					top(c.cut_ops, "replaced");
+					std::fprintf(stderr, ";");
+					top(c.inserted_ops, "ours inserted before");
+					std::fprintf(stderr, "\n");
+					c = {};
+				}
 				m_verbatim_dw = m_total_dw = m_verbatim_runs = 0;
 				m_run_hist    = {};
 				m_changed_ops = {};
@@ -2860,6 +2896,15 @@ private:
 	uint64_t                m_verbatim_runs = 0;
 	std::array<uint64_t, 4> m_run_hist {};
 	std::array<uint64_t, 256> m_changed_ops {};
+	// Direct-execution view, [0] DCBs and [1] ACBs: dwords, stretches between cuts, replaced packets and
+	// packets with an insertion of ours before them (Pm4TranslateStats::cut_*).
+	struct CutStats {
+		uint64_t                  total_dw = 0;
+		uint64_t                  cut_runs = 0;
+		std::array<uint64_t, 256> cut_ops {};
+		std::array<uint64_t, 256> inserted_ops {};
+	};
+	std::array<CutStats, 2> m_cut_stats {};
 	uint64_t      m_flatten_failed = 0; // and could not
 	double        m_gpu_ms_total   = 0.0;
 	double        m_cs_ms_total    = 0.0;

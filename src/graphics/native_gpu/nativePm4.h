@@ -132,6 +132,12 @@ struct Pm4TranslateStats {
 	uint32_t verbatim_runs     = 0;
 	std::array<uint32_t, 4> run_hist {}; // runs under 16, 64, 256 dwords, and longer
 	std::array<uint32_t, 256> changed_ops {}; // packets that did not go through verbatim, by opcode
+	// Direct execution (the GPU running the guest buffer in place): the stretches it would run between
+	// cuts, if NOPs that emit nothing stayed in place and a packet only preceded by ours ran as itself;
+	// the packets replaced, and the ones only preceded by an insertion of ours, by opcode.
+	uint32_t                  cut_runs = 0;
+	std::array<uint32_t, 256> cut_ops {};
+	std::array<uint32_t, 256> inserted_ops {};
 	uint32_t nops              = 0; // IT_NOP packets skipped (markers included)
 	uint32_t marker_flip       = 0; // IT_NOP R_FLIP
 	uint32_t marker_release    = 0; // IT_NOP R_RELEASE_MEM
