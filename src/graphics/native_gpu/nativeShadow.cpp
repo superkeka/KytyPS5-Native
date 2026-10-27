@@ -334,6 +334,11 @@ public:
 	}
 	// RCIU CAM `entry` the way the PS5 kernel programs it (phase 0 = register | pipe enables, then mask
 	// and value); the helper puts the old entry back when this connection closes. 0 or -errno.
+	// GFXOFF off while this connection is open (the helper's request on debugfs amdgpu_gfxoff). 0 or -errno.
+	int KeepGfxPowered() {
+		uint32_t v = 0;
+		return Call(16u, 0, 0, &v);
+	}
 	int SetRciu(uint32_t entry, uint32_t phase0, uint32_t mask, uint32_t value) {
 		uint32_t v = 0;
 		return Call(15u | entry << 8u, phase0, mask | static_cast<uint64_t>(value) << 32u, &v);
@@ -2930,14 +2935,22 @@ private:
 		// The PS5 kernel's RCIU CAM entry 19 (on in primary mode; KYTY_NATIVE_GPU_PS5_REG_OVERRIDES=0 off).
 		// Entry 18 (UCONFIG 0xc035 bit 0) and the per-process UCONFIG 0xc035..0xc03c are Oberon registers
 		// gfx1013 does not define, so nothing is written for them.
+		// GFX stays powered between submissions, as a PS5 title's GPU does: with GFXOFF the gfx block powers
+		// down whenever the ring idles, and ASTRO BOT's heavy view missed five times as many refreshes (13.9
+		// late frames in 120 instead of 2.8). Through the kyty-lodhw helper (root), which lets GFXOFF back
+		// on when Kyty exits; KYTY_NATIVE_GPU_GFXOFF=1 leaves it on.
+		if (!EnvOn("KYTY_NATIVE_GPU_GFXOFF")) {
+			const int r = m_rciu_hw.On() || m_rciu_hw.Connect() ? m_rciu_hw.KeepGfxPowered() : -ENOTCONN;
+			std::fprintf(stderr, "native shadow: GFXOFF %s\n", r == 0 ? "off while Kyty runs" : std::strerror(-r));
+		}
 		// With the kyty-lodhw helper (root) the CAM entry itself is programmed, as on the PS5, and register
 		// writes reach the CP as the title made them; without it the translator sets the bit in each write.
 		if (PrimaryFeature("KYTY_NATIVE_GPU_PS5_REG_OVERRIDES")) {
-			const int r = m_rciu_hw.Connect() ? m_rciu_hw.SetRciu(19, 0xa310u | 1u << 24u | 1u << 25u, 4u, 4u) : -ENOTCONN;
+			const int r = m_rciu_hw.On() || m_rciu_hw.Connect() ? m_rciu_hw.SetRciu(19, 0xa310u | 1u << 24u | 1u << 25u, 4u, 4u)
+			                                                           : -ENOTCONN;
 			if (r == 0) {
 				std::fprintf(stderr, "native shadow: RCIU CAM entry 19 programmed as on the PS5 (PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID)\n");
 			} else {
-				m_rciu_hw.Disconnect();
 				m_translator.SetPs5RegOverrides(true);
 				std::fprintf(stderr,
 				             "native shadow: PS5 register overrides in the translator (PA_SC_SHADER_CONTROL.LOAD_COLLISION_WAVEID; "
@@ -3138,7 +3151,7 @@ private:
 	// KYTY_NATIVE_GPU_PS5_REGS (InitPs5Regs): its own helper connection, so closing it (exit, crash)
 	// puts the registers back, and the LOD statistics client is not turned on by it.
 	LodStatsHw            m_ps5_hw;
-	LodStatsHw            m_rciu_hw; // KYTY_NATIVE_GPU_PS5_REG_OVERRIDES: holds the RCIU CAM entry while Kyty runs
+	LodStatsHw            m_rciu_hw; // holds the RCIU CAM entry and GFXOFF off while Kyty runs
 	std::mutex            m_ps5_mutex;
 	uint32_t              m_ps5_regs     = 0; // kPs5* bits
 	uint32_t              m_ps5_pasid    = 0;

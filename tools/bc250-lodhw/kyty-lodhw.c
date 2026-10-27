@@ -46,6 +46,10 @@
 //      in every write of that register, from any packet. `size` 0xffffffff reads the entry instead
 //      (index, then three DATA reads): value = phase 0. What the entry held before goes back when the
 //      client disconnects.
+//   op 16: GFXOFF off while this client is connected (debugfs amdgpu_gfxoff, a request count in the
+//      kernel: 0 adds a request to keep GFX powered, 1 drops it), as a PS5 title's GPU never powers its
+//      graphics block down between submissions; GFXOFF cost ASTRO BOT five times the late frames. The
+//      helper holds one request while any client asks and drops it when the last one disconnects.
 // Build: cc -O2 -pthread -o kyty-lodhw kyty-lodhw.c. Run as root: kyty-lodhw [socket path] [socket group gid]
 
 #define _GNU_SOURCE
@@ -143,6 +147,13 @@ static const uint32_t kJt[3][2] = {{0xA000 + 0x5814, 0xA000 + 0x5815}, {0xA000 +
                                    {0xA000 + 0x5818, 0xA000 + 0x5819}};
 
 static pthread_mutex_t g_hw = PTHREAD_MUTEX_INITIALIZER;
+static int             g_gfxoff = -1;      // debugfs amdgpu_gfxoff
+static uint32_t        g_gfxoff_holders;   // clients that asked for GFXOFF off (op 16)
+
+// One request to the kernel's GFXOFF count: 0 keeps GFX powered, 1 allows GFXOFF again. 0 or -errno.
+static int GfxoffRequest(uint32_t allow) {
+	return g_gfxoff >= 0 && pwrite(g_gfxoff, &allow, 4, 0) == 4 ? 0 : -EIO;
+}
 
 static uint32_t Rd(uint32_t reg);
 static int      Wr(uint32_t reg, uint32_t v);
@@ -350,6 +361,7 @@ static void* Client(void* arg) {
 	int           golden  = 0; // op 7 asked to restore the golden table at disconnect
 	uint32_t      rciu_old[kRciuEntries][3];
 	uint32_t      rciu_set = 0; // entries op 15 changed, put back at disconnect
+	int           gfxoff_held = 0; // op 16 asked to keep GFX powered
 	for (;;) {
 		struct {
 			uint32_t op, size;
@@ -529,6 +541,16 @@ static void* Client(void* arg) {
 				        entry, kRciu[k].name, rciu_old[entry][0], rciu_old[entry][1], rciu_old[entry][2], phase[0], phase[1], phase[2],
 				        now[0], now[1], now[2]);
 			}
+		} else if (q.op == 16) {
+			if (!gfxoff_held) {
+				rep.status = g_gfxoff_holders == 0 ? GfxoffRequest(0) : 0;
+				if (rep.status == 0) {
+					gfxoff_held = 1;
+					g_gfxoff_holders++;
+					fprintf(stderr, "kyty-lodhw: GFXOFF off (%u clients)\n", g_gfxoff_holders);
+				}
+			}
+			rep.value = g_gfxoff_holders;
 		} else {
 			rep.status = -EINVAL;
 		}
@@ -538,6 +560,14 @@ static void* Client(void* arg) {
 		}
 	}
 	close(c);
+	if (gfxoff_held) {
+		pthread_mutex_lock(&g_hw);
+		if (--g_gfxoff_holders == 0) {
+			GfxoffRequest(1);
+		}
+		fprintf(stderr, "kyty-lodhw: GFXOFF request dropped (%u clients left)\n", g_gfxoff_holders);
+		pthread_mutex_unlock(&g_hw);
+	}
 	if (rciu_set != 0) {
 		pthread_mutex_lock(&g_hw);
 		for (uint32_t e = 0; e < kRciuEntries; e++) {
@@ -587,6 +617,18 @@ int main(int argc, char** argv) {
 	if (g_regs < 0) {
 		fprintf(stderr, "kyty-lodhw: open %s: %s\n", g.gl_pathv[0], strerror(errno));
 		return 1;
+	}
+	{
+		char gfxoff[512];
+		snprintf(gfxoff, sizeof(gfxoff), "%s", g.gl_pathv[0]);
+		char* slash = strrchr(gfxoff, '/');
+		if (slash != NULL) {
+			snprintf(slash + 1, sizeof(gfxoff) - (size_t)(slash + 1 - gfxoff), "amdgpu_gfxoff");
+			g_gfxoff = open(gfxoff, O_WRONLY | O_CLOEXEC);
+		}
+		if (g_gfxoff < 0) {
+			fprintf(stderr, "kyty-lodhw: no %s, op 16 unavailable\n", gfxoff);
+		}
 	}
 	globfree(&g);
 	LoadGolden();
