@@ -3165,6 +3165,11 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 
 	*phys_addr_out = static_cast<int64_t>(addr);
 	LogDirectMemory(automatic ? "automatic" : "allocate", addr, len, memory_type, static_cast<int64_t>(len));
+#if KYTY_GEM_BACKING_SUPPORTED
+	if (auto* gem = GetGemBacking(); gem != nullptr) {
+		gem->SetMemoryType(addr, len, memory_type);
+	}
+#endif
 
 	LOGF_COLOR(Log::Color::Green, "\tphys_addr    = %016" PRIx64 "\n\t[Ok]\n", addr);
 

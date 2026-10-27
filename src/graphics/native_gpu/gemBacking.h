@@ -346,7 +346,7 @@ public:
 		std::lock_guard<std::mutex> lock(m_lock);
 		const bool ok = ForEachBlockPiece(offset, size, [&](uint64_t index, uint64_t inner, uint64_t done, uint64_t part) {
 			const uint32_t handle = m_blocks[index].resident ? m_blocks[index].bo.handle : m_dummy.handle;
-			return VaOp(AMDGPU_VA_OP_REPLACE, handle, vaddr + done, inner, part) == 0;
+			return VaReplace(handle, vaddr + done, inner, offset + done, part) == 0;
 		});
 		auto it = m_views.find(vaddr);
 		if (it != m_views.end() && it->second.size == size && it->second.offset == offset) {
@@ -358,6 +358,42 @@ public:
 			m_views_generation++;
 		}
 		return ok;
+	}
+
+	// The guest memory type of backing bytes [offset, offset + size), as direct memory is allocated.
+	// The PS5 kernel maps the title's shared memory (type 12, SCE_KERNEL_MTYPE_C_SHARED: ASTRO BOT and My
+	// First Gran Turismo keep there the labels the CPU reads and writes) with MTYPE C_RW_S, and its
+	// GPU-only memory (11, SCE_KERNEL_MTYPE_C) with C_RW_US, amdgpu's NC. Views of a coherent type map
+	// with CoherentMtype(), the others with the default (NC). Off by default: the GPU then reads a CPU
+	// store without stale GL2 lines, but nothing needs that yet, and My First Gran Turismo dropped a few
+	// more frames with its shared memory C_RW_S (ASTRO BOT: no cost).
+	// KYTY_NATIVE_GPU_COHERENT_TYPES: comma-separated types (12 as the PS5), none by default.
+	void SetMemoryType(uint64_t offset, uint64_t size, int type) {
+		if (size == 0) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(m_lock);
+		const uint64_t end = offset + size;
+		auto           it  = m_coherent.lower_bound(offset);
+		if (it != m_coherent.begin() && std::prev(it)->second > offset) {
+			it = std::prev(it);
+		}
+		while (it != m_coherent.end() && it->first < end) {
+			const auto [s, e] = *it;
+			it                = m_coherent.erase(it);
+			if (s < offset) {
+				m_coherent.emplace(s, offset);
+			}
+			if (e > end) {
+				m_coherent.emplace(end, e);
+			}
+		}
+		if (CoherentType(type)) {
+			m_coherent.emplace(offset, end);
+			std::fprintf(stderr, "GemBacking: direct memory 0x%llx +0x%llx (type %d) maps coherent (MTYPE %s)\n",
+			             static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size), type,
+			             CoherentMtype() == AMDGPU_VM_MTYPE_RW ? "C_RW_S" : "CC");
+		}
 	}
 
 	// Removes every GPU mapping in [vaddr, vaddr + size) and forgets the views there (the caller has
@@ -848,6 +884,72 @@ private:
 	}
 	static inline const uint32_t kRwxPageFlags =
 	    AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE | MtypeFlags();
+
+	static bool CoherentType(int type) {
+		static const std::vector<int> types = [] {
+			std::vector<int> t;
+			const char*      v = std::getenv("KYTY_NATIVE_GPU_COHERENT_TYPES");
+			if (v == nullptr) {
+				return t;
+			}
+			for (const char* p = v; *p != '\0';) {
+				char*      next = nullptr;
+				const long n    = std::strtol(p, &next, 0);
+				if (next == p) {
+					break; // "none" and anything else that is not a number
+				}
+				t.push_back(static_cast<int>(n));
+				p = *next == ',' ? next + 1 : next;
+			}
+			return t;
+		}();
+		return std::find(types.begin(), types.end(), type) != types.end();
+	}
+
+	// The MTYPE of coherent memory types: C_RW_S (AMDGPU_VM_MTYPE_RW) as the PS5 maps its shared type,
+	// where the patched amdgpu has it (tools/bc250-amdgpu, bc250_mtype_rw), else CC.
+	static uint32_t CoherentMtype() {
+		static const uint32_t mtype = [] {
+			FILE* f = std::fopen("/sys/module/amdgpu/parameters/bc250_mtype_rw", "re");
+			int   v = 0;
+			if (f != nullptr) {
+				if (std::fscanf(f, "%d", &v) != 1) {
+					v = 0;
+				}
+				std::fclose(f);
+			}
+			return v == 1 ? AMDGPU_VM_MTYPE_RW : AMDGPU_VM_MTYPE_CC;
+		}();
+		return mtype;
+	}
+
+	// REPLACE of [vaddr, vaddr + size), backing bytes from `backing` on: the parts in coherent memory
+	// with MTYPE CC (unless KYTY_NATIVE_GPU_MTYPE sets one for all). The caller holds m_lock.
+	int VaReplace(uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t backing, uint64_t size) const {
+		if (m_coherent.empty() || MtypeFlags() != 0) {
+			return VaOp(AMDGPU_VA_OP_REPLACE, handle, vaddr, offset_in_bo, size);
+		}
+		int      r    = 0;
+		uint64_t done = 0;
+		while (done < size) {
+			const uint64_t at       = backing + done;
+			uint64_t       end      = backing + size;
+			bool           coherent = false;
+			auto           next     = m_coherent.upper_bound(at);
+			if (next != m_coherent.begin() && std::prev(next)->second > at) {
+				coherent = true;
+				end      = std::min(end, std::prev(next)->second);
+			} else if (next != m_coherent.end()) {
+				end = std::min(end, next->first);
+			}
+			const uint64_t len = end - at;
+			const int      one = VaOp(AMDGPU_VA_OP_REPLACE, handle, vaddr + done, offset_in_bo + done, len,
+			                         coherent ? kRwxPageFlags | CoherentMtype() : kRwxPageFlags);
+			r                  = r != 0 ? r : one;
+			done += len;
+		}
+		return r;
+	}
 
 	int VaOp(uint32_t op, uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t size,
 	         uint32_t page_flags = kRwxPageFlags) const {
@@ -1483,7 +1585,7 @@ private:
 		::munmap(bo_cpu, block.size);
 		// GPU mappings of the block's views now map the buffer instead of the dummy (or the old buffer).
 		for (size_t i = 0; i < gpu_pieces.size(); i++) {
-			VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, gpu_pieces[i].first, gpu_pieces[i].second, gpu_lengths[i]);
+			VaReplace(bo.handle, gpu_pieces[i].first, gpu_pieces[i].second, start + gpu_pieces[i].second, gpu_lengths[i]);
 		}
 		if (from_cpu != nullptr) {
 			MarkVaStale(); // the GPU mappings moved from a buffer the GPU used
@@ -1727,6 +1829,7 @@ private:
 	uint64_t                      m_touched_bytes  = 0;
 	std::vector<Block>            m_blocks;
 	std::map<uint64_t, View>      m_views;     // guest VA -> view of the backing
+	std::map<uint64_t, uint64_t>  m_coherent;  // backing ranges of coherent memory types: start -> end
 	std::atomic<uint64_t>         m_views_generation {0}; // changed under m_lock, read without it
 	Bo                            m_dummy;     // GPU target of every non-resident block
 	uint8_t*                      m_dummy_cpu = nullptr;
