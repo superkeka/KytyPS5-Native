@@ -202,6 +202,7 @@ struct VideoOutConfig {
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
+	uint64_t                            current_flip_id = 0; // the request that put flip_status.currentBuffer on screen
 	VideoOutVblankStatus                pre_vblank_status;
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
@@ -955,6 +956,13 @@ static bool LogFlips() {
 	return on;
 }
 
+// Milliseconds on the monotonic clock, for the flip log's timeline.
+static double FlipLogMs() {
+	struct timespec ts {};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) * 1e-6;
+}
+
 bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
                         uint64_t& request_id) {
 	Common::LockGuard lock(m_mutex);
@@ -1010,7 +1018,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	pending.push_back(r);
 	request_id = r.id;
 	if (LogFlips()) {
-		std::fprintf(stderr, "flip %" PRIu64 ": reserved buffer %d from the %s (pending %d, current %d)\n", r.id, index,
+		std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": reserved buffer %d from the %s (pending %d, current %d)\n", FlipLogMs(), r.id, index,
 		     source == FlipRequestSource::GpuEop ? "GPU" : "CPU", cfg.flip_status.flipPendingNum + 1,
 		     cfg.flip_status.currentBuffer);
 	}
@@ -1077,7 +1085,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	if (LogFlips()) {
-		std::fprintf(stderr, "flip %" PRIu64 ": prepare\n", request_id);
+		std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": prepare\n", FlipLogMs(), request_id);
 	}
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
@@ -1217,7 +1225,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 
 void FlipQueue::Complete(uint64_t request_id) {
 	if (LogFlips()) {
-		std::fprintf(stderr, "flip %" PRIu64 ": recording complete\n", request_id);
+		std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": recording complete\n", FlipLogMs(), request_id);
 	}
 	m_mutex.Lock();
 	auto request = std::find_if(m_requests.begin(), m_requests.end(),
@@ -1272,25 +1280,35 @@ void FlipQueue::SignalDoneLocked() {
 // A display buffer is safe for rendering once it is neither displayed nor waiting to be. Only flips
 // requested before `before` count: on the PS5 the GPU checks this before the frame's end-of-pipe
 // event lets the title request the next flip, so a later request of the same buffer (possible here,
-// where the check runs after the frame's GPU work, or behind it) cannot hold the wait forever.
+// where the check runs after the frame's GPU work, or behind it) cannot hold the wait forever. That
+// holds for the buffer on screen too: when a later flip has already shown it (the check ran late,
+// after the frame's own flip), the PS5's GPU passed the wait before that flip existed. Holding it
+// until the next vblank instead made each frame miss one, and My First GT stayed at 30 fps.
 bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t before) {
 	Common::LockGuard lock(m_mutex);
 	auto matches = [&cfg, index, before](const auto& r) { return r.cfg == &cfg && r.index == index && r.id < before; };
-	const bool safe = cfg.flip_status.currentBuffer != index &&
+	const bool safe = (cfg.flip_status.currentBuffer != index || cfg.current_flip_id >= before) &&
 	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
 	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	m_gpu_waiting = !safe;
-	if (!safe && LogFlips()) {
-		static int last_index = -1;
-		static int last_current = -2;
-		if (last_index != index || last_current != cfg.flip_status.currentBuffer) {
-			last_index   = index;
-			last_current = cfg.flip_status.currentBuffer;
-			std::fprintf(stderr, "flip: buffer %d not safe for rendering (current %d)\n", index, cfg.flip_status.currentBuffer);
+	if (LogFlips()) {
+		// The first check that holds a buffer, and the one that lets it go.
+		static int      last_index  = -1;
+		static uint64_t last_before = 0;
+		static bool     last_safe   = true;
+		if (safe != last_safe || index != last_index || before != last_before) {
+			last_index  = index;
+			last_before = before;
+			last_safe   = safe;
+			std::fprintf(stderr, "flip [%.2f]: buffer %d %s for rendering (current %d from flip %" PRIu64 ", flips before %" PRIu64 ")\n",
+			             FlipLogMs(), index, safe ? "safe" : "not safe", cfg.flip_status.currentBuffer, cfg.current_flip_id, before);
 			for (const auto* queue: {&m_requests, &m_cpu_requests}) {
 				for (const auto& r: *queue) {
-					std::fprintf(stderr, "\t %s request %" PRIu64 ": buffer %d, state %d\n", queue == &m_requests ? "GPU-side" : "CPU",
-					     r.id, r.index, static_cast<int>(r.state));
+					if (safe) {
+						break;
+					}
+					std::fprintf(stderr, "\t %s request %" PRIu64 ": buffer %d, state %d\n", queue == &m_requests ? "GPU-side" : "CPU", r.id,
+					             r.index, static_cast<int>(r.state));
 				}
 			}
 		}
@@ -1385,8 +1403,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
 		r.cfg->flip_status.flipArg                  = r.flip_arg;
 		r.cfg->flip_status.currentBuffer            = r.index;
+		r.cfg->current_flip_id                      = r.id;
 		if (LogFlips()) {
-			std::fprintf(stderr, "flip %" PRIu64 ": buffer %d displayed\n", r.id, r.index);
+			std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": buffer %d displayed\n", FlipLogMs(), r.id, r.index);
 		}
 		r.cfg->flip_status.flipPendingNum--;
 		r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
@@ -1492,7 +1511,7 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	Common::LockGuard lock(ctx->mutex);
 	ctx->flip_rate = rate;
 	if (LogFlips()) {
-		std::fprintf(stderr, "flip: rate %d (a flip every %d vblanks)\n", rate, rate + 1);
+		std::fprintf(stderr, "flip [%.2f]: rate %d (a flip every %d vblanks)\n", FlipLogMs(), rate, rate + 1);
 	}
 
 	return OK;
