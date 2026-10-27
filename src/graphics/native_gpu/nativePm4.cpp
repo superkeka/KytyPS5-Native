@@ -241,16 +241,37 @@ bool LabelEventOk(uint32_t event) {
 	const uint32_t type  = event & 0x3fu;
 	const uint32_t index = (event >> 8u) & 0xfu;
 	const bool     known = type == 0x14u || type == 0x28u || type == 0x2bu || type == 0x2du || type == 0x2fu || type == 0x30u;
-	return known && (index == 5u || index == 6u) && (event & ~(0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) == 0u &&
-	       (event & (kGcrGlmWb | kGcrGl2Wb)) == (kGcrGlmWb | kGcrGl2Wb);
+	return known && (index == 5u || index == 6u) && (event & ~(0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) == 0u;
 }
-uint32_t LabelEventCntl(uint32_t guest_event) {
+// KYTY_NATIVE_GPU_LABEL_WB=0 (experiment): a label release keeps exactly the guest's cache actions. The
+// label itself goes to memory past the caches (DST_SEL 0) either way, and GPU waits read it through
+// GL2; the added write-backs only make the GPU's other results visible to the CPU, and they come at
+// every label (ASTRO BOT: ~900 a frame, ~5400 where it draws much).
+bool LabelWriteBack() {
+	static const bool wb = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_LABEL_WB");
+		return v == nullptr || v[0] != '0';
+	}();
+	return wb;
+}
+// The tracker's own stores (segment ends, points before a GPU wait): bottom of pipe, GLM and GL2
+// written back so the CPU sees the GPU's results by the time the tracker acts, nothing invalidated.
+// The barrier's form invalidated every cache at each of them, hundreds of times a frame.
+constexpr uint32_t kTrackerWbEventCntl = 0x28u | (5u << 8u) | kGcrGlmWb | kGcrGl2Wb;
+bool FullLabelFlush() {
 	static const bool full = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_LABEL_FLUSH");
 		return v != nullptr && std::strcmp(v, "full") == 0;
 	}();
-	const uint32_t event = (guest_event & (0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) | kGcrGlmWb | kGcrGl2Wb;
-	return !full && LabelEventOk(event) ? event : kFlushEventCntl;
+	return full;
+}
+// KYTY_NATIVE_GPU_LABEL_FLUSH=full: the barrier's form here too.
+uint32_t TrackerEventCntl() { return FullLabelFlush() ? kFlushEventCntl : kTrackerWbEventCntl; }
+
+uint32_t LabelEventCntl(uint32_t guest_event) {
+	const uint32_t event =
+	    (guest_event & (0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) | (LabelWriteBack() ? kGcrGlmWb | kGcrGl2Wb : 0u);
+	return !FullLabelFlush() && LabelEventOk(event) ? event : kFlushEventCntl;
 }
 
 // KYTY_NATIVE_GPU_RELEASE_FORMS=1: each distinct guest RELEASE_MEM form (event dword, the select
@@ -1826,7 +1847,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			return;
 		}
 		const uint32_t dw = static_cast<uint32_t>(body.size()) + 5u;
-		EmitRelease32(body, m_tracker_va, 0u, m_compute_ring);
+		EmitRelease32(body, m_tracker_va, 0u, m_compute_ring, TrackerEventCntl());
 		for (auto& p: queued_points) {
 			p.dw = dw;
 			segs.back().points.push_back(std::move(p));
@@ -1841,7 +1862,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			end.kind = TrackerPoint::Kind::End;
 			queued_points.push_back(std::move(end));
 			const uint32_t dw = static_cast<uint32_t>(body.size()) + 5u;
-			EmitRelease32(body, m_tracker_va, 0u, m_compute_ring);
+			EmitRelease32(body, m_tracker_va, 0u, m_compute_ring, TrackerEventCntl());
 			for (auto& p: queued_points) {
 				p.dw = dw;
 				segs.back().points.push_back(std::move(p));
@@ -2074,7 +2095,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							body.push_back(i == 6 ? 0u : bptr[i]);
 						}
 					} else if (!interrupt && !cpu_point && ((bptr[0] >> 12u) & 0x1fffu) != 0) {
-						EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring);
+						EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring, LabelEventCntl(bptr[0]));
 					}
 					seg_effects = true;
 					if (sel != 0) {

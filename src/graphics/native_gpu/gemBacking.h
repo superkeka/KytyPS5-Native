@@ -1038,7 +1038,17 @@ private:
 		c.in.alignment    = 2ull * 1024 * 1024;
 		c.in.domains      = AMDGPU_GEM_DOMAIN_GTT;
 		c.in.domain_flags = AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
-		int r             = Ioctl(DRM_IOCTL_AMDGPU_GEM_CREATE, &c);
+		// KYTY_NATIVE_GPU_BO_USWC=1 (experiment): write-combined for the CPU, so the GPU reaches the
+		// block without snooping the CPU's caches, as the PS5 GPU reaches its "Garlic" memory. A cached
+		// GTT buffer is snooped on every GPU access.
+		static const bool uswc = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_BO_USWC");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (uswc) {
+			c.in.domain_flags |= AMDGPU_GEM_CREATE_CPU_GTT_USWC;
+		}
+		int r = Ioctl(DRM_IOCTL_AMDGPU_GEM_CREATE, &c);
 		if (r != 0) {
 			std::fprintf(stderr, "GemBacking: always-valid GEM_CREATE of %llu MiB failed: %s\n",
 			             static_cast<unsigned long long>(size / (1024 * 1024)), std::strerror(-r));
