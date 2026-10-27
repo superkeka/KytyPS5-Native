@@ -3549,8 +3549,15 @@ private:
 			m_last_write.clear();
 		}
 		m_emits++;
+		// Who writes a label matters only to a wait that may be held on the CPU. With every wait on the
+		// GPU (compute queues on KFD, gfx waits while each guest gfx queue has its own ring) none is,
+		// and recording ~5000 label writes a frame in these maps took a fifth of this thread.
+		const bool holds_possible = !AllWaitsOnGpu() || m_gfx_shared;
 		for (const auto& w: p.seg.writes) {
 			TraceLabel(w.gpu ? 'W' : 'C', queue, w.addr, w.value);
+			if (!holds_possible) {
+				continue;
+			}
 			m_last_write[w.addr] = {w, m_emits};
 			m_ring[w.addr] = RingWrite {w, m_seq, slot, m_batch};
 			if (w.wide) {
