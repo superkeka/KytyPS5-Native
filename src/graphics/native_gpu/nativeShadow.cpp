@@ -1343,11 +1343,12 @@ public:
 			// MEC packet forms. The gfx translator is unchanged.
 			m_acb_translator.SetComputeRing(true);
 		}
-		// KYTY_NATIVE_GPU_DIRECT_RUNS=1 (or a dword count, default 256): DCB stretches passed on as written
-		// run from the title's buffer as IB2s (Pm4Translator::SetDirectRuns). An IB2 costs the CP about
-		// 0.3 us (probe ib2), the dwords it saves copying and validating about 1 ns each.
-		if (const char* v = std::getenv("KYTY_NATIVE_GPU_DIRECT_RUNS"); v != nullptr && v[0] != '0') {
-			const unsigned long n = std::strtoul(v, nullptr, 0);
+		// Direct runs: DCB stretches passed on as written run from the title's buffer as IB2s
+		// (Pm4Translator::SetDirectRuns), as the PS5's CP runs the title's own buffer. An IB2 costs the CP
+		// about 0.3 us (probe ib2), the dwords it saves copying and validating about 1 ns each.
+		// KYTY_NATIVE_GPU_DIRECT_RUNS=N: stretches of N+ dwords (default 256); =0 copies everything.
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_DIRECT_RUNS"); v == nullptr || v[0] != '0') {
+			const unsigned long n = v != nullptr ? std::strtoul(v, nullptr, 0) : 0ul;
 			m_direct_min_dw       = n > 1 ? static_cast<uint32_t>(n) : 256u;
 			m_translator.SetDirectRuns(m_direct_min_dw);
 			m_submitter->SetGfxMemSync(true);
