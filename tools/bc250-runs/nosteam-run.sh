@@ -9,6 +9,8 @@ restore() {
 		'systemctl --user unmask --runtime steam-launcher.service; systemctl --user start steam-launcher.service'
 }
 trap restore EXIT
+# A stop sends SIGTERM, on which bash may skip the EXIT trap (it did): restore there too.
+trap 'trap - EXIT; restore; exit 143' TERM INT HUP
 # Steam stopped while it is still starting (a previous run just brought it back) hangs in its stop:
 # let it have been up for 20 s first.
 started=$(systemctl --user show steam-launcher.service -p ActiveEnterTimestampMonotonic --value)

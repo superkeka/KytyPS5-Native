@@ -3022,12 +3022,21 @@ public:
 	// pieces of the same queue still held come before it, then writes ahead in the ring that have not
 	// landed yet, then guest memory.
 	Plan PlanWait(const WaitCond& wait) override {
-		// Every queue a hardware queue of its own (KFD for compute): a wait is what the title wrote, run
-		// by the GPU as on PS5. Whatever writes the label can always make progress, so no wait needs
-		// holding on the CPU.
-		if (AllWaitsOnGpu()) {
+		// A guest compute queue has a hardware queue of its own (KFD): its wait is what the title wrote,
+		// run by the GPU as on PS5, and holds up nothing but that queue. The gfx ring is one in-order
+		// ring for every guest graphics queue (the PS5 has more), so a gfx wait whose writer is not known
+		// to be ahead stays on the CPU, or another guest queue's writer behind it never runs (My First
+		// Gran Turismo stopped at once); one memory already meets runs as itself, not as a barrier.
+		const bool gpu_waits = AllWaitsOnGpu();
+		if (gpu_waits && SlotOf(m_translating) != 0) {
 			return Plan::Native;
 		}
+		const Plan plan = PlanWaitHeld(wait);
+		return gpu_waits && plan == Plan::Met ? Plan::Native : plan;
+	}
+
+private:
+	Plan PlanWaitHeld(const WaitCond& wait) {
 		auto decide = [&](const LabelWrite& w) -> std::optional<Plan> {
 			uint64_t  v = 0;
 			const int c = w.Covers(wait.addr, wait.wide, &v, wait.mask);
@@ -3483,9 +3492,6 @@ private:
 		m_emits++;
 		for (const auto& w: p.seg.writes) {
 			TraceLabel(w.gpu ? 'W' : 'C', queue, w.addr, w.value);
-			if (AllWaitsOnGpu()) {
-				continue; // nothing is held, so nothing asks who writes a label
-			}
 			m_last_write[w.addr] = {w, m_emits};
 			m_ring[w.addr] = RingWrite {w, m_seq, slot, m_batch};
 			if (w.wide) {
