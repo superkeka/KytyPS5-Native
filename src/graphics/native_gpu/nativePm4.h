@@ -690,6 +690,18 @@ public:
 	void SetDirectRuns(uint32_t min_dw) { m_direct_min_dw = min_dw; }
 	void SetSource(std::vector<SourcePiece> source) { m_source = std::move(source); }
 
+	// GPU timing (KYTY_NATIVE_GPU_FLIP_TRACE): each gfx buffer is bracketed by GPU clocks (the micro
+	// engine at its start, end of pipe at its end) in `span_va`, each GPU wait by two micro-engine
+	// clocks in `wait_va`; each is a ring of `pairs` 16-byte (begin, end) pairs, used in order.
+	// GpuTimesNext says how many pairs of each ring were handed out so far. 0 turns it off.
+	void SetGpuTimes(uint64_t span_va, uint64_t wait_va, uint32_t pairs) {
+		m_time_span_va = span_va;
+		m_time_wait_va = wait_va;
+		m_time_pairs   = pairs;
+	}
+	[[nodiscard]] uint64_t GpuSpansNext() const { return m_time_spans; }
+	[[nodiscard]] uint64_t GpuWaitsNext() const { return m_time_waits; }
+
 	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
 	// (NativeSubmitter::HasGds), otherwise such packets are refused.
 	void SetGdsAvailable(bool available) { m_gds = available; }
@@ -787,6 +799,11 @@ private:
 	bool                         m_compute_queue  = false;
 	bool                         m_compute_ring   = false;
 	uint32_t                     m_direct_min_dw  = 0;
+	uint64_t                     m_time_span_va   = 0;
+	uint64_t                     m_time_wait_va   = 0;
+	uint32_t                     m_time_pairs     = 0;
+	uint64_t                     m_time_spans     = 0;
+	uint64_t                     m_time_waits     = 0;
 	std::vector<SourcePiece>     m_source;
 	uint64_t                     m_fence_va       = 0;
 	LabelOracle*                 m_labels         = nullptr;

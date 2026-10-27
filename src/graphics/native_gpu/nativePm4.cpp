@@ -21,6 +21,7 @@ namespace {
 // build dependency on the rest of Kyty and stays unit-testable off the board).
 constexpr uint32_t IT_NOP                      = 0x10;
 constexpr uint32_t IT_INDIRECT_BUFFER          = 0x3F;
+constexpr uint32_t IT_COPY_DATA                = 0x40;
 constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_SET_BASE                 = 0x11;
 constexpr uint32_t IT_SET_PREDICATION          = 0x20;
@@ -321,6 +322,30 @@ void EmitTimestampRelease(std::vector<uint32_t>& ib, uint64_t addr, bool compute
 	ib.push_back(0u);
 }
 
+// GPU timing (SetGpuTimes): the GPU clock when the micro engine gets here (COPY_DATA SRC_SEL 9, 64 bit,
+// write confirmed), and when everything before has finished (RELEASE_MEM BOTTOM_OF_PIPE_TS, DATA_SEL 3,
+// no cache actions). Both only on a busy GPU: an idle gfx ring stopped on a clock read (probe clock).
+constexpr uint32_t kClockCopyCntl = 9u | (5u << 8u) | (1u << 16u) | (1u << 20u);
+constexpr uint32_t kClockEopCntl  = 0x28u | (5u << 8u);
+void EmitClockCopy(std::vector<uint32_t>& ib, uint64_t addr) {
+	ib.push_back(Pkt3(IT_COPY_DATA, 5, false));
+	ib.push_back(kClockCopyCntl);
+	ib.push_back(0u);
+	ib.push_back(0u);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+}
+void EmitClockEop(std::vector<uint32_t>& ib, uint64_t addr) {
+	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, false));
+	ib.push_back(kClockEopCntl);
+	ib.push_back(kDataTimestampCntl);
+	ib.push_back(static_cast<uint32_t>(addr));
+	ib.push_back(static_cast<uint32_t>(addr >> 32u));
+	ib.push_back(0u);
+	ib.push_back(0u);
+	ib.push_back(0u);
+}
+
 void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint32_t mask, bool compute) {
 	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, compute));
 	ib.push_back(kWaitEqualMemMe);
@@ -530,8 +555,8 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				if ((b[0] == kFlushEventCntl || LabelEventOk(b[0])) && b[1] == kData32Cntl) {
 					break; // the barrier's form, or a label in the guest's event (LabelEventCntl)
 				}
-				if (b[0] == kFlushEventCntl && b[1] == kDataTimestampCntl && b[4] == 0u && b[5] == 0u &&
-				    (b[2] & 7u) == 0u) {
+				if ((b[0] == kFlushEventCntl || (b[0] == kClockEopCntl && !compute)) && b[1] == kDataTimestampCntl &&
+				    b[4] == 0u && b[5] == 0u && (b[2] & 7u) == 0u) {
 					break;
 				}
 				if (((b[1] >> 29u) & 0x7u) == 5u && ((b[1] >> 24u) & 0x7u) == 0u) {
@@ -545,6 +570,12 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				break;
 			case IT_GET_LOD_STATS:
 				if (compute || !lod_stats) {
+					return bad();
+				}
+				break;
+			// GPU timing (SetGpuTimes): the GPU clock to memory, on the gfx ring.
+			case IT_COPY_DATA:
+				if (compute || size != 6 || b[0] != kClockCopyCntl || (b[3] & 7u) != 0u) {
 					return bad();
 				}
 				break;
@@ -1127,6 +1158,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// refused DCB leaves the shadow and the IB in a usable state for the next one.
 	std::vector<uint32_t> body;
 	body.reserve(dcb.size());
+	// SetGpuTimes: the GPU clock when the micro engine starts the buffer (its end at the last segment's
+	// end). A first segment that does nothing is dropped with this clock: that pair stays without its
+	// begin.
+	const bool     span_timed = m_time_pairs != 0 && !m_compute_ring;
+	const uint64_t span_pair  = m_time_span_va + 16ull * (m_time_spans % (m_time_pairs != 0 ? m_time_pairs : 1u));
+	if (span_timed) {
+		EmitClockCopy(body, span_pair);
+	}
 	Pm4TranslateStats stats;
 
 	// A scratch copy of the shadow so a refusal mid-DCB does not leave it half-updated.
@@ -2574,7 +2613,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (plan == LabelOracle::Plan::Native) {
 						flush_points();
 					}
-					if (plan == LabelOracle::Plan::Native && !EmitNativeWait(body, w, m_compute_ring)) {
+					const bool timed = plan == LabelOracle::Plan::Native && m_time_pairs != 0 && !m_compute_ring;
+					const uint64_t wait_pair = m_time_wait_va + 16ull * (m_time_waits % m_time_pairs);
+					if (timed) {
+						EmitClockCopy(body, wait_pair);
+					}
+					const bool emitted = plan == LabelOracle::Plan::Native && EmitNativeWait(body, w, m_compute_ring);
+					if (timed) {
+						EmitClockCopy(body, wait_pair + 8);
+						m_time_waits++;
+					}
+					if (plan == LabelOracle::Plan::Native && !emitted) {
 						plan = LabelOracle::Plan::Split;
 					}
 					switch (plan) {
@@ -3205,6 +3254,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 
 	if (labels) {
+		if (span_timed) {
+			EmitClockEop(body, span_pair + 8);
+			m_time_spans++;
+		}
 		close_segment(true);
 		// Each kept segment: its preamble (the first one's from the committed shadow, as without native
 		// labels), its body, padding; tracker points and patch sites move from body to IB offsets.

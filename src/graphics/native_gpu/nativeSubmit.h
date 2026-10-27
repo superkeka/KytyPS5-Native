@@ -50,7 +50,8 @@ public:
 	static constexpr uint32_t kSlots     = 128;
 	// The last bytes of the IB buffer are a scratch area the IB itself may write into (pipeline
 	// statistics samples); IBs must stay below it.
-	static constexpr uint64_t kScratchSize = 4096;
+	// 4 KiB of scratch slots, then two 32 KiB rings of GPU clock pairs (Pm4Translator::SetGpuTimes).
+	static constexpr uint64_t kScratchSize = 4096 + 65536;
 	static constexpr uint64_t kSlotSize    = ((kIbSize - kScratchSize) / kSlots) & ~0xfffull;
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;

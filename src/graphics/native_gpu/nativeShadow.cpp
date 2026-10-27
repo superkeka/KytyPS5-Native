@@ -489,9 +489,14 @@ public:
 		m_wait_lock_s += t_locked - t_enter;
 		struct BusyScope {
 			double& total;
+			double& trace_total;
 			double  start;
-			~BusyScope() { total += NowSecShadow() - start; }
-		} busy {m_busy_s, t_locked};
+			~BusyScope() {
+				const double d = NowSecShadow() - start;
+				total += d;
+				trace_total += d;
+			}
+		} busy {m_busy_s, m_trace_busy_s, t_locked};
 		if (!m_initialized) {
 			Init();
 			m_initialized = true;
@@ -563,6 +568,7 @@ public:
 		{
 			CutStats& c = m_cut_stats[acb ? 1 : 0];
 			c.total_dw += result.stats.total_dw;
+			m_trace_dw[acb ? 1 : 0] += result.stats.total_dw;
 			c.cut_runs += result.stats.cut_runs;
 			for (size_t i = 0; i < c.cut_ops.size(); i++) {
 				c.cut_ops[i] += result.stats.cut_ops[i];
@@ -1079,7 +1085,10 @@ public:
 	}
 
 	// Lock-free: the native labels tracker calls this, and m_mutex is held for whole translations.
-	void AddGpuBusy(double seconds) { m_gpu_busy_s.fetch_add(seconds, std::memory_order_relaxed); }
+	void AddGpuBusy(double seconds) {
+		m_gpu_busy_s.fetch_add(seconds, std::memory_order_relaxed);
+		m_trace_gpu_busy_s.fetch_add(seconds, std::memory_order_relaxed);
+	}
 
 	// One pipelined buffer finished: `queued` waiting for the worker, `latency` from the guest's
 	// submit to its continuation being done, `then` the continuation (Kyty's command processor).
@@ -1093,9 +1102,72 @@ public:
 		m_chain_max_s = std::max(m_chain_max_s, latency);
 	}
 
+	// KYTY_NATIVE_GPU_FLIP_TRACE=1: one line per flip in flips.csv (the working directory) with what
+	// happened since the previous one, to see what the late frames have that the others do not.
+	void FlipTrace(double now, double present_s) {
+		static const bool on = EnvOn("KYTY_NATIVE_GPU_FLIP_TRACE");
+		if (!on) {
+			return;
+		}
+		struct Mark {
+			double   t = 0, translate_ms = 0, busy_s = 0, gpu_s = 0;
+			uint64_t dcbs = 0, acbs = 0, dcb_dw = 0, acb_dw = 0, irqs = 0, waits = 0, labels = 0;
+		};
+		static std::FILE* f    = nullptr;
+		static Mark       prev;
+		static uint64_t   flip = 0;
+		// GPU clock pairs finished since the last flip, in order; a pair without its begin (a dropped first
+		// segment) or long unfinished (a refused buffer) is skipped.
+		static uint64_t span_from = 0, wait_from = 0;
+		auto take = [&](uint64_t offset, uint64_t& from, uint64_t next, uint32_t* n) {
+			double ms = 0;
+			for (; from < next; from++) {
+				auto* p = reinterpret_cast<volatile uint64_t*>(m_submitter->ScratchCpu() + offset + 16ull * (from % kGpuTimesPairs));
+				const uint64_t b = p[0], e = p[1];
+				if (e == 0 && next - from < 64) {
+					break; // still on the GPU
+				}
+				if (b != 0 && e >= b) {
+					ms += static_cast<double>(e - b) * 1e-5; // 100 MHz
+					(*n)++;
+				}
+				p[0] = 0;
+				p[1] = 0;
+			}
+			return ms;
+		};
+		uint32_t     spans = 0, waits = 0;
+		const double span_ms = take(kGpuTimesOffset, span_from, m_translator.GpuSpansNext(), &spans);
+		const double wait_ms = take(kGpuTimesOffset + 16ull * kGpuTimesPairs, wait_from, m_translator.GpuWaitsNext(), &waits);
+		const Mark cur {now, m_translate_ms_total, m_trace_busy_s, m_trace_gpu_busy_s.load(std::memory_order_relaxed),
+		                m_frames, m_acbs, m_trace_dw[0], m_trace_dw[1], m_labels_stats[2], m_labels_stats[3], m_labels_stats[0]};
+		if (f == nullptr) {
+			f = std::fopen("flips.csv", "w");
+			if (f == nullptr) {
+				return;
+			}
+			std::fprintf(f, "flip,t_s,interval_ms,translate_ms,submit_ms,gpu_busy_ms,present_ms,dcbs,dcb_kdw,acbs,acb_kdw,"
+			                "interrupts,gpu_waits,labels,gfx_gpu_ms,gfx_buffers,gfx_wait_ms,gfx_waits\n");
+		} else {
+			std::fprintf(f, "%llu,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.1f,%llu,%.1f,%llu,%llu,%llu,%.2f,%u,%.2f,%u\n",
+			             static_cast<unsigned long long>(flip), now, (now - prev.t) * 1e3, cur.translate_ms - prev.translate_ms,
+			             (cur.busy_s - prev.busy_s) * 1e3, (cur.gpu_s - prev.gpu_s) * 1e3, present_s * 1e3,
+			             static_cast<unsigned long long>(cur.dcbs - prev.dcbs), (cur.dcb_dw - prev.dcb_dw) / 1e3,
+			             static_cast<unsigned long long>(cur.acbs - prev.acbs), (cur.acb_dw - prev.acb_dw) / 1e3,
+			             static_cast<unsigned long long>(cur.irqs - prev.irqs), static_cast<unsigned long long>(cur.waits - prev.waits),
+			             static_cast<unsigned long long>(cur.labels - prev.labels), span_ms, spans, wait_ms, waits);
+			if ((flip & 63u) == 0) {
+				std::fflush(f);
+			}
+		}
+		prev = cur;
+		flip++;
+	}
+
 	void FlipStats(double present_s) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double now = NowSecShadow();
+		FlipTrace(now, present_s);
 		m_flips++;
 		m_present_s += present_s;
 		// Flip-to-flip intervals by display refreshes: on time (one 60 Hz period), one late (two), worse.
@@ -1342,6 +1414,13 @@ public:
 		if (m_acb_rings) {
 			// MEC packet forms. The gfx translator is unchanged.
 			m_acb_translator.SetComputeRing(true);
+		}
+		if (EnvOn("KYTY_NATIVE_GPU_FLIP_TRACE")) {
+			for (uint64_t i = kGpuTimesOffset; i < kGpuTimesOffset + 2 * 16ull * kGpuTimesPairs; i++) {
+				m_submitter->ScratchCpu()[i] = 0;
+			}
+			const uint64_t va = m_submitter->ScratchVa() + kGpuTimesOffset;
+			m_translator.SetGpuTimes(va, va + 16ull * kGpuTimesPairs, kGpuTimesPairs);
 		}
 		// Direct runs: DCB stretches passed on as written run from the title's buffer as IB2s
 		// (Pm4Translator::SetDirectRuns), as the PS5's CP runs the title's own buffer. An IB2 costs the CP
@@ -2405,6 +2484,9 @@ private:
 	// COPY_DATA SRC_SEL 9 (GPU clock, gpu_counter_freq = 100 MHz on BC-250) -> memory, 64 bit.
 	static constexpr uint32_t kItCopyData       = 0x40;
 	static constexpr uint32_t kTimestampOffset  = 512;
+	// KYTY_NATIVE_GPU_FLIP_TRACE: the GPU clock pair rings past the 4 KiB of scratch slots.
+	static constexpr uint64_t kGpuTimesOffset = 4096;
+	static constexpr uint32_t kGpuTimesPairs  = 2048;
 	// Native labels: the 32-bit slot tracker points write and, 8 bytes on, the dword flush-only releases
 	// write (the fences are at 1024 and 1032; with ACB rings each ring's is its slot's last dword). ACB
 	// rings give each ring its own slot, stride 16.
@@ -2893,6 +2975,10 @@ private:
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
 	std::atomic<double> m_gpu_busy_s {0.0};
+	// KYTY_NATIVE_GPU_FLIP_TRACE=1: never-reset totals FlipTrace takes per-flip differences of.
+	double                  m_trace_busy_s = 0.0;
+	std::atomic<double>     m_trace_gpu_busy_s {0.0};
+	std::array<uint64_t, 2> m_trace_dw {};
 	bool          m_check_order = EnvOn("KYTY_NATIVE_GPU_CHECK_ORDER");
 	struct PendingWait {
 		Pm4TranslateResult::UnmetWait wait;
