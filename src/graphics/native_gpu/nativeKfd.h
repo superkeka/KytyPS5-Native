@@ -5,6 +5,7 @@
 
 #if KYTY_GEM_BACKING_SUPPORTED
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -202,6 +203,14 @@ public:
 		return true;
 	}
 
+	// True when KFD sized its queues' wave save areas for more CUs than amdgpu counted at init (the
+	// BC-250's patched amdgpu: every CU the chip has), so waves may run on CUs enabled after init.
+	static bool SaveAreaCoversLateCus(uint32_t gpu_id) {
+		uint32_t cu = 0, cwsr = 0, ctl = 0, counted = 0;
+		ReadTopology(gpu_id, &cu, &cwsr, &ctl, &counted);
+		return cu > counted;
+	}
+
 private:
 	static constexpr uint32_t kRingBytes   = 64 * 1024;
 	static constexpr uint32_t kRingDwords  = kRingBytes / 4;
@@ -288,7 +297,7 @@ private:
 		*m = Mem {};
 	}
 
-	static void ReadTopology(uint32_t gpu_id, uint32_t* cu, uint32_t* cwsr, uint32_t* ctl) {
+	static void ReadTopology(uint32_t gpu_id, uint32_t* cu, uint32_t* cwsr, uint32_t* ctl, uint32_t* counted_out = nullptr) {
 		for (int n = 0; n < 16; n++) {
 			char path[128];
 			std::snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/gpu_id", n);
@@ -307,15 +316,27 @@ private:
 				return;
 			}
 			char     line[128];
-			unsigned simd = 0, per_cu = 1;
+			unsigned simd = 0, per_cu = 1, arrays = 0, cu_per_array = 0;
 			while (std::fgets(line, sizeof(line), f) != nullptr) {
 				std::sscanf(line, "simd_count %u", &simd);
 				std::sscanf(line, "simd_per_cu %u", &per_cu);
+				std::sscanf(line, "array_count %u", &arrays);
+				std::sscanf(line, "cu_per_simd_array %u", &cu_per_array);
 				std::sscanf(line, "cwsr_size %u", cwsr);
 				std::sscanf(line, "ctl_stack_size %u", ctl);
 			}
 			std::fclose(f);
-			*cu = per_cu != 0 ? simd / per_cu : 0;
+			// The CUs KFD sized the save area for: the ones amdgpu counted at init, or every CU the chip
+			// has (the BC-250's patched amdgpu: 40, of which bc250-cu-live-manager enables 16 after
+			// init). The control stack, 12 bytes for each of 32 waves per CU plus a 48-byte header,
+			// page aligned, tells which; the debug area the queue's buffer also holds follows from it.
+			const uint32_t counted  = per_cu != 0 ? simd / per_cu : 0;
+			const uint32_t physical = arrays * cu_per_array;
+			const auto     ctl_for  = [](uint32_t cus) { return std::min<uint32_t>((cus * 32 * 12 + 48 + 4095) & ~4095u, 0x7000); };
+			*cu                     = physical > counted && *ctl == ctl_for(physical) ? physical : counted;
+			if (counted_out != nullptr) {
+				*counted_out = counted;
+			}
 			return;
 		}
 	}

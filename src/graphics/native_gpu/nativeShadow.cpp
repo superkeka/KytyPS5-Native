@@ -1661,10 +1661,16 @@ private:
 			std::lock_guard<std::mutex> lock(m_ps5_mutex);
 			Ps5KfdRegs();
 		}
-		// The wave save area KFD gives a queue holds the CUs amdgpu counted at init; on a board with more
-		// CUs enabled after it (the BC-250's 40 of 24), a preempted queue would overflow it. ACBs stay on
-		// those CUs unless KYTY_NATIVE_GPU_KFD_CU_CLAMP=0.
-		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_CU_CLAMP"); v == nullptr || v[0] != '0') {
+		// The wave save area stock KFD gives a queue holds the CUs amdgpu counted at init; on a board with
+		// more CUs enabled after it (the BC-250's 40 of 24), a preempted queue would overflow it. ACBs
+		// stay on those CUs unless the save area holds every CU (the BC-250's patched amdgpu) or
+		// KYTY_NATIVE_GPU_KFD_CU_CLAMP says otherwise (1: always, 0: never).
+		const char* clamp_env = std::getenv("KYTY_NATIVE_GPU_KFD_CU_CLAMP");
+		const bool  clamp     = clamp_env != nullptr && clamp_env[0] != '\0' ? clamp_env[0] != '0'
+		                                                                     : !KfdQueue::SaveAreaCoversLateCus(m_gem->KfdGpuId());
+		if (!clamp) {
+			std::fprintf(stderr, "native shadow: ACBs on every CU (KFD's wave save areas hold them all)\n");
+		} else {
 			const auto masks = m_submitter->InitCuMasks();
 			m_acb_translator.SetComputeCuClamp(masks);
 			std::fprintf(stderr, "native shadow: ACB CU masks clamped to amdgpu's init CUs 0x%08x 0x%08x 0x%08x 0x%08x\n", masks[0],

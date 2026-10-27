@@ -177,6 +177,32 @@
  	amdgpu_vm_flush_compute_tlb(adev, vm, TLB_FLUSH_HEAVYWEIGHT,
  				    pdd->dev->xcc_mask);
  }
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_queue.c
+@@ -488,6 +488,13 @@
+ 
+ #define SIZEOF_HSA_USER_CONTEXT_SAVE_AREA_HEADER 40
+ 
++/* BC-250: amdgpu counts the CUs enabled at init (24 of the chip's 40); bc250-cu-live-manager routes
++ * the rest in later. A queue's wave save area, control stack and debug area hold every CU the chip
++ * has (array_count x cu_per_simd_array), so a preempted queue with waves on all of them fits; on a
++ * board left at 24 they are only larger (bc250 cwsr physical cus).
++ */
++#define BC250_PCI_DEVICE_ID_CWSR 0x13FE
++
+ void kfd_queue_ctx_save_restore_size(struct kfd_topology_device *dev)
+ {
+ 	struct kfd_node_properties *props = &dev->node_props;
+@@ -501,6 +508,9 @@
+ 		return;
+ 
+ 	cu_num = props->simd_count / props->simd_per_cu / NUM_XCC(dev->gpu->xcc_mask);
++	if (dev->gpu && dev->gpu->adev->pdev->device == BC250_PCI_DEVICE_ID_CWSR &&
++	    props->array_count * props->cu_per_simd_array > cu_num)
++		cu_num = props->array_count * props->cu_per_simd_array; /* BC-250 */
+ 	wave_num = get_num_waves(props, gfxv, cu_num);
+ 
+ 	wg_data_size = ALIGN(cu_num * WG_CONTEXT_DATA_SIZE_PER_CU(gfxv, props),
 --- a/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
 +++ b/drivers/gpu/drm/amd/amdkfd/kfd_svm.c
 @@ -36,6 +36,7 @@

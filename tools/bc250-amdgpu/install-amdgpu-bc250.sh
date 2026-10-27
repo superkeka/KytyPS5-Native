@@ -1,8 +1,9 @@
 #!/bin/bash
 # Installs the amdgpu module build-amdgpu-bc250.sh made (bc250-amdgpu.patch: PASID flushes through
 # MMIO, runlist rebuild on KFD map/unmap under HWS, the KFD VMID flushed directly without it, legacy TLB
-# flushes) next to the stock one, for the running SteamOS kernel only. It sets amdgpu.sched_policy=2:
-# KFD's queues sit on their hardware queues for good, as the PS5's compute queues do.
+# flushes, wave save areas for all 40 CUs) next to the stock one, for the running SteamOS kernel only.
+# It sets amdgpu.sched_policy=2: KFD's queues sit on their hardware queues for good, as the PS5's
+# compute queues do.
 # The stock module stays in place; uninstall-amdgpu-bc250.sh removes this one. Run with sudo.
 # A SteamOS update replaces /usr, which drops this module as well (the board is then stock again).
 set -eu
