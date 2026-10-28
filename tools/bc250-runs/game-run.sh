@@ -8,12 +8,13 @@ TITLE=$1 MODE=$2 SECS=$3 TAG=$4 EVERY=${5:-15}
 OUT=/home/deck/dev/kyty-runs/$TAG
 EMU=${KYTY_EMU:-/home/deck/dev/KytyPS5-bc250/_Build/linux-no-qt/kyty_emulator}
 mkdir -p "$OUT"
-# Saves and trophies live in one place for every run (Kyty writes them into its working directory),
+# Saves, trophies and download data (GT7 keeps its progress there) live in one place for every run
+# (Kyty writes them into its working directory),
 # so progress carries over between runs. KYTY_FRESH_SAVES=1 starts this run from an empty save.
 SAVES=${KYTY_SAVES:-/home/deck/kyty-saves}
 if [ "${KYTY_FRESH_SAVES:-0}" != 1 ]; then
-  mkdir -p "$SAVES/_SaveData" "$SAVES/_Trophies"
-  for d in _SaveData _Trophies; do
+  mkdir -p "$SAVES/_SaveData" "$SAVES/_Trophies" "$SAVES/_DownloadData"
+  for d in _SaveData _Trophies _DownloadData; do
     # A tag reused from an old run may hold a directory of its own: kept aside, never deleted.
     [ -d "$OUT/$d" ] && [ ! -L "$OUT/$d" ] && mv "$OUT/$d" "$OUT/$d.old-$(date +%s)"
     [ -e "$OUT/$d" ] || ln -s "$SAVES/$d" "$OUT/$d"
