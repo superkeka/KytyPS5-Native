@@ -103,6 +103,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `uconfig` | **took the board down**, see below; do not rerun as is |
 | `clock` | GPU clock reads on the gfx ring: `COPY_DATA` SRC_SEL 9, `RELEASE_MEM` DATA_SEL 3 (two events) |
 | `tag342` | libSceAgc's internal-data tags (`SET_UCONFIG_REG` of 0x342) on the gfx and a compute ring |
+| `condib` | libSceAgc's conditional branch (`COND_INDIRECT_BUFFER`, 14 dwords) on the gfx ring: then, else and none taken, with and without VALID (`PROBE_CONDIB_VALID=0`) in the sizes |
 | `atomicmem` | libSceAgc's `ATOMIC_MEM` around a context push or pop (atomic 0x67, command 2) on the gfx ring: the flags swap, a `WRITE_DATA` after it lands |
 | `mecforms` | libSceAgc's ACB packets without the shader-type bit on the compute ring: store dispatch, `EVENT_WRITE` + `ACQUIRE_MEM`, `DMA_DATA`, `WAIT_REG_MEM_64`, `RELEASE_MEM` |
 | `waitforms` | the guest's `WAIT_REG_MEM` / `WAIT_REG_MEM_64` forms (ME and PFP, EQUAL and GREATER_EQUAL, met and released by the CPU) on the gfx ring |

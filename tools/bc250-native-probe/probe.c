@@ -1675,6 +1675,108 @@ static bool DangerTag342(Device* d, Common* c) {
 	return ok;
 }
 
+// libSceAgc's conditional branch (AgcCbBranch): INDIRECT_BUFFER with 14 dwords, AMD's COND_INDIRECT_BUFFER.
+// MODE 1 if-then, 2 if-then-else; a 64-bit compare (FUNCTION as WAIT_REG_MEM's) of memory against a
+// reference under a mask; two IB targets (address, size with the cache policy in 29:28). Each branch
+// writes its own marker; a WRITE_DATA after the packet shows the ring went on. PROBE_CONDIB_VALID=0
+// leaves bit 23 (VALID, which amdgpu sets on gfx10 IBs) out of the sizes, as libSceAgc writes them.
+// Result on BC-250: the CP picks the right branch (with or without VALID) but does not come back from it
+// (a chain, not a call): the rest of the IB runs only when no branch is taken. With each branch ending in
+// a chain back to the rest of the IB (PROBE_CONDIB_CHAINBACK=1) then and else both come back. MODE 1
+// with a false condition took the else target in that run: a translator gives MODE 2 with an else of its own.
+static bool DangerCondIb(Device* d, Common* c) {
+	const bool valid = getenv("PROBE_CONDIB_VALID") == NULL || getenv("PROBE_CONDIB_VALID")[0] != '0';
+	printf("== danger condib: COND_INDIRECT_BUFFER (libSceAgc's branch) on the gfx ring, sizes %s VALID\n",
+	       valid ? "with" : "without");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m = (volatile uint32_t*)mem.cpu;
+	// The branches: each writes its marker (then: dword 16, else: dword 17), padded to 8 dwords.
+	for (int b = 0; b < 2; b++) {
+		volatile uint32_t* t = m + (b == 0 ? 0x400 : 0x800);
+		const uint64_t     dst = mem.va + 4u * (16u + (uint32_t)b);
+		t[0] = Pkt3Gfx(0x37u, 4);
+		t[1] = (5u << 8) | (1u << 20);
+		t[2] = (uint32_t)dst;
+		t[3] = (uint32_t)(dst >> 32);
+		t[4] = b == 0 ? 0x7e4e0000u : 0xe15e0000u;
+		t[5] = t[6] = t[7] = 0xffff1000u;
+	}
+	struct {
+		uint32_t    mode;
+		uint64_t    value;
+		const char* want;
+	} cases[] = {{2, 5, "then"}, {2, 6, "else"}, {1, 6, "none"}};
+	Bo*  bos[] = {&mem};
+	bool ok    = true;
+	for (int k = 0; k < 3; k++) {
+		m[0] = (uint32_t)cases[k].value;
+		m[1] = 0;
+		m[16] = m[17] = m[18] = 0;
+		__sync_synchronize();
+		const uint32_t v  = valid ? (1u << 23) : 0u;
+		Ib             ib = {.n = 0};
+		IbPush(&ib, Pkt3Gfx(0x3fu, 13));
+		IbPush(&ib, cases[k].mode | (3u << 8)); // EQUAL
+		IbPush(&ib, (uint32_t)mem.va);
+		IbPush(&ib, (uint32_t)(mem.va >> 32));
+		IbPush(&ib, 0xffffffffu);
+		IbPush(&ib, 0xffffffffu);
+		IbPush(&ib, 5u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, (uint32_t)(mem.va + 0x1000));
+		IbPush(&ib, (uint32_t)((mem.va + 0x1000) >> 32));
+		IbPush(&ib, 8u | v);
+		IbPush(&ib, (uint32_t)(mem.va + 0x2000));
+		IbPush(&ib, (uint32_t)((mem.va + 0x2000) >> 32));
+		IbPush(&ib, 8u | v);
+		IbPush(&ib, Pkt3Gfx(0x37u, 4));
+		IbPush(&ib, (5u << 8) | (1u << 20));
+		IbPush(&ib, (uint32_t)(mem.va + 72));
+		IbPush(&ib, (uint32_t)((mem.va + 72) >> 32));
+		IbPush(&ib, 0xaf7e0000u + (uint32_t)k);
+		IbPad(&ib);
+		// PROBE_CONDIB_CHAINBACK=1: each branch ends with a chain back to the rest of this IB, right after
+		// the 14-dword packet, which is how a call would return.
+		if (getenv("PROBE_CONDIB_CHAINBACK") != NULL) {
+			for (int b = 0; b < 2; b++) {
+				volatile uint32_t* t    = m + (b == 0 ? 0x400 : 0x800);
+				const uint64_t     cont = c->ib.va + 14u * 4u;
+				t[5]                    = Pkt3Gfx(0x3fu, 3);
+				t[6]                    = (uint32_t)cont;
+				t[7]                    = (uint32_t)(cont >> 32);
+				t[8]                    = (ib.n - 14u) | (1u << 20) | (1u << 23);
+			}
+			__sync_synchronize();
+			ib.dw[10] = 9u | v; // the branches' sizes cover the chain
+			ib.dw[13] = 9u | v;
+		}
+		uint64_t seq = 0;
+		r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+		int     w    = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 2.0) : r;
+		int64_t st   = ContextState(d);
+		const char* got = m[16] == 0x7e4e0000u ? (m[17] ? "then+else" : "then") : (m[17] == 0xe15e0000u ? "else" : "none");
+		printf("  mode %u, value %llu (ref 5): %s, ctx 0x%" PRIx64 ", branch taken %s (want %s), WRITE_DATA after it %s\n",
+		       cases[k].mode, (unsigned long long)cases[k].value, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st, got,
+		       cases[k].want, m[18] == 0xaf7e0000u + (uint32_t)k ? "landed" : "missing");
+		fflush(stdout);
+		if (w != 0 || st != 0) {
+			_exit(3);
+		}
+		ok = ok && strcmp(got, cases[k].want) == 0 && m[18] == 0xaf7e0000u + (uint32_t)k;
+	}
+	BoDestroy(d, &mem);
+	return ok;
+}
+
 // libSceAgc's ATOMIC_MEM around a context push or pop (AgcDcbContextStateOp) as it writes it, on the gfx
 // ring: engine bit 30, COMMAND 2, atomic 0x67, 64-bit source {1, 0} over flags that hold {0, 1}. The flags
 // should read {1, 0} after it, and a WRITE_DATA after it lands.
@@ -2463,7 +2565,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
+	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
 }
 
 int main(int argc, char** argv) {
@@ -2548,6 +2650,8 @@ int main(int argc, char** argv) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x64u, 0x342u, "SQ_THREAD_TRACE_USERDATA_2");
 		} else if (strcmp(danger, "regindex-sh-nr") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb030u - 0xb000u) / 4, "SPI_SHADER_USER_DATA_PS_0");
+		} else if (strcmp(danger, "condib") == 0) {
+			ok = DangerCondIb(&d, &c);
 		} else if (strcmp(danger, "atomicmem") == 0) {
 			ok = DangerAtomicMem(&d, &c);
 		} else if (strcmp(danger, "mecforms") == 0) {
