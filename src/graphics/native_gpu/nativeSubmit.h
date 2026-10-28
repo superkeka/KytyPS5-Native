@@ -112,6 +112,8 @@ public:
 	}
 
 	~NativeSubmitter() {
+		delete m_kfd_relay;
+		m_kfd_relay = nullptr;
 		for (KfdQueue*& q: m_kfd_queue) {
 			delete q;
 			q = nullptr;
@@ -181,6 +183,23 @@ public:
 			}
 		}
 	}
+	// True when compute ring index `ring` runs on a KFD queue (or will, on its first submission).
+	[[nodiscard]] bool OnKfdQueue(uint32_t ring) const { return ring < kMaxKfdQueues && (m_kfd_rings & (1u << ring)) != 0; }
+	// One more KFD queue, past the guest queues' indexes, that only relays points of the other rings to a
+	// KFD event (KfdQueue::RelayInterrupt): on the stock amdgpu only KFD queues' interrupts reach one.
+	// After EnableKfdQueues; true once the queue runs.
+	bool CreateKfdRelay() {
+		if (m_kfd_relay == nullptr && m_kfd_count != 0) {
+			// 256 KiB: some 4000 points outstanding, a few frames of a title's interrupts.
+			m_kfd_relay = KfdQueue::Create(m_gem->KfdFd(), m_gem->KfdGpuId(), m_drm_fd, kKfdQueueVa + kMaxKfdQueues * kKfdQueueStride,
+			                               15, 256 * 1024);
+			std::fprintf(stderr, "NativeSubmitter: KFD relay queue for interrupts%s\n", m_kfd_relay != nullptr ? "" : " failed");
+		}
+		return m_kfd_relay != nullptr;
+	}
+	// Queues an interrupt with context id `ctx` once the dword at `va` reaches `ref`; false when the
+	// relay's ring is full or there is no relay. Any one thread.
+	bool RelayInterrupt(uint64_t va, uint32_t ref, uint32_t ctx) { return m_kfd_relay != nullptr && m_kfd_relay->RelayInterrupt(va, ref, ctx); }
 	// Invalidates the KFD VMIDs' TLBs without a KFD ioctl; true once done.
 	void SetKfdTlbFlush(std::function<bool()> flush) { m_kfd_tlb_flush = std::move(flush); }
 
@@ -753,6 +772,7 @@ private:
 	uint64_t    m_ib_kfd_va     = 0;
 	uint64_t    m_ib_kfd_handle = 0;
 	KfdQueue*   m_kfd_queue[kMaxKfdQueues] {};
+	KfdQueue*   m_kfd_relay = nullptr; // CreateKfdRelay
 	uint32_t    m_kfd_rings = 0;                     // ring indexes whose submissions go to KFD queues
 	uint32_t    m_kfd_count = 0;                     // KFD queues created (EnableKfdQueues)
 	uint64_t    m_kfd_va_changes = 0;                // GemBacking::VaChanges at the last KFD TLB flush

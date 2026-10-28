@@ -38,11 +38,14 @@ class KfdQueue {
 public:
 	// `va` is a private GPU VA range of at least 64 MiB for the queue's own buffers.
 	// `priority` is KFD's queue priority, 0-15 (the CP_HQD_QUEUE_PRIORITY the scheduler gives it).
-	static KfdQueue* Create(int kfd_fd, uint32_t gpu_id, int drm_fd, uint64_t va, uint32_t priority = 7) {
-		auto* q    = new KfdQueue();
-		q->m_kfd   = kfd_fd;
-		q->m_gpu   = gpu_id;
-		q->m_drm   = drm_fd;
+	// `ring_bytes`: the ring's size, a power of two from 4 KiB to 1 MiB.
+	static KfdQueue* Create(int kfd_fd, uint32_t gpu_id, int drm_fd, uint64_t va, uint32_t priority = 7,
+	                        uint32_t ring_bytes = kRingBytes) {
+		auto* q          = new KfdQueue();
+		q->m_kfd         = kfd_fd;
+		q->m_gpu         = gpu_id;
+		q->m_drm         = drm_fd;
+		q->m_ring_dwords = ring_bytes / 4;
 		uint32_t cu = 0, cwsr = 0, ctl = 0;
 		ReadTopology(gpu_id, &cu, &cwsr, &ctl);
 		const uint64_t debug = (static_cast<uint64_t>(cu) * 32 * 32 + 63) & ~63ull; // 32 waves per CU, 32 bytes each
@@ -51,7 +54,7 @@ public:
 		constexpr uint32_t gtt = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE |
 		                         KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE |
 		                         KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
-		if (cu == 0 || cwsr == 0 || !q->Alloc(&q->m_ring, va, kRingBytes, gtt) || !q->Alloc(&q->m_ptrs, va + 0x100000, 4096, gtt) ||
+		if (cu == 0 || cwsr == 0 || !q->Alloc(&q->m_ring, va, ring_bytes, gtt) || !q->Alloc(&q->m_ptrs, va + 0x100000, 4096, gtt) ||
 		    // The CP's fetcher reaches the EOP buffer with execute permission (an end-of-pipe RELEASE_MEM
 		    // without it is a permission fault on the queue's VMID).
 		    !q->Alloc(&q->m_eop, va + 0x200000, 4096,
@@ -62,13 +65,13 @@ public:
 			delete q;
 			return nullptr;
 		}
-		std::memset(q->m_ring.cpu, 0, kRingBytes);
+		std::memset(q->m_ring.cpu, 0, ring_bytes);
 		std::memset(q->m_ptrs.cpu, 0, 4096);
 		struct kfd_ioctl_create_queue_args a {};
 		a.ring_base_address        = q->m_ring.va;
 		a.write_pointer_address    = q->m_ptrs.va;
 		a.read_pointer_address     = q->m_ptrs.va + kRptrOffset;
-		a.ring_size                = kRingBytes;
+		a.ring_size                = ring_bytes;
 		a.gpu_id                   = gpu_id;
 		a.queue_type               = KFD_IOC_QUEUE_TYPE_COMPUTE;
 		a.queue_percentage         = 100;
@@ -138,7 +141,7 @@ public:
 	bool Submit(uint64_t ib_va, uint32_t dwords, double timeout_sec, uint64_t* seq) {
 		constexpr uint32_t kPacket = 8 + 4 + 8; // ACQUIRE_MEM + INDIRECT_BUFFER + RELEASE_MEM
 		const double       end     = Now() + timeout_sec;
-		while (m_wptr + kPacket - Rptr() > kRingDwords - 8) {
+		while (m_wptr + kPacket - Rptr() > m_ring_dwords - 8) {
 			if (Now() > end) {
 				return false;
 			}
@@ -209,6 +212,38 @@ public:
 		*m_doorbell = m_wptr;
 	}
 
+	// Waits on the GPU until the dword at `va` is at least `ref`, then raises an end-of-pipe interrupt
+	// with context id `ctx` (and the next sequence number to the fence). A KFD queue's interrupts reach
+	// KFD events on the stock amdgpu, which drops those of render-node submissions: this relays a
+	// point the gfx ring passes to such an event. False when the ring is full (nothing queued).
+	bool RelayInterrupt(uint64_t va, uint32_t ref, uint32_t ctx) {
+		constexpr uint32_t kPacket = 7 + 8; // WAIT_REG_MEM + RELEASE_MEM
+		if (m_wptr + kPacket - Rptr() > m_ring_dwords - 8) {
+			return false;
+		}
+		const uint64_t s = ++m_seq;
+		Push(Pkt3(0x3c, 6));
+		Push(5u | (1u << 4u)); // greater or equal, memory
+		Push(static_cast<uint32_t>(va) & ~3u);
+		Push(static_cast<uint32_t>(va >> 32u));
+		Push(ref);
+		Push(0xffffffffu);
+		Push(4u); // poll interval, as the translator's waits
+		Push(Pkt3(0x49, 7));
+		Push(0x28u | (5u << 8u) | (3u << 25u)); // bottom of pipe, as Submit's fence
+		Push((1u << 29u) | (2u << 24u));        // 32-bit data, INT_SEL 2
+		Push(static_cast<uint32_t>(FenceVa()));
+		Push(static_cast<uint32_t>(FenceVa() >> 32u));
+		Push(static_cast<uint32_t>(s));
+		Push(0u);
+		Push(ctx);
+		__sync_synchronize();
+		*reinterpret_cast<volatile uint64_t*>(m_ptrs.cpu) = m_wptr;
+		__sync_synchronize();
+		*m_doorbell = m_wptr;
+		return true;
+	}
+
 	// The last sequence number the queue has finished (32-bit wrap-around compare with Reached).
 	[[nodiscard]] uint32_t Fence() const { return *reinterpret_cast<volatile const uint32_t*>(static_cast<uint8_t*>(m_ptrs.cpu) + kFenceOffset); }
 	[[nodiscard]] bool     Reached(uint64_t seq) const { return static_cast<int32_t>(Fence() - static_cast<uint32_t>(seq)) >= 0; }
@@ -217,7 +252,7 @@ public:
 	void Describe(char* out, size_t size) const {
 		const uint64_t rptr = *reinterpret_cast<volatile const uint64_t*>(static_cast<uint8_t*>(m_ptrs.cpu) + kRptrOffset);
 		std::snprintf(out, size, "queue %u: wptr %llu, rptr %llu (ring %u dwords), fence %u of %llu submitted", m_queue_id,
-		              static_cast<unsigned long long>(m_wptr), static_cast<unsigned long long>(rptr), kRingDwords, Fence(),
+		              static_cast<unsigned long long>(m_wptr), static_cast<unsigned long long>(rptr), m_ring_dwords, Fence(),
 		              static_cast<unsigned long long>(m_seq));
 	}
 
@@ -242,9 +277,21 @@ public:
 		return cu > counted;
 	}
 
+	// True when KFD never saves a queue's waves (amdgpu.cwsr_enable=0, a stock option): a preempted
+	// queue drains its waves instead, so the save area's size does not matter.
+	static bool WavesNeverSaved() {
+		int on = 1;
+		if (FILE* f = std::fopen("/sys/module/amdgpu/parameters/cwsr_enable", "re"); f != nullptr) {
+			if (std::fscanf(f, "%d", &on) != 1) {
+				on = 1;
+			}
+			std::fclose(f);
+		}
+		return on == 0;
+	}
+
 private:
 	static constexpr uint32_t kRingBytes   = 64 * 1024;
-	static constexpr uint32_t kRingDwords  = kRingBytes / 4;
 	static constexpr uint32_t kRptrOffset  = 64;
 	static constexpr uint32_t kFenceOffset = 128;
 
@@ -268,11 +315,11 @@ private:
 	[[nodiscard]] uint64_t FenceVa() const { return m_ptrs.va + kFenceOffset; }
 	[[nodiscard]] uint64_t Rptr() const {
 		// The CP reports the read pointer in dwords, modulo the ring size.
-		const uint64_t r = *reinterpret_cast<volatile const uint64_t*>(static_cast<uint8_t*>(m_ptrs.cpu) + kRptrOffset) % kRingDwords;
-		const uint64_t w = m_wptr % kRingDwords;
-		return m_wptr - ((w + kRingDwords - r) % kRingDwords);
+		const uint64_t r = *reinterpret_cast<volatile const uint64_t*>(static_cast<uint8_t*>(m_ptrs.cpu) + kRptrOffset) % m_ring_dwords;
+		const uint64_t w = m_wptr % m_ring_dwords;
+		return m_wptr - ((w + m_ring_dwords - r) % m_ring_dwords);
 	}
-	void Push(uint32_t v) { static_cast<uint32_t*>(m_ring.cpu)[(m_wptr++) % kRingDwords] = v; }
+	void Push(uint32_t v) { static_cast<uint32_t*>(m_ring.cpu)[(m_wptr++) % m_ring_dwords] = v; }
 
 	int KfdIoctl(unsigned long request, void* arg) const {
 		int r = -1;
@@ -375,6 +422,7 @@ private:
 	int               m_kfd = -1;
 	int               m_drm = -1;
 	uint32_t          m_gpu = 0;
+	uint32_t          m_ring_dwords = kRingBytes / 4;
 	Mem               m_ring, m_ptrs, m_eop, m_save;
 	uint32_t          m_queue_id  = 0;
 	bool              m_has_queue = false;
@@ -391,10 +439,17 @@ private:
 // bc250_gfx_eop_events=1 or 2) signals the event its context id names, from gfx rings, amdgpu compute
 // rings and KFD queues alike. The event resets as a wait takes it, so interrupts that land while
 // nobody waits leave it set for the next wait and none is lost.
+//
+// Stock KFD (Stock) signals it only from KFD queues' interrupts, and only while the event's mailbox
+// slot in the signal page is written: it takes the slot back as it signals the event, and an
+// interrupt that finds the slot taken signals nothing. The GPU does not write the slot here; the
+// tracker does (Arm), after each wait and before it looks at its points, so an interrupt that comes
+// before it looks is one whose point it sees, and one that comes after leaves the event set.
 class KfdEopEvent {
 public:
-	// The event's id, 0 when the kernel would not deliver it (stock amdgpu, or no KFD process).
-	static uint32_t Create(int kfd_fd) {
+	// True when amdgpu is the BC-250 build that signals it from every ring (bc250_gfx_eop_events 1,
+	// or 2: context id 0 from an IB goes to the EOP log too).
+	static bool FromEveryRing() {
 		int on = 0;
 		if (FILE* f = std::fopen("/sys/module/amdgpu/parameters/bc250_gfx_eop_events", "re"); f != nullptr) {
 			if (std::fscanf(f, "%d", &on) != 1) {
@@ -402,17 +457,36 @@ public:
 			}
 			std::fclose(f);
 		}
-		if (on < 1 || kfd_fd < 0) { // 1, or 2: context id 0 from an IB goes to the EOP log too
+		return on >= 1;
+	}
+
+	// The event's id, 0 when the kernel would not deliver it (stock amdgpu, or no KFD process).
+	static uint32_t Create(int kfd_fd) { return FromEveryRing() ? CreateEvent(kfd_fd, nullptr) : 0; }
+
+	// The event on any amdgpu, signaled from KFD queues only unless FromEveryRing; `Arm` its mailbox
+	// before every wait. 0 without KFD.
+	uint32_t Stock(int kfd_fd) {
+		uint64_t offset = 0;
+		const uint32_t id = CreateEvent(kfd_fd, &offset);
+		if (id == 0 || offset == 0 || id >= kSlots) {
 			return 0;
 		}
-		struct kfd_ioctl_create_event_args a {};
-		a.event_type = KFD_IOC_EVENT_SIGNAL;
-		a.auto_reset = 1;
-		if (::ioctl(kfd_fd, AMDKFD_IOC_CREATE_EVENT, &a) != 0) {
-			std::fprintf(stderr, "KfdEopEvent: CREATE_EVENT failed: %s\n", std::strerror(errno));
+		void* page = ::mmap(nullptr, kSlots * 8, PROT_READ | PROT_WRITE, MAP_SHARED, kfd_fd, static_cast<off_t>(offset));
+		if (page == MAP_FAILED) {
+			std::fprintf(stderr, "KfdEopEvent: signal page mmap failed: %s\n", std::strerror(errno));
 			return 0;
 		}
-		return a.event_id;
+		m_mailbox = static_cast<volatile uint64_t*>(page) + id;
+		Arm();
+		return id;
+	}
+
+	// Writes the mailbox slot (anything but KFD's unsignaled value), so the next interrupt signals the event.
+	void Arm() {
+		if (m_mailbox != nullptr) {
+			*m_mailbox = 1;
+			__sync_synchronize();
+		}
 	}
 
 	// True when the event fired within `timeout_ms` (or had fired since the last wait).
@@ -429,6 +503,28 @@ public:
 		} while (r == -1 && errno == EINTR);
 		return r == 0 && w.wait_result == KFD_IOC_WAIT_RESULT_COMPLETE;
 	}
+
+private:
+	static constexpr uint32_t kSlots = 4096; // KFD_SIGNAL_EVENT_LIMIT
+
+	static uint32_t CreateEvent(int kfd_fd, uint64_t* page_offset) {
+		if (kfd_fd < 0) {
+			return 0;
+		}
+		struct kfd_ioctl_create_event_args a {};
+		a.event_type = KFD_IOC_EVENT_SIGNAL;
+		a.auto_reset = 1;
+		if (::ioctl(kfd_fd, AMDKFD_IOC_CREATE_EVENT, &a) != 0) {
+			std::fprintf(stderr, "KfdEopEvent: CREATE_EVENT failed: %s\n", std::strerror(errno));
+			return 0;
+		}
+		if (page_offset != nullptr) {
+			*page_offset = a.event_page_offset;
+		}
+		return a.event_id;
+	}
+
+	volatile uint64_t* m_mailbox = nullptr;
 };
 
 // The patched amdgpu's EOP log (kfd_bc250_eop_log): every end-of-pipe interrupt of this VM whose

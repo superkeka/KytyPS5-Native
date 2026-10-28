@@ -1505,9 +1505,14 @@ public:
 					m_labels_mark[i] = m_labels_stats[i];
 				}
 				if (m_irq_event != 0) {
-					std::fprintf(stderr, "native shadow: tracker interrupts so far: %llu waits woken, %llu ran out (10 ms)\n",
+					std::fprintf(stderr, "native shadow: tracker interrupts so far: %llu waits woken, %llu ran out (%u ms)\n",
 					             static_cast<unsigned long long>(m_irq_wakes.load()),
-					             static_cast<unsigned long long>(m_irq_timeouts.load()));
+					             static_cast<unsigned long long>(m_irq_timeouts.load()), IrqBackstopMs());
+					if (m_irq_relay) {
+						std::fprintf(stderr, "native shadow: points relayed to the tracker's event so far: %llu, %llu left to the backstop\n",
+						             static_cast<unsigned long long>(m_irq_relayed.load()),
+						             static_cast<unsigned long long>(m_irq_relay_missed.load()));
+					}
 				}
 #if KYTY_GEM_BACKING_SUPPORTED
 				if (m_eop_log_open) {
@@ -1591,14 +1596,23 @@ public:
 			EnableKfdQueues();
 		}
 		// Tracker points as the PS5 takes a title's EOP interrupts: each tracker release raises one,
-		// and the tracker sleeps on it instead of polling its slots every millisecond. Needs the
-		// patched amdgpu; KYTY_NATIVE_GPU_IRQ=0 keeps the polling.
+		// and the tracker sleeps on it instead of polling its slots every millisecond. KYTY_NATIVE_GPU_IRQ=0
+		// keeps the polling.
 		if (!EnvIs("KYTY_NATIVE_GPU_IRQ", "0")) {
-			m_irq_event = KfdEopEvent::Create(m_gem->KfdFd());
+			// The patched amdgpu takes them from every ring. The stock one only from KFD queues (or with
+			// KYTY_NATIVE_GPU_STOCK_IRQ=1): the ACBs' points raise the event from their own KFD queues, a
+			// relay queue raises it for the gfx ring's (RelayIrq), and the tracker arms its mailbox
+			// (KfdEopEvent::Arm). KYTY_NATIVE_GPU_STOCK_IRQ=0 polls there instead.
+			if (KfdEopEvent::FromEveryRing() && !EnvIs("KYTY_NATIVE_GPU_STOCK_IRQ", "1")) {
+				m_irq_event = KfdEopEvent::Create(m_gem->KfdFd());
+			} else if (m_kfd_queues && !EnvIs("KYTY_NATIVE_GPU_STOCK_IRQ", "0") && m_submitter->CreateKfdRelay()) {
+				m_irq_event = m_irq_stock.Stock(m_gem->KfdFd());
+				m_irq_relay = m_irq_event != 0;
+			}
 			// A title's interrupts with context ids reach it through the EOP log (patched amdgpu), raised
 			// by the GPU where its graphics queue's releases run. KYTY_NATIVE_GPU_GUEST_IRQ=0 keeps them
 			// tracker points.
-			if (m_irq_event != 0 && !EnvIs("KYTY_NATIVE_GPU_GUEST_IRQ", "0") && m_eop_log.Open(m_gem->KfdFd())) {
+			if (m_irq_event != 0 && !m_irq_relay && !EnvIs("KYTY_NATIVE_GPU_GUEST_IRQ", "0") && m_eop_log.Open(m_gem->KfdFd())) {
 				m_eop_log_open = true;
 				m_translator.SetGuestInterruptsOnGpu(true);
 				// bc250_gfx_eop_events=2: interrupts with context id 0 reach the log too (from inside an IB).
@@ -1611,10 +1625,11 @@ public:
 			}
 			m_irq_ctx = m_irq_event | (m_eop_log_open ? KfdEopLog::kEventBit : 0u);
 			if (m_irq_event != 0) {
-				std::fprintf(stderr, "native shadow: tracker points raise the EOP interrupt (KFD event %u)%s%s\n", m_irq_event,
+				std::fprintf(stderr, "native shadow: tracker points raise the EOP interrupt (KFD event %u)%s%s%s\n", m_irq_event,
 				             m_eop_log_open ? "; the graphics queue's interrupts with context ids are raised by the GPU (EOP log)"
 				                            : "",
-				             m_irq_ctx0 ? ", context id 0 too" : "");
+				             m_irq_ctx0 ? ", context id 0 too" : "",
+				             m_irq_relay ? "; KFD queues' own, the other rings' through the relay queue (stock amdgpu)" : "");
 			} else {
 				std::fprintf(stderr, "native shadow: no EOP interrupts for tracker points (needs KFD and the patched amdgpu, "
 				                     "bc250_gfx_eop_events=1 or 2); the tracker polls\n");
@@ -1716,6 +1731,35 @@ public:
 
 	// The KFD event the tracker's releases raise (INT_SEL 2); 0 when they do not.
 	uint32_t IrqEvent() const { return m_irq_event; }
+	// True when `slot`'s points reach that event through the relay queue instead (stock amdgpu: only
+	// KFD queues' interrupts reach a KFD event; slot n > 0 is compute ring n - 1).
+	bool IrqRelayed(uint32_t slot) const {
+#if KYTY_GEM_BACKING_SUPPORTED
+		return m_irq_relay && (GfxSlot(slot) || !m_submitter->OnKfdQueue(slot - 1));
+#else
+		(void)slot;
+		return false;
+#endif
+	}
+	// The relay queue raises the event once `slot` reaches point `seq` (IrqRelayed).
+	void RelayIrq(uint32_t slot, uint64_t seq) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		// It waits for greater or equal on 32 bits: a point just below the wrap could wait for good once the
+		// slot wraps, so those are left to the tracker's backstop, as is a point that finds the ring full.
+		const auto     ref = static_cast<uint32_t>(seq);
+		const uint64_t va  = m_submitter->ScratchVa() + kTrackerOffset + static_cast<uint64_t>(slot) * kTrackerStride;
+		if (ref < 0xffff0000u && m_submitter->RelayInterrupt(va, ref, m_irq_ctx)) {
+			m_irq_relayed++;
+		} else {
+			m_irq_relay_missed++;
+		}
+#else
+		(void)slot;
+		(void)seq;
+#endif
+	}
+	// How long the tracker sleeps on the event at most: a relayed point the relay missed waits this long.
+	uint32_t IrqBackstopMs() const { return m_irq_relay ? 2 : 10; }
 	// The context id that names it.
 	uint32_t IrqCtx() const { return m_irq_ctx; }
 	// Sleeps until the tracker's interrupt fires or `timeout_ms` passes.
@@ -1726,6 +1770,7 @@ public:
 		} else {
 			m_irq_timeouts++;
 		}
+		m_irq_stock.Arm(); // before the tracker looks at its points again
 #else
 		(void)timeout_ms;
 #endif
@@ -2191,13 +2236,17 @@ private:
 		}
 		// The wave save area stock KFD gives a queue holds the CUs amdgpu counted at init; on a board with
 		// more CUs enabled after it (the BC-250's 40 of 24), a preempted queue would overflow it. ACBs
-		// stay on those CUs unless the save area holds every CU (the BC-250's patched amdgpu) or
+		// stay on those CUs unless the save area holds every CU (the BC-250's patched amdgpu), KFD never
+		// saves waves (amdgpu.cwsr_enable=0: a preempted queue drains them) or
 		// KYTY_NATIVE_GPU_KFD_CU_CLAMP says otherwise (1: always, 0: never).
 		const char* clamp_env = std::getenv("KYTY_NATIVE_GPU_KFD_CU_CLAMP");
-		const bool  clamp     = clamp_env != nullptr && clamp_env[0] != '\0' ? clamp_env[0] != '0'
-		                                                                     : !KfdQueue::SaveAreaCoversLateCus(m_gem->KfdGpuId());
+		const bool  no_save   = KfdQueue::WavesNeverSaved();
+		const bool  clamp     = clamp_env != nullptr && clamp_env[0] != '\0'
+		                            ? clamp_env[0] != '0'
+		                            : !no_save && !KfdQueue::SaveAreaCoversLateCus(m_gem->KfdGpuId());
 		if (!clamp) {
-			std::fprintf(stderr, "native shadow: ACBs on every CU (KFD's wave save areas hold them all)\n");
+			std::fprintf(stderr, "native shadow: ACBs on every CU (%s)\n",
+			             no_save ? "KFD drains preempted queues, cwsr_enable=0" : "KFD's wave save areas hold them all");
 		} else {
 			const auto masks = m_submitter->InitCuMasks();
 			m_acb_translator.SetComputeCuClamp(masks);
@@ -3310,7 +3359,11 @@ private:
 	bool                  m_kfd_queues   = false; // EnableKfdQueues succeeded
 	uint32_t              m_irq_event    = 0;     // KfdEopEvent of the tracker's releases (0: it polls)
 	uint32_t              m_irq_ctx      = 0;     // their context id: the event, with KfdEopLog::kEventBit once the log is open
+	bool                  m_irq_relay    = false; // m_irq_event is the stock one, other rings' points relayed (IrqRelayed)
+	std::atomic<uint64_t> m_irq_relayed {0};      // points the relay queue took
+	std::atomic<uint64_t> m_irq_relay_missed {0}; // and those left to the backstop
 #if KYTY_GEM_BACKING_SUPPORTED
+	KfdEopEvent           m_irq_stock;            // its mailbox (m_irq_relay)
 	KfdEopLog             m_eop_log;              // a title's interrupts the GPU raises (SetGuestInterruptsOnGpu)
 	bool                  m_irq_ctx0 = false;     // those with context id 0 too (SetGuestInterruptsCtx0)
 #endif
@@ -4201,13 +4254,17 @@ private:
 		}
 		const uint32_t     slot = SlotOf(queue);
 		std::vector<Entry> entries;
-		uint32_t           packet = ~0u;
+		uint32_t           packet  = ~0u;
+		const bool         relayed = Shadow::Instance().IrqEvent() != 0 && Shadow::Instance().IrqRelayed(slot);
+		m_relay.clear();
 		for (auto& point: p.seg.points) {
 			if (point.dw != packet) { // points sharing a packet share its number
 				packet         = point.dw;
 				p.ib[point.dw] = static_cast<uint32_t>(++m_seq);
 				m_slot_seq[slot] = m_seq;
-				if (Shadow::Instance().IrqEvent() != 0) {
+				if (relayed) {
+					m_relay.push_back(m_seq); // raised by the relay queue once the ring passes it
+				} else if (Shadow::Instance().IrqEvent() != 0) {
 					// RELEASE_MEM: control 3 dwords before the data, context id 2 after it.
 					p.ib[point.dw - 3] |= 2u << 24u; // INT_SEL 2: interrupt once the write is confirmed
 					p.ib[point.dw + 2] = Shadow::Instance().IrqCtx();
@@ -4266,6 +4323,9 @@ private:
 				Shadow::Instance().AppendBatch(p.ib, slot);
 				m_appended = true;
 			}
+		}
+		for (uint64_t seq: m_relay) {
+			Shadow::Instance().RelayIrq(slot, seq);
 		}
 		std::lock_guard<std::mutex> lock(m_track_mutex);
 		for (auto& e: entries) {
@@ -4358,10 +4418,11 @@ private:
 				continue;
 			}
 			// With EOP interrupts every tracker release raises one: sleep until the next. An interrupt that
-			// fired since the scan above left the event set, so this returns at once. The 10 ms cap is
-			// a backstop that also lets a point whose submission has not run yet be looked at again.
+			// fired since the scan above left the event set, so this returns at once. The cap (10 ms, 2 with
+			// the relay queue) is a backstop that also lets a point whose submission has not run yet, or
+			// one the relay missed, be looked at again.
 			if (Shadow::Instance().IrqEvent() != 0) {
-				Shadow::Instance().WaitIrq(10);
+				Shadow::Instance().WaitIrq(Shadow::Instance().IrqBackstopMs());
 				continue;
 			}
 			// Block on a ring's fence: the gfx ring's when it has points outstanding (compute queues may
@@ -4548,6 +4609,7 @@ private:
 	bool                                    m_acb_rings = false;
 	uint32_t                                m_compute_mask = 0;
 	uint64_t                                m_slot_seq[33] = {};
+	std::vector<uint64_t>                   m_relay;          // Emit: the points the relay queue raises the event for
 	bool                                    m_native_waits = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_NATIVE_WAITS");
 		return v == nullptr || v[0] != '0';
