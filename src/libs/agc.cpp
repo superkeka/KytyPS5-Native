@@ -1613,6 +1613,11 @@ struct ContextStateMemory {
 };
 
 static constexpr uint32_t CONTEXT_STATE_TABLE_PAIRS = 0x400u;
+static std::atomic<const uint32_t*> g_context_state_table {nullptr};
+
+bool AgcIsDefaultContextTable(const void* table) {
+	return table != nullptr && table == g_context_state_table.load(std::memory_order_acquire);
+}
 
 static ContextStateMemory* context_state_memory() {
 	static std::mutex           mutex;
@@ -1627,6 +1632,7 @@ static ContextStateMemory* context_state_memory() {
 		mem.flags    = mem.table + 2u * CONTEXT_STATE_TABLE_PAIRS;
 		mem.flags[0] = 0;
 		mem.flags[1] = 1;
+		g_context_state_table.store(mem.table, std::memory_order_release);
 	}
 	const uint32_t ver = AgcRegisterDefaultsVersion();
 	if (mem.version != ver) {

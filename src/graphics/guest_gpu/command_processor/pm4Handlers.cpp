@@ -2073,6 +2073,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// libSceAgc's default context (a context-state clear) holds every register's default, many of them
+	// state Kyty does not model; those are left out here.
+	const bool defaults = Gen5::AgcIsDefaultContextTable(indirect_buffer);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2115,6 +2118,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 					Log::WriteToConsoleAndLog(
 					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
 				}
+				continue;
+			}
+			if (defaults) {
 				continue;
 			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
@@ -3542,6 +3548,10 @@ void GraphicsInitJmpTablesCxIndirect() {
 		auto line_width = KYTY_PM4_GET(value, PA_SU_LINE_CNTL, WIDTH);
 		cp.GetCtx().SetLineWidth(line_width == 8 ? 1.0f : static_cast<float>(line_width) / 8.0f);
 	};
+	// The foveated-rendering grid (Stray programs it); the native path gives it to the hardware.
+	for (uint32_t grid: {Pm4::PA_SC_RIGHT_VERT_GRID, Pm4::PA_SC_LEFT_VERT_GRID, Pm4::PA_SC_HORIZ_GRID}) {
+		g_hw_ctx_indirect_func[grid] = [](KYTY_HW_CTX_INDIRECT_ARGS) { HwCtxIgnoreFovWindow(value); };
+	}
 	g_hw_ctx_indirect_func[Pm4::PA_SC_FOV_WINDOW_LR] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreFovWindow(value);
 	};

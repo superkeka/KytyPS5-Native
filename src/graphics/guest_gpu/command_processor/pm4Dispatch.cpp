@@ -55,6 +55,9 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_BACK_OFFSET]  = HwCtxSetPolyOffsetRegisters;
 	g_hw_ctx_func[Pm4::PA_CL_VTE_CNTL]                 = HwCtxSetViewportTransformControl;
 	g_hw_ctx_func[Pm4::PA_SU_LINE_CNTL]                = HwCtxSetLineControl;
+	g_hw_ctx_func[Pm4::PA_SC_RIGHT_VERT_GRID]          = HwCtxSetFovWindow;
+	g_hw_ctx_func[Pm4::PA_SC_LEFT_VERT_GRID]           = HwCtxSetFovWindow;
+	g_hw_ctx_func[Pm4::PA_SC_HORIZ_GRID]               = HwCtxSetFovWindow;
 	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_LR]            = HwCtxSetFovWindow;
 	g_hw_ctx_func[Pm4::PA_SC_FOV_WINDOW_TB]            = HwCtxSetFovWindow;
 	g_hw_ctx_func[Pm4::PA_SC_MODE_CNTL_0]              = HwCtxSetScanModeControl;
