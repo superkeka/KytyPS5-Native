@@ -59,6 +59,9 @@ constexpr uint32_t R_WAIT_FLIP_DONE = 0x06;
 constexpr uint32_t R_FLIP           = 0x17;
 constexpr uint32_t R_RELEASE_MEM    = 0x18;
 constexpr uint32_t R_CONTEXT_STATE  = 0x1A; // Kyty's marker for Agc context-state push/pop/clear
+constexpr uint32_t R_DISPATCH_RESET = 0x09;
+constexpr uint32_t R_PUSH_MARKER    = 0x0B;
+constexpr uint32_t R_POP_MARKER     = 0x0C;
 
 // High bits of a register offset select an indexed SET variant; the register itself is the rest.
 constexpr uint32_t kRegisterSelectorMask = 0x70000000u;
@@ -563,7 +566,8 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 		const uint32_t* b = ib.data() + dw + 1;
 		switch ((header >> 8u) & 0xffu) {
 			case IT_NOP:
-				if (header != kFiller) {
+				// A title's NOP on the gfx ring (AgcCbNop) is skipped by the CP; its length is checked above.
+				if (header != kFiller && compute) {
 					return bad();
 				}
 				break;
@@ -2455,6 +2459,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
 					context_state_op(bptr[0]);
+				}
+				// A plain NOP (AgcCbNop, workload markers) runs in place with direct runs, as the PS5's CP skips
+				// it: dropping it cut the title's run in two (ASTRO BOT: 44k -> 63k dwords a flip run from the
+				// title's buffer). Kyty's debug markers and dispatch reset carry marker bits in header bits 7:2;
+				// in place they hung ASTRO BOT's gfx ring before its first frame, so they stay dropped
+				// (KYTY_NATIVE_GPU_NOPS_IN_PLACE=2 runs them too). =0 drops every NOP as before.
+				static const int nops_in_place = [] {
+					const char* v = std::getenv("KYTY_NATIVE_GPU_NOPS_IN_PLACE");
+					return v == nullptr ? 1 : std::atoi(v);
+				}();
+				if (op == IT_NOP && nops_in_place != 0 && direct && !m_compute_ring && body.size() == body_before && segs.size() == segs_before &&
+				    ((marker == R_ZERO && (body_count == 0 || !IsFlipMarker(bptr[0]))) ||
+				     (nops_in_place >= 2 && (marker == R_PUSH_MARKER || marker == R_POP_MARKER || marker == R_DISPATCH_RESET)))) {
+					in_place = true;
 				}
 				break; // the CP ignores NOPs; present/sync markers are handled elsewhere later
 			}

@@ -1013,6 +1013,21 @@ void TestDirectRuns() {
 		Check(!pts.empty() && IsTrackerPacket(r.ib, pts.back().dw) && r.segments[0].end == r.ib.size() && IbAligned(r.ib),
 		      "the end point moves with the IB");
 	}
+	{
+		// A title's NOPs (AgcCbNop) run in place: one stretch.
+		std::vector<uint32_t> nops = dcb;
+		nops.insert(nops.begin() + 99, {0xc0021000u, 0u, 0u, 0u}); // 4 dwords
+		nops.insert(nops.begin() + 202, {0xc0001000u, 0u});         // 2 dwords
+		Pm4Translator t;
+		t.SetDirectRuns(64);
+		t.SetSource({{0u, static_cast<uint32_t>(nops.size()), kVa}});
+		auto r = t.Translate(nops);
+		Check(r.ok && r.stats.direct_ib2 == 1 && r.stats.direct_dw == nops.size() && r.stats.changed_ops[IT_NOP] == 0,
+		      "NOPs inside a stretch run in place");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(nops, false, &bad, NativeIbKind::Gfx), "a title's NOP passes the gfx check");
+		Check(!ValidateNativeIb(nops, false, &bad, NativeIbKind::Compute), "not the compute check");
+	}
 }
 
 // A WRITE_DATA of a block of data is one write: a wait on a dword inside it that the block meets runs
@@ -1575,7 +1590,14 @@ void TestValidateNativeIb() {
 		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "a guest-form WAIT_REG_MEM (cache policy, poll 0x19) passes on gfx");
 	}
 	rejects({0xc0053c02u, 0x13u, 0x1000u, 0u, 1u, ~0u, 4u}, "WAIT_REG_MEM with the compute bit rejected");
-	rejects({0xc0011000u, 0u, 0u}, "a NOP that is not a filler rejected");
+	{
+		// A title's NOP: skipped by the gfx CP, not taken on a compute ring.
+		std::vector<uint32_t> ib = {0xc0011000u, 0u, 0u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u};
+		uint32_t              bad = ~0u;
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx) && !ValidateNativeIb(ib, false, &bad, NativeIbKind::Compute) &&
+		          bad == 0u,
+		      "a NOP that is not a filler passes on gfx only");
+	}
 	rejects({0xc0028e00u, 64u, 0x1000u, 0u}, "GET_LOD_STATS rejected unless enabled");
 	rejects({0x12345678u}, "not a type-3 packet");
 	std::vector<uint32_t> lod = {0xc0028e00u, 64u, 0x1000u, 0u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u};
