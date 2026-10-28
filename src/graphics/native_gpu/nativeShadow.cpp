@@ -83,6 +83,21 @@ bool EnvOn(const char* name) {
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// An amdgpu module parameter as a number; -1 when it cannot be read.
+int AmdgpuParam(const char* name) {
+	char path[128];
+	std::snprintf(path, sizeof(path), "/sys/module/amdgpu/parameters/%s", name);
+	std::FILE* f = std::fopen(path, "r");
+	int        v = -1;
+	if (f != nullptr) {
+		if (std::fscanf(f, "%d", &v) != 1) {
+			v = -1;
+		}
+		std::fclose(f);
+	}
+	return v;
+}
+
 // True when `name` is set to exactly `value`.
 bool EnvIs(const char* name, const char* value) {
 	const char* v = std::getenv(name);
@@ -1586,6 +1601,9 @@ public:
 			if (m_irq_event != 0 && !EnvIs("KYTY_NATIVE_GPU_GUEST_IRQ", "0") && m_eop_log.Open(m_gem->KfdFd())) {
 				m_eop_log_open = true;
 				m_translator.SetGuestInterruptsOnGpu(true);
+				// bc250_gfx_eop_events=2: interrupts with context id 0 reach the log too (from inside an IB).
+				m_irq_ctx0 = AmdgpuParam("bc250_gfx_eop_events") >= 2 && !EnvIs("KYTY_NATIVE_GPU_IRQ_CTX0", "0");
+				m_translator.SetGuestInterruptsCtx0(m_irq_ctx0);
 				if (m_kfd_queues) {
 					m_submitter->SetKfdCalibration(kKfdCalibrationCtx); // ACBs' interrupts too (UseAcbTracker)
 				}
@@ -1593,12 +1611,13 @@ public:
 			}
 			m_irq_ctx = m_irq_event | (m_eop_log_open ? KfdEopLog::kEventBit : 0u);
 			if (m_irq_event != 0) {
-				std::fprintf(stderr, "native shadow: tracker points raise the EOP interrupt (KFD event %u)%s\n", m_irq_event,
+				std::fprintf(stderr, "native shadow: tracker points raise the EOP interrupt (KFD event %u)%s%s\n", m_irq_event,
 				             m_eop_log_open ? "; the graphics queue's interrupts with context ids are raised by the GPU (EOP log)"
-				                            : "");
+				                            : "",
+				             m_irq_ctx0 ? ", context id 0 too" : "");
 			} else {
 				std::fprintf(stderr, "native shadow: no EOP interrupts for tracker points (needs KFD and the patched amdgpu, "
-				                     "bc250_gfx_eop_events=1); the tracker polls\n");
+				                     "bc250_gfx_eop_events=1 or 2); the tracker polls\n");
 			}
 		}
 		const uint64_t va      = m_submitter->ScratchVa() + kTrackerOffset;
@@ -1787,6 +1806,7 @@ public:
 		                 m_kfd_guest_queue[slot - 1].load() != 0 && m_kfd_guest_queue[slot - 1].load() != kSharedKfdQueue &&
 		                 !EnvIs("KYTY_NATIVE_GPU_ACB_IRQ", "0");
 		m_acb_translator.SetGuestInterruptsOnGpu(own);
+		m_acb_translator.SetGuestInterruptsCtx0(own && m_irq_ctx0);
 #else
 		(void)slot;
 #endif
@@ -3292,6 +3312,7 @@ private:
 	uint32_t              m_irq_ctx      = 0;     // their context id: the event, with KfdEopLog::kEventBit once the log is open
 #if KYTY_GEM_BACKING_SUPPORTED
 	KfdEopLog             m_eop_log;              // a title's interrupts the GPU raises (SetGuestInterruptsOnGpu)
+	bool                  m_irq_ctx0 = false;     // those with context id 0 too (SetGuestInterruptsCtx0)
 #endif
 	bool                  m_eop_log_open = false;
 	std::atomic<uint64_t> m_irq_gpu {0};          // title interrupts the translator left to the GPU

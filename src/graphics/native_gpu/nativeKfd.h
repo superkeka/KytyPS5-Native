@@ -388,7 +388,7 @@ private:
 // their context id (INT_SEL 2), so the tracker sleeps until the GPU passes a point, woken by the
 // interrupt the way the PS5 kernel takes a title's EOP interrupts. Stock KFD drops EOP interrupts of
 // render-node submissions (their VMIDs are not KFD's); the patched amdgpu (tools/bc250-amdgpu,
-// bc250_gfx_eop_events=1) signals the event its context id names, from gfx rings, amdgpu compute
+// bc250_gfx_eop_events=1 or 2) signals the event its context id names, from gfx rings, amdgpu compute
 // rings and KFD queues alike. The event resets as a wait takes it, so interrupts that land while
 // nobody waits leave it set for the next wait and none is lost.
 class KfdEopEvent {
@@ -402,7 +402,7 @@ public:
 			}
 			std::fclose(f);
 		}
-		if (on != 1 || kfd_fd < 0) {
+		if (on < 1 || kfd_fd < 0) { // 1, or 2: context id 0 from an IB goes to the EOP log too
 			return 0;
 		}
 		struct kfd_ioctl_create_event_args a {};

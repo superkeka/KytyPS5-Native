@@ -678,8 +678,10 @@ public:
 	// the packet as written when it carries no data, else after the label (INT_SEL 2 into the scratch
 	// dword), and the patched amdgpu logs its context id for Kyty (KfdEopLog) instead of the tracker
 	// raising it at the end of the segment. Interrupts with context id 0 stay tracker points: amdgpu's
-	// own fences raise theirs with 0.
+	// own fences raise theirs with 0. SetGuestInterruptsCtx0: those too (a patched amdgpu with
+	// bc250_gfx_eop_events=2 logs an id-0 interrupt raised inside an IB, where amdgpu's fences are not).
 	void SetGuestInterruptsOnGpu(bool on) { m_guest_irq = on; }
+	void SetGuestInterruptsCtx0(bool on) { m_guest_irq_ctx0 = on; }
 	// With native labels: a DCB's flip (AgcDcbSetFlip) is requested as soon as the GPU passes it, a
 	// tracker point (woken by the EOP interrupt), as the PS5 kernel queues a title's flip from the
 	// end-of-pipe interrupt; not in Kyty's continuation after the whole buffer.
@@ -847,6 +849,7 @@ private:
 	bool                         m_cpu_timestamps = false;
 	bool                         m_tracker_writes = false;
 	bool                         m_guest_irq      = false;
+	bool                         m_guest_irq_ctx0 = false;
 	bool                         m_eop_flips      = false;
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;

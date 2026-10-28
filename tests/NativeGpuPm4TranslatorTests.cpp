@@ -1260,6 +1260,15 @@ void TestGuestInterruptsOnGpu() {
 	Check(std::count_if(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Interrupt; }) == 1,
 	      "one tracker interrupt point");
 
+	// SetGuestInterruptsCtx0 (bc250_gfx_eop_events=2): context id 0 is raised by the GPU too.
+	Pm4Translator t0;
+	t0.SetNativeLabels(&o, kTrackerVa);
+	t0.SetGuestInterruptsOnGpu(true);
+	t0.SetGuestInterruptsCtx0(true);
+	auto r0 = t0.Translate(dcb);
+	Check(r0.ok && r0.stats.interrupts_gpu == 3 && r0.stats.interrupts == 0, "context id 0 on the GPU as well");
+	Check(ValidateNativeIb(r0.ib, false, nullptr, NativeIbKind::Gfx), "the packet check takes it");
+
 	// A compute queue with a KFD queue of its own: the interrupt alone goes in our form, compute bit set.
 	Pm4Translator acb;
 	acb.SetNativeLabels(&o, kTrackerVa);

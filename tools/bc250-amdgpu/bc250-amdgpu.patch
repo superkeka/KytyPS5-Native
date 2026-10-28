@@ -409,7 +409,7 @@
  {
 --- a/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v10.c
 +++ b/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v10.c
-@@ -25,6 +25,20 @@
+@@ -25,6 +25,22 @@
  #include "soc15_int.h"
  #include "kfd_device_queue_manager.h"
  
@@ -419,35 +419,40 @@
 + * interrupts from its graphics and compute queues alike. A context id with bit 27 set names a KFD
 + * event (the other bits) and signals it without its mailbox slot being written: Kyty's own. Any
 + * other goes to the process's EOP log when it has one (kfd_bc250_eop_log: a title's ids, which
-+ * libSceAgc keeps to 27 bits), else names an event as before. amdgpu's own fences use id 0.
++ * libSceAgc keeps to 27 bits), else names an event as before. amdgpu's own fences use id 0 and run
++ * in the ring, outside any IB, as VMID 0; with 2 (the default) an id-0 interrupt from a non-zero VMID
++ * (inside an IB: a title's RELEASE_MEM with context id 0) goes to the EOP log too.
 + */
 +#define BC250_EOP_EVENT_BIT	(1u << 27)
-+static int bc250_gfx_eop_events = 1;
++static int bc250_gfx_eop_events = 2;
 +module_param(bc250_gfx_eop_events, int, 0444);
 +MODULE_PARM_DESC(bc250_gfx_eop_events,
-+		 "EOP interrupts of render-node submissions signal the KFD event named by their context id (1 = on, 0 = off)");
++		 "EOP interrupts of render-node submissions signal the KFD event named by their context id (2 = on, id 0 from an IB to the EOP log too; 1 = on; 0 = off)");
 +
  /*
   * GFX10 SQ Interrupts
   *
-@@ -143,6 +157,9 @@
+@@ -143,6 +159,9 @@
  	/* Only handle interrupts from KFD VMIDs */
  	vmid = SOC15_VMID_FROM_IH_ENTRY(ih_ring_entry);
  	if (!KFD_IRQ_IS_FENCE(client_id, source_id) &&
 +	    !(bc250_gfx_eop_events && client_id == SOC15_IH_CLIENTID_GRBM_CP &&
 +	      source_id == SOC15_INTSRC_CP_END_OF_PIPE &&
-+	      SOC15_CONTEXT_ID0_FROM_IH_ENTRY(ih_ring_entry) != 0) &&
++	      (SOC15_CONTEXT_ID0_FROM_IH_ENTRY(ih_ring_entry) != 0 || (bc250_gfx_eop_events >= 2 && vmid != 0))) &&
  	   (vmid < dev->vm_info.first_vmid_kfd ||
  	    vmid > dev->vm_info.last_vmid_kfd))
  		return false;
-@@ -210,8 +227,14 @@
+@@ -210,8 +229,17 @@
  	    client_id == SOC15_IH_CLIENTID_SE1SH ||
  	    client_id == SOC15_IH_CLIENTID_SE2SH ||
  	    client_id == SOC15_IH_CLIENTID_SE3SH) {
 -		if (source_id == SOC15_INTSRC_CP_END_OF_PIPE)
 -			kfd_signal_event_interrupt(pasid, context_id0, 32, true);
 +		if (source_id == SOC15_INTSRC_CP_END_OF_PIPE) {
-+			if (!bc250_gfx_eop_events || !context_id0)
++			if (!context_id0 && bc250_gfx_eop_events >= 2 && vmid &&
++			    kfd_bc250_eop_log(pasid, 0, vmid << 8 | SOC15_RING_ID_FROM_IH_ENTRY(ih_ring_entry)))
++				; /* a title's id-0 interrupt, logged */
++			else if (!bc250_gfx_eop_events || !context_id0)
 +				kfd_signal_event_interrupt(pasid, context_id0, 32, true);
 +			else if ((context_id0 & BC250_EOP_EVENT_BIT) ||
 +				 !kfd_bc250_eop_log(pasid, context_id0,

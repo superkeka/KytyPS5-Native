@@ -9,7 +9,9 @@
 //   4. amdgpu compute ring 0: the event wakes;
 //   5. one IB with 32 interrupting releases: the waits that follow see at least one wake, none hang;
 //   6. EOP log (AMDKFD_IOC_BC250_EOP_LOG): a title's context ids from the gfx ring and compute ring 0
-//      land in the signal page's log in order, with their ring; a KFD event's id still wakes it alone.
+//      land in the signal page's log in order, with their ring; a KFD event's id still wakes it alone;
+//   7. with bc250_gfx_eop_events=2: amdgpu's own fences stay out of the log, context id 0 from inside an
+//      IB lands there with the IB's VMID.
 // Build: cc -O2 -o eop_irq_probe eop_irq_probe.c. Needs /dev/kfd (no root).
 #define _GNU_SOURCE
 #include <drm/amdgpu_drm.h>
@@ -398,6 +400,50 @@ int main(void) {
 			*tail = h;
 			printf("log %s\n", order_ok ? "in order, all there (right)" : "WRONG");
 			bad += !woke || !woke_c || !woke_a || !order_ok;
+
+			// 7. bc250_gfx_eop_events=2: context id 0. amdgpu's own fences (ring level, VMID 0) stay out of the
+			// log; a release with id 0 inside an IB lands there, with the IB's VMID.
+			FILE* pf    = fopen("/sys/module/amdgpu/parameters/bc250_gfx_eop_events", "r");
+			int   param = 0;
+			if (pf != NULL) {
+				if (fscanf(pf, "%d", &param) != 1) {
+					param = 0;
+				}
+				fclose(pf);
+			}
+			if (param >= 2) {
+				for (int k = 0; k < 8; k++) { // plain submissions: only amdgpu's fences interrupt
+					n = Release((uint32_t*)ib.cpu, 0, k & 1, 500 + k, 0, 0);
+					Submit((k & 1) ? AMDGPU_HW_IP_COMPUTE : AMDGPU_HW_IP_GFX, Pad(n), &seq);
+					WaitCs((k & 1) ? AMDGPU_HW_IP_COMPUTE : AMDGPU_HW_IP_GFX, seq);
+				}
+				usleep(50000);
+				const uint64_t fences = *head - *tail;
+				n = Release((uint32_t*)ib.cpu, 0, 0, 600, 1, 0);
+				n = Release((uint32_t*)ib.cpu, n, 0, 601, 2, 0);
+				Submit(AMDGPU_HW_IP_GFX, Pad(n), &seq);
+				WaitCs(AMDGPU_HW_IP_GFX, seq);
+				n = Release((uint32_t*)ib.cpu, 0, 1, 602, 2, 0);
+				Submit(AMDGPU_HW_IP_COMPUTE, Pad(n), &seq);
+				WaitCs(AMDGPU_HW_IP_COMPUTE, seq);
+				for (int k = 0; k < 10 && *head - *tail < fences + 3; k++) {
+					WaitEvent(log, 20);
+				}
+				const uint64_t h7 = *head, t7 = *tail;
+				int            ok7 = fences == 0 && h7 - t7 == 3;
+				printf("context id 0: %llu entries from 8 plain submissions (want 0), %llu from 3 id-0 releases in IBs (want 3)\n",
+				       (unsigned long long)fences, (unsigned long long)(h7 - t7 - fences));
+				for (uint64_t i = t7; i < h7; i++) {
+					const uint64_t e = ring[i % 1024];
+					printf("  ctx 0x%x vmid %u ring id 0x%02x\n", (uint32_t)e, (uint32_t)(e >> 40) & 0xf, (uint32_t)(e >> 32) & 0xff);
+					ok7 &= (uint32_t)e == 0 && ((e >> 40) & 0xf) != 0;
+				}
+				*tail = h7;
+				printf("context id 0 %s\n", ok7 ? "as expected" : "WRONG");
+				bad += !ok7;
+			} else {
+				printf("context id 0: bc250_gfx_eop_events=%d, skipped (needs 2)\n", param);
+			}
 		}
 	}
 	printf("%s\n", bad ? "FAILED" : "all as expected");
