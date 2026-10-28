@@ -12,7 +12,10 @@ eop_irq_probe: eop_irq_probe.c
 scanout_probe: scanout_probe.c
 	$(CC) $(CFLAGS) -o $@ scanout_probe.c -lxcb -lxcb-dri3 -lxcb-present
 
+ring_share_probe: ring_share_probe.c
+	$(CC) $(CFLAGS) -o $@ ring_share_probe.c
+
 clean:
-	rm -f bc250-native-probe kfd_probe eop_irq_probe scanout_probe
+	rm -f bc250-native-probe kfd_probe eop_irq_probe scanout_probe ring_share_probe
 
 .PHONY: clean

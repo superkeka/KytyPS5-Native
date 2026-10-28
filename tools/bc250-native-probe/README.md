@@ -35,6 +35,12 @@ layout is the display engine's 64K_R_X), Present completes every frame as FLIP (
 buffer to gamescope without a copy), 16.7 ms apart. gamescope composites it (the plane shows its own
 three framebuffers) rather than scanning it out directly; why is still open.
 
+`ring_share_probe` checks whether the patched amdgpu's two gfx rings (`bc250_gfx_queues=2`, both on
+pipe 0) run past each other's waits. 2026-10-28: they do not. A label written on ring 0 lands only
+after ring 1's WAIT_REG_MEM is released, so a GPU wait in a title's command buffer holds up every
+other gfx-ring user, Kyty's Vulkan presenter and gamescope's composition included (RADV gives this
+board no compute queue family).
+
 `shaders.h` is generated from the `.s` files by `gen_shaders.sh` (LLVM `llvm-mc`, gfx1013).
 
 `--blob FILE [--vgprs N]` runs a raw shader binary as one wave64 group of 64 lanes (destination
