@@ -3245,12 +3245,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				    zpass_sync && !m_compute_ring && body_count >= 1 && ((bptr[0] & 0x3fu) == 0x39u || (bptr[0] & 0x3fu) == 0x15u)) {
 					emit_barrier(true);
 				}
-				// PIXEL_PIPE_STAT_DUMP (0x39) leaves memory untouched on the BC-250 DB. ZPASS_DONE (0x15) writes the
-				// same thing: one 64-bit counter per RB, 16 bytes apart (STRIDE 2 of PS5's PIXEL_PIPE_STAT_CONTROL),
-				// bit 63 set. KYTY_NATIVE_GPU_ZPASS_DUMP=0 sends 0x39 as the title wrote it.
+				// PIXEL_PIPE_STAT_DUMP (0x39) goes as the title wrote it: after PIXEL_PIPE_STAT_CONTROL (the
+				// preamble) the BC-250's DB writes one 64-bit counter per RB, 16 bytes apart (STRIDE 2), bit 63
+				// set, as the PS5's. KYTY_NATIVE_GPU_ZPASS_DUMP=1 sends ZPASS_DONE (0x15) instead, which writes the
+				// same counters.
 				if (static const bool zpass_dump = [] {
 					    const char* e = std::getenv("KYTY_NATIVE_GPU_ZPASS_DUMP");
-					    return e == nullptr || e[0] != '0';
+					    return e != nullptr && e[0] == '1';
 				    }();
 				    zpass_dump && !m_compute_ring && body_count >= 3 && (bptr[0] & 0x3fu) == 0x39u) {
 					body[body.size() - size + 1] = (bptr[0] & ~0x3fu) | 0x15u;

@@ -2967,10 +2967,15 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	} else if (addressed_event) {
 		auto addr = reinterpret_cast<uint64_t>(address);
 
-		// PIXEL_PIPE_STAT_DUMP (0x39) leaves memory untouched on the BC-250's DB; ZPASS_DONE (0x15) writes
-		// the same counters. When the native path draws, the packet goes in that form, so the GPU runs
-		// it as written instead of the translator replacing ~13000 of them a frame (ASTRO BOT).
-		const uint8_t type = event_type == 0x39u && Libs::Graphics::NativeGpu::PrimaryRendering() ? 0x15u : event_type;
+		// PIXEL_PIPE_STAT_DUMP (0x39) as libSceAgc writes it: with libSceAgc's PIXEL_PIPE_STAT_CONTROL
+		// from the context start state (the translator's preamble) the BC-250's DB writes the 16 RB
+		// counters, as the PS5's does. KYTY_NATIVE_GPU_ZPASS_DUMP=1 writes ZPASS_DONE (0x15) instead when
+		// the native path draws, which writes the same counters.
+		static const bool zpass_dump = [] {
+			const char* e = std::getenv("KYTY_NATIVE_GPU_ZPASS_DUMP");
+			return e != nullptr && e[0] == '1';
+		}();
+		const uint8_t type = event_type == 0x39u && zpass_dump && Libs::Graphics::NativeGpu::PrimaryRendering() ? 0x15u : event_type;
 		cmd[1] = 0x100u | type;
 		cmd[2] = static_cast<uint32_t>(addr) & 0xfffffff8u;
 		cmd[3] = static_cast<uint32_t>(addr >> 32u);
