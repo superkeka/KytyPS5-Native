@@ -819,16 +819,22 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			continue;
 		}
 		if ((header >> 30u) == 3u && op == kIndirect) {
-			if (len != 4) {
+			// libSceAgc's branch (AgcCbBranch, 14 dwords: COND_INDIRECT_BUFFER) with compare function 0 is
+			// always taken: a call of its first target, the way Stray calls nested buffers. The BC-250's CP
+			// takes the branch but does not come back from it (probe --danger condib), so it is inlined like
+			// a call. A branch on memory still refuses the buffer.
+			const bool always_branch = len == 14 && ((in[dw + 1] >> 8u) & 0x7u) == 0u && (in[dw + 1] & 0x3u) != 0u;
+			if (len != 4 && !always_branch) {
 				return stop("INDIRECT_BUFFER of another form", dw);
 			}
 			if (!flush(dw)) {
 				return stop("too large", dw);
 			}
-			const uint32_t control = in[dw + 3];
-			const auto*    target  = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[dw + 2]) << 32u) | (in[dw + 1] & ~3u));
-			const uint32_t size    = control & 0xfffffu;
-			const bool     chain   = (control & (1u << 20u)) != 0;
+			const uint32_t  base_dw = always_branch ? dw + 7u : dw; // the then target: address at dwords 8-9, size at 10
+			const uint32_t  control = in[base_dw + 3];
+			const auto*     target  = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[base_dw + 2]) << 32u) | (in[base_dw + 1] & ~3u));
+			const uint32_t  size    = control & 0xfffffu;
+			const bool      chain   = !always_branch && (control & (1u << 20u)) != 0;
 			changed                = 1;
 			if (size == 0) {
 				if (chain) {

@@ -2134,6 +2134,21 @@ void TestFlattenIndirectBuffers() {
 	Check(FlattenIndirectBuffers(buf, &out) && out == std::vector<uint32_t>({0xc0001000u, 0x1111u, 0xc0001000u, 0xbbbbu}),
 	      "a call runs the target, then the rest");
 
+	// libSceAgc's branch with compare function 0 (AgcCbBranch, 14 dwords; Stray's calls): its then target is
+	// called. A branch on memory (function 3) is not inlined.
+	auto branch = [](const std::vector<uint32_t>& target, uint32_t function) {
+		const auto va = reinterpret_cast<uint64_t>(target.data());
+		return std::vector<uint32_t> {0xc00c3f00u, 1u | (function << 8u), 0x1000u, 0u, 0u, 0u, 0u, 0u, static_cast<uint32_t>(va),
+		                              static_cast<uint32_t>(va >> 32u), static_cast<uint32_t>(target.size()), 0u, 0u, 0u};
+	};
+	buf = branch(called, 0);
+	buf.insert(buf.end(), nop_b.begin(), nop_b.end());
+	Check(FlattenIndirectBuffers(buf, &out) && out == std::vector<uint32_t>({0xc0001000u, 0x1111u, 0xc0001000u, 0xbbbbu}),
+	      "an always-taken branch calls its then target");
+	buf = branch(called, 3);
+	out.clear();
+	Check(!FlattenIndirectBuffers(buf, &out), "a branch on memory is not inlined");
+
 	// The chunked layout titles use: a valid REWIND, then a chain to the next chunk; nothing after
 	// the chain runs.
 	std::vector<uint32_t> next = nop_b;

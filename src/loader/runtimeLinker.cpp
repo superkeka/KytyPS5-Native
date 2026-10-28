@@ -935,6 +935,14 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
+	// KYTY_LOG_UNRESOLVED=1: every import left to a stub, on the console, to see what a title needs at once.
+	static const bool log_unresolved = [] {
+		const char* v = std::getenv("KYTY_LOG_UNRESOLVED");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (patched && stubbed && log_unresolved) {
+		printf("Unresolved import: %s\n", ri.name.c_str());
+	}
 	if (patched && stubbed) {
 		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
