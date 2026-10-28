@@ -547,14 +547,15 @@ void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
 
 // Opcodes an ACB passes to MEC with the header as the title wrote it, without the shader-type bit the
 // translator set before: libSceAgc does not set it, and the PS5's MEC runs them so. The BC-250's MEC does too
-// for SET_SH_REG, DISPATCH_DIRECT/INDIRECT, ACQUIRE_MEM and DMA_DATA (probe --danger mecforms; ASTRO BOT plays).
+// for SET_SH_REG, DISPATCH_DIRECT/INDIRECT, ACQUIRE_MEM, DMA_DATA and EVENT_WRITE (probe --danger mecforms;
+// ASTRO BOT plays).
 // KYTY_NATIVE_GPU_ACB_PLAIN=<opcodes, comma-separated> replaces the list; =0 sets the bit on every packet.
 static bool MecPlainOp(uint32_t op) {
 	static const std::array<bool, 256> plain = [] {
 		std::array<bool, 256> a {};
 		const char*           v = std::getenv("KYTY_NATIVE_GPU_ACB_PLAIN");
 		if (v == nullptr) {
-			for (uint32_t o: {IT_SET_SH_REG, IT_DISPATCH_DIRECT, IT_DISPATCH_INDIRECT, IT_ACQUIRE_MEM, IT_DMA_DATA}) {
+			for (uint32_t o: {IT_SET_SH_REG, IT_DISPATCH_DIRECT, IT_DISPATCH_INDIRECT, IT_ACQUIRE_MEM, IT_DMA_DATA, IT_EVENT_WRITE}) {
 				a[o] = true;
 			}
 		}
