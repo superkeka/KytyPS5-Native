@@ -366,11 +366,13 @@ public:
 	// The PS5 kernel maps the title's shared memory (type 12, SCE_KERNEL_MTYPE_C_SHARED: ASTRO BOT and My
 	// First Gran Turismo keep there the labels the CPU reads and writes) with MTYPE C_RW_S, and its
 	// GPU-only memory (11, SCE_KERNEL_MTYPE_C) with C_RW_US, amdgpu's NC. Views of a coherent type map
-	// with CoherentMtype(), the others with the default (NC). On by default for type 12, as on the PS5:
-	// the GPU then reads the title's CPU stores without stale GL2 lines, and KFD queues need no GL2
-	// write-back and invalidate before each IB (KfdQueue::Submit). Gran Turismo 7 race: frames over
-	// 20 ms 2.25% instead of 3.94% with C_RW_S and no such invalidates.
-	// KYTY_NATIVE_GPU_COHERENT_TYPES: comma-separated types, 12 by default; "none" maps everything NC.
+	// with CoherentMtype(), the others with the default (NC). On by default for type 12 where amdgpu has
+	// C_RW_S (the patched one), as on the PS5: the GPU then reads the title's CPU stores without stale
+	// GL2 lines, and KFD queues need no GL2 write-back and invalidate before each IB (KfdQueue::Submit).
+	// Gran Turismo 7 race: frames over 20 ms 1.7% instead of 3.9%, 58 fps instead of 54. The stock
+	// amdgpu would map it CC, which cost GT7 its GPU time (median 15.2 ms instead of 13.3, 90th
+	// percentile 25 ms, 50 fps): there it stays NC with the invalidates unless asked for.
+	// KYTY_NATIVE_GPU_COHERENT_TYPES: comma-separated types (12 as the PS5); "none" maps everything NC.
 	void SetMemoryType(uint64_t offset, uint64_t size, int type) {
 		if (size == 0) {
 			return;
@@ -903,7 +905,7 @@ private:
 			std::vector<int> t;
 			const char*      v = std::getenv("KYTY_NATIVE_GPU_COHERENT_TYPES");
 			if (v == nullptr || v[0] == '\0') {
-				return std::vector<int> {12};
+				return CoherentMtype() == AMDGPU_VM_MTYPE_RW ? std::vector<int> {12} : std::vector<int> {};
 			}
 			for (const char* p = v; *p != '\0';) {
 				char*      next = nullptr;
