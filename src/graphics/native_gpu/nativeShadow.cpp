@@ -2217,6 +2217,17 @@ private:
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUE_RINGS"); v != nullptr && v[0] != '\0') {
 			rings &= static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
 		}
+		// The helper's KFD TLB flush is set before the queues are created: each queue flushes once its
+		// buffers are mapped (KfdQueue::Create), and every GEM_VA change flushes after.
+		if (!LodStatsHw::Instance().On()) {
+			LodStatsHw::Instance().Connect();
+		}
+		if (LodStatsHw::Instance().On() && LodStatsHw::Instance().InvalidateKfdTlb() == 0) {
+			m_submitter->SetKfdTlbFlush([] { return LodStatsHw::Instance().InvalidateKfdTlb() == 0; });
+			std::fprintf(stderr, "native shadow: KFD TLB flushes by the kyty-lodhw helper when queues are made and after GEM_VA changes\n");
+		} else {
+			std::fprintf(stderr, "native shadow: no KFD TLB flush through kyty-lodhw (helper missing or older than op 14)\n");
+		}
 		if (!m_submitter->EnableKfdQueues(rings)) {
 			std::fprintf(stderr, "native shadow: KFD queues unavailable; ACBs stay on CS compute rings\n");
 			return;
@@ -2224,12 +2235,6 @@ private:
 		m_kfd_queues = true;
 		std::fprintf(stderr, "native shadow: ACBs on %u KFD user-mode queues, one per guest queue (doorbell submission, GDS %u bytes)\n",
 		             m_submitter->KfdQueueCount(), m_submitter->GdsSize());
-		if (LodStatsHw::Instance().On() && LodStatsHw::Instance().InvalidateKfdTlb() == 0) {
-			m_submitter->SetKfdTlbFlush([] { return LodStatsHw::Instance().InvalidateKfdTlb() == 0; });
-			std::fprintf(stderr, "native shadow: KFD TLB flushes by the kyty-lodhw helper after GEM_VA changes\n");
-		} else {
-			std::fprintf(stderr, "native shadow: no KFD TLB flush through kyty-lodhw (helper missing or older than op 14)\n");
-		}
 		{
 			std::lock_guard<std::mutex> lock(m_ps5_mutex);
 			Ps5KfdRegs();

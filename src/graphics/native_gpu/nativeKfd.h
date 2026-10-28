@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 
 #include <fcntl.h>
 #include <linux/kfd_ioctl.h>
@@ -36,11 +37,17 @@ namespace Libs::Graphics::NativeGpu {
 // doorbell mapped through the process's whole 8 KiB doorbell slice.
 class KfdQueue {
 public:
+	static constexpr uint32_t kRingBytes = 64 * 1024; // the ring's default size
+
 	// `va` is a private GPU VA range of at least 64 MiB for the queue's own buffers.
 	// `priority` is KFD's queue priority, 0-15 (the CP_HQD_QUEUE_PRIORITY the scheduler gives it).
 	// `ring_bytes`: the ring's size, a power of two from 4 KiB to 1 MiB.
+	// `flush_tlb` invalidates the KFD VMIDs' TLBs once the queue's buffers are mapped. The stock amdgpu
+	// without the firmware scheduler never does: a process gets VMID 8 again, and its queue's CP read
+	// the previous process's ring and pointers at the same addresses through stale entries (CPF faults
+	// at the pointer page, an illegal opcode) until the board rebooted.
 	static KfdQueue* Create(int kfd_fd, uint32_t gpu_id, int drm_fd, uint64_t va, uint32_t priority = 7,
-	                        uint32_t ring_bytes = kRingBytes) {
+	                        uint32_t ring_bytes = kRingBytes, const std::function<bool()>& flush_tlb = {}) {
 		auto* q          = new KfdQueue();
 		q->m_kfd         = kfd_fd;
 		q->m_gpu         = gpu_id;
@@ -67,6 +74,9 @@ public:
 		}
 		std::memset(q->m_ring.cpu, 0, ring_bytes);
 		std::memset(q->m_ptrs.cpu, 0, 4096);
+		if (flush_tlb && !flush_tlb()) {
+			std::fprintf(stderr, "KfdQueue: KFD TLB flush before the queue failed\n");
+		}
 		struct kfd_ioctl_create_queue_args a {};
 		a.ring_base_address        = q->m_ring.va;
 		a.write_pointer_address    = q->m_ptrs.va;
@@ -291,7 +301,6 @@ public:
 	}
 
 private:
-	static constexpr uint32_t kRingBytes   = 64 * 1024;
 	static constexpr uint32_t kRptrOffset  = 64;
 	static constexpr uint32_t kFenceOffset = 128;
 

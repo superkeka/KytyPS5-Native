@@ -192,7 +192,7 @@ public:
 		if (m_kfd_relay == nullptr && m_kfd_count != 0) {
 			// 256 KiB: some 4000 points outstanding, a few frames of a title's interrupts.
 			m_kfd_relay = KfdQueue::Create(m_gem->KfdFd(), m_gem->KfdGpuId(), m_drm_fd, kKfdQueueVa + kMaxKfdQueues * kKfdQueueStride,
-			                               15, 256 * 1024);
+			                               15, 256 * 1024, m_kfd_tlb_flush);
 			std::fprintf(stderr, "NativeSubmitter: KFD relay queue for interrupts%s\n", m_kfd_relay != nullptr ? "" : " failed");
 		}
 		return m_kfd_relay != nullptr;
@@ -560,7 +560,8 @@ private:
 			return;
 		}
 		m_kfd_queue[target.ring] = KfdQueue::Create(m_gem->KfdFd(), m_gem->KfdGpuId(), m_drm_fd,
-		                                            kKfdQueueVa + target.ring * kKfdQueueStride, m_kfd_priority[target.ring]);
+		                                            kKfdQueueVa + target.ring * kKfdQueueStride, m_kfd_priority[target.ring],
+		                                            KfdQueue::kRingBytes, m_kfd_tlb_flush);
 		std::fprintf(stderr, "NativeSubmitter: KFD queue for compute index %u (priority %u)%s\n", target.ring,
 		             m_kfd_priority[target.ring], m_kfd_queue[target.ring] != nullptr ? "" : " failed");
 		if (m_kfd_queue[target.ring] == nullptr) {
