@@ -170,6 +170,17 @@ public:
 	// Called with the ring index after each KFD queue is created (it is mapped to a hardware queue by
 	// then), on the submitting thread.
 	void SetKfdQueueHook(std::function<void(uint32_t)> hook) { m_kfd_queue_hook = std::move(hook); }
+	// Each KFD queue raises an EOP interrupt with context id `base | ring index` once created, which the
+	// EOP log shows with the hardware queue it runs on (0: none).
+	// The queues created already raise theirs now. Call it on the submitting thread.
+	void SetKfdCalibration(uint32_t base) {
+		m_kfd_calibration = base;
+		for (uint32_t ring = 0; ring < kMaxKfdQueues && base != 0; ring++) {
+			if (m_kfd_queue[ring] != nullptr) {
+				m_kfd_queue[ring]->RaiseCalibration(base | ring);
+			}
+		}
+	}
 	// Invalidates the KFD VMIDs' TLBs without a KFD ioctl; true once done.
 	void SetKfdTlbFlush(std::function<bool()> flush) { m_kfd_tlb_flush = std::move(flush); }
 
@@ -535,8 +546,13 @@ private:
 		             m_kfd_priority[target.ring], m_kfd_queue[target.ring] != nullptr ? "" : " failed");
 		if (m_kfd_queue[target.ring] == nullptr) {
 			m_kfd_rings &= ~(1u << target.ring);
-		} else if (m_kfd_queue_hook) {
-			m_kfd_queue_hook(target.ring);
+		} else {
+			if (m_kfd_calibration != 0) {
+				m_kfd_queue[target.ring]->RaiseCalibration(m_kfd_calibration | target.ring);
+			}
+			if (m_kfd_queue_hook) {
+				m_kfd_queue_hook(target.ring);
+			}
 		}
 	}
 
@@ -747,6 +763,7 @@ private:
 		return a;
 	}();
 	std::function<void(uint32_t)> m_kfd_queue_hook; // SetKfdQueueHook
+	uint32_t m_kfd_calibration = 0; // SetKfdCalibration
 	std::function<bool()>         m_kfd_tlb_flush;  // SetKfdTlbFlush
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	struct SlotUse {

@@ -2406,10 +2406,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// A title's interrupt with a context id the GPU can raise itself (SetGuestInterruptsOnGpu): as
 					// written when it carries no data, else after the label, into the scratch dword.
 					const uint32_t guest_ctx  = bptr[6];
-					const bool     irq_on_gpu = interrupt && m_guest_irq && !m_compute_queue && op == IT_RELEASE_MEM && !cpu_point &&
-					                        guest_ctx != 0 && guest_ctx < (1u << 27u);
+					const bool     irq_on_gpu = interrupt && m_guest_irq && op == IT_RELEASE_MEM && !cpu_point && guest_ctx != 0 &&
+					                        guest_ctx < (1u << 27u);
 					if (irq_on_gpu) {
-						if (int_sel == 1 && data_sel == 0 && glm_ok && LabelEventOk(bptr[0])) {
+						if (!m_compute_queue && int_sel == 1 && data_sel == 0 && glm_ok && LabelEventOk(bptr[0])) {
 							write_as_written();
 						} else {
 							EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring, LabelEventCntl(bptr[0]));

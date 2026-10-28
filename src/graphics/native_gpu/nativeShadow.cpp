@@ -1586,6 +1586,9 @@ public:
 			if (m_irq_event != 0 && !EnvIs("KYTY_NATIVE_GPU_GUEST_IRQ", "0") && m_eop_log.Open(m_gem->KfdFd())) {
 				m_eop_log_open = true;
 				m_translator.SetGuestInterruptsOnGpu(true);
+				if (m_kfd_queues) {
+					m_submitter->SetKfdCalibration(kKfdCalibrationCtx); // ACBs' interrupts too (UseAcbTracker)
+				}
 				std::thread([this] { ReadEopLog(); }).detach();
 			}
 			m_irq_ctx = m_irq_event | (m_eop_log_open ? KfdEopLog::kEventBit : 0u);
@@ -1684,6 +1687,14 @@ public:
 	uint32_t ComputeRingMask() const { return m_compute_mask; }
 	// Guest compute queues run on KFD user-mode queues of their own (EnableKfdQueues).
 	bool KfdQueuesOn() const { return m_kfd_queues; }
+	// LabelPipeline::SlotOf gave guest compute queue `queue` KFD queue `index`.
+	void NoteKfdGuestQueue(uint32_t index, uint32_t queue) {
+		if (index < m_kfd_guest_queue.size()) {
+			const uint32_t prev = m_kfd_guest_queue[index].load();
+			m_kfd_guest_queue[index] = prev == 0 ? queue + 1u : kSharedKfdQueue;
+		}
+	}
+
 	// The KFD event the tracker's releases raise (INT_SEL 2); 0 when they do not.
 	uint32_t IrqEvent() const { return m_irq_event; }
 	// The context id that names it.
@@ -1770,6 +1781,12 @@ public:
 		const uint64_t va = m_submitter->ScratchVa() + kTrackerOffset + static_cast<uint64_t>(slot) * kTrackerStride;
 		m_acb_translator.SetNativeLabels(m_label_oracle, va);
 		m_acb_translator.SetFenceAddress(va + 12);
+		// A guest compute queue with a KFD queue of its own: its interrupts with context ids are raised
+		// by the GPU too, and the EOP log tells its hardware queue apart (ReadEopLog).
+		const bool own = m_eop_log_open && m_kfd_queues && slot >= 1 && slot - 1 < m_kfd_guest_queue.size() &&
+		                 m_kfd_guest_queue[slot - 1].load() != 0 && m_kfd_guest_queue[slot - 1].load() != kSharedKfdQueue &&
+		                 !EnvIs("KYTY_NATIVE_GPU_ACB_IRQ", "0");
+		m_acb_translator.SetGuestInterruptsOnGpu(own);
 #else
 		(void)slot;
 #endif
@@ -2024,15 +2041,48 @@ private:
 	void ReadEopLog() {
 #if KYTY_GEM_BACKING_SUPPORTED
 		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul);
+		// A compute entry names its hardware queue (the IV ring id); each KFD queue's calibration
+		// interrupt says which index that is. Entries from a queue not calibrated yet wait for it.
+		std::array<int32_t, 256>                     ring_index;
+		std::deque<std::pair<uint32_t, uint32_t>>    waiting;
+		ring_index.fill(-1);
+		auto deliver = [this, &ring_index](uint32_t ctx, uint32_t ring) {
+			const uint32_t queue = m_kfd_guest_queue[static_cast<uint32_t>(ring_index[ring])].load();
+			if (queue == 0 || queue == kSharedKfdQueue) {
+				m_irq_stray++;
+				return;
+			}
+			m_irq_logged++;
+			if (HostCallbacks().interrupt) {
+				HostCallbacks().interrupt(static_cast<int>(queue - 1u), ctx);
+			}
+		};
 		for (;;) {
-			m_eop_log.Drain(100, [this](uint32_t ctx, uint32_t source) {
-				if (((source >> 2u) & 0x3u) != 0u) {
+			m_eop_log.Drain(100, [&](uint32_t ctx, uint32_t source) {
+				const uint32_t ring = source & 0xffu;
+				if (((source >> 2u) & 0x3u) == 0u) {
+					m_irq_logged++;
+					if (HostCallbacks().interrupt) {
+						HostCallbacks().interrupt(0, ctx);
+					}
+				} else if ((ctx & ~0x1fu) == kKfdCalibrationCtx) {
+					ring_index[ring] = static_cast<int32_t>(ctx & 0x1fu);
+					std::fprintf(stderr, "native shadow: KFD queue %u runs on hardware queue me %u pipe %u queue %u\n", ctx & 0x1fu,
+					             (ring >> 2u) & 3u, ring & 3u, (ring >> 4u) & 7u);
+					for (auto it = waiting.begin(); it != waiting.end();) {
+						if (it->second == ring) {
+							deliver(it->first, ring);
+							it = waiting.erase(it);
+						} else {
+							++it;
+						}
+					}
+				} else if (ring_index[ring] >= 0) {
+					deliver(ctx, ring);
+				} else if (waiting.size() < 4096) {
+					waiting.emplace_back(ctx, ring);
+				} else {
 					m_irq_stray++;
-					return;
-				}
-				m_irq_logged++;
-				if (HostCallbacks().interrupt) {
-					HostCallbacks().interrupt(0, ctx);
 				}
 			});
 		}
@@ -3246,6 +3296,11 @@ private:
 	std::atomic<uint64_t> m_irq_gpu {0};          // title interrupts the translator left to the GPU
 	std::atomic<uint64_t> m_irq_logged {0};       // and those the EOP log delivered
 	std::atomic<uint64_t> m_irq_stray {0};        // log entries from a ring with no guest queue here
+	// KFD queue index -> its guest compute queue + 1 (0: none yet, kSharedKfdQueue: more than one).
+	std::array<std::atomic<uint32_t>, 32> m_kfd_guest_queue {};
+	static constexpr uint32_t             kSharedKfdQueue = 0xffffffffu;
+	// Context ids the KFD queues raise once created (NativeSubmitter::SetKfdCalibration): this | index.
+	static constexpr uint32_t kKfdCalibrationCtx = 0x07ffff00u;
 	std::atomic<uint64_t> m_irq_wakes {0};        // tracker waits the interrupt ended
 	std::atomic<uint64_t> m_irq_timeouts {0};     // and those that ran out instead
 	// KYTY_NATIVE_GPU_PS5_REGS (InitPs5Regs): its own helper connection, so closing it (exit, crash)
@@ -3707,6 +3762,7 @@ private:
 		auto [it, fresh] = m_queue_index.try_emplace(queue, static_cast<uint32_t>(m_queue_index.size()) % Shadow::Instance().KfdQueueCount());
 		if (fresh) {
 			std::fprintf(stderr, "native shadow: guest compute queue 0x%x runs on KFD queue %u\n", queue, it->second);
+			Shadow::Instance().NoteKfdGuestQueue(it->second, queue);
 		}
 		return it->second + 1u;
 	}

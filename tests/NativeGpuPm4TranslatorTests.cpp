@@ -1228,6 +1228,22 @@ void TestGuestInterruptsOnGpu() {
 	Check(std::count_if(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Interrupt; }) == 1,
 	      "one tracker interrupt point");
 
+	// A compute queue with a KFD queue of its own: the interrupt alone goes in our form, compute bit set.
+	Pm4Translator acb;
+	acb.SetNativeLabels(&o, kTrackerVa);
+	acb.SetComputeQueue(true);
+	acb.SetComputeRing(true);
+	acb.SetGuestInterruptsOnGpu(true);
+	std::vector<uint32_t> acb_buf;
+	AppendGuestRelease(acb_buf, 0, 1, 0, 0, 1, 0x06000514u, 0xau);
+	auto       ra   = acb.Translate(acb_buf);
+	const auto apkt = Decode(ra.ib);
+	const auto air  = std::find_if(apkt.begin(), apkt.end(), [](const Packet& p) { return p.op == 0x49u && p.body[6] == 0xau; });
+	Check(ra.ok && ra.stats.interrupts_gpu == 1 && ra.stats.interrupts == 0 && air != apkt.end() && air->compute &&
+	          ((air->body[1] >> 24u) & 7u) == 2u,
+	      "an ACB's interrupt is raised by the GPU in our form");
+	Check(ValidateNativeIb(ra.ib, false, nullptr, NativeIbKind::Compute), "which the compute packet check takes");
+
 	// Off by default.
 	Pm4Translator plain;
 	plain.SetNativeLabels(&o, kTrackerVa);

@@ -672,7 +672,8 @@ public:
 	// Timestamps stay on the tracker (Kyty's host TSC scaled to 100 MHz) instead of the GPU clock.
 	// KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1. The two clocks have the same unit and different zeros.
 	void SetCpuTimestamps(bool on) { m_cpu_timestamps = on; }
-	// With native labels on the graphics queue: a title's RELEASE_MEM interrupt with a context id
+	// With native labels (on a compute queue: one that has a KFD queue of its own, always in our form): a
+	// title's RELEASE_MEM interrupt with a context id
 	// (not 0, within libSceAgc's 27 bits) is raised by the GPU where the release runs, as on the PS5:
 	// the packet as written when it carries no data, else after the label (INT_SEL 2 into the scratch
 	// dword), and the patched amdgpu logs its context id for Kyty (KfdEopLog) instead of the tracker

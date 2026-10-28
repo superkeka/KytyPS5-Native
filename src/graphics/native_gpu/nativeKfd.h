@@ -191,6 +191,24 @@ public:
 		return true;
 	}
 
+	// An end-of-pipe interrupt with context id `ctx` (and the next sequence number to the fence), so the
+	// EOP log (KfdEopLog) shows which hardware queue (me, pipe, queue) this queue runs on.
+	void RaiseCalibration(uint32_t ctx) {
+		const uint64_t s = ++m_seq;
+		Push(Pkt3(0x49, 7));
+		Push(0x28u | (5u << 8u) | (3u << 25u)); // bottom of pipe, as Submit's fence
+		Push((1u << 29u) | (2u << 24u));        // 32-bit data, INT_SEL 2
+		Push(static_cast<uint32_t>(FenceVa()));
+		Push(static_cast<uint32_t>(FenceVa() >> 32u));
+		Push(static_cast<uint32_t>(s));
+		Push(0u);
+		Push(ctx);
+		__sync_synchronize();
+		*reinterpret_cast<volatile uint64_t*>(m_ptrs.cpu) = m_wptr;
+		__sync_synchronize();
+		*m_doorbell = m_wptr;
+	}
+
 	// The last sequence number the queue has finished (32-bit wrap-around compare with Reached).
 	[[nodiscard]] uint32_t Fence() const { return *reinterpret_cast<volatile const uint32_t*>(static_cast<uint8_t*>(m_ptrs.cpu) + kFenceOffset); }
 	[[nodiscard]] bool     Reached(uint64_t seq) const { return static_cast<int32_t>(Fence() - static_cast<uint32_t>(seq)) >= 0; }
