@@ -15,7 +15,10 @@ scanout_probe: scanout_probe.c
 ring_share_probe: ring_share_probe.c
 	$(CC) $(CFLAGS) -o $@ ring_share_probe.c
 
+svm_probe: svm_probe.c
+	$(CC) $(CFLAGS) -o $@ svm_probe.c
+
 clean:
-	rm -f bc250-native-probe kfd_probe eop_irq_probe scanout_probe ring_share_probe
+	rm -f bc250-native-probe kfd_probe eop_irq_probe scanout_probe ring_share_probe svm_probe
 
 .PHONY: clean

@@ -294,3 +294,17 @@ distrobox enter shadps4-dev -- sh -c "cc -O2 -o /tmp/gem_view_probe gem_view_pro
 On 2026-10-23 every check passed. A CS listing a 256 MiB GTT buffer took 0.008 ms. The same
 buffer as userptr costs a page-table walk on every submit, about 31 ms per frame for Dead Cells'
 13.5 GiB backing.
+
+## svm_probe
+
+`svm_probe` checks KFD's shared virtual memory (`AMDKFD_IOC_SVM`) as a PS5-like memory model: a range
+of the process's own memory (anonymous or a memfd) given to the GPU at the same addresses, used by
+render-node submissions on the VM KFD acquired. Result (28.10.2026): the gfx and compute rings read
+and write it and the CPU sees their writes, but the GPU loses write access wherever the CPU
+write-protects a page: a GPU write there faults and stops the gfx ring. The ioctl's size must cover
+the attributes (`AMDKFD_IOC_SVM + (n * 8 << _IOC_SIZESHIFT)`, as libhsakmt does), else it is EINVAL.
+
+```
+distrobox enter bc250-mesa-dev -- make svm_probe && ./svm_probe
+```
+
