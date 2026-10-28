@@ -1663,12 +1663,13 @@ void TestComputeRingPackets() {
 	}
 	Check(sh != nullptr && sh->compute && sh->body[1] == 0x11u, "compute SH state is replayed with the shader bit");
 	bool release_cs = false;
-	bool wait_cs    = false;
+	bool wait_plain = false;
 	for (const auto& p: pkts) {
 		release_cs = release_cs || (p.op == 0x49u && p.compute && IsLabelEvent(p.body[0]));
-		wait_cs    = wait_cs || (p.op == 0x3Cu && p.compute && p.body[1] == static_cast<uint32_t>(addr));
+		wait_plain = wait_plain || (p.op == 0x3Cu && !p.compute && p.body[1] == static_cast<uint32_t>(addr));
 	}
-	Check(release_cs && wait_cs && r.stats.waits_native == 1, "label release and the guest wait use the compute shader bit");
+	Check(release_cs && wait_plain && r.stats.waits_native == 1,
+	      "the label release uses the compute shader bit, the guest wait goes to MEC as written");
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "the IB passes the compute-ring check");
 	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a compute-bit release is not a gfx-ring packet");

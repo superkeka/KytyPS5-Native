@@ -575,6 +575,20 @@ static bool MecPlainOp(uint32_t op) {
 	return plain[op & 0xffu];
 }
 
+// An ACB's WAIT_REG_MEM / WAIT_REG_MEM_64 go to MEC as written, the micro engine's (MEC has no prefetch parser;
+// ASTRO BOT plays). KYTY_NATIVE_GPU_ACB_WAITS_VERBATIM=0 emits our form.
+static bool AcbWaitsVerbatim() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_ACB_WAITS_VERBATIM");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
+static bool MecGuestWaitOk(uint32_t control) {
+	return AcbWaitsVerbatim() && GuestWaitControlOk(control) && ((control >> 8u) & 0x3u) == 0u;
+}
+
 bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind) {
 	const bool compute = kind == NativeIbKind::Compute;
 	uint32_t dw = 0;
@@ -631,12 +645,12 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				if (header == Pkt3(IT_WAIT_REG_MEM, 6, compute) && b[0] == kWaitEqualMemMe && b[5] == kWaitPoll) {
 					break; // the translator's own form, on either ring
 				}
-				if (compute || size != 7 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
+				if ((compute && !MecGuestWaitOk(b[0])) || size != 7 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
 					return bad();
 				}
-				break; // a guest wait as written (gfx ring)
+				break; // a guest wait as written
 			case IT_WAIT_REG_MEM_64:
-				if (compute || size != 9 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
+				if ((compute && !MecGuestWaitOk(b[0])) || size != 9 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
 					return bad();
 				}
 				break;
@@ -2830,8 +2844,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						EmitClockCopy(body, wait_pair);
 					}
 					// The guest's packet as written where the gfx CP runs it (SetWaitsVerbatim), else our form.
-					const bool as_written = plan == LabelOracle::Plan::Native && !m_compute_ring && m_waits_verbatim &&
-					                        GuestWaitControlOk(bptr[0]);
+					const bool as_written = plan == LabelOracle::Plan::Native && (dcb[dw] & 2u) == 0 &&
+					                        (m_compute_ring ? MecGuestWaitOk(bptr[0]) : m_waits_verbatim && GuestWaitControlOk(bptr[0]));
 					if (as_written) {
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 						NoteGpuWait(w);
