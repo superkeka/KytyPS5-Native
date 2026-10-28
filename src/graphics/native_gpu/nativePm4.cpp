@@ -545,6 +545,35 @@ void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
 	}
 }
 
+// Opcodes an ACB passes to MEC with the header as the title wrote it, without the shader-type bit the
+// translator set before: libSceAgc does not set it, and the PS5's MEC runs them so. The BC-250's MEC does too
+// for SET_SH_REG, DISPATCH_DIRECT/INDIRECT, ACQUIRE_MEM and DMA_DATA (probe --danger mecforms; ASTRO BOT plays).
+// KYTY_NATIVE_GPU_ACB_PLAIN=<opcodes, comma-separated> replaces the list; =0 sets the bit on every packet.
+static bool MecPlainOp(uint32_t op) {
+	static const std::array<bool, 256> plain = [] {
+		std::array<bool, 256> a {};
+		const char*           v = std::getenv("KYTY_NATIVE_GPU_ACB_PLAIN");
+		if (v == nullptr) {
+			for (uint32_t o: {IT_SET_SH_REG, IT_DISPATCH_DIRECT, IT_DISPATCH_INDIRECT, IT_ACQUIRE_MEM, IT_DMA_DATA}) {
+				a[o] = true;
+			}
+		}
+		while (v != nullptr && *v != '\0') {
+			char*               end = nullptr;
+			const unsigned long n   = std::strtoul(v, &end, 0);
+			if (end == v) {
+				break;
+			}
+			if (n < 256) {
+				a[n] = true;
+			}
+			v = *end == ',' ? end + 1 : end;
+		}
+		return a;
+	}();
+	return plain[op & 0xffu];
+}
+
 bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind) {
 	const bool compute = kind == NativeIbKind::Compute;
 	uint32_t dw = 0;
@@ -579,7 +608,8 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				// its context id (the pipeline sets both when it numbers the point), and a title's interrupt
 				// keeps its context id: INT_SEL 2 after a label or into the scratch dword, or the title's
 				// interrupt alone as written (INT_SEL 1, no data, gfx ring).
-				if (header != Pkt3(IT_RELEASE_MEM, 7, compute) || (b[6] != 0u && ((b[1] >> 24u) & 0x7u) == 0u)) {
+				if ((header != Pkt3(IT_RELEASE_MEM, 7, compute) && !(compute && MecPlainOp(IT_RELEASE_MEM) && header == Pkt3(IT_RELEASE_MEM, 7, false))) ||
+				    (b[6] != 0u && ((b[1] >> 24u) & 0x7u) == 0u)) {
 					return bad();
 				}
 				if ((b[0] == kFlushEventCntl || LabelEventOk(b[0])) && (b[1] == kData32Cntl || b[1] == (kData32Cntl | kIntSel2))) {
@@ -630,7 +660,7 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			// A guest WRITE_DATA to memory, write confirmed; on MEC from the micro engine.
 			case IT_WRITE_DATA:
 				if (size < 5 || !WriteDataToMemory(b[0]) || (b[0] & (1u << 20u)) == 0 ||
-				    (compute && ((header & 2u) == 0 || (b[0] >> 30u) != 0))) {
+				    (compute && (((header & 2u) == 0 && !MecPlainOp(IT_WRITE_DATA)) || (b[0] >> 30u) != 0))) {
 					return bad();
 				}
 				break;
@@ -642,7 +672,7 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			case IT_DMA_DATA:
 			case IT_ACQUIRE_MEM:
 			case IT_SET_SH_REG:
-				if (compute && (header & 2u) == 0) {
+				if (compute && (header & 2u) == 0 && !MecPlainOp((header >> 8u) & 0xffu)) {
 					return bad();
 				}
 				break;
@@ -3328,6 +3358,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				r.unknown_ops.insert(op);
 				break;
+		}
+		// MecPlainOp: the title's header (no shader-type bit) where the packet is passed on.
+		if (m_compute_ring && MecPlainOp(op) && body.size() > body_before && (body[body_before] & ~2u) == (header & ~2u)) {
+			body[body_before] = header;
 		}
 		if (IsWork(op)) {
 			seg_effects = true;

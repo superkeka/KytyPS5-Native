@@ -6,6 +6,10 @@
 # until SSH answers again.
 set -u
 TAG=$1 SECS=$2 ENVS=$3 TITLE=${4:-PPSA21567} ARGS=${5:-}
+# The run goes through nosteam-run.sh: the Steam client is stopped for it (2-3 GB of RAM a title with
+# full residency needs; with it ASTRO BOT swaps) and started again after. TRY_STEAM=1 keeps it running.
+RUNNER=nosteam-run.sh
+[ "${TRY_STEAM:-0}" = 1 ] && RUNNER=game-run.sh
 # TRY_CRUMBS=0 runs without breadcrumbs (they sync every submission to disk: slow).
 CRUMBS='KYTY_NATIVE_GPU_BREADCRUMBS=$C'
 [ "${TRY_CRUMBS:-1}" = 0 ] && CRUMBS=""
@@ -26,7 +30,7 @@ fi
 ssh -o BatchMode=yes -o ServerAliveInterval=2 -o ServerAliveCountMax=5 $H 'journalctl -kf -n 0 --no-pager -o short-monotonic' > "$LOCAL/kernel.log" 2>&1 &
 KLOG=$!
 sleep 2
-ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS $CRUMBS\" --setenv=EXTRA_ARGS=\"$ARGS\" ${TRY_NO_OVERLAY:+--setenv=OVERLAY=} ${TRY_EMU:+--setenv=KYTY_EMU=$TRY_EMU} --setenv=KYTY_FRESH_SAVES=${TRY_FRESH_SAVES:-1} $RUNS/game-run.sh $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
+ssh -o BatchMode=yes $H "C=$RUNS/crumbs-$TAG; mkdir -p \$C; systemd-run --user --collect --unit=kyty-$TAG --setenv=EXTRA_ENV=\"$ENVS $CRUMBS\" --setenv=EXTRA_ARGS=\"$ARGS\" ${TRY_NO_OVERLAY:+--setenv=OVERLAY=} ${TRY_EMU:+--setenv=KYTY_EMU=$TRY_EMU} --setenv=KYTY_FRESH_SAVES=${TRY_FRESH_SAVES:-1} $RUNS/$RUNNER $TITLE primary $SECS $TAG ${TRY_SHOT:-30}" > /dev/null 2>&1
 result=TIMEOUT
 for i in $(seq 1 $(( (SECS + 60) / 5 ))); do
 	sleep 5

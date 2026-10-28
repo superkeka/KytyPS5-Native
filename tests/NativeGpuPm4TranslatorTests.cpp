@@ -1612,6 +1612,23 @@ void TestValidateNativeIb() {
 	Check(ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "with it, it passes there");
 }
 
+// libSceAgc's ACB packets without the shader-type bit go to MEC as written (SET_SH_REG, DISPATCH_DIRECT,
+// ACQUIRE_MEM, DMA_DATA); the compute-ring check takes them.
+void TestComputeRingPlainHeaders() {
+	Pm4Translator t;
+	t.SetComputeQueue(true);
+	t.SetComputeRing(true);
+	std::vector<uint32_t> acb;
+	Append(acb, IT_SET_SH_REG, {0x240u, 0x11u}, false);
+	Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 0x41u}, false);
+	auto r = t.Translate(acb);
+	Check(r.ok && r.stats.changed_ops[IT_SET_SH_REG] == 0 && r.stats.changed_ops[IT_DISPATCH_DIRECT] == 0 &&
+	          std::search(r.ib.begin(), r.ib.end(), acb.begin(), acb.end()) != r.ib.end(),
+	      "an ACB's SET_SH_REG and DISPATCH_DIRECT reach MEC as written");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "the compute-ring check takes them");
+}
+
 void TestComputeRingPackets() {
 	Pm4Translator t;
 	TestOracle    o;
@@ -2362,6 +2379,7 @@ int main() {
 	TestLabelsWait64();
 	TestValidateNativeIb();
 	TestComputeRingPackets();
+	TestComputeRingPlainHeaders();
 	TestUnreachableLabel();
 	TestGpuTimestamp();
 	TestLabelsGpuOnly();

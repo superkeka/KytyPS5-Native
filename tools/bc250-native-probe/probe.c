@@ -1666,6 +1666,179 @@ static bool DangerTag342(Device* d, Common* c) {
 	return ok;
 }
 
+// libSceAgc's ACB packets as it writes them, without the shader-type bit (header bit 1) the translator
+// sets for MEC: does the BC-250's MEC run them as the PS5's does? One job per step on the compute ring,
+// each checked by what it writes; the first that does not finish stops the run (a stopped MEC needs a
+// reboot with gpu_recovery=0). Steps: a store dispatch (SET_SH_REG, DISPATCH_DIRECT), EVENT_WRITE,
+// ACQUIRE_MEM, DMA_DATA, WAIT_REG_MEM_64, RELEASE_MEM.
+// Result on BC-250: the store dispatch runs without the bit and writes all 64 values.
+static bool DangerMecForms(Device* d, Common* c) {
+	printf("== danger mecforms: ACB packets without the shader-type bit on the compute ring\n");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 2 * MiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem, &c->code};
+	const uint32_t     magic = 0x6d656300u;
+	// Clears the shader-type bit in every packet header of `ib` from dword `from` on.
+	// PROBE_MEC_STEPS: the steps to run, e.g. "1,2a,3,4,5" (the default; 2e is EVENT_WRITE CS_PARTIAL_FLUSH,
+	// which stopped amdgpu's compute ring even with the bit, 2a ACQUIRE_MEM). PROBE_MEC_BIT=1 keeps the
+	// shader-type bit (the control run).
+	const char* steps   = getenv("PROBE_MEC_STEPS") != NULL ? getenv("PROBE_MEC_STEPS") : "1,2a,3,4,5";
+	const bool  keepbit = getenv("PROBE_MEC_BIT") != NULL;
+	#define MEC_STEP(name) (strstr(steps, (name)) != NULL)
+	#define MEC_PLAIN(ib, from)                                                                     \
+		for (uint32_t k_ = (from); k_ < (ib).n;) {                                              \
+			const uint32_t h_ = (ib).dw[k_];                                                \
+			(ib).dw[k_]       = keepbit ? h_ : h_ & ~2u;                                    \
+			k_ += (h_ & 0x3fffff00u) == 0x3fff1000u ? 1u : ((h_ >> 16) & 0x3fffu) + 2u;     \
+		}
+	#define MEC_MARK(ib, off, value)                                                                \
+		do {                                                                                    \
+			IbPush(&(ib), Pkt3(0x37u, 4));                                                  \
+			IbPush(&(ib), (5u << 8) | (1u << 20));                                          \
+			IbPush(&(ib), (uint32_t)(mem.va + (off)));                                      \
+			IbPush(&(ib), (uint32_t)((mem.va + (off)) >> 32));                              \
+			IbPush(&(ib), (value));                                                         \
+		} while (0)
+	#define MEC_RUN(ib, what)                                                                       \
+		do {                                                                                    \
+			IbPad(&(ib));                                                                   \
+			uint64_t seq_ = 0;                                                              \
+			r             = Submit(d, &c->ib, &(ib), bos, 2, &seq_);                         \
+			int     w_    = r == 0 ? Wait(d, seq_, 3.0) : r;                                \
+			int64_t st_   = ContextState(d);                                                \
+			printf("  %-34s %s, ctx 0x%" PRIx64 "\n", (what), w_ == 1 ? "TIMEOUT" : ErrStr(w_), (uint64_t)st_); \
+			fflush(stdout);                                                                 \
+			if (w_ != 0 || st_ != 0) {                                                      \
+				_exit(3); /* freeing buffers would wait on the stopped ring */              \
+			}                                                                               \
+		} while (0)
+
+	printf("  shader-type bit %s; steps %s\n", keepbit ? "kept (control)" : "cleared", steps);
+	memset(mem.cpu, 0, 64 * KiB);
+	Ib   ib = {.n = 0};
+	bool ok = true;
+	// 1. A store dispatch: SET_SH_REG and DISPATCH_DIRECT.
+	if (MEC_STEP("1")) {
+		LoadCode(c, k_store_w64, sizeof(k_store_w64));
+		const uint32_t base  = 0x5100000u;
+		uint32_t       ud[3] = {(uint32_t)mem.va, (uint32_t)(mem.va >> 32), base};
+		Dispatch       p     = {c->code.va, 64, 8, 3, true, 64, 1, ud};
+		IbDispatch(&ib, &p);
+		MEC_PLAIN(ib, 0);
+		MEC_RUN(ib, "SET_SH_REG + DISPATCH_DIRECT:");
+		uint32_t good = 0;
+		for (uint32_t i = 0; i < 64; i++) {
+			good += m[i] == base + i ? 1u : 0u;
+		}
+		printf("    store dispatch wrote %u of 64 values\n", good);
+		ok = good == 64;
+	}
+
+	// 2e. EVENT_WRITE CS_PARTIAL_FLUSH.
+	if (MEC_STEP("2e")) {
+		ib.n = 0;
+		IbPush(&ib, Pkt3(0x46u, 1));
+		IbPush(&ib, 7u | (4u << 8));
+		MEC_PLAIN(ib, 0);
+		MEC_MARK(ib, 0x1000, magic | 2u);
+		MEC_RUN(ib, "EVENT_WRITE:");
+		ok = ok && m[0x400] == (magic | 2u);
+	}
+	// 2a. ACQUIRE_MEM (gfx10 form, as amdgpu's emit_mem_sync: GL2/GL1/GLV invalidate + GL2 writeback).
+	if (MEC_STEP("2a")) {
+		ib.n = 0;
+		IbPush(&ib, Pkt3(0x58u, 7));
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0xffffffffu);
+		IbPush(&ib, 0xffffffu);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0xau);
+		IbPush(&ib, 0x8000u | 0x4000u | 0x200u | 0x100u);
+		MEC_PLAIN(ib, 0);
+		MEC_MARK(ib, 0x1040, magic | 3u);
+		MEC_RUN(ib, "ACQUIRE_MEM:");
+		ok = ok && m[0x410] == (magic | 3u);
+	}
+
+	// 3. DMA_DATA memory to memory, CP_SYNC.
+	if (MEC_STEP("3")) {
+	for (uint32_t i = 0; i < 4; i++) {
+		m[0x800 + i] = magic | (0x30u + i);
+	}
+	__sync_synchronize();
+	ib.n = 0;
+	IbPush(&ib, Pkt3(0x50u, 6));
+	IbPush(&ib, 1u << 31);
+	IbPush(&ib, (uint32_t)(mem.va + 0x2000));
+	IbPush(&ib, (uint32_t)((mem.va + 0x2000) >> 32));
+	IbPush(&ib, (uint32_t)(mem.va + 0x3000));
+	IbPush(&ib, (uint32_t)((mem.va + 0x3000) >> 32));
+	IbPush(&ib, 16u);
+	MEC_PLAIN(ib, 0);
+	MEC_RUN(ib, "DMA_DATA:");
+	ok = ok && m[0xc00] == (magic | 0x30u) && m[0xc03] == (magic | 0x33u);
+	printf("    DMA_DATA copy %s\n", m[0xc00] == (magic | 0x30u) && m[0xc03] == (magic | 0x33u) ? "landed" : "missing");
+	}
+
+	// 4. WAIT_REG_MEM_64 on a 64-bit value already there (EQUAL, mask ~0), then a marker.
+	if (MEC_STEP("4")) {
+	m[0x1000] = 1u;
+	m[0x1001] = 0u;
+	__sync_synchronize();
+	ib.n = 0;
+	IbPush(&ib, Pkt3(0x93u, 8));
+	IbPush(&ib, 0x13u);
+	IbPush(&ib, (uint32_t)(mem.va + 0x4000));
+	IbPush(&ib, (uint32_t)((mem.va + 0x4000) >> 32));
+	IbPush(&ib, 1u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0xffffffffu);
+	IbPush(&ib, 0xffffffffu);
+	IbPush(&ib, 0x19u);
+	MEC_PLAIN(ib, 0);
+	MEC_MARK(ib, 0x1100, magic | 4u);
+	MEC_RUN(ib, "WAIT_REG_MEM_64:");
+	ok = ok && m[0x440] == (magic | 4u);
+	}
+
+	// 5. RELEASE_MEM: CACHE_FLUSH_AND_INV_TS_EVENT, 32-bit data to memory, no interrupt.
+	if (MEC_STEP("5")) {
+	ib.n = 0;
+	IbPush(&ib, Pkt3(0x49u, 7));
+	IbPush(&ib, 0x14u | (5u << 8));
+	IbPush(&ib, 1u << 29);
+	IbPush(&ib, (uint32_t)(mem.va + 0x5000));
+	IbPush(&ib, (uint32_t)((mem.va + 0x5000) >> 32));
+	IbPush(&ib, magic | 5u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0u);
+	MEC_PLAIN(ib, 0);
+	MEC_RUN(ib, "RELEASE_MEM:");
+	for (int i = 0; i < 100 && m[0x1400] != (magic | 5u); i++) {
+		usleep(1000);
+	}
+	printf("    RELEASE_MEM data %s\n", m[0x1400] == (magic | 5u) ? "landed" : "missing");
+	ok = ok && m[0x1400] == (magic | 5u);
+	}
+	#undef MEC_STEP
+	#undef MEC_PLAIN
+	#undef MEC_MARK
+	#undef MEC_RUN
+	BoDestroy(d, &mem);
+	printf("  %s\n", ok ? "every step ran and wrote what it should" : "a step did not write what it should");
+	return ok;
+}
+
 // The guest's own GPU waits (libSceAgc's AgcDcbWaitRegMem: WAIT_REG_MEM and WAIT_REG_MEM_64, ENGINE_SEL ME
 // or PFP, any compare function) as written, on the gfx ring: whether the BC-250's CP runs them as the PS5's
 // does, so the translator can pass them through. Each step is one job, the wait then a WRITE_DATA marker;
@@ -2230,7 +2403,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
+	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
 }
 
 int main(int argc, char** argv) {
@@ -2315,6 +2488,8 @@ int main(int argc, char** argv) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x64u, 0x342u, "SQ_THREAD_TRACE_USERDATA_2");
 		} else if (strcmp(danger, "regindex-sh-nr") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb030u - 0xb000u) / 4, "SPI_SHADER_USER_DATA_PS_0");
+		} else if (strcmp(danger, "mecforms") == 0) {
+			ok = DangerMecForms(&d, &c);
 		} else if (strcmp(danger, "regindex-shc-nr") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb900u - 0xb000u) / 4, "COMPUTE_USER_DATA_0");
 		} else if (strcmp(danger, "regindex-ctx-nr") == 0) {
