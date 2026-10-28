@@ -3050,9 +3050,10 @@ private:
 			m_acb_translator.SetCompactRefs(true);
 		}
 		SyncCollectRefs();
-		if (EnvOn("KYTY_NATIVE_GPU_WAITS_VERBATIM")) {
+		// The guest's WAIT_REG_MEM / WAIT_REG_MEM_64 run as written on the gfx ring (probe waitforms: the
+		// BC-250's CP runs them as the PS5's does). KYTY_NATIVE_GPU_WAITS_VERBATIM=0 emits our form.
+		if (!EnvIs("KYTY_NATIVE_GPU_WAITS_VERBATIM", "0")) {
 			m_translator.SetWaitsVerbatim(true);
-			std::fprintf(stderr, "native shadow: guest WAIT_REG_MEM / WAIT_REG_MEM_64 run as written on the gfx ring (experiment)\n");
 		}
 		if (EnvOn("KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT")) {
 			m_translator.SetPfpSyncIndirect(true);

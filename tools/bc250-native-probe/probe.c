@@ -1518,6 +1518,8 @@ static bool DangerRegIndex(Device* d, Common* c, const char* which) {
 	};
 	static const struct Case cases[] = {
 	    {"sh", 0x63u, 0x76u, 0xb000u, 0xb030u, "SPI_SHADER_USER_DATA_PS_0"},
+	    // A compute register from a graphics-type header (shader type 0), as My First GT's DCB dispatches load theirs.
+	    {"shc", 0x63u, 0x76u, 0xb000u, 0xb900u, "COMPUTE_USER_DATA_0"},
 	    {"ctx", 0x9fu, 0x69u, 0x28000u, 0x28030u, "PA_SC_SCREEN_SCISSOR_TL"},
 	    {"uc", 0x64u, 0x79u, 0x30000u, 0x30e0cu, "TEXTURE_GRADIENT_FACTORS"}, // a COPY_DATA read of VGT_OBJECT_ID stopped the ring
 	};
@@ -1528,7 +1530,7 @@ static bool DangerRegIndex(Device* d, Common* c, const char* which) {
 		}
 	}
 	if (k == NULL) {
-		fprintf(stderr, "regindex case: sh, ctx or uc\n");
+		fprintf(stderr, "regindex case: sh, shc, ctx or uc\n");
 		return false;
 	}
 	printf("== danger regindex-%s: packet 0x%02x (one pair into %s) on the gfx ring\n", k->name, k->op, k->reg_name);
@@ -1602,7 +1604,8 @@ static bool DangerRegIndex(Device* d, Common* c, const char* which) {
 // SQ_THREAD_TRACE_USERDATA_2 (0x342) around waits and multi draws, as the CP would get them verbatim.
 // DCB form on the gfx ring (header 0xc0017904: bit 2 set), ACB form on a compute ring (0x342 and the
 // profiler's 0x343), each followed by a WRITE_DATA that shows the ring went on. No readback.
-// Result on BC-250: the gfx ring runs them; the compute ring (amdgpu's MEC queue) stops.
+// Result on BC-250: the gfx ring runs them, the 64-bit wait's two-register begin tag too; the compute
+// ring (amdgpu's MEC queue) stops.
 static bool DangerTag342(Device* d, Common* c) {
 	printf("== danger tag342: SET_UCONFIG_REG of SQ_THREAD_TRACE_USERDATA_2/3 from user IBs\n");
 	Bo  mem;
@@ -1618,7 +1621,9 @@ static bool DangerTag342(Device* d, Common* c) {
 	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
 	Bo*                bos[] = {&mem};
 	bool               ok    = true;
-	for (int k = 0; k < 2 && ok; k++) {
+	// PROBE_TAG342_GFX=1: the gfx ring only (the compute ring is known to stop).
+	const int          rings = getenv("PROBE_TAG342_GFX") != NULL ? 1 : 2;
+	for (int k = 0; k < rings && ok; k++) {
 		const bool     gfx    = k == 0;
 		const uint32_t ip     = gfx ? AMDGPU_HW_IP_GFX : AMDGPU_HW_IP_COMPUTE;
 		const uint32_t magic  = 0x7a690000u | (uint32_t)k;
@@ -1632,6 +1637,14 @@ static bool DangerTag342(Device* d, Common* c) {
 		IbPush(&ib, header);
 		IbPush(&ib, gfx ? 0x342u : 0x343u);
 		IbPush(&ib, 0xc8000000u); // AGC_WAIT_USER_DATA_END_TAG
+		if (gfx) {
+			// The begin tag of a 64-bit wait: 0x342 and 0x343 in one packet (the tag with address bits
+			// 47:32, then the low dword), header 0xc0027904.
+			IbPush(&ib, 0xc0027904u);
+			IbPush(&ib, 0x342u);
+			IbPush(&ib, 0xc8020000u | (uint32_t)((mem.va >> 32) & 0xffffu));
+			IbPush(&ib, (uint32_t)mem.va);
+		}
 		IbPush(&ib, gfx ? Pkt3Gfx(0x37u, 4) : Pkt3(0x37u, 4));
 		IbPush(&ib, (5u << 8) | (1u << 20));
 		IbPush(&ib, (uint32_t)(mem.va + 4u * k));
@@ -2302,6 +2315,8 @@ int main(int argc, char** argv) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x64u, 0x342u, "SQ_THREAD_TRACE_USERDATA_2");
 		} else if (strcmp(danger, "regindex-sh-nr") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb030u - 0xb000u) / 4, "SPI_SHADER_USER_DATA_PS_0");
+		} else if (strcmp(danger, "regindex-shc-nr") == 0) {
+			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb900u - 0xb000u) / 4, "COMPUTE_USER_DATA_0");
 		} else if (strcmp(danger, "regindex-ctx-nr") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x9fu, (0x28030u - 0x28000u) / 4, "PA_SC_SCREEN_SCISSOR_TL");
 		} else if (strncmp(danger, "regindex-", 9) == 0) {

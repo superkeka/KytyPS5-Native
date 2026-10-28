@@ -2542,10 +2542,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						break;
 					}
 				}
-				// libSceAgc's internal-data tags (SQ_THREAD_TRACE_USERDATA_2, around waits and multi draws) go
-				// to the gfx CP as written: a user IB writes them there (probe --danger tag342), while a
-				// compute ring stops on the same packet.
-				if (!m_compute_ring && op == IT_SET_UCONFIG_REG && body_count == 2 && Normalize(bptr[0]) == 0x342u) {
+				// libSceAgc's internal-data tags (SQ_THREAD_TRACE_USERDATA_2, around waits and multi draws; a
+				// 64-bit wait's begin tag goes on into USERDATA_3) go to the gfx CP as written: a user IB writes
+				// them there (probe --danger tag342), while a compute ring stops on the same packet.
+				if (!m_compute_ring && op == IT_SET_UCONFIG_REG && (body_count == 2 || body_count == 3) &&
+				    Normalize(bptr[0]) == 0x342u) {
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					stats.set_uconfig++;
 					break;
@@ -2610,8 +2611,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// probe --danger regindex-*: the table is loaded). The packet goes as written when every pair
 				// is one the translator would emit unchanged: no stub entries (the CP would write them),
 				// no patched values, UCONFIG only whitelisted and not VGT_PRIMITIVE_TYPE/INDEX_TYPE (those
-				// need SET_UCONFIG_REG_INDEX), SH only of the header's shader type. The shadow copy is kept
-				// from the same pairs. KYTY_NATIVE_GPU_TABLES_VERBATIM=0 expands every table as before.
+				// need SET_UCONFIG_REG_INDEX). SH tables may hold compute registers under a graphics-type
+				// header, as libSceAgc's own SET_SH_REG does for DCB dispatches (My First GT; probe --danger
+				// regindex-shc-nr runs it). The shadow copy is kept from the same pairs.
+				// KYTY_NATIVE_GPU_TABLES_VERBATIM=0 expands every table as before.
 				static const bool tables_verbatim = [] {
 					const char* v = std::getenv("KYTY_NATIVE_GPU_TABLES_VERBATIM");
 					return v == nullptr || v[0] != '0';
@@ -2624,7 +2627,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					return v == nullptr || v[0] != '0';
 				}();
 				bool verbatim = tables_verbatim && !m_compute_ring && bptr[2] == 0x80000000u && (bptr[0] & 3u) == 0;
-				const bool compute_sh = (dcb[dw] & 2u) != 0;
 				for (uint32_t i = 0; i < num && verbatim; i++) {
 					const uint32_t raw   = pairs[2 * i];
 					const uint32_t value = pairs[2 * i + 1];
@@ -2634,7 +2636,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					} else if (op == IT_SET_CONTEXT_REG_INDIRECT) {
 						verbatim = PatchContext(off, value) == value;
 					} else if (op == IT_SET_SH_REG_INDIRECT) {
-						verbatim = off != kShNop && (off >= kShComputeBase) == compute_sh && PatchSh(off, value) == value;
+						verbatim = off != kShNop && PatchSh(off, value) == value;
 					} else {
 						verbatim = off != kUcNop && (tables_prim || (off != 0x242u && off != 0x243u)) && UconfigAllowed(off);
 					}

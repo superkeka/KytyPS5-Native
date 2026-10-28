@@ -267,6 +267,15 @@ void TestIndirectTablesVerbatim() {
 	auto r3 = t.Translate(held);
 	Check(r3.ok && r3.stats.loads_verbatim == 1 && r3.stats.loaded_uc_regs == 2 && r3.stats.loaded_cx_regs == 2,
 	      "stub entries and other data formats are expanded, a primitive-type table runs as written");
+
+	// Compute registers under a graphics-type header (My First GT's DCB dispatches), duplicates included.
+	std::vector<uint32_t> cs_pairs = {0x215u, 0u, 0x20Cu, 0x905593cu, 0x20Du, 0u, 0x22Au, 0x28000100u, 0x22Au, 0x1157a6b7u};
+	std::vector<uint32_t> cs;
+	AppendIndirect(cs, IT_SET_SH_REG_INDIRECT, cs_pairs, 0x80000000u);
+	auto r4 = t.Translate(cs);
+	Check(r4.ok && r4.stats.loads_verbatim == 1 && r4.stats.changed_ops[IT_SET_SH_REG_INDIRECT] == 0 &&
+	          std::search(r4.ib.begin(), r4.ib.end(), cs.begin(), cs.end()) != r4.ib.end(),
+	      "a compute table under a graphics-type header runs as written on the gfx ring");
 }
 
 void TestIndirectShComputeBit() {
@@ -343,6 +352,14 @@ void TestAgcTagsVerbatim() {
 	      "the two 0x342 tags are in the gfx IB as written");
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a tagged IB passes the gfx-ring check");
+
+	// A 64-bit wait's begin tag: 0x342 and 0x343 in one packet.
+	Pm4Translator         t64;
+	std::vector<uint32_t> wide = {0xc0027904u, 0x342u, 0xc8020010u, 0x00ee89e0u};
+	auto                  r64  = t64.Translate(wide);
+	Check(r64.ok && r64.stats.uconfig_skipped == 0 && r64.stats.changed_ops[IT_SET_UCONFIG_REG] == 0 &&
+	          std::search(r64.ib.begin(), r64.ib.end(), wide.begin(), wide.end()) != r64.ib.end(),
+	      "the two-register begin tag is in the gfx IB as written");
 }
 
 // GFX9+ only updates the CP's copy of VGT_PRIMITIVE_TYPE / VGT_INDEX_TYPE through
