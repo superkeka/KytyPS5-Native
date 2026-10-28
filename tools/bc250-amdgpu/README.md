@@ -45,6 +45,27 @@ What it affects outside Kyty: only KFD users (ROCm/HIP: llama.cpp and the like).
 fixed number of hardware queues, so many ROCm processes at once can run out of them. Steam games use
 Vulkan on gfx ring 0 and the kernel compute rings, as before.
 
+## Without the patch
+
+The stock SteamOS amdgpu runs the native backend too, with three of its own module options:
+
+```
+options amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0
+```
+
+- `sched_policy=2`: as above. Kyty turns KFD queues on by this option, patched or not; under the firmware
+  scheduler (the stock default) the first queues hang the GPU (`timeout waiting for kiq fence`).
+- `vm_update_mode=0`: as above.
+- `cwsr_enable=0`: KFD drains a preempted queue's waves instead of saving them. The stock save area holds
+  the 24 CUs amdgpu counts at init, and waves on the other 16 would overflow it, so with CWSR on Kyty keeps
+  ACBs on those 24 CUs (`ACB CU masks clamped` in the log).
+
+What Kyty does instead of the patch: stock KFD signals a KFD event only from KFD queues' interrupts, so
+the ACBs' tracker points raise it from their own queues, and a relay KFD queue waits for the gfx ring's
+points and raises it for them (`through the relay queue (stock amdgpu)` in the log). A title's
+interrupts become tracker points (no EOP log), there is one gfx ring, and `AMDGPU_VM_MTYPE_RW` memory
+is mapped CC. ASTRO BOT, 28.10, same scene: 96.2% of flips under 20 ms on both.
+
 ## Build, install, roll back (on the board)
 
 ```sh

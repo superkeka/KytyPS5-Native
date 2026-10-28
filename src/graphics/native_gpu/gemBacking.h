@@ -89,8 +89,10 @@ namespace Libs::Graphics::NativeGpu {
 // nativeKfd.h). A KFD queue reaches KFD memory and, in this VM, the always-valid blocks of map
 // residency; without those (partial residency, KYTY_NATIVE_GPU_ALWAYS_VALID=0) the blocks and the
 // external ranges become KFD buffers.
-// On by default in primary mode when amdgpu is the BC-250 build with the KFD TLB fixes (the stock
-// one hangs flushing the KFD VMIDs' TLBs through the KIQ under gfx load); =0 turns it off, =1 on.
+// On by default in primary mode when KFD runs without the firmware scheduler (amdgpu.sched_policy=2,
+// a stock option, which the BC-250's patched amdgpu sets too): queues then stay on their hardware
+// queues, as on the PS5. Under the scheduler (the stock default) the runlist rebuilds preempt busy
+// queues and the KIQ's TLB flushes hang the GPU on the BC-250. =0 turns it off, =1 on.
 inline bool KfdQueuesWanted() {
 	static const bool on = [] {
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUES"); v != nullptr && v[0] != '\0') {
@@ -100,15 +102,15 @@ inline bool KfdQueuesWanted() {
 		if (primary == nullptr || primary[0] == '\0' || primary[0] == '0') {
 			return false;
 		}
-		int   flush = 0;
-		FILE* f     = std::fopen("/sys/module/amdgpu/parameters/bc250_flush_by_runlist", "re");
+		int   policy = 0;
+		FILE* f      = std::fopen("/sys/module/amdgpu/parameters/sched_policy", "re");
 		if (f != nullptr) {
-			if (std::fscanf(f, "%d", &flush) != 1) {
-				flush = 0;
+			if (std::fscanf(f, "%d", &policy) != 1) {
+				policy = 0;
 			}
 			std::fclose(f);
 		}
-		return flush != 0;
+		return policy == 2;
 	}();
 	return on;
 }
