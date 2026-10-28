@@ -165,8 +165,12 @@ public:
 		// stores stopped invalidating GL2); on the PS5 memory shared with the GPU is coherent. Once per
 		// submitted ACB, not at every label. KYTY_NATIVE_GPU_KFD_IB_SYNC=0 leaves it out, =1 also ends the
 		// IB with amdgpu's fence form.
+		// Not needed while the title's shared memory maps coherent (GemBacking::AnyCoherentType, the default),
+		// as on the PS5, where its CPU stores live; =1 or =2 brings it back.
 		static const char* const ib_sync_env = std::getenv("KYTY_NATIVE_GPU_KFD_IB_SYNC");
-		static const bool        ib_acquire  = ib_sync_env == nullptr || ib_sync_env[0] != '0';
+		static const bool        ib_acquire  = ib_sync_env == nullptr || ib_sync_env[0] == '\0'
+		                                           ? !GemBacking::AnyCoherentType()
+		                                           : ib_sync_env[0] != '0';
 		static const bool        ib_sync     = ib_sync_env != nullptr && ib_sync_env[0] == '1';
 		if (ib_acquire) {
 			Push(Pkt3(0x58, 7));

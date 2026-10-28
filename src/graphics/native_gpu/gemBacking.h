@@ -366,10 +366,11 @@ public:
 	// The PS5 kernel maps the title's shared memory (type 12, SCE_KERNEL_MTYPE_C_SHARED: ASTRO BOT and My
 	// First Gran Turismo keep there the labels the CPU reads and writes) with MTYPE C_RW_S, and its
 	// GPU-only memory (11, SCE_KERNEL_MTYPE_C) with C_RW_US, amdgpu's NC. Views of a coherent type map
-	// with CoherentMtype(), the others with the default (NC). Off by default: the GPU then reads a CPU
-	// store without stale GL2 lines, but nothing needs that yet, and My First Gran Turismo dropped a few
-	// more frames with its shared memory C_RW_S (ASTRO BOT: no cost).
-	// KYTY_NATIVE_GPU_COHERENT_TYPES: comma-separated types (12 as the PS5), none by default.
+	// with CoherentMtype(), the others with the default (NC). On by default for type 12, as on the PS5:
+	// the GPU then reads the title's CPU stores without stale GL2 lines, and KFD queues need no GL2
+	// write-back and invalidate before each IB (KfdQueue::Submit). Gran Turismo 7 race: frames over
+	// 20 ms 2.25% instead of 3.94% with C_RW_S and no such invalidates.
+	// KYTY_NATIVE_GPU_COHERENT_TYPES: comma-separated types, 12 by default; "none" maps everything NC.
 	void SetMemoryType(uint64_t offset, uint64_t size, int type) {
 		if (size == 0) {
 			return;
@@ -888,11 +889,21 @@ private:
 	    AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE | MtypeFlags();
 
 	static bool CoherentType(int type) {
+		const auto& types = CoherentTypes();
+		return std::find(types.begin(), types.end(), type) != types.end();
+	}
+
+public:
+	// True when some guest memory type maps coherent (CoherentType).
+	static bool AnyCoherentType() { return !CoherentTypes().empty(); }
+
+private:
+	static const std::vector<int>& CoherentTypes() {
 		static const std::vector<int> types = [] {
 			std::vector<int> t;
 			const char*      v = std::getenv("KYTY_NATIVE_GPU_COHERENT_TYPES");
-			if (v == nullptr) {
-				return t;
+			if (v == nullptr || v[0] == '\0') {
+				return std::vector<int> {12};
 			}
 			for (const char* p = v; *p != '\0';) {
 				char*      next = nullptr;
@@ -905,7 +916,7 @@ private:
 			}
 			return t;
 		}();
-		return std::find(types.begin(), types.end(), type) != types.end();
+		return types;
 	}
 
 	// The MTYPE of coherent memory types: C_RW_S (AMDGPU_VM_MTYPE_RW) as the PS5 maps its shared type,
