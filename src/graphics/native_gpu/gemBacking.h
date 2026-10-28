@@ -115,17 +115,17 @@ inline bool KfdQueuesWanted() {
 
 class GemBacking {
 public:
-	// Residency granularity. Every resident block is listed in every submission (a listed buffer
-	// costs the CS ioctl about 2 us, measured), so smaller blocks waste less memory but make longer
-	// lists. ASTRO BOT in gameplay: 16 MiB is ~600 buffers, 1.5-2 ms per CS, the GPU idle 40% of the
-	// time (38 FPS); 64 MiB is ~160 buffers, 48 FPS, 0.9 GiB more resident; 128 MiB no faster and
-	// swapping. KYTY_NATIVE_GPU_BLOCK_MIB: a power of two from 2 to 1024, default 64; 16 to 512 divide
-	// the 13.5 GiB backing evenly.
+	// Residency granularity. Listed in every submission, small blocks once cost CS time (16 MiB was
+	// ~600 buffers, 1.5-2 ms per CS); always-valid blocks (map residency, the default) are listed in
+	// none, so a block's size now only decides how much a partly used one wastes. ASTRO BOT in gameplay,
+	// 28.10: 64 MiB 12.0 GiB resident and 0.4 GB of RAM left, 16 MiB 11.7 GiB and 1.0 GB left (map-time
+	// residency reaches 11.5 GiB instead of 10.6), 3.9% late frames. KYTY_NATIVE_GPU_BLOCK_MIB: a power
+	// of two from 2 to 1024, default 16; 16 to 512 divide the 13.5 GiB backing evenly.
 	static uint64_t BlockSize() {
 		static const uint64_t size = [] {
 			const char*    v   = std::getenv("KYTY_NATIVE_GPU_BLOCK_MIB");
-			const uint64_t mib = v != nullptr ? std::strtoull(v, nullptr, 0) : 64;
-			return (mib >= 2 && mib <= 1024 && (mib & (mib - 1)) == 0 ? mib : 64) * 1024 * 1024;
+			const uint64_t mib = v != nullptr ? std::strtoull(v, nullptr, 0) : 16;
+			return (mib >= 2 && mib <= 1024 && (mib & (mib - 1)) == 0 ? mib : 16) * 1024 * 1024;
 		}();
 		return size;
 	}
