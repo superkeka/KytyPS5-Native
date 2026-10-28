@@ -1957,6 +1957,44 @@ void TestDirectRunsWriteData() {
 }
 
 
+void TestLabelWriteBackOnlyForCpu() {
+	// A label the same buffer waits on is a GPU sync: its release keeps only the guest's cache actions.
+	// One nobody in the buffer waits on keeps the added GLM and GL2 write-backs, so the CPU sees the
+	// GPU's results by the time it sees the label. KYTY_NATIVE_GPU_LABEL_WB set picks another mode.
+	if (const char* v = std::getenv("KYTY_NATIVE_GPU_LABEL_WB"); v != nullptr && v[0] != '\0') {
+		return;
+	}
+	static uint32_t sync  = 0;
+	static uint32_t done  = 0;
+	const uint64_t  a     = reinterpret_cast<uint64_t>(&sync);
+	const uint64_t  b     = reinterpret_cast<uint64_t>(&done);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(dcb, 1, 0, a, 1, 0);
+	AppendWait(dcb, a, 1);
+	Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(dcb, 1, 0, b, 1, 0);
+
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.waits_native == 1 && r.stats.label_wb_stripped == 1, "the waited label's write-back is taken off");
+	const auto pkts = Decode(r.ib);
+	constexpr uint32_t wb      = (1u << 12u) | (1u << 21u);
+	const auto         release = [&](uint64_t addr) {
+		return IndexOf(pkts, [&](const Packet& p) {
+			return p.op == 0x49u && p.body[1] == (1u << 29u) && p.body[2] == static_cast<uint32_t>(addr) && p.body[4] == 1u;
+		});
+	};
+	const auto ra = release(a);
+	const auto rb = release(b);
+	Check(ra < pkts.size() && (pkts[ra].body[0] & wb) == 0u && (pkts[ra].body[0] & 0x3fu) == 0x28u,
+	      "the GPU-waited label keeps the guest's event without write-backs");
+	Check(rb < pkts.size() && (pkts[rb].body[0] & wb) == wb, "the label nobody here waits on keeps the write-backs");
+}
+
 void TestLabelsGpuOnly() {
 	using Libs::Graphics::NativeGpu::ValidateNativeIb;
 	// A label the GPU can reach is written by the GPU alone, in stream order, as on PS5. A CPU store at
@@ -2464,6 +2502,7 @@ int main() {
 	TestUnreachableLabel();
 	TestGpuTimestamp();
 	TestLabelsGpuOnly();
+	TestLabelWriteBackOnlyForCpu();
 	TestPlanRingWait();
 	TestComputeRingForQueue();
 	TestSplitIbAtPackets();

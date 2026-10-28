@@ -650,6 +650,7 @@ public:
 		m_total_dw += result.stats.total_dw;
 		m_verbatim_runs += result.stats.verbatim_runs;
 		m_labels_native += result.stats.labels_native;
+		m_label_wb_stripped += result.stats.label_wb_stripped;
 		m_write_data_dw += result.stats.write_data_dw;
 		m_direct_ib2 += result.stats.direct_ib2;
 		m_direct_dw += result.stats.direct_dw;
@@ -1433,10 +1434,11 @@ public:
 					std::fprintf(stderr, "\n");
 					c = {};
 				}
-				std::fprintf(stderr, "native shadow: GPU label writes per flip: %.0f, %.0f dwords of WRITE_DATA\n",
-				             static_cast<double>(m_labels_native) / m_flips, static_cast<double>(m_write_data_dw) / m_flips);
+				std::fprintf(stderr, "native shadow: GPU label writes per flip: %.0f (%.0f releases without the added write-back), %.0f dwords of WRITE_DATA\n",
+				             static_cast<double>(m_labels_native) / m_flips, static_cast<double>(m_label_wb_stripped) / m_flips,
+				             static_cast<double>(m_write_data_dw) / m_flips);
 				m_verbatim_dw = m_total_dw = m_verbatim_runs = 0;
-				m_labels_native = m_write_data_dw = 0;
+				m_labels_native = m_write_data_dw = m_label_wb_stripped = 0;
 				if (m_direct_min_dw != 0) {
 					std::fprintf(stderr, "native shadow: direct runs per flip: %.0f IB2 calls, %.0f dwords run in place\n",
 					             static_cast<double>(m_direct_ib2) / m_flips, static_cast<double>(m_direct_dw) / m_flips);
@@ -3464,6 +3466,7 @@ private:
 	uint64_t                m_verbatim_runs = 0;
 	uint64_t                m_labels_native = 0; // Pm4TranslateStats::labels_native and write_data_dw, same flips
 	uint64_t                m_write_data_dw = 0;
+	uint64_t                m_label_wb_stripped = 0; // Pm4TranslateStats::label_wb_stripped, same flips
 	uint64_t                m_bench_count   = 0; // KYTY_NATIVE_GPU_TRANSLATE_BENCH
 	// KYTY_NATIVE_GPU_FLIP_TRACE=gpu (NoteLabelWriters).
 	struct LabelWriter {

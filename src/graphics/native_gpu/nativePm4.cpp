@@ -252,16 +252,35 @@ bool LabelEventOk(uint32_t event) {
 	const bool     known = type == 0x14u || type == 0x28u || type == 0x2bu || type == 0x2du || type == 0x2fu || type == 0x30u;
 	return known && (index == 5u || index == 6u) && (event & ~(0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) == 0u;
 }
-// KYTY_NATIVE_GPU_LABEL_WB=0 (experiment): a label release keeps exactly the guest's cache actions. The
-// label itself goes to memory past the caches (DST_SEL 0) either way, and GPU waits read it through
-// GL2; the added write-backs only make the GPU's other results visible to the CPU, and they come at
-// every label (ASTRO BOT: ~900 a frame, ~5400 where it draws much).
-bool LabelWriteBack() {
-	static const bool wb = [] {
+// The label itself goes to memory past the caches (DST_SEL 0) either way, and GPU waits read it
+// through GL2; the added write-backs make the GPU's other results visible to the CPU by the time it
+// sees the label. Without them Gran Turismo 7 froze for up to a second at a time: the title read the
+// label and waited on data still in GL2. They came at every label, though (GT7: ~150 a frame, each
+// followed by a wait of the same DCB that waited on the write-back too, ~1 ms of GPU a frame), and a
+// label the same buffer waits on is a GPU sync: its write-back is taken off again once that wait is
+// seen (StripLabelWriteBack), and the data reaches memory with the next label that keeps one or the
+// segment's tracker store. KYTY_NATIVE_GPU_LABEL_WB: 1 every label (as before), 0 none (experiment:
+// freezes), unset: all but the GPU-waited ones.
+int LabelWriteBackMode() {
+	static const int mode = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_LABEL_WB");
-		return v == nullptr || v[0] != '0';
+		return v == nullptr || v[0] == '\0' ? 2 : (v[0] == '0' ? 0 : 1);
 	}();
-	return wb;
+	return mode;
+}
+bool LabelWriteBack() { return LabelWriteBackMode() != 0; }
+// The write-back bits LabelEventCntl added to `guest_event` that a GPU-waited label can drop: GL2_WB,
+// and GLM_WB unless the guest's own GL2_WB or GLM_INV still needs it (the metadata cache is written
+// back whenever GL2 is, or dropped).
+uint32_t StrippableWriteBack(uint32_t guest_event, uint32_t event) {
+	if (LabelWriteBackMode() != 2 || event == kFlushEventCntl) {
+		return 0u;
+	}
+	uint32_t strip = event & ~guest_event & kGcrGl2Wb;
+	if ((event & ~guest_event & kGcrGlmWb) != 0u && (guest_event & (kGcrGl2Wb | kGcrGlmInv)) == 0u) {
+		strip |= kGcrGlmWb;
+	}
+	return strip;
 }
 // KYTY_NATIVE_GPU_LABELS_VERBATIM: which label releases go as the title wrote them, by DATA_SEL: 1
 // 32-bit data, 2 64-bit, 4 the GPU clock, 8 none (cache actions alone); 0 rewrites every one (data to
@@ -2046,6 +2065,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	std::vector<bool>                  seg_keep(1, true);
 	bool                               seg_effects = false;
 	std::vector<LabelWrite>            local_writes;
+	// Label releases of this buffer whose added write-backs a GPU wait of the same buffer takes off
+	// again (StrippableWriteBack): the label, the event dword's index in `body`, the bits.
+	struct LabelRelease {
+		size_t   write    = 0; // its entry in local_writes
+		size_t   event_dw = 0;
+		uint32_t strip    = 0;
+	};
+	std::vector<LabelRelease> label_releases;
+	// The label's note_write follows, as local_writes' next entry.
+	auto emit_label = [&](uint64_t addr, uint32_t value, uint32_t guest_event) {
+		const uint32_t event = LabelEventCntl(guest_event);
+		EmitRelease32(body, addr, value, m_compute_ring, event);
+		if (const uint32_t strip = StrippableWriteBack(guest_event, event); strip != 0u) {
+			label_releases.push_back({local_writes.size(), body.size() - 7u, strip});
+		}
+	};
 	// CPU-side points of this segment (interrupts the guest asked for, labels the GPU cannot write,
 	// the end). They share one sequence packet, emitted when the segment closes, instead of a cache
 	// flush per point. A guest interrupt still runs, at the end of the segment, which is where the
@@ -2444,13 +2479,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						mirror_store(dst, std::span<const uint32_t>(bptr + 4, sel), false);
 						NoteOnce(12, "RELEASE_MEM label as the title wrote it");
 					} else if (sel == 1) {
-						EmitRelease32(body, dst, bptr[4], m_compute_ring, LabelEventCntl(bptr[0]));
+						emit_label(dst, bptr[4], bptr[0]);
 						mirror_store(dst, std::span<const uint32_t>(bptr + 4, 1), false);
 						NoteOnce(0, m_tracker_writes ? "RELEASE_MEM 32-bit label (GPU store, mirrored to the CPU)"
 						                             : "RELEASE_MEM 32-bit label (GPU store only)");
 					} else if (sel == 2) {
-						EmitRelease32(body, dst + 4, bptr[5], m_compute_ring, LabelEventCntl(bptr[0]));
-						EmitRelease32(body, dst, bptr[4], m_compute_ring, LabelEventCntl(bptr[0]));
+						emit_label(dst + 4, bptr[5], bptr[0]);
+						emit_label(dst, bptr[4], bptr[0]);
 						mirror_store(dst, std::span<const uint32_t>(bptr + 4, 2), false);
 						NoteOnce(1, m_tracker_writes ? "RELEASE_MEM 64-bit label (GPU store, mirrored to the CPU)"
 						                             : "RELEASE_MEM 64-bit label (GPU store only, two halves)");
@@ -2849,14 +2884,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					WaitCond w {addr, ref, mask, bptr[0] & 0x7u, wide, pfp};
 					LabelOracle::Plan plan    = LabelOracle::Plan::Split;
 					bool              decided = false;
+					size_t            decider = 0; // the local write that decides the wait
 					for (auto it = local_writes.rbegin(); it != local_writes.rend() && !decided; ++it) {
 						uint64_t  v = 0;
 						const int c = it->Covers(addr, wide, &v, mask);
 						if (c != 0) {
 							decided = true;
+							decider = static_cast<size_t>(local_writes.rend() - it) - 1u;
 							plan    = c == 1 && w.Met(v) && it->gpu ? LabelOracle::Plan::Native : LabelOracle::Plan::Split;
 						}
 					}
+					const bool own_label = decided && plan == LabelOracle::Plan::Native;
 					if (!decided) {
 						plan = m_labels->PlanWait(w);
 					}
@@ -2892,6 +2930,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					if (plan == LabelOracle::Plan::Native && !emitted) {
 						plan = LabelOracle::Plan::Split;
+					}
+					if (plan == LabelOracle::Plan::Native && own_label) {
+						// A GPU sync within this buffer: the release that wrote the label it waits for need not
+						// write GL2 back for the CPU.
+						for (auto& rel: label_releases) {
+							if (rel.strip != 0u && rel.write == decider) {
+								body[rel.event_dw] &= ~rel.strip;
+								rel.strip = 0u;
+								stats.label_wb_stripped++;
+							}
+						}
 					}
 					switch (plan) {
 						case LabelOracle::Plan::Native:

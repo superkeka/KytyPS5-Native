@@ -192,6 +192,7 @@ struct Pm4TranslateStats {
 	uint32_t interrupts        = 0; // native labels: RELEASE_MEM interrupts raised through the tracker
 	uint32_t interrupts_gpu    = 0; // and those the GPU raises where they run (SetGuestInterruptsOnGpu)
 	uint32_t waits_native      = 0; // native labels: guest waits passed through (an earlier GPU write satisfies them)
+	uint32_t label_wb_stripped = 0; // label releases whose added write-backs a wait of the same buffer took off
 	uint32_t waits_split       = 0; // native labels: guest waits the IB is cut at (no known writer yet)
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
