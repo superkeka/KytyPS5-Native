@@ -37,8 +37,7 @@ public:
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	// `flip_watermark`: NextFlipRequestId() when the guest submitted the buffer (default: now), for
 	// its waits for a flip (CommandProcessor::WaitFlipDone).
-	void Submit(std::span<const uint32_t> draw_commands, std::span<const uint32_t> constant_commands,
-	            uint64_t flip_watermark = UINT64_MAX);
+	void Submit(std::span<const uint32_t> commands, uint64_t flip_watermark = UINT64_MAX);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
 	// A DCB's flip the GPU has just passed (native labels, from the tracker): prepared on the GPU
@@ -65,19 +64,15 @@ private:
 		SubmissionType            type     = SubmissionType::Graphics;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
-		std::span<const uint32_t> constant_commands;
-		Pm4Execution              command_execution;
-		Pm4Execution              constant_execution;
-		bool                      started           = false;
-		bool                      command_complete  = false;
-		bool                      constant_complete = false;
-		bool                      blocked           = false;
-		uint64_t                  flip_request_id   = 0;
-		int                       eop_flip[3]       = {};   // EopFlip: handle, index, mode
-		int64_t                   eop_flip_arg      = 0;
-		uint64_t                  flip_watermark    = UINT64_MAX; // NextFlipRequestId() at submission
-		uint64_t                  blocked_since_ms  = 0;          // first time Process left it unfinished
-		bool                      blocked_logged    = false;
+		Pm4Execution              execution;
+		bool                      started          = false;
+		bool                      blocked          = false;
+		uint64_t                  flip_request_id  = 0;
+		int                       eop_flip[3]      = {};          // EopFlip: handle, index, mode
+		int64_t                   eop_flip_arg     = 0;
+		uint64_t                  flip_watermark   = UINT64_MAX;  // NextFlipRequestId() at submission
+		uint64_t                  blocked_since_ms = 0;           // first time Process left it unfinished
+		bool                      blocked_logged   = false;
 	};
 
 	void              Enqueue(Submission submission);

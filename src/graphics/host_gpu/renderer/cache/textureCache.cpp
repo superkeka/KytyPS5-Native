@@ -252,24 +252,24 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 void TextureCache::DeleteImage(ImageId id) {
-	auto* image = m_slot_images.try_get(id);
-	if (image == nullptr || !image->registered) {
+	auto& image = m_slot_images[id];
+	if (!image.registered) {
 		return;
 	}
-	if (image->depth_id) {
-		std::erase(m_slot_images[image->depth_id].stencil_ids, id);
+	if (image.depth_id) {
+		std::erase(m_slot_images[image.depth_id].stencil_ids, id);
 	} else {
 		// Detach first: deleting each association also unlinks it from its depth owner.
-		for (const auto association: std::exchange(image->stencil_ids, {})) {
+		for (const auto association: std::exchange(image.stencil_ids, {})) {
 			FreeImage(association);
 		}
 	}
-	if (image->IsGpuModified()) {
+	if (image.IsGpuModified()) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (image->info.metadata.kind == ImageMetadataKind::Htile) {
-		m_surface_metas.erase(image->info.metadata.range.address);
+	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
+		m_surface_metas.erase(image.info.metadata.range.address);
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -433,12 +433,6 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		return {};
 	}
 
-	uint32_t query_epoch = ++m_image_query_epoch;
-	if (query_epoch == 0) {
-		m_slot_images.ForEach([](ImageId, const Image& image) { image.query_epoch = 0; });
-		query_epoch = ++m_image_query_epoch;
-	}
-
 	ImageIds result;
 	ForEachPage(address, size, [&](uint64_t page) {
 		const auto* owners = m_image_page_table.Find(page);
@@ -446,19 +440,17 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 			return;
 		}
 		owners->ForEach([&](ImageId id) {
-			auto* image = m_slot_images.try_get(id);
-			if (image == nullptr) {
+			const auto& image = m_slot_images[id];
+			if (image.picked || !image.Overlaps(address, size, page_overlap)) {
 				return;
 			}
-			if (image->query_epoch == query_epoch) {
-				return;
-			}
-			image->query_epoch = query_epoch;
-			if (image->Overlaps(address, size, page_overlap)) {
-				result.push_back(id);
-			}
+			image.picked = true;
+			result.push_back(id);
 		});
 	});
+	for (const auto id: result) {
+		m_slot_images[id].picked = false;
+	}
 	return result;
 }
 
@@ -500,16 +492,15 @@ void TextureCache::RefreshCopySource(ImageId id) {
 }
 
 bool TextureCache::CopyD16(Image& destination, Image& source) {
-	const bool source_depth      = source.info.IsDepth();
-	const bool destination_depth = destination.info.IsDepth();
-	if (source_depth == destination_depth) {
+	// Converts guest D16 between a four-byte host depth aspect and two-byte color or D16 depth.
+	const bool source_wide = DepthAspectTransferBytes(source.backing.format) == sizeof(uint32_t);
+	if (source_wide == (DepthAspectTransferBytes(destination.backing.format) == sizeof(uint32_t))) {
 		return false;
 	}
-	auto&      depth          = source_depth ? source : destination;
-	auto&      color          = source_depth ? destination : source;
-	const auto transfer_bytes = DepthAspectTransferBytes(depth.backing.format);
+	auto& depth  = source_wide ? source : destination;
+	auto& narrow = source_wide ? destination : source;
 	if (depth.info.bytes_per_block != sizeof(uint16_t) ||
-	    color.info.bytes_per_block != sizeof(uint16_t) || transfer_bytes != sizeof(uint32_t)) {
+	    narrow.info.bytes_per_block != sizeof(uint16_t)) {
 		return false;
 	}
 	EXIT_IF(source.backing.samples != 1 || destination.backing.samples != 1 ||
@@ -519,42 +510,42 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 
 	const auto     layers = depth.info.resources.layers;
 	const uint64_t depth_slice =
-	    static_cast<uint64_t>(depth.info.pitch) * depth.info.extent.height * transfer_bytes;
-	const uint64_t color_slice =
-	    static_cast<uint64_t>(color.info.pitch) * color.info.extent.height * sizeof(uint16_t);
-	EXIT_IF(layers == 0 || depth_slice > UINT64_MAX / layers || color_slice > UINT64_MAX / layers);
-	const auto                       depth_size = depth_slice * layers;
-	const auto                       color_size = color_slice * layers;
-	const std::array                 depth_copies {
+	    static_cast<uint64_t>(depth.info.pitch) * depth.info.extent.height * sizeof(uint32_t);
+	const uint64_t narrow_slice =
+	    static_cast<uint64_t>(narrow.info.pitch) * narrow.info.extent.height * sizeof(uint16_t);
+	EXIT_IF(layers == 0 || depth_slice > UINT64_MAX / layers || narrow_slice > UINT64_MAX / layers);
+	const std::array depth_copies {
 	    vk::BufferImageCopy {0,
 	                         depth.info.pitch,
 	                         depth.info.extent.height,
 	                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers},
 	                         {},
 	                         depth.info.extent}};
-	const std::array color_copies {
+	const std::array narrow_copies {
 	    vk::BufferImageCopy {0,
-	                         color.info.pitch,
-	                         color.info.extent.height,
-	                         {vk::ImageAspectFlagBits::eColor, 0, 0, layers},
+	                         narrow.info.pitch,
+	                         narrow.info.extent.height,
+	                         {narrow.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+	                                                : vk::ImageAspectFlagBits::eColor,
+	                          0, 0, layers},
 	                         {},
-	                         color.info.extent}};
+	                         narrow.info.extent}};
 
-	auto                         depth_buffer = m_tiler.GetScratchBuffer(depth_size);
-	auto                         color_buffer = m_tiler.GetScratchBuffer(color_size, depth_buffer.buffer);
+	auto depth_buffer  = m_tiler.GetScratchBuffer(depth_slice * layers);
+	auto narrow_buffer = m_tiler.GetScratchBuffer(narrow_slice * layers, depth_buffer.buffer);
 	const TileManager::D16Layout promote_layout {
 	    .width               = depth.info.extent.width,
 	    .height              = depth.info.extent.height,
 	    .layers              = layers,
-	    .source_row_stride   = static_cast<uint64_t>(color.info.pitch) * sizeof(uint16_t),
-	    .target_row_stride   = static_cast<uint64_t>(depth.info.pitch) * transfer_bytes,
-	    .source_slice_stride = color_slice,
+	    .source_row_stride   = static_cast<uint64_t>(narrow.info.pitch) * sizeof(uint16_t),
+	    .target_row_stride   = static_cast<uint64_t>(depth.info.pitch) * sizeof(uint32_t),
+	    .source_slice_stride = narrow_slice,
 	    .target_slice_stride = depth_slice,
 	};
 	const bool d32 = DepthAspectTransferFormat(depth.backing.format) == vk::Format::eD32Sfloat;
-	if (source_depth) {
+	if (source_wide) {
 		source.Download(depth_copies, depth_buffer.buffer, depth_buffer.offset, depth_buffer.size);
-		m_tiler.ConvertD16(depth_buffer, color_buffer, TileManager::D16Direction::Demote, d32,
+		m_tiler.ConvertD16(depth_buffer, narrow_buffer, TileManager::D16Direction::Demote, d32,
 		                   {.width               = promote_layout.width,
 		                    .height              = promote_layout.height,
 		                    .layers              = promote_layout.layers,
@@ -562,11 +553,12 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 		                    .target_row_stride   = promote_layout.source_row_stride,
 		                    .source_slice_stride = promote_layout.target_slice_stride,
 		                    .target_slice_stride = promote_layout.source_slice_stride});
-		destination.Upload(color_copies, color_buffer.buffer, color_buffer.offset,
-		                   color_buffer.size);
+		destination.Upload(narrow_copies, narrow_buffer.buffer, narrow_buffer.offset,
+		                   narrow_buffer.size);
 	} else {
-		source.Download(color_copies, color_buffer.buffer, color_buffer.offset, color_buffer.size);
-		m_tiler.ConvertD16(color_buffer, depth_buffer, TileManager::D16Direction::Promote, d32,
+		source.Download(narrow_copies, narrow_buffer.buffer, narrow_buffer.offset,
+		                narrow_buffer.size);
+		m_tiler.ConvertD16(narrow_buffer, depth_buffer, TileManager::D16Direction::Promote, d32,
 		                   promote_layout);
 		destination.Upload(depth_copies, depth_buffer.buffer, depth_buffer.offset,
 		                   depth_buffer.size);
@@ -791,15 +783,22 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id) {
-	auto owner = m_slot_images.try_get(cached_id);
-	if (owner == nullptr || !owner->registered) {
+	auto& cached = m_slot_images[cached_id];
+	if (!cached.registered) {
 		return {merged_id};
 	}
-	if (BcAlias::Matches(requested, owner->info) && !owner->IsCpuDirty()) {
+	// PS5: image heaps keep BC images and raw block views of their layers resident together, so a
+	// raw read of a layer subset with the same levels views the BC image instead of evicting it.
+	const bool raw_view = binding == BindingType::Texture && !requested.IsBlock() &&
+	                      requested.type == cached.info.type &&
+	                      requested.data.address == cached.info.data.address &&
+	                      requested.BlockExtent() == cached.info.BlockExtent() &&
+	                      requested.resources.levels == cached.info.resources.levels &&
+	                      requested.resources.layers < cached.info.resources.layers;
+	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
-	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
@@ -873,9 +872,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
-			const auto result    = m_slot_images.try_get(result_id);
-			return {result != nullptr && ImageViewOps::FormatsCompatible(result->info.pixel_format,
-			                                                             requested.pixel_format)
+			return {ImageViewOps::FormatsCompatible(m_slot_images[result_id].info.pixel_format,
+			                                        requested.pixel_format)
 			            ? result_id
 			            : ImageId {}};
 		}
@@ -1222,9 +1220,8 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
-		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->info.data == stencil &&
-		    owner->info.extent == depth.info.extent) {
+		const auto& owner = m_slot_images[id];
+		if (owner.info.data == stencil && owner.info.extent == depth.info.extent) {
 			association = id;
 		}
 	}
@@ -1317,12 +1314,24 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					view_layer = overlap.layer;
 				}
 			}
+			// PS5: image heaps hold a descriptor per dynamic-resolution extent of a render target,
+			// and only one extent at an address holds data, so heap lookups create no second one.
+			if (!result && desc.heap &&
+			    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+				    const auto* image = m_slot_images.try_get(id);
+				    return image != nullptr && image->registered &&
+					       image->heap_refs.load(std::memory_order_relaxed) != 0u &&
+					       image->info.data.address == desc.info.data.address &&
+					       image->info.type == desc.info.type &&
+					       image->info.extent != desc.info.extent;
+			    })) {
+				return {};
+			}
 		} else if (block_alias) {
 			for (const auto candidate: candidates) {
-				const auto* owner = m_slot_images.try_get(candidate);
-				if (candidate != result && owner != nullptr && owner->registered &&
-				    !owner->IsCpuDirty() &&
-				    BcAlias::Matches(m_slot_images[result].info, owner->info)) {
+				const auto& owner = m_slot_images[candidate];
+				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
+				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
 					BcAlias::Resolve(*this, candidate, result);
 				}
 			}
@@ -1385,14 +1394,14 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	std::scoped_lock lock {m_lock};
 	ImageIds         matches;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
-		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr || owner->info.data.address != address) {
+		const auto* owner = &m_slot_images[id];
+		if (owner->info.data.address != address) {
 			continue;
 		}
 		if (ensure_valid && owner->depth_id) {
-			owner = m_slot_images.try_get(owner->depth_id);
+			owner = &m_slot_images[owner->depth_id];
 		}
-		if (owner == nullptr || (ensure_valid && !owner->SafeToDownload())) {
+		if (ensure_valid && !owner->SafeToDownload()) {
 			continue;
 		}
 		matches.push_back(id);
@@ -1409,11 +1418,8 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 			}
 		}
 	}
-	if (selected && ensure_valid) {
-		const auto owner = m_slot_images.try_get(selected);
-		if (owner != nullptr && owner->depth_id) {
-			selected = owner->depth_id;
-		}
+	if (selected && ensure_valid && m_slot_images[selected].depth_id) {
+		selected = m_slot_images[selected].depth_id;
 	}
 	return selected;
 }
@@ -1434,9 +1440,8 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	    desc.info.data.End() <= image.info.stencil.End()) {
 		for (const auto stencil_id:
 		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
-			const auto* stencil = m_slot_images.try_get(stencil_id);
-			if (stencil != nullptr && stencil->depth_id == id &&
-			    stencil->info.data == image.info.stencil) {
+			const auto& stencil = m_slot_images[stencil_id];
+			if (stencil.depth_id == id && stencil.info.data == image.info.stencil) {
 				RefreshImage(stencil_id);
 				break;
 			}
@@ -1547,27 +1552,24 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	vk::ImageAspectFlags  aspect {};
 	ImageSubresourceRange subresources;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
-		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr) {
-			continue;
-		}
+		const auto&          owner = m_slot_images[id];
 		vk::ImageAspectFlags candidate {};
 		ImageId              candidate_id = id;
 		ImageSubresourceRange candidate_subresources {
-		    0, owner->info.resources.levels, 0, owner->info.TransferLayers()};
-		if (owner->depth_id && owner->info.data.address == address &&
-		    owner->info.data.size == size) {
+		    0, owner.info.resources.levels, 0, owner.info.TransferLayers()};
+		if (owner.depth_id && owner.info.data.address == address &&
+		    owner.info.data.size == size) {
 			candidate              = vk::ImageAspectFlagBits::eStencil;
-			candidate_id           = owner->depth_id;
-			candidate_subresources = owner->stencil_subresources;
-			owner        = m_slot_images.try_get(candidate_id);
-			if (owner == nullptr || owner->backing.image == nullptr || !owner->info.HasStencil()) {
+			candidate_id           = owner.depth_id;
+			candidate_subresources = owner.stencil_subresources;
+			const auto& depth      = m_slot_images[candidate_id];
+			if (depth.backing.image == nullptr || !depth.info.HasStencil()) {
 				continue;
 			}
-		} else if (!owner->depth_id && owner->info.data.address == address &&
-		           owner->info.data.size == size) {
-			candidate = owner->info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
-			                                  : vk::ImageAspectFlagBits::eColor;
+		} else if (!owner.depth_id && owner.info.data.address == address &&
+		           owner.info.data.size == size) {
+			candidate = owner.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+			                                 : vk::ImageAspectFlagBits::eColor;
 		}
 		if (!candidate) {
 			continue;
@@ -1908,23 +1910,20 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
-		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr) {
-			continue;
-		}
-		if (owner->Overlaps(address, size)) {
-			owner->MarkCpuDirty();
+		auto& owner = m_slot_images[id];
+		if (owner.Overlaps(address, size)) {
+			owner.MarkCpuDirty();
 			UntrackImage(id);
 			continue;
 		}
-		const auto image_begin = owner->info.data.address;
-		const auto image_end   = owner->info.data.End();
+		const auto image_begin = owner.info.data.address;
+		const auto image_end   = owner.info.data.End();
 		if (page_end < image_end) {
 			UntrackImageHead(id);
 		} else if (image_begin < page_begin) {
 			UntrackImageTail(id);
 		} else {
-			MarkAsMaybeDirty(id, *owner);
+			MarkAsMaybeDirty(id, owner);
 		}
 	}
 }
@@ -2076,8 +2075,7 @@ void TextureCache::ProcessDownloadImages() {
 	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
-		const auto owner = m_slot_images.try_get(id);
-		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
+		if (m_slot_images[id].IsGpuModified()) {
 			(void)DownloadImageMemory(id);
 		}
 	}

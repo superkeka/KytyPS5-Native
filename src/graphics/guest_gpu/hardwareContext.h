@@ -597,14 +597,10 @@ struct ShaderRegisters {
 	}
 };
 
-enum class UserSgprType { Unknown, Region, Vsharp };
-
 struct UserSgprInfo {
 	static constexpr int SGPRS_MAX = 32;
 
-	uint32_t     value[SGPRS_MAX] = {0};
-	UserSgprType type[SGPRS_MAX]  = {};
-	uint32_t     count            = 0;
+	uint32_t value[SGPRS_MAX] = {0};
 };
 
 struct VertexShaderInfo {
@@ -1056,30 +1052,10 @@ public:
 	void SetCsShader(const CsStageRegisters& cs_regs) { m_cs.cs_regs = cs_regs; }
 	void SetCsWaveSize(uint8_t wave_size) { m_cs.cs_regs.wave_size = wave_size; }
 
-	void SetPsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
-		m_ps.ps_user_sgpr.value[id] = value;
-		m_ps.ps_user_sgpr.type[id]  = type;
-		m_ps.ps_user_sgpr.count =
-		    ((id + 1) > m_ps.ps_user_sgpr.count ? (id + 1) : m_ps.ps_user_sgpr.count);
-	}
-	void SetCsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
-		m_cs.cs_user_sgpr.value[id] = value;
-		m_cs.cs_user_sgpr.type[id]  = type;
-		m_cs.cs_user_sgpr.count =
-		    ((id + 1) > m_cs.cs_user_sgpr.count ? (id + 1) : m_cs.cs_user_sgpr.count);
-	}
-	void SetHsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
-		m_vs.hs_user_sgpr.value[id] = value;
-		m_vs.hs_user_sgpr.type[id]  = type;
-		m_vs.hs_user_sgpr.count =
-		    ((id + 1) > m_vs.hs_user_sgpr.count ? (id + 1) : m_vs.hs_user_sgpr.count);
-	}
-	void SetGsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
-		m_vs.gs_user_sgpr.value[id] = value;
-		m_vs.gs_user_sgpr.type[id]  = type;
-		m_vs.gs_user_sgpr.count =
-		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
-	}
+	void SetPsUserSgpr(uint32_t id, uint32_t value) { m_ps.ps_user_sgpr.value[id] = value; }
+	void SetCsUserSgpr(uint32_t id, uint32_t value) { m_cs.cs_user_sgpr.value[id] = value; }
+	void SetHsUserSgpr(uint32_t id, uint32_t value) { m_vs.hs_user_sgpr.value[id] = value; }
+	void SetGsUserSgpr(uint32_t id, uint32_t value) { m_vs.gs_user_sgpr.value[id] = value; }
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }

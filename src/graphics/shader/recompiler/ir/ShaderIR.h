@@ -14,7 +14,6 @@
 
 #include <array>
 #include <bit>
-#include <deque>
 #include <list>
 #include <memory>
 #include <optional>
@@ -27,8 +26,6 @@ class CodeGenerator;
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
-
-class SrtWalker;
 
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
@@ -254,6 +251,8 @@ enum class StageInputKind {
 	LocalInvocationId,
 	LocalInvocationIndex,
 	GlobalInvocationId,
+	BaseVertex,
+	BaseInstance,
 	Parameter,
 };
 
@@ -368,7 +367,7 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
+	static constexpr uint32_t MeshDrawDwordCount = 5;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -498,9 +497,15 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
+	// reads 0 for ranges of 2 GiB or more on NVIDIA.
+	[[nodiscard]] uint32_t MemorySizeDword() const {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemorySizeDword() +
+		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -544,6 +549,7 @@ struct ShaderInfo {
 	bool                            subgroup_shuffle              = false;
 	bool                            subgroup_arithmetic           = false;
 	bool                            subgroup_local_invocation_id  = false;
+	bool                            helper_invocation             = false;
 	bool                            compute_derivatives           = false;
 	bool                            image_gather_extended         = false;
 	bool                            function_lds                  = false;
@@ -568,6 +574,13 @@ struct DescriptorSource {
 
 				bool operator==(const CountedRows& other) const = default;
 			};
+			struct MaskRanks {
+				uint32_t source = UINT32_MAX;
+				uint32_t stride = 0; // Byte spacing of the mask words its load can address.
+				uint32_t offset = 0;
+
+				bool operator==(const MaskRanks& other) const = default;
+			};
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
@@ -575,10 +588,12 @@ struct DescriptorSource {
 			uint32_t bit_offset = 0;
 			uint32_t bit_mask = UINT32_MAX;
 			bool global = false;
-			// Four DWORD bitmap words per record; set-bit ranks subtract from the last key.
+			// Four or eight DWORD bitmap words per record; set ranks subtract from the last key.
 			bool bitset = false;
 			std::optional<CountedRows> rows;
 			std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;
+			std::optional<uint32_t> excluded; // A guard keeps this key from the read.
+			std::optional<MaskRanks> ranks;   // Records are the bits some mask word sets.
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
@@ -602,8 +617,12 @@ struct DescriptorSource {
 		bool     indexed = false;
 		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
+		// Nonzero shift: workgroup keys are (selector_first + ID) * multiplier >> shift.
+		uint32_t workgroup_multiplier = 0;
+		uint32_t workgroup_shift      = 0;
 		Value    key_count;
-		// First selector index, or first descriptor key for a direct or bitmap range.
+		// First selector index, workgroup key base, or first descriptor key for a direct or bitmap
+		// range.
 		Value                 selector_first;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;
@@ -630,6 +649,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> images;
 	std::vector<uint32_t> srt_reads;
 };
 
@@ -658,22 +678,8 @@ struct UniformFillPlan {
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
 	struct SelectorKeys {
-		uint32_t              source = UINT32_MAX;
 		std::vector<uint32_t> values;
 		bool                  resolved = false;
-	};
-
-	struct EvaluationContext {
-		struct Entry {
-			uint64_t value      = 0;
-			uint64_t generation = 0;
-		};
-
-		std::vector<Entry> values;
-		uint64_t           generation = 0;
-		const SrtWalker*    session = nullptr;
-		Value              active_mask;
-		uint8_t            read_policy = 0;
 	};
 
 	ResourcePlan();
@@ -695,21 +701,18 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
-	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
-	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint8_t>            reachable_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
+	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
+	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
+	// GPU-thread scratch for walker results and material keys.
+	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
 };

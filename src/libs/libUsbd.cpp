@@ -36,9 +36,6 @@ static int KYTY_SYSV_ABI UsbdHandleEventsTimeout() {
 static int64_t KYTY_SYSV_ABI UsbdGetDeviceList(void*** list) {
 	PRINT_NAME();
 
-	static void* empty_list[] = {nullptr};
-	*list                     = empty_list;
-
 	return 0;
 }
 
