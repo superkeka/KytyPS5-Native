@@ -375,6 +375,12 @@ void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint3
 
 // A guest wait's CONTROL the gfx CP runs as the PS5's (probe waitforms): on memory, wait only (OPERATION
 // 0), the micro engine or the prefetch parser, any compare function but the reserved 7.
+// libSceAgc's debug markers write the rest of their string with WRITE_DATA to SQ_THREAD_TRACE_USERDATA_3
+// (register 0xc343, DST_SEL 0, micro engine; the thread-trace user data registers 0xc340..0xc347).
+bool TraceUserDataWrite(uint32_t control, uint32_t addr_lo, uint32_t addr_hi) {
+	return ((control >> 8u) & 0xfu) == 0u && (control >> 30u) == 0u && addr_hi == 0u && addr_lo >= 0xc340u && addr_lo <= 0xc347u;
+}
+
 bool GuestWaitControlOk(uint32_t control) {
 	return (control & 0x7u) != 7u && ((control >> 4u) & 0x3u) == 1u && ((control >> 6u) & 0x3u) == 0u &&
 	       ((control >> 8u) & 0x3u) <= 1u;
@@ -674,6 +680,9 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				break;
 			// A guest WRITE_DATA to memory, write confirmed; on MEC from the micro engine.
 			case IT_WRITE_DATA:
+				if (!compute && size >= 5 && TraceUserDataWrite(b[0], b[1], b[2])) {
+					break; // a debug marker's string, on the gfx ring as written
+				}
 				if (size < 5 || !WriteDataToMemory(b[0]) || (b[0] & (1u << 20u)) == 0 ||
 				    (compute && (((header & 2u) == 0 && !MecPlainOp(IT_WRITE_DATA)) || (b[0] >> 30u) != 0))) {
 					return bad();
@@ -2938,6 +2947,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			case IT_WRITE_DATA:
+				// A debug marker's string (libSceAgc, to SQ_THREAD_TRACE_USERDATA_3): as written on the gfx ring, as
+				// its 0x342 tag; MEC stops on thread-trace registers, so a compute ring drops it.
+				if (body_count >= 3 && TraceUserDataWrite(bptr[0], bptr[1], bptr[2])) {
+					if (!m_compute_ring && direct) {
+						in_place = true;
+					} else if (!m_compute_ring) {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
+					break;
+				}
 				// Games write their completion labels with WRITE_DATA. The native IB completes before
 				// Kyty has even parsed this DCB, so a native label tells the game the GPU is done while
 				// Kyty is still reading the command buffer, and the game starts rewriting it (Dead

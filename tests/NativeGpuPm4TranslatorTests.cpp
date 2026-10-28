@@ -360,6 +360,24 @@ void TestAgcTagsVerbatim() {
 	Check(r64.ok && r64.stats.uconfig_skipped == 0 && r64.stats.changed_ops[IT_SET_UCONFIG_REG] == 0 &&
 	          std::search(r64.ib.begin(), r64.ib.end(), wide.begin(), wide.end()) != r64.ib.end(),
 	      "the two-register begin tag is in the gfx IB as written");
+
+	// A push marker as libSceAgcDriver writes it: tag and first 4 characters to 0x342, the rest with
+	// WRITE_DATA to the register 0xc343. As written on the gfx ring, dropped on a compute ring.
+	std::vector<uint32_t> marker = {0xc0027904u, 0x342u, 0xc100c000u, 0x6c6c6568u,
+	                                0xc0043704u, 0x06010000u, 0xc343u, 0u, 0x726f776fu, 0x0000646cu};
+	Pm4Translator tm;
+	auto          rm = tm.Translate(marker);
+	Check(rm.ok && rm.stats.changed_ops[IT_SET_UCONFIG_REG] == 0 && rm.stats.changed_ops[IT_WRITE_DATA] == 0 &&
+	          std::search(rm.ib.begin(), rm.ib.end(), marker.begin(), marker.end()) != rm.ib.end() &&
+	          ValidateNativeIb(rm.ib, false, nullptr, NativeIbKind::Gfx),
+	      "a push marker reaches the gfx CP as written");
+	Pm4Translator tc;
+	tc.SetComputeQueue(true);
+	tc.SetComputeRing(true);
+	auto rc = tc.Translate(marker);
+	Check(rc.ok && std::find(rc.ib.begin(), rc.ib.end(), 0xc343u) == rc.ib.end() &&
+	          ValidateNativeIb(rc.ib, false, nullptr, NativeIbKind::Compute),
+	      "a compute ring drops it");
 }
 
 // GFX9+ only updates the CP's copy of VGT_PRIMITIVE_TYPE / VGT_INDEX_TYPE through

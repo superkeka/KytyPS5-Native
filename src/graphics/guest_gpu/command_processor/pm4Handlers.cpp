@@ -2696,6 +2696,13 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 	auto  write_control = buffer[0];
 	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 
+	// libSceAgc's debug markers write the rest of their string to SQ_THREAD_TRACE_USERDATA_3 (register
+	// 0xc343, DST_SEL 0): thread-trace data, nothing to do here.
+	if (((write_control >> 8u) & 0xfu) == 0u && (write_control >> 30u) == 0u && buffer[2] == 0u && buffer[1] >= 0xc340u &&
+	    buffer[1] <= 0xc347u) {
+		return 1 + dw_num;
+	}
+
 	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
 
 	return 1 + dw_num;

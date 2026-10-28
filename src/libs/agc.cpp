@@ -2540,6 +2540,9 @@ static uint32_t decode_draw_index_initiator(uint64_t modifier) {
 }
 
 static constexpr uint32_t AGC_INTERNAL_DATA_REGISTER            = 0x342u;
+static constexpr uint32_t AGC_MARKER_SET_TAG                    = 0xc0000000u; // debug markers (agc_marker_write)
+static constexpr uint32_t AGC_MARKER_PUSH_TAG                   = 0xc1000000u;
+static constexpr uint32_t AGC_MARKER_POP_TAG                    = 0xc2000000u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG     = 0xc6000008u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
@@ -3933,8 +3936,15 @@ static uint32_t wait_reg_mem64_control(uint8_t compare_function, uint8_t op, uin
 }
 
 bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
-	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
-	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != AGC_INTERNAL_DATA_REGISTER) {
+	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG || payload[0] != AGC_INTERNAL_DATA_REGISTER) {
+		return false;
+	}
+	// Debug markers (agc_marker_write), in DCBs and ACBs.
+	if (const uint32_t tag = payload[1] & 0xff000000u;
+	    (tag == AGC_MARKER_SET_TAG || tag == AGC_MARKER_PUSH_TAG || tag == AGC_MARKER_POP_TAG) && KYTY_PM4_LEN(cmd_id) <= 4u) {
+		return true;
+	}
+	if (KYTY_PM4_R(cmd_id) != 1u) {
 		return false;
 	}
 
@@ -4050,62 +4060,98 @@ uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
 	}
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t /*color*/) {
+// Debug markers as libSceAgcDriver writes them (its helpers +b34-CLWc0s, zmw2uVSEj94, LEnn-4ARRJM,
+// VhLnEiTuuWo): SQ_THREAD_TRACE_USERDATA_2 (0x342) takes a tag (0xC0 set, 0xC1 push, 0xC2 pop) with the
+// string's length and the color as RGB555, plus the first 4 characters; the rest of the string goes to
+// SQ_THREAD_TRACE_USERDATA_3 (0xc343) with a WRITE_DATA to that register, one address. DCB packets have
+// header bit 2 set, ACB packets not.
+
+static uint32_t agc_marker_size_dw(uint32_t len) {
+	if (len == 0) {
+		return 3;
+	}
+	const uint32_t n = (len + 3u) / 4u;
+	return n == 1 ? 4u : n + 7u;
+}
+
+static uint32_t agc_marker_write(uint32_t* cmd, bool acb, uint32_t tag, const char* str, uint32_t len, uint32_t color) {
+	const uint32_t r      = acb ? 0u : 4u;
+	const bool     inline4 = str != nullptr && len != 0;
+	const uint32_t rgb555 = ((color >> 1u) & 0x7c00u) | ((color >> 14u) & 0x3e0u) | (color >> 27u);
+	cmd[0] = (inline4 ? 0xc0027900u : 0xc0017900u) | r;
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
+	cmd[2] = tag + ((((len << 13u) + 0x6000u) & 0x7f8000u) + rgb555);
+	uint32_t* out = cmd + 3;
+	if (inline4) {
+		const uint32_t first = std::min(len, 4u);
+		out[0]               = 0;
+		memcpy(out, str, first);
+		out++;
+		str += first;
+		len -= first;
+	}
+	if (str != nullptr && len != 0) {
+		const uint32_t data_dw = (len + 3u) / 4u;
+		out[0]                 = 0xc0003700u | ((data_dw + 2u) << 16u) | r;
+		out[1]                 = 0x06010000u; // WR_ONE_ADDR, to a register
+		out[2]                 = 0xc343u;     // SQ_THREAD_TRACE_USERDATA_3
+		out[3]                 = 0;
+		memset(out + 4, 0, static_cast<size_t>(data_dw) * 4u);
+		memcpy(out + 4, str, len);
+		out += 4 + data_dw;
+	}
+	return static_cast<uint32_t>(out - cmd);
+}
+
+static uint32_t* agc_marker(CommandBuffer* buf, bool acb, uint32_t tag, const char* str, uint32_t color) {
 	if (buf == nullptr) {
 		return nullptr;
 	}
-
-	if (str == nullptr) {
-		str = "";
-	}
-
-	const auto len            = strlen(str) + 1;
-	const auto payload_dwords = static_cast<uint32_t>((len + 3) / 4);
-	const auto size           = 1u + (payload_dwords == 0 ? 1u : payload_dwords);
-	auto*      cmd            = buf->AllocateDW(size);
-
+	const auto len = static_cast<uint32_t>(str != nullptr ? strlen(str) : 0);
+	auto*      cmd = buf->AllocateDW(agc_marker_size_dw(len));
 	if (cmd == nullptr) {
 		return nullptr;
 	}
-
-	cmd[0] = KYTY_PM4(size, Pm4::IT_NOP, Pm4::R_PUSH_MARKER);
-	memset(cmd + 1, 0, static_cast<size_t>(size - 1) * sizeof(uint32_t));
-	memcpy(cmd + 1, str, len);
-
+	agc_marker_write(cmd, acb, tag, str, len, color);
 	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
+	return agc_marker(buf, false, AGC_MARKER_PUSH_TAG, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
-	return AgcDcbPushMarker(buf, str, color);
+	return agc_marker(buf, false, AGC_MARKER_SET_TAG, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
-	return AgcDcbSetMarker(buf, str, color);
+	return agc_marker(buf, true, AGC_MARKER_SET_TAG, str, color);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
-	return AgcDcbPushMarker(buf, str, color);
+	return agc_marker(buf, true, AGC_MARKER_PUSH_TAG, str, color);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
+static uint32_t* agc_pop_marker(CommandBuffer* buf, bool acb) {
 	if (buf == nullptr) {
 		return nullptr;
 	}
-
-	auto* cmd = buf->AllocateDW(2);
-
+	auto* cmd = buf->AllocateDW(3);
 	if (cmd == nullptr) {
 		return nullptr;
 	}
-
-	cmd[0] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_POP_MARKER);
-	cmd[1] = 0;
-
+	cmd[0] = 0xc0017900u | (acb ? 0u : 4u);
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
+	cmd[2] = AGC_MARKER_POP_TAG;
 	return cmd;
 }
 
+uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
+	return agc_pop_marker(buf, false);
+}
+
 uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
-	return AgcDcbPopMarker(buf);
+	return agc_pop_marker(buf, true);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,

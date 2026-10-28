@@ -1605,7 +1605,8 @@ static bool DangerRegIndex(Device* d, Common* c, const char* which) {
 // DCB form on the gfx ring (header 0xc0017904: bit 2 set), ACB form on a compute ring (0x342 and the
 // profiler's 0x343), each followed by a WRITE_DATA that shows the ring went on. No readback.
 // Result on BC-250: the gfx ring runs them, the 64-bit wait's two-register begin tag too; the compute
-// ring (amdgpu's MEC queue) stops.
+// ring (amdgpu's MEC queue) stops. The gfx step also writes a debug marker's string to 0xc343 with
+// WRITE_DATA to a register, as libSceAgcDriver does.
 static bool DangerTag342(Device* d, Common* c) {
 	printf("== danger tag342: SET_UCONFIG_REG of SQ_THREAD_TRACE_USERDATA_2/3 from user IBs\n");
 	Bo  mem;
@@ -1644,6 +1645,14 @@ static bool DangerTag342(Device* d, Common* c) {
 			IbPush(&ib, 0x342u);
 			IbPush(&ib, 0xc8020000u | (uint32_t)((mem.va >> 32) & 0xffffu));
 			IbPush(&ib, (uint32_t)mem.va);
+			// A push marker's string past its first 4 characters: WRITE_DATA to the register
+			// SQ_THREAD_TRACE_USERDATA_3 (0xc343, DST_SEL 0, one address), as libSceAgcDriver writes it.
+			IbPush(&ib, 0xc0043704u);
+			IbPush(&ib, 0x06010000u);
+			IbPush(&ib, 0xc343u);
+			IbPush(&ib, 0u);
+			IbPush(&ib, 0x6c6c6568u); // "hell"
+			IbPush(&ib, 0x0000006fu); // "o"
 		}
 		IbPush(&ib, gfx ? Pkt3Gfx(0x37u, 4) : Pkt3(0x37u, 4));
 		IbPush(&ib, (5u << 8) | (1u << 20));
