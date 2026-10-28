@@ -198,6 +198,7 @@ struct Pm4TranslateStats {
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
 	uint32_t pfp_syncs_emitted = 0; // PFP_SYNC_ME emitted in place of dropped PFP waits
 	uint32_t clear_state       = 0; // IT_CLEAR_STATE
+	uint32_t context_checks    = 0; // libSceAgc's COND_EXEC + RELEASE_MEM around a context push/pop, left out
 	uint32_t uconfig_skipped   = 0; // non-whitelisted UCONFIG writes dropped for board safety
 	uint32_t preamble_cx       = 0; // context registers emitted in the IB preamble
 	uint32_t preamble_sh       = 0; // SH registers emitted in the IB preamble

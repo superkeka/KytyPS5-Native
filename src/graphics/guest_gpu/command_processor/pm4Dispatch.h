@@ -128,6 +128,8 @@ uint32_t CpOpIndexType(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, u
 uint32_t CpOpNumInstances(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDrawIndexAuto(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpCondExec(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpContextControl(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpAtomicMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetPredication(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWriteData(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndirectBuffer(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

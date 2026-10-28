@@ -26,6 +26,7 @@ constexpr uint32_t PacketSizeDw(uint32_t header) {
 constexpr uint32_t IT_NOP                       = 0x10;
 constexpr uint32_t IT_SET_BASE                  = 0x11;
 constexpr uint32_t IT_CLEAR_STATE               = 0x12;
+constexpr uint32_t IT_ATOMIC_MEM                = 0x1E;
 constexpr uint32_t IT_INDEX_BUFFER_SIZE         = 0x13;
 constexpr uint32_t IT_DISPATCH_DIRECT           = 0x15;
 constexpr uint32_t IT_DISPATCH_INDIRECT         = 0x16;

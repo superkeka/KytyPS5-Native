@@ -1602,55 +1602,175 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	}
 }
 
+// libSceAgc's context-state state, guest memory the GPU reads: the default context (a table of 1024
+// register pairs for SET_CONTEXT_REG_INDIRECT, 0xffffffff stubs past the defaults; libSceAgc fills its
+// own from the register defaults of the version in use) and the push/pop flags (8 bytes, {0, 1} at the
+// start: a push swaps in {1, 0}, a pop {0, 1}).
+struct ContextStateMemory {
+	uint32_t* table   = nullptr; // 1024 pairs
+	uint32_t* flags   = nullptr;
+	uint32_t  version = UINT32_MAX;
+};
+
+static constexpr uint32_t CONTEXT_STATE_TABLE_PAIRS = 0x400u;
+
+static ContextStateMemory* context_state_memory() {
+	static std::mutex           mutex;
+	static ContextStateMemory   mem;
+	std::lock_guard<std::mutex> lock(mutex);
+	if (mem.table == nullptr) {
+		const uint64_t bytes = 8ull * CONTEXT_STATE_TABLE_PAIRS + 8u;
+		const uint64_t addr  = LibKernel::Memory::AllocateRuntimeMemory(0, bytes, Common::VirtualMemory::Mode::ReadWrite,
+		                                                                "agc context state");
+		EXIT_NOT_IMPLEMENTED(addr == 0);
+		mem.table    = reinterpret_cast<uint32_t*>(addr);
+		mem.flags    = mem.table + 2u * CONTEXT_STATE_TABLE_PAIRS;
+		mem.flags[0] = 0;
+		mem.flags[1] = 1;
+	}
+	const uint32_t ver = AgcRegisterDefaultsVersion();
+	if (mem.version != ver) {
+		const auto defaults = AgcStartStateDefaults(ver);
+		for (uint32_t i = 0; i < CONTEXT_STATE_TABLE_PAIRS; i++) {
+			const bool set        = i < defaults.context.size();
+			mem.table[2 * i]     = set ? defaults.context[i].first : 0xffffffffu;
+			mem.table[2 * i + 1] = set ? defaults.context[i].second : 0u;
+		}
+		EXIT_NOT_IMPLEMENTED(defaults.context.size() > CONTEXT_STATE_TABLE_PAIRS);
+		mem.version = ver;
+	}
+	return &mem;
+}
+
+static void context_state_load_defaults(uint32_t* cmd, const ContextStateMemory* mem) {
+	const auto addr = reinterpret_cast<uint64_t>(mem->table);
+	cmd[0]          = KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG_INDIRECT, 0u);
+	cmd[1]          = static_cast<uint32_t>(addr) & ~0x3u;
+	cmd[2]          = static_cast<uint32_t>(addr >> 32u);
+	cmd[3]          = 0x80000000u;
+	cmd[4]          = CONTEXT_STATE_TABLE_PAIRS;
+}
+
+// CONTEXT_CONTROL with shadowing of the context (and global config, for a push) as libSceAgc enables it.
+static void context_state_control(uint32_t* cmd, uint32_t shadow) {
+	cmd[0] = 0xc0012800u;
+	cmd[1] = 0;
+	cmd[2] = shadow;
+}
+
+// libSceAgc's 22-dword piece around a push (1) or pop (2): a COND_EXEC on its flag (the low dword for a push,
+// the high one for a pop) over a RELEASE_MEM that tells the kernel of a second push or pop in a row (INT_SEL
+// 4, context id 0x08100000 | operation), then an ATOMIC_MEM that swaps the flags.
+static bool context_state_save_restore(CommandBuffer* buf, uint32_t operation, const ContextStateMemory* mem) {
+	if (!buf->ReserveDW(22)) {
+		return false;
+	}
+	const bool push = operation == 1 || operation == 3;
+	if (AgcDcbCondExec(buf, mem->flags + (push ? 0 : 1), 8) == nullptr) {
+		return false;
+	}
+	auto* rel = AgcCbReleaseMem(buf, 0x28, 0, 1, 3, nullptr, 0, 0, 0, 0, 4, 0);
+	if (rel == nullptr) {
+		return false;
+	}
+	rel[7]    = (rel[7] & 0xf0000000u) + (operation & 0xfffffu) + 0x08100000u;
+	auto* cmd = buf->AllocateDW(9);
+	if (cmd == nullptr) {
+		return false;
+	}
+	const auto flags = reinterpret_cast<uint64_t>(mem->flags);
+	cmd[0]           = 0xc0071e00u;                    // ATOMIC_MEM
+	cmd[1]           = (1u << 30u) | (2u << 8u) | 0x67u; // libSceAgc's engine, command and atomic
+	cmd[2]           = static_cast<uint32_t>(flags);
+	cmd[3]           = static_cast<uint32_t>(flags >> 32u);
+	cmd[4]           = push ? 1u : 0u;
+	cmd[5]           = push ? 0u : 1u;
+	cmd[6]           = 0;
+	cmd[7]           = 0;
+	cmd[8]           = 0x190u >> 6u;                     // loop interval
+	return true;
+}
+
+// AgcDcbContextStateOp as libSceAgc writes it: 0 clear (the default context loaded), 1 push, 2 pop (the
+// save/restore piece, CONTEXT_CONTROL with shadowing, CLEAR_STATE with the operation: the CP's
+// PUSH_STATE / POP_STATE), 3 push then clear (a push, then the default context loaded).
 uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
 	PRINT_NAME();
 	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
 
-	const auto size_dw = context_state_op_size_dw(operation);
-	if (buf == nullptr || size_dw == 0) {
+	if (buf == nullptr || context_state_op_size_dw(operation) == 0) {
 		return nullptr;
 	}
-
-	uint32_t*  first  = nullptr;
-	const auto append = [&](uint32_t segment_size_dw) {
-		auto* segment = buf->AllocateDW(segment_size_dw);
-		if (segment == nullptr) {
-			return false;
-		}
-		std::fill_n(segment, segment_size_dw, 0u);
+	const auto* mem   = context_state_memory();
+	uint32_t*   first = nullptr;
+	auto        put   = [&](uint32_t dw) {
+		auto* cmd = buf->AllocateDW(dw);
 		if (first == nullptr) {
-			first      = segment;
-			segment[0] = KYTY_PM4(segment_size_dw, Pm4::IT_NOP, Pm4::R_CONTEXT_STATE);
-			segment[1] = operation;
-		} else {
-			segment[0] = KYTY_PM4(segment_size_dw, Pm4::IT_NOP, Pm4::R_ZERO);
+			first = cmd;
 		}
-		return true;
+		return cmd;
 	};
-	const auto append_save_restore = [&] {
-		// The native helper reserves 22 dwords, then emits 5-, 8-, and 9-dword packets.
-		return buf->ReserveDW(22) && append(5) && append(8) && append(9);
+	auto mark_first = [&]() {
+		// The first packet of the save/restore piece is its COND_EXEC.
+		if (first == nullptr) {
+			first = buf->cursor_up;
+		}
 	};
-
-	// Preserve native packet sizes, allocation boundaries, Push/Pop ordering, and
-	// returned first-packet address. The native packets reference process-private state buffers,
-	// so their net Cx operation is represented by the first HLE packet and type-3 NOPs.
-	bool complete = false;
-	switch (static_cast<ContextStateOperation>(operation)) {
-		case ContextStateOperation::Clear: complete = append(5); break;
-		case ContextStateOperation::Push:
-			complete = append_save_restore() && append(3) && append(2);
+	switch (operation) {
+		case 0: {
+			auto* cmd = put(5);
+			if (cmd == nullptr) {
+				return nullptr;
+			}
+			context_state_load_defaults(cmd, mem);
+			return first;
+		}
+		case 1:
+		case 3: {
+			mark_first();
+			if (!context_state_save_restore(buf, 1, mem)) {
+				return nullptr;
+			}
 			break;
-		case ContextStateOperation::Pop:
-			complete = append(3) && append_save_restore() && append(2);
-			break;
-		case ContextStateOperation::PushClear:
-			complete = append_save_restore() && append(3) && append(2) && append(5);
-			break;
-		default: break;
+		}
+		case 2: {
+			auto* cmd = put(3);
+			if (cmd == nullptr) {
+				return nullptr;
+			}
+			context_state_control(cmd, 0x80018003u);
+			if (!context_state_save_restore(buf, 2, mem)) {
+				return nullptr;
+			}
+			auto* clear = buf->AllocateDW(2);
+			if (clear == nullptr) {
+				return nullptr;
+			}
+			clear[0] = 0xc0001200u;
+			clear[1] = 2;
+			return first;
+		}
+		default: return nullptr;
 	}
-
-	return complete ? first : nullptr;
+	auto* cmd = buf->AllocateDW(3);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	context_state_control(cmd, 0x80018001u);
+	auto* clear = buf->AllocateDW(2);
+	if (clear == nullptr) {
+		return nullptr;
+	}
+	clear[0] = 0xc0001200u; // CLEAR_STATE: PUSH_STATE
+	clear[1] = 1;
+	if (operation == 3) {
+		auto* load = buf->AllocateDW(5);
+		if (load == nullptr) {
+			return nullptr;
+		}
+		context_state_load_defaults(load, mem);
+	}
+	return first;
 }
 
 uint64_t KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {

@@ -193,6 +193,8 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_NUM_INSTANCES]             = CpOpNumInstances;
 	g_cp_op_func[Pm4::IT_DRAW_INDEX_AUTO]           = CpOpDrawIndexAuto;
 	g_cp_op_func[Pm4::IT_COND_EXEC]                 = CpOpCondExec;
+	g_cp_op_func[Pm4::IT_CONTEXT_CONTROL]           = CpOpContextControl;
+	g_cp_op_func[Pm4::IT_ATOMIC_MEM]                = CpOpAtomicMem;
 	g_cp_op_func[Pm4::IT_SET_PREDICATION]           = CpOpSetPredication;
 	g_cp_op_func[Pm4::IT_WRITE_DATA]                = CpOpWriteData;
 	g_cp_op_func[Pm4::IT_WAIT_REG_MEM]              = CpOpWaitRegMem32;

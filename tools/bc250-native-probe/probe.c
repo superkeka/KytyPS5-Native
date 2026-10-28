@@ -1675,6 +1675,57 @@ static bool DangerTag342(Device* d, Common* c) {
 	return ok;
 }
 
+// libSceAgc's ATOMIC_MEM around a context push or pop (AgcDcbContextStateOp) as it writes it, on the gfx
+// ring: engine bit 30, COMMAND 2, atomic 0x67, 64-bit source {1, 0} over flags that hold {0, 1}. The flags
+// should read {1, 0} after it, and a WRITE_DATA after it lands.
+static bool DangerAtomicMem(Device* d, Common* c) {
+	printf("== danger atomicmem: libSceAgc's ATOMIC_MEM (atomic 0x67, command 2) on the gfx ring\n");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m = (volatile uint32_t*)mem.cpu;
+	m[0]                 = 0;
+	m[1]                 = 1;
+	m[4]                 = 0;
+	__sync_synchronize();
+	Ib ib = {.n = 0};
+	IbPush(&ib, 0xc0071e00u);
+	IbPush(&ib, (1u << 30) | (2u << 8) | 0x67u);
+	IbPush(&ib, (uint32_t)mem.va);
+	IbPush(&ib, (uint32_t)(mem.va >> 32));
+	IbPush(&ib, 1u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 6u);
+	IbPush(&ib, Pkt3Gfx(0x37u, 4));
+	IbPush(&ib, (5u << 8) | (1u << 20));
+	IbPush(&ib, (uint32_t)(mem.va + 16));
+	IbPush(&ib, (uint32_t)((mem.va + 16) >> 32));
+	IbPush(&ib, 0x61746f6du);
+	IbPad(&ib);
+	Bo*      bos[] = {&mem};
+	uint64_t seq   = 0;
+	r              = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+	int     w      = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 2.0) : r;
+	int64_t st     = ContextState(d);
+	printf("  gfx ring: %s, ctx 0x%" PRIx64 ", flags {%u, %u} (want {1, 0}), WRITE_DATA after it %s\n", w == 1 ? "TIMEOUT" : ErrStr(w),
+	       (uint64_t)st, m[0], m[1], m[4] == 0x61746f6du ? "landed" : "missing");
+	if (w != 0 || st != 0) {
+		_exit(3);
+	}
+	const bool ok = m[0] == 1 && m[1] == 0 && m[4] == 0x61746f6du;
+	BoDestroy(d, &mem);
+	return ok;
+}
+
 // libSceAgc's ACB packets as it writes them, without the shader-type bit (header bit 1) the translator
 // sets for MEC: does the BC-250's MEC run them as the PS5's does? One job per step on the compute ring,
 // each checked by what it writes; the first that does not finish stops the run (a stopped MEC needs a
@@ -2412,7 +2463,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
+	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
 }
 
 int main(int argc, char** argv) {
@@ -2497,6 +2548,8 @@ int main(int argc, char** argv) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x64u, 0x342u, "SQ_THREAD_TRACE_USERDATA_2");
 		} else if (strcmp(danger, "regindex-sh-nr") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb030u - 0xb000u) / 4, "SPI_SHADER_USER_DATA_PS_0");
+		} else if (strcmp(danger, "atomicmem") == 0) {
+			ok = DangerAtomicMem(&d, &c);
 		} else if (strcmp(danger, "mecforms") == 0) {
 			ok = DangerMecForms(&d, &c);
 		} else if (strcmp(danger, "regindex-shc-nr") == 0) {

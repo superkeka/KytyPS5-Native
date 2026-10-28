@@ -23,6 +23,8 @@ constexpr uint32_t IT_NOP                      = 0x10;
 constexpr uint32_t IT_INDIRECT_BUFFER          = 0x3F;
 constexpr uint32_t IT_COPY_DATA                = 0x40;
 constexpr uint32_t IT_CLEAR_STATE              = 0x12;
+constexpr uint32_t IT_ATOMIC_MEM               = 0x1E;
+constexpr uint32_t IT_COND_EXEC                = 0x22;
 constexpr uint32_t IT_SET_BASE                 = 0x11;
 constexpr uint32_t IT_SET_PREDICATION          = 0x20;
 constexpr uint32_t IT_INDEX_BUFFER_SIZE        = 0x13;
@@ -697,6 +699,12 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			case IT_ACQUIRE_MEM:
 			case IT_SET_SH_REG:
 				if (compute && (header & 2u) == 0 && !MecPlainOp((header >> 8u) & 0xffu)) {
+					return bad();
+				}
+				break;
+			// libSceAgc's flag swap around a context push or pop (AgcDcbContextStateOp), on the gfx ring.
+			case IT_ATOMIC_MEM:
+				if (compute || size != 9 || (b[0] & 0x7fu) != 0x67u) {
 					return bad();
 				}
 				break;
@@ -3359,7 +3367,49 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					NoteEvent(bptr[0] & 0x3fu);
 				}
 				break;
+			case IT_CONTEXT_CONTROL:
+				// libSceAgc's around a context push or pop turns on register shadowing, which needs the kernel's
+				// shadow memory; the translator keeps the context in its shadow and sets its own preamble.
+				if (m_compute_ring) {
+					return fail(op, dw);
+				}
+				break;
+			case IT_COND_EXEC: {
+				// libSceAgc's check around a context push or pop: a RELEASE_MEM that tells the kernel of a second
+				// push or pop in a row (INT_SEL 4, context id with bit 27 set), run when its flag is set. That is
+				// the PS5 kernel's; both are left out. Any other COND_EXEC refuses the buffer.
+				const uint32_t next = dw + size;
+				if (m_compute_ring || body_count < 4 || (bptr[3] & 0x3fffu) != 8u || next + 8u > dcb.size() ||
+				    dcb[next] != 0xc0064900u || ((dcb[next + 2] >> 24u) & 0x7u) != 4u || (dcb[next + 7] & 0x08000000u) == 0) {
+					return fail(op, dw);
+				}
+				stats.context_checks++;
+				dw += 8u; // the RELEASE_MEM
+				break;
+			}
+			case IT_ATOMIC_MEM:
+				// libSceAgc's flag swap around a context push or pop: as written on the gfx ring.
+				if (m_compute_ring || body_count != 8 || (bptr[0] & 0x7fu) != 0x67u) {
+					return fail(op, dw);
+				}
+				if (direct) {
+					in_place = true;
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				}
+				{
+					const uint64_t addr = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					add_ref(addr, 8, false);
+					note_gpu_written(addr, addr + 8);
+				}
+				break;
 			case IT_CLEAR_STATE:
+				// CMD 1-3 (libSceAgc's AgcDcbContextStateOp): PUSH_STATE, POP_STATE, push then clear, which the
+				// PS5's CP does with register shadowing the kernel sets up. The shadow does them here.
+				if (body_count >= 1 && (bptr[0] & 0xfu) != 0) {
+					context_state_op(bptr[0] & 0xfu);
+					break;
+				}
 				// The hardware resets the context to amdgpu's clear state, the PS5 CP to its own
 				// defaults (Kyty: the same as a context-state clear). Follow it with the defaults, every
 				// one of them, since the hardware no longer matches the shadow.

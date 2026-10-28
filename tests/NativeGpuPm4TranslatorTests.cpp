@@ -1639,6 +1639,43 @@ void TestValidateNativeIb() {
 	Check(ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "with it, it passes there");
 }
 
+// AgcDcbContextStateOp as libSceAgc writes it: a push and a pop around a register write. The shadow does
+// the push and pop (CLEAR_STATE CMD 1 and 2), the COND_EXEC + RELEASE_MEM checks are left out, the
+// ATOMIC_MEM flag swaps go as written, and the pop puts the register back.
+void TestContextStateOpPackets() {
+	static uint32_t flags[2] = {0, 1};
+	const uint64_t  fa       = reinterpret_cast<uint64_t>(flags);
+	auto            piece    = [&](std::vector<uint32_t>& d, uint32_t op) {
+        const uint64_t f = fa + (op == 1 ? 0u : 4u);
+        d.insert(d.end(), {0xc0032200u, static_cast<uint32_t>(f), static_cast<uint32_t>(f >> 32u), 0u, 8u});
+        d.insert(d.end(), {0xc0064900u, 0x28u | (5u << 8u) | (3u << 25u), (1u << 16u) | (4u << 24u), 0u, 0u, 0u, 0u, 0x08100000u | op});
+        d.insert(d.end(), {0xc0071e00u, (1u << 30u) | (2u << 8u) | 0x67u, static_cast<uint32_t>(fa), static_cast<uint32_t>(fa >> 32u),
+                           op == 1 ? 1u : 0u, op == 1 ? 0u : 1u, 0u, 0u, 6u});
+	};
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x10u, 0x1111u}, false);
+	piece(dcb, 1);
+	dcb.insert(dcb.end(), {0xc0012800u, 0u, 0x80018001u, 0xc0001200u, 1u});
+	Append(dcb, IT_SET_CONTEXT_REG, {0x10u, 0x2222u}, false);
+	dcb.insert(dcb.end(), {0xc0012800u, 0u, 0x80018003u});
+	piece(dcb, 2);
+	dcb.insert(dcb.end(), {0xc0001200u, 2u});
+	Pm4Translator t;
+	auto          r = t.Translate(dcb);
+	Check(r.ok && r.stats.context_ops == 2 && r.stats.context_checks == 2, "push and pop done by the shadow, checks left out");
+	uint32_t atomics = 0, last_10 = 0, clear_states = 0;
+	for (const auto& p: Decode(r.ib)) {
+		atomics += p.op == 0x1Eu ? 1u : 0u;
+		clear_states += p.op == IT_CLEAR_STATE && !p.body.empty() && p.body[0] != 0u ? 1u : 0u; // the preamble's has CMD 0
+		if (p.op == IT_SET_CONTEXT_REG && p.body.size() == 2 && p.body[0] == 0x10u) {
+			last_10 = p.body[1];
+		}
+	}
+	Check(atomics == 2 && clear_states == 0, "the flag swaps go as written, no PUSH_STATE / POP_STATE reaches the GPU");
+	Check(last_10 == 0x1111u, "the pop puts the register back");
+	Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "the packet check takes it");
+}
+
 // libSceAgc's ACB packets without the shader-type bit go to MEC as written (SET_SH_REG, DISPATCH_DIRECT,
 // ACQUIRE_MEM, DMA_DATA); the compute-ring check takes them.
 void TestComputeRingPlainHeaders() {
@@ -2408,6 +2445,7 @@ int main() {
 	TestValidateNativeIb();
 	TestComputeRingPackets();
 	TestComputeRingPlainHeaders();
+	TestContextStateOpPackets();
 	TestUnreachableLabel();
 	TestGpuTimestamp();
 	TestLabelsGpuOnly();

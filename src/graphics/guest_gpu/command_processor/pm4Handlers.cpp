@@ -1788,15 +1788,43 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 	return 2;
 }
 
+// CLEAR_STATE's CMD: 0 clear, 1 push (PUSH_STATE), 2 pop (POP_STATE), 3 push then clear (libSceAgc's
+// AgcDcbContextStateOp).
 KYTY_CP_OP_PARSER(CpOpClearState) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0001200);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0xfu) != 0);
+	EXIT_NOT_IMPLEMENTED(buffer[0] > static_cast<uint32_t>(ContextStateOperation::PushClear));
 
-	cp.ApplyContextStateOperation(ContextStateOperation::Clear);
+	cp.ApplyContextStateOperation(static_cast<ContextStateOperation>(buffer[0]));
 
 	return 1;
+}
+
+// libSceAgc's CONTEXT_CONTROL around a context push or pop turns on register shadowing; Kyty keeps the
+// context itself.
+KYTY_CP_OP_PARSER(CpOpContextControl) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 3u);
+
+	return 2;
+}
+
+// ATOMIC_MEM as libSceAgc writes it around a context push or pop: atomic 0x67 (a 64-bit swap, nothing
+// returned) of the source data into its flags.
+KYTY_CP_OP_PARSER(CpOpAtomicMem) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 9u);
+	EXIT_NOT_IMPLEMENTED((buffer[0] & 0x7fu) != 0x67u);
+
+	auto* addr = reinterpret_cast<volatile uint64_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+	EXIT_NOT_IMPLEMENTED(addr == nullptr);
+	*addr = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+
+	return 8;
 }
 
 KYTY_CP_OP_PARSER(CpOpContextState) {
@@ -2341,6 +2369,10 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
 
 	auto trigger_interrupt = [&]() {
+		// A context id with bit 27 set is libSceAgc's own (its context push/pop checks), not the title's.
+		if ((buffer[6] & 0x08000000u) != 0) {
+			return;
+		}
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
