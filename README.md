@@ -44,7 +44,7 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
 
 ## Install
 
-### SteamOS (recommended): Decky plugin
+### SteamOS (recommended), Bazzite, CachyOS: Decky plugin
 
 1. Install [Decky Loader](https://decky.xyz) and turn on its developer mode
 2. Download the latest `KytyPS5-Native-*-Decky.zip` from [Releases](https://github.com/superkeka/KytyPS5-Native/releases)

@@ -36,6 +36,7 @@ VIDEOS = {
 # Recommended kernel settings (README, tools/bc250-amdgpu): GTT 14 GiB, KFD queues without CWSR.
 GRUB_CFG = "/etc/default/grub.d/kytyps5-native.cfg"
 MODPROBE_CONF = "/etc/modprobe.d/kytyps5-native.conf"
+LIMINE_CONF = "/etc/limine-entry-tool.d/kytyps5-native.conf"
 GTT_PAGES = "3670016"
 AMDGPU = {"sched_policy": "2", "vm_update_mode": "0", "cwsr_enable": "0"}
 
@@ -163,29 +164,58 @@ def _ostree_kargs(tool):
     return dict(a.split("=", 1) if "=" in a else (a, "") for a in out.split())
 
 
+def _limine():
+    """limine-entry-tool (CachyOS with Limine, its default on the Handheld Edition): it writes the boot
+    entries from its config, kernel arguments go into a drop-in of its own."""
+    path = os.environ.get("PATH", "") + ":/usr/bin:/usr/sbin"
+    return shutil.which("limine-entry-tool", path=path) and shutil.which("limine-update", path=path)
+
+
+def _limine_kernel():
+    """The package name of the running kernel (linux-cachyos-deckify), the key limine-entry-tool uses."""
+    return _read(f"/usr/lib/modules/{os.uname().release}/pkgbase")
+
+
+def _limine_kargs():
+    """The kernel arguments limine-entry-tool gives the running kernel's entries, drop-ins included."""
+    code, out = _run("limine-entry-tool", "--get-cmdline", _limine_kernel(), "--no-hooks")
+    if code != 0 or not out:
+        return None
+    return dict(a.split("=", 1) if "=" in a else (a, "") for a in out.splitlines()[-1].split())
+
+
 def _kernel_method():
     """How the kernel config is set here: SteamOS (GRUB snippet and modprobe file, tested on the
-    BC-250), rpm-ostree (Bazzite: kernel arguments, tested on Fedora CoreOS), or not at all: other
-    systems set it by hand (README)."""
+    BC-250), rpm-ostree (Bazzite: kernel arguments, tested on Fedora CoreOS), limine (CachyOS: kernel
+    arguments in a limine-entry-tool drop-in, tested on a CachyOS VM), or not at all: other systems set
+    it by hand (README)."""
     if _rpm_ostree():
         return "rpm-ostree"
     if re.search(r"^ID=\"?steamos\"?$", _read("/etc/os-release"), re.M):
         return "files"
+    if _limine() and _limine_kernel():
+        return "limine"
     return "unsupported"
 
 
-# The kernel argument for each setting. On rpm-ostree systems all of them are kernel arguments: amdgpu
-# may load from an initramfs built without /etc/modprobe.d (Bazzite's docs say the same).
+# The kernel argument for each setting. On rpm-ostree and limine systems all of them are kernel
+# arguments: amdgpu may load from an initramfs built without /etc/modprobe.d (Bazzite's docs say the
+# same).
 KARG_NAMES = {"gtt": "ttm.pages_limit", **{k: f"amdgpu.{k}" for k in AMDGPU}}
 
 
 def _kernel_status():
-    ostree = _rpm_ostree()
-    kargs = _ostree_kargs(ostree) if ostree else {}
+    method = _kernel_method()
+    # Kernel arguments of the next boot, where the config is kernel arguments.
+    kargs = None
+    if method == "rpm-ostree":
+        kargs = _ostree_kargs(_rpm_ostree())
+    elif method == "limine":
+        kargs = _limine_kargs() or {}
     cmdline = _read("/proc/cmdline")
     m = re.search(r"ttm\.pages_limit=(\d+)", cmdline)
     gtt_active = m.group(1) if m else ""
-    if ostree:
+    if kargs is not None:
         gtt_conf = kargs.get("ttm.pages_limit", "")
     else:
         g = re.search(r"ttm\.pages_limit=(\d+)", _grub_lines())
@@ -197,7 +227,7 @@ def _kernel_status():
     opts = _modprobe_options()
     for k, v in AMDGPU.items():
         conf, where = opts.get(k, ("", ""))
-        if ostree and KARG_NAMES[k] in kargs:
+        if kargs and KARG_NAMES[k] in kargs:
             conf, where = kargs[KARG_NAMES[k]], "kernel arguments"
         items.append({
             "key": k, "label": f"amdgpu {k}={v}", "want": v,
@@ -213,8 +243,9 @@ def _kernel_status():
         it["reverting"] = reverted and it["ok"] and it["configured"] != it["want"]
     return {
         "items": items,
-        "method": _kernel_method(),
-        "ours": bool(_load().get("ostree_kargs")) if ostree else
+        "method": method,
+        "ours": bool(_load().get("ostree_kargs")) if method == "rpm-ostree" else
+                os.path.exists(LIMINE_CONF) if method == "limine" else
                 os.path.exists(GRUB_CFG) or os.path.exists(MODPROBE_CONF),
         "reboot": any(it["pending"] or it["reverting"] for it in items),
         "all_ok": all(it["ok"] for it in items),
@@ -237,6 +268,49 @@ def _update_boot():
     if shutil.which("grub-mkconfig") and os.path.exists("/boot/grub/grub.cfg"):
         return _run("grub-mkconfig", "-o", "/boot/grub/grub.cfg")
     return 1, "no update-grub or grub-mkconfig: add ttm.pages_limit=%s to the kernel command line" % GTT_PAGES
+
+
+def _limine_apply(st):
+    """The arguments still missing go into the plugin's limine-entry-tool drop-in (with the ones it
+    holds already); limine-update then writes the boot entries and initramfs. A value set otherwise
+    (by the user, another file) is left alone."""
+    log = []
+    ours = set(re.findall(r"\S+=\S+", re.sub(r'.*\+="?|"$', "", _read(LIMINE_CONF), flags=re.M)))
+    add = []
+    for it in st["items"]:
+        arg = f"{KARG_NAMES[it['key']]}={it['want']}"
+        if it["configured"] == it["want"] and arg not in ours:
+            continue
+        if it["configured"] and it["configured"] != it["want"]:
+            log.append(f"{KARG_NAMES[it['key']]}={it['configured']} is set in {it.get('file') or 'kernel arguments'}: left as it is")
+            continue
+        add.append(arg)
+    before = _limine_kargs()
+    if before is None:
+        return {"ok": False, "log": "limine-entry-tool --get-cmdline failed"}
+    os.makedirs(os.path.dirname(LIMINE_CONF), exist_ok=True)
+    with open(LIMINE_CONF, "w") as f:
+        f.write("# KytyPS5-Native (Decky plugin): GTT 14 GiB and KFD queues for PS5 games.\n"
+                f'KERNEL_CMDLINE[default]+="{" ".join(add)}"\n')
+    # A drop-in's += replaces a command line that only /etc/kernel/cmdline holds, and /etc/default/limine
+    # may set one with = over it: the next boot must keep every argument it had and get ours.
+    after = _limine_kargs() or {}
+    lost = [k for k in before if k not in after and f"{k}={before[k]}" not in ours]
+    missing = [a for a in add if a.split("=", 1)[0] not in after]
+    if lost or missing:
+        os.remove(LIMINE_CONF)
+        return {"ok": False, "log": "limine-entry-tool would " +
+                (f"drop {' '.join(lost)}" if lost else f"not take {' '.join(missing)}") +
+                ": add the arguments to KERNEL_CMDLINE in /etc/default/limine by hand (README)"}
+    code, out = _run("limine-update")
+    if code != 0:
+        os.remove(LIMINE_CONF)
+        _run("limine-update")
+        return {"ok": False, "log": out[-400:]}
+    s = _load()
+    s.pop("reverted_boot", None)
+    _save(s)
+    return {"ok": True, "log": "\n".join(log)}
 
 
 # --- games ----------------------------------------------------------------------------------------
@@ -482,6 +556,8 @@ class Plugin:
                 s.pop("reverted_boot", None)
                 _save(s)
                 return {"ok": True, "log": "\n".join(log)}
+            if st["method"] == "limine":
+                return _limine_apply(st)
             gtt = st["items"][0]
             if gtt["configured"] != GTT_PAGES and not gtt["ok"]:
                 with open(GRUB_CFG, "w") as f:
@@ -525,6 +601,11 @@ class Plugin:
                 s = _load()
                 s["ostree_kargs"] = []
                 _save(s)
+            elif os.path.exists(LIMINE_CONF):
+                os.remove(LIMINE_CONF)
+                code, out = _run("limine-update")
+                if code != 0:
+                    return {"ok": False, "log": out[-400:]}
             elif os.path.exists(GRUB_CFG):
                 os.remove(GRUB_CFG)
                 log.append(_update_boot()[1][-300:])

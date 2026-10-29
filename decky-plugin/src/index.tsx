@@ -39,7 +39,7 @@ interface State {
   games: Game[];
   gone: Record<string, { appid: number }>;
   videos: Record<string, boolean>;
-  kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
+  kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "limine" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
   game_running: boolean;
 }
 
@@ -196,7 +196,9 @@ function Content() {
                       "Now: " + state.kernel.items.map((it) => `${it.label} ${kernelText(it)}`).join(", ") + ". " +
                       (state.kernel.method === "rpm-ostree"
                         ? "Set as kernel arguments with rpm-ostree kargs (a new deployment). "
-                        : "Files: /etc/default/grub.d/kytyps5-native.cfg, /etc/modprobe.d/kytyps5-native.conf. ") +
+                        : state.kernel.method === "limine"
+                          ? "Set as kernel arguments in /etc/limine-entry-tool.d/kytyps5-native.conf, then limine-update. "
+                          : "Files: /etc/default/grub.d/kytyps5-native.cfg, /etc/modprobe.d/kytyps5-native.conf. ") +
                       "Takes effect after a reboot; Revert removes them.",
                     "Apply",
                     () =>
