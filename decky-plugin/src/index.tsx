@@ -85,6 +85,18 @@ function Title() {
 
 const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({ title, body });
 
+// Decky's own installer (as its store): asks, swaps the files and reloads this plugin alone. Without
+// it, the backend swaps them and restarts Decky.
+async function updatePlugin(release: Release) {
+  const decky = (window as any).DeckyBackend;
+  if (decky?.call) {
+    await decky.call("utilities/install_plugin", release.plugin_url!, "KytyPS5-Native", release.tag, "", 2);
+    return;
+  }
+  const r = await installPlugin(release.plugin_url!, release.tag);
+  toast(r.ok ? "Updated, Decky restarts" : r.log || "failed");
+}
+
 const confirm = (title: string, text: string, ok: string, action: () => void) =>
   showModal(<ConfirmModal strTitle={title} strDescription={text} strOKButtonText={ok} onOK={action} />);
 
@@ -141,7 +153,7 @@ function Content() {
             {state.kyty_installed ? state.kyty_version || "installed" : "not installed"}
           </Field>
         </PanelSectionRow>
-        {(kytyUpdate || !state.kyty_installed) && (
+        {!state.kyty_installed && (
           <PanelSectionRow>
             <ButtonItem
               layout="below"
@@ -153,7 +165,7 @@ function Content() {
                 })
               }
             >
-              {busy === "Installing KytyPS5-Native" ? "Installing..." : state.kyty_installed ? `Update to ${release?.tag}` : "Install"}
+              {busy === "Installing KytyPS5-Native" ? "Installing..." : "Install"}
             </ButtonItem>
           </PanelSectionRow>
         )}
@@ -213,6 +225,41 @@ function Content() {
             ) : (
               <Field label="Kernel config" description="Recommended (set outside the plugin)" focusable />
             )}
+          </PanelSectionRow>
+        )}
+        {state.kyty_installed && (
+          <PanelSectionRow>
+            <ButtonItem
+              layout="inline"
+              label="Updates"
+              description={
+                kytyUpdate || pluginUpdate ? `${release!.tag} is out` : `Plugin ${state.plugin_release || state.plugin_version}`
+              }
+              disabled={!!busy || ((kytyUpdate || pluginUpdate) && state.game_running)}
+              onClick={() =>
+                kytyUpdate || pluginUpdate
+                  ? run("Update", async () => {
+                      if (kytyUpdate) {
+                        const r = await installKyty(release!.kyty_url!, release!.tag);
+                        if (!r.ok) {
+                          toast(r.log || "failed");
+                          return;
+                        }
+                        toast(`KytyPS5-Native ${release!.tag} installed`);
+                      }
+                      if (pluginUpdate) await updatePlugin(release!);
+                    })
+                  : run("Check", async () => {
+                      const r = await latestRelease();
+                      setRelease(r);
+                      const kyty = !!r.kyty_url && r.tag !== state.kyty_version;
+                      const plugin = !!r.plugin_url && !!state.plugin_release && r.tag !== state.plugin_release;
+                      toast(r.error ? `No connection to GitHub: ${r.error}` : kyty || plugin ? `${r.tag} is out` : "Up to date");
+                    })
+              }
+            >
+              {busy === "Update" ? "Updating..." : busy === "Check" ? "Checking..." : kytyUpdate || pluginUpdate ? "Update" : "Check"}
+            </ButtonItem>
           </PanelSectionRow>
         )}
         {release?.error && (
@@ -284,34 +331,6 @@ function Content() {
         ))}
       </PanelSection>
 
-      <PanelSection title="Plugin">
-        <PanelSectionRow>
-          <Field label="Version" focusable>{state.plugin_release || state.plugin_version}</Field>
-        </PanelSectionRow>
-        {pluginUpdate && (
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              disabled={!!busy}
-              onClick={() =>
-                run("Plugin", async () => {
-                  // Decky's own installer (as its store): asks, swaps the files and reloads this plugin
-                  // alone. Without it, the backend swaps them and restarts Decky.
-                  const decky = (window as any).DeckyBackend;
-                  if (decky?.call) {
-                    await decky.call("utilities/install_plugin", release!.plugin_url!, "KytyPS5-Native", release!.tag, "", 2);
-                    return;
-                  }
-                  const r = await installPlugin(release!.plugin_url!, release!.tag);
-                  toast(r.ok ? "Updated, Decky restarts" : r.log || "failed");
-                })
-              }
-            >
-              Update plugin
-            </ButtonItem>
-          </PanelSectionRow>
-        )}
-      </PanelSection>
     </>
   );
 }
