@@ -149,25 +149,50 @@ def _modprobe_options():
     return opts
 
 
+def _rpm_ostree():
+    """rpm-ostree on Fedora Atomic systems (Bazzite): ostree owns the boot entries there, kernel
+    arguments go through `rpm-ostree kargs` (the BLS and GRUB files are not ours to edit)."""
+    return shutil.which("rpm-ostree", path=os.environ.get("PATH", "") + ":/usr/bin:/usr/sbin")
+
+
+def _ostree_kargs(tool):
+    """The kernel arguments of the deployment the next boot uses."""
+    code, out = _run(tool, "kargs")
+    if code != 0:
+        return {}
+    return dict(a.split("=", 1) if "=" in a else (a, "") for a in out.split())
+
+
+# The kernel argument for each setting. On rpm-ostree systems all of them are kernel arguments: amdgpu
+# may load from an initramfs built without /etc/modprobe.d (Bazzite's docs say the same).
+KARG_NAMES = {"gtt": "ttm.pages_limit", **{k: f"amdgpu.{k}" for k in AMDGPU}}
+
+
 def _kernel_status():
+    ostree = _rpm_ostree()
+    kargs = _ostree_kargs(ostree) if ostree else {}
     cmdline = _read("/proc/cmdline")
     m = re.search(r"ttm\.pages_limit=(\d+)", cmdline)
     gtt_active = m.group(1) if m else ""
-    g = re.search(r"ttm\.pages_limit=(\d+)", _grub_lines())
-    gtt_conf = g.group(1) if g else ""
-    if not gtt_conf and shutil.which("rpm-ostree"):
-        gtt_conf = gtt_active
+    if ostree:
+        gtt_conf = kargs.get("ttm.pages_limit", "")
+    else:
+        g = re.search(r"ttm\.pages_limit=(\d+)", _grub_lines())
+        gtt_conf = g.group(1) if g else ""
     items = [{
         "key": "gtt", "label": "GTT 14 GiB", "want": GTT_PAGES,
         "active": gtt_active, "configured": gtt_conf,
     }]
     opts = _modprobe_options()
     for k, v in AMDGPU.items():
+        conf, where = opts.get(k, ("", ""))
+        if ostree and KARG_NAMES[k] in kargs:
+            conf, where = kargs[KARG_NAMES[k]], "kernel arguments"
         items.append({
             "key": k, "label": f"amdgpu {k}={v}", "want": v,
             "active": _read(f"/sys/module/amdgpu/parameters/{k}"),
-            "configured": opts.get(k, ("", ""))[0],
-            "file": opts.get(k, ("", ""))[1],
+            "configured": conf,
+            "file": where,
         })
     # Reverted in this boot: the old values stay active until a reboot.
     reverted = _load().get("reverted_boot") == _read("/proc/sys/kernel/random/boot_id")
@@ -177,7 +202,9 @@ def _kernel_status():
         it["reverting"] = reverted and it["ok"] and it["configured"] != it["want"]
     return {
         "items": items,
-        "ours": os.path.exists(GRUB_CFG) or os.path.exists(MODPROBE_CONF),
+        "method": "rpm-ostree" if ostree else "files",
+        "ours": bool(_load().get("ostree_kargs")) if ostree else
+                os.path.exists(GRUB_CFG) or os.path.exists(MODPROBE_CONF),
         "reboot": any(it["pending"] or it["reverting"] for it in items),
         "all_ok": all(it["ok"] for it in items),
     }
@@ -421,18 +448,36 @@ class Plugin:
         def work():
             log = []
             st = _kernel_status()
+            ostree = _rpm_ostree()
+            if ostree:
+                # One rpm-ostree transaction (a new deployment) with every argument still missing; a
+                # value set otherwise (by the user, another file) is left alone.
+                add = []
+                for it in st["items"]:
+                    if it["configured"] == it["want"]:
+                        continue
+                    if it["configured"]:
+                        log.append(f"{KARG_NAMES[it['key']]}={it['configured']} is set in {it.get('file') or 'kernel arguments'}: left as it is")
+                        continue
+                    add.append(f"{KARG_NAMES[it['key']]}={it['want']}")
+                if add:
+                    code, out = _run(ostree, "kargs", *[f"--append-if-missing={a}" for a in add])
+                    if code != 0:
+                        return {"ok": False, "log": out[-400:]}
+                s = _load()
+                s["ostree_kargs"] = sorted(set(s.get("ostree_kargs", [])) | set(add))
+                s.pop("reverted_boot", None)
+                _save(s)
+                return {"ok": True, "log": "\n".join(log)}
             gtt = st["items"][0]
             if gtt["configured"] != GTT_PAGES and not gtt["ok"]:
-                if shutil.which("rpm-ostree"):
-                    log.append(_run("rpm-ostree", "kargs", f"--append-if-missing=ttm.pages_limit={GTT_PAGES}")[1])
-                else:
-                    with open(GRUB_CFG, "w") as f:
-                        f.write("# KytyPS5-Native (Decky plugin): GTT 14 GiB for PS5 games.\n"
-                                f'GRUB_CMDLINE_LINUX="${{GRUB_CMDLINE_LINUX}} ttm.pages_limit={GTT_PAGES}"\n')
-                    code, out = _update_boot()
-                    log.append(out[-300:])
-                    if code != 0:
-                        return {"ok": False, "log": "\n".join(log)}
+                with open(GRUB_CFG, "w") as f:
+                    f.write("# KytyPS5-Native (Decky plugin): GTT 14 GiB for PS5 games.\n"
+                            f'GRUB_CMDLINE_LINUX="${{GRUB_CMDLINE_LINUX}} ttm.pages_limit={GTT_PAGES}"\n')
+                code, out = _update_boot()
+                log.append(out[-300:])
+                if code != 0:
+                    return {"ok": False, "log": "\n".join(log)}
             mine = {}
             for it in st["items"][1:]:
                 if it["configured"] and it["configured"] != it["want"] and it.get("file") != MODPROBE_CONF:
@@ -454,8 +499,17 @@ class Plugin:
             log = []
             if os.path.exists(MODPROBE_CONF):
                 os.remove(MODPROBE_CONF)
-            if shutil.which("rpm-ostree"):
-                log.append(_run("rpm-ostree", "kargs", f"--delete-if-present=ttm.pages_limit={GTT_PAGES}")[1])
+            ostree = _rpm_ostree()
+            if ostree:
+                # Exactly the arguments this plugin added.
+                added = _load().get("ostree_kargs", [])
+                if added:
+                    code, out = _run(ostree, "kargs", *[f"--delete-if-present={a}" for a in added])
+                    if code != 0:
+                        return {"ok": False, "log": out[-400:]}
+                s = _load()
+                s["ostree_kargs"] = []
+                _save(s)
             elif os.path.exists(GRUB_CFG):
                 os.remove(GRUB_CFG)
                 log.append(_update_boot()[1][-300:])

@@ -39,7 +39,7 @@ interface State {
   games: Game[];
   gone: Record<string, { appid: number }>;
   videos: Record<string, boolean>;
-  kernel: { items: KernelItem[]; ours: boolean; reboot: boolean; all_ok: boolean };
+  kernel: { items: KernelItem[]; method: "files" | "rpm-ostree"; ours: boolean; reboot: boolean; all_ok: boolean };
   game_running: boolean;
 }
 
@@ -190,7 +190,9 @@ function Content() {
                     "Kernel options only, the kernel stays the same: GTT 14 GiB (ttm.pages_limit, big games need it) and " +
                       "amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0 (the GPU queues PS5 games use). " +
                       "Now: " + state.kernel.items.map((it) => `${it.label} ${kernelText(it)}`).join(", ") + ". " +
-                      "Files: /etc/default/grub.d/kytyps5-native.cfg, /etc/modprobe.d/kytyps5-native.conf. " +
+                      (state.kernel.method === "rpm-ostree"
+                        ? "Set as kernel arguments with rpm-ostree kargs (a new deployment). "
+                        : "Files: /etc/default/grub.d/kytyps5-native.cfg, /etc/modprobe.d/kytyps5-native.conf. ") +
                       "Takes effect after a reboot; Revert removes them.",
                     "Apply",
                     () =>
@@ -209,7 +211,7 @@ function Content() {
                 description="Recommended config is on. Press to revert it"
                 disabled={!!busy}
                 onClick={() =>
-                  confirm("Revert", "Remove the kernel options this plugin added? Takes effect after a reboot.", "Revert", () =>
+                  confirm("Revert", "Remove the kernel options this plugin added (only those)? Takes effect after a reboot.", "Revert", () =>
                     run("Kernel", async () => {
                       const r = await kernelRevert();
                       toast(r.ok ? "Reverted, reboot to finish" : r.log || "failed");
