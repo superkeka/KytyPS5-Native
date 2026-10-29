@@ -47,9 +47,7 @@ if [ "$KEEP_STEAM" = 0 ] && [ -z "${KYTYPS5_DETACHED:-}" ] && steam_unit_active;
 fi
 
 APPID=${SteamAppId:-${SteamGameId:-0}}
-front_appid=${APPID}
 if [ -n "${KYTYPS5_DETACHED:-}" ]; then
-	front_appid=424242
 	restore_steam() {
 		systemd-run --user --collect --quiet /bin/sh -c \
 			'systemctl --user unmask --runtime steam-launcher.service; systemctl --user start steam-launcher.service'
@@ -76,33 +74,24 @@ SCREEN=${SCREEN:-1920x1080}
 [ -n "${KYTYPS5_DETACHED:-}" ] && DISPLAY=$ROOT_DISPLAY xprop -root -f GAMESCOPE_XWAYLAND_MODE_CONTROL 32c \
 	-set GAMESCOPE_XWAYLAND_MODE_CONTROL "1,${SCREEN%x*},${SCREEN#*x},1" 2>/dev/null
 
-# What gamescope shows. Without Steam: the base layer app id. With Steam: the shortcut's app id on
-# every window of ours (gamescope only shows windows of the game Steam started).
-show() { # window id, app id
-	DISPLAY=$DISPLAY xprop -id "$1" -f STEAM_GAME 32c -set STEAM_GAME "$2" 2>/dev/null
+# What gamescope shows: Kyty sets the app id in KYTY_GAMESCOPE_APPID on its window (gamescope shows only
+# windows of the app in front). With Steam: the shortcut's app id. Without Steam: our own ids, and the
+# base layer on the root window (:0) picks the one in front.
+GAME_APPID=$APPID
+VIDEO_APPID=$APPID
+[ -n "${KYTYPS5_DETACHED:-}" ] && GAME_APPID=424242 VIDEO_APPID=424243
+front() {
 	[ -n "${KYTYPS5_DETACHED:-}" ] && DISPLAY=$ROOT_DISPLAY xprop -root -f GAMESCOPECTRL_BASELAYER_APPID 32co \
-		-set GAMESCOPECTRL_BASELAYER_APPID "$2" 2>/dev/null
+		-set GAMESCOPECTRL_BASELAYER_APPID "$1" 2>/dev/null
 }
-find_window() { # name regex, pid to watch
-	local wid=""
-	for _ in $(seq 1 600); do
-		wid=$(xdotool search --name "$1" 2>/dev/null | head -1)
-		[ -n "$wid" ] && break
-		kill -0 "$2" 2>/dev/null || break
-		sleep 0.1
-	done
-	echo "$wid"
-}
+# Present while a video plays: the game is not brought back in front over it.
+VIDEO_FLAG=$SHARE/.video
 play_video() {
 	[ -f "$1" ] || return 0
-	"$EMU" --play-video "$1" >> "$LOG" 2>&1 &
-	local pid=$!
-	local wid
-	wid=$(find_window '^KytyPS5-Native video$' $pid)
-	if [ -n "$wid" ]; then
-		if [ -n "${KYTYPS5_DETACHED:-}" ]; then show "$wid" 424243; else show "$wid" "$APPID"; fi
-	fi
-	wait $pid
+	touch "$VIDEO_FLAG"
+	front "$VIDEO_APPID"
+	KYTY_GAMESCOPE_APPID=$VIDEO_APPID "$EMU" --play-video "$1" >> "$LOG" 2>&1
+	rm -f "$VIDEO_FLAG"
 }
 
 cd "$SHARE/data"
@@ -138,30 +127,27 @@ done
 [ -n "$NOTICE_TITLES" ] && export KYTY_NOTICE_TITLE="$NOTICE_TITLES" KYTY_NOTICE_TEXT="$NOTICE_TEXTS"
 
 MARKER=$SHARE/data/.exit-$TITLE
-rm -f "$MARKER"
+rm -f "$MARKER" "$VIDEO_FLAG"
+front "$GAME_APPID"
 {
 	echo "== $(date) $GAME"
-	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" "$EMU" --game "$GAME" \
+	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" KYTY_GAMESCOPE_APPID=$GAME_APPID "$EMU" --game "$GAME" \
 		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen
 	echo "== exit=$?"
 } >> "$LOG" 2>&1 &
 EMUPID=$!
 # The exit video starts as soon as the user leaves from the menu, while the game shuts down.
 ( while :; do
-	[ -e "$MARKER" ] && { rm -f "$MARKER"; play_video "$CONFIG/exit.webm"; break; }
+	[ -e "$MARKER" ] && { play_video "$CONFIG/exit.webm"; rm -f "$MARKER"; break; }
 	kill -0 $EMUPID 2>/dev/null || break
 	sleep 0.1
 done ) &
 WATCH=$!
-GAME_WID=$(find_window "$TITLE" $EMUPID)
-if [ -n "$GAME_WID" ]; then
-	show "$GAME_WID" "$front_appid"
-	# Without Steam nothing else sets the base layer; keep the game in front until a video takes it.
-	while kill -0 $EMUPID 2>/dev/null; do
-		sleep 2
-		[ -n "${KYTYPS5_DETACHED:-}" ] && [ ! -e "$MARKER" ] && ! xdotool search --name '^KytyPS5-Native video$' >/dev/null 2>&1 &&
-			show "$GAME_WID" 424242
-	done
-fi
+# Without Steam nothing else sets the base layer; keep the game in front unless the user left or a
+# video plays.
+while kill -0 $EMUPID 2>/dev/null; do
+	sleep 2
+	[ ! -e "$MARKER" ] && [ ! -e "$VIDEO_FLAG" ] && front "$GAME_APPID"
+done
 wait $EMUPID
 wait $WATCH

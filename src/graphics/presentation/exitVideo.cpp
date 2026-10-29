@@ -15,6 +15,10 @@ extern "C" {
 #include <cstdlib>
 #include <thread>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
 namespace Libs::Graphics {
 
 namespace {
@@ -69,6 +73,7 @@ int PlayExitVideo(const char* path) {
 		return 1;
 	}
 	SDL_Window*   window   = SDL_CreateWindow("KytyPS5-Native video", 1280, 720, SDL_WINDOW_FULLSCREEN);
+	MarkGamescopeWindow(window);
 	// Vulkan, as the game: under gamescope with Steam unloaded an OpenGL window stays black.
 	SDL_Renderer* renderer = window != nullptr ? SDL_CreateRenderer(window, "vulkan") : nullptr;
 	if (renderer == nullptr && window != nullptr) {
@@ -193,6 +198,42 @@ int PlayExitVideo(const char* path) {
 	SDL_Quit();
 	avformat_close_input(&format);
 	return 0;
+}
+
+void MarkGamescopeWindow(SDL_Window* window) {
+#if defined(__linux__)
+	const char* appid = std::getenv("KYTY_GAMESCOPE_APPID");
+	if (window == nullptr || appid == nullptr || *appid == '\0') {
+		return;
+	}
+	const SDL_PropertiesID props   = SDL_GetWindowProperties(window);
+	void*                  display = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
+	const auto             xid     = static_cast<unsigned long>(SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0));
+	if (display == nullptr || xid == 0) {
+		return;
+	}
+	// SDL's X11 backend has libX11 loaded already.
+	void* x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_NOLOAD);
+	if (x11 == nullptr) {
+		return;
+	}
+	using InternAtom     = unsigned long (*)(void*, const char*, int);
+	using ChangeProperty = int (*)(void*, unsigned long, unsigned long, unsigned long, int, int, const unsigned char*, int);
+	using Flush          = int (*)(void*);
+	auto intern          = reinterpret_cast<InternAtom>(dlsym(x11, "XInternAtom"));
+	auto change          = reinterpret_cast<ChangeProperty>(dlsym(x11, "XChangeProperty"));
+	auto flush           = reinterpret_cast<Flush>(dlsym(x11, "XFlush"));
+	if (intern != nullptr && change != nullptr && flush != nullptr) {
+		// Format 32 data is an array of long; XA_CARDINAL is 6, PropModeReplace 0.
+		const long value = std::strtol(appid, nullptr, 10);
+		change(display, xid, intern(display, "STEAM_GAME", 0), 6, 32, 0, reinterpret_cast<const unsigned char*>(&value), 1);
+		flush(display);
+		std::fprintf(stderr, "gamescope: window 0x%lx is app %ld\n", xid, value);
+	}
+	dlclose(x11);
+#else
+	(void)window;
+#endif
 }
 
 void MarkUserExit() {
