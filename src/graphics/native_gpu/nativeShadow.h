@@ -24,6 +24,10 @@
 
 namespace Libs::Graphics::NativeGpu {
 
+// On the PS5's APU (BC-250, PS5 under Linux) turns native mode on unless the switches are set by hand
+// or KYTY_NATIVE_GPU=0 (nativeDefaults.cpp). Called first in main.
+void ApplyNativeDefaults();
+
 // Translates and natively submits one guest DCB in shadow mode. Does nothing unless enabled. On a
 // GPU timeout or context reset it disables itself for the rest of the run.
 void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
