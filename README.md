@@ -1,6 +1,6 @@
 # KytyPS5-bc250
 
-A fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) that runs PS5 games' GPU work natively on the
+A fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) that runs PS5 games GPU work natively on the
 AMD BC-250. The BC-250 has the PS5's GPU silicon (gfx1013, "Oberon"), so the title's command buffers
 run on the hardware after a light translation, and its shaders run with small patches. Vulkan stays for
 presentation and as a fallback.
@@ -11,21 +11,31 @@ presentation and as a fallback.
 
 ## Status
 
-| Game | Native |
-|---|---|
-| Gran Turismo 7 | 60 fps in races |
-| ASTRO BOT | levels playable |
-| Stray | 60 fps |
-| My First Gran Turismo | 60 fps |
-| Dead Cells | 60 fps |
-
-## Screenshots
-
 <table align="center">
   <tr>
     <td align="center">
-      <strong>ASTRO BOT</strong><br>
-      <img src="docs/screenshots/bc250-astro-bot.jpg" width="600" alt="ASTRO BOT running natively on the BC-250">
+      <strong>Gran Turismo 7</strong> (60 fps in races)<br>
+      <img src="docs/screenshots/bc250-gran-turismo-7.jpg" width="300" alt="Gran Turismo 7 running natively on the BC-250">
+    </td>
+    <td align="center">
+      <strong>ASTRO BOT</strong> (levels playable)<br>
+      <img src="docs/screenshots/bc250-astro-bot.jpg" width="300" alt="ASTRO BOT running natively on the BC-250">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>Stray</strong> (60 fps)<br>
+      <img src="docs/screenshots/bc250-stray.jpg" width="300" alt="Stray running natively on the BC-250">
+    </td>
+    <td align="center">
+      <strong>My First Gran Turismo</strong> (60 fps)<br>
+      <img src="docs/screenshots/bc250-my-first-gran-turismo.jpg" width="300" alt="My First Gran Turismo running natively on the BC-250">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>Dead Cells</strong> (60 fps)<br>
+      <img src="docs/screenshots/bc250-dead-cells.jpg" width="300" alt="Dead Cells running natively on the BC-250">
     </td>
   </tr>
 </table>
