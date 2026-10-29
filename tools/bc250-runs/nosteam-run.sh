@@ -20,4 +20,5 @@ if [ "$(systemctl --user is-active steam-launcher.service)" = active ] && [ "${s
 fi
 systemctl --user mask --runtime steam-launcher.service
 systemctl --user stop steam-launcher.service
-/home/deck/dev/kyty-runs/game-run.sh "$@"
+# Boot and exit videos when they are there (game-run.sh).
+KYTY_VIDEOS=${KYTY_VIDEOS:-1} /home/deck/dev/kyty-runs/game-run.sh "$@"

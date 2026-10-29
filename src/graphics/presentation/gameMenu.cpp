@@ -1,6 +1,7 @@
 #include "graphics/presentation/gameMenu.h"
 
 #include "graphics/native_gpu/nativeShadow.h"
+#include "graphics/presentation/exitVideo.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "imgui.h"
 
@@ -82,6 +83,7 @@ void Activate(const MenuState& state) {
 	}
 	if (state.selected == ConfirmExitGame) {
 		SetState({});
+		MarkUserExit();
 		LeaveGame();
 	} else {
 		SetState({Page::Main, ItemExit});

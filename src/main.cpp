@@ -8,6 +8,7 @@
 #include "common/virtualMemory.h"
 #include "emulator.h"
 #include "graphics/native_gpu/nativeShadow.h"
+#include "graphics/presentation/exitVideo.h"
 #include "kytyGitVersion.h"
 
 #include <algorithm>
@@ -438,6 +439,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
+	if (argc == 3 && std::string_view(argv[1]) == "--play-video") {
+		return Libs::Graphics::PlayExitVideo(argv[2]);
+	}
 	Libs::Graphics::NativeGpu::ApplyNativeDefaults();
 	VirtualMemory::Init();
 	InitializeThreads();
