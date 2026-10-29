@@ -1600,8 +1600,11 @@ public:
 				             static_cast<double>(g_dcb_queued_us.exchange(0, std::memory_order_relaxed)) / 1e3 / jobs);
 			}
 			if (m_stream_chunks != 0 || m_stream_fallbacks != 0) {
-				std::fprintf(stderr, "native shadow: streamed DCB chunks so far: %llu, chains ended early for want of a slot: %llu\n",
-				             static_cast<unsigned long long>(m_stream_chunks), static_cast<unsigned long long>(m_stream_fallbacks));
+				std::fprintf(stderr,
+				             "native shadow: streamed DCB chunks so far: %llu, chains ended early for want of a slot: %llu, "
+				             "%.1f ms waited for the CP to free a trampoline\n",
+				             static_cast<unsigned long long>(m_stream_chunks), static_cast<unsigned long long>(m_stream_fallbacks),
+				             m_stream_wait_s * 1e3);
 			}
 			static const char* const kReason[kHoldReasons] = {"cross-ring unsubmitted", "write does not satisfy", "CPU writer",
 			                                                  "partial cover", "no writer yet", "no native form"};
@@ -2114,9 +2117,16 @@ public:
 		}
 		if (!m_stream_ready) {
 			*reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamFlagOffset) = 0;
+			*reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamDoneOffset) = 0;
 			__sync_synchronize();
 			m_stream_counter = 0;
 			m_stream_ready   = true;
+		}
+		if (m_stream != StreamState::Off) {
+			// The previous DCB's chain is still open (its last pieces held back): end it here, or its CP
+			// would follow a trampoline the new stream reuses.
+			m_stream_final = true;
+			StreamFlushLocked(m_acb_rings ? m_ring_batch[0] : m_batch);
 		}
 		m_stream       = StreamState::Head;
 		m_stream_final = false;
@@ -2706,9 +2716,34 @@ private:
 		ib.push_back(8u | (1u << 20u) | (1u << 23u));        // 8 dwords, CHAIN, VALID
 	}
 	static uint32_t StreamTrampOffset(uint32_t n) { return kStreamTrampOffset + 32u * (n % kStreamTramps); }
+	// The first packet of chunk `n` in a stream: the CP notes it has left trampoline `n` behind
+	// (PublishStreamLocked reuses a trampoline only once the CP is past it).
+	void AppendStreamDoneLocked(std::vector<uint32_t>& ib, uint32_t n) const {
+		const uint64_t done = m_submitter->ScratchVa() + kStreamDoneOffset;
+		ib.push_back(StatPkt3(0x37, 4));                     // WRITE_DATA
+		ib.push_back((5u << 8u) | (1u << 30u));              // memory, PFP
+		ib.push_back(static_cast<uint32_t>(done));
+		ib.push_back(static_cast<uint32_t>(done >> 32u));
+		ib.push_back(n);
+	}
 	// Trampoline `n` chains to `len` dwords at `va` (or is empty: the chain ends), then the counter lets the
-	// CP past the wait for it.
+	// CP past the wait for it. The CPU translates far ahead of the GPU (Stray: well over kStreamTramps
+	// chunks), so first it waits until the CP has left behind the chunk that last used this trampoline;
+	// overwritten early, the CP followed the newer chain and the gfx ring hung.
 	void PublishStreamLocked(uint32_t n, uint64_t va, size_t len) {
+		const auto* done = reinterpret_cast<const volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamDoneOffset);
+		if (n > kStreamTramps) {
+			const double t0 = NowSecShadow();
+			while (static_cast<int32_t>(*done - (n - kStreamTramps)) < 0) {
+				if (NowSecShadow() - t0 > m_timeout_sec) {
+					break; // a hung ring: its timeout disables the path anyway
+				}
+				struct timespec nap = {0, 50000};
+				nanosleep(&nap, nullptr);
+			}
+			const double waited = NowSecShadow() - t0;
+			m_stream_wait_s += waited;
+		}
 		auto* t = reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + StreamTrampOffset(n));
 		uint32_t k = 0;
 		if (va != 0) {
@@ -2748,7 +2783,9 @@ private:
 		}
 		// A buffer created since the head CS is not in its BO list: end the chain there.
 		const bool end = m_stream_final || m_disabled || m_gem->CreatedHandles().size() != m_stream_handles;
-		std::vector<uint32_t> ib = std::move(batch);
+		std::vector<uint32_t> ib;
+		AppendStreamDoneLocked(ib, m_stream_pending); // also in an empty chunk, or PublishStreamLocked would wait for it
+		ib.insert(ib.end(), batch.begin(), batch.end());
 		batch.clear();
 		const size_t content = ib.size();
 		uint32_t     next    = 0;
@@ -3646,8 +3683,10 @@ private:
 	size_t      m_stream_handles    = 0;
 	uint64_t    m_stream_chunks     = 0;
 	uint64_t    m_stream_fallbacks  = 0;
+	double      m_stream_wait_s     = 0.0;    // spent waiting for the CP to free a trampoline
 	// The stream counter and its trampolines, in the scratch page past the samples and tracker slots.
 	static constexpr uint32_t kStreamFlagOffset  = 2048;
+	static constexpr uint32_t kStreamDoneOffset  = 2052; // the last chunk the CP has entered
 	static constexpr uint32_t kStreamTrampOffset = 2112;
 	static constexpr uint32_t kStreamTramps      = 60;
 	// Per-ring batches and the last fence on each (KYTY_NATIVE_GPU_ACB_RINGS). Slot 0 is gfx.
@@ -4372,6 +4411,11 @@ private:
 		// streamed IB (Shadow::StreamBegin).
 		static const bool stream = !EnvIs("KYTY_NATIVE_GPU_CHUNK_STREAM", "0");
 		if (stream) {
+			// Another chunked DCB of the same round (Stray submits several a flip) still has its chain open:
+			// its last pieces go into it first, which ends it.
+			if (Shadow::Instance().StreamActive()) {
+				PumpAndFlush();
+			}
 			Shadow::Instance().StreamBegin();
 		}
 		struct StreamEnd {
