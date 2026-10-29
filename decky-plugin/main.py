@@ -25,8 +25,8 @@ KYTY_DIR = os.path.join(SHARE, "kyty")
 CONFIG_DIR = os.path.join(HOME, ".config/KytyPS5-Native")
 SETTINGS = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
 ART_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "art")
-# Present (holding the release tag) while a newer release is out: the panel shows it, and the launch
-# wrapper has Kyty say so when a game starts.
+# Present (holding the release tag) while a newer release is out: the launch wrapper has Kyty say so
+# when a game starts.
 UPDATE_FLAG = os.path.join(CONFIG_DIR, "update-available")
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
 VIDEOS = {
@@ -241,9 +241,6 @@ class Plugin:
         while True:
             await self.latest_release()
             await asyncio.sleep(6 * 3600)
-
-    async def update_flag(self):
-        return _read(UPDATE_FLAG)
 
     # The videos are on by default: fetched once, unless the user turned one off. A few tries, the
     # network may come up after Decky.
