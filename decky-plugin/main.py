@@ -163,6 +163,17 @@ def _ostree_kargs(tool):
     return dict(a.split("=", 1) if "=" in a else (a, "") for a in out.split())
 
 
+def _kernel_method():
+    """How the kernel config is set here: SteamOS (GRUB snippet and modprobe file, tested on the
+    BC-250), rpm-ostree (Bazzite: kernel arguments, tested on Fedora CoreOS), or not at all: other
+    systems set it by hand (README)."""
+    if _rpm_ostree():
+        return "rpm-ostree"
+    if re.search(r"^ID=\"?steamos\"?$", _read("/etc/os-release"), re.M):
+        return "files"
+    return "unsupported"
+
+
 # The kernel argument for each setting. On rpm-ostree systems all of them are kernel arguments: amdgpu
 # may load from an initramfs built without /etc/modprobe.d (Bazzite's docs say the same).
 KARG_NAMES = {"gtt": "ttm.pages_limit", **{k: f"amdgpu.{k}" for k in AMDGPU}}
@@ -202,7 +213,7 @@ def _kernel_status():
         it["reverting"] = reverted and it["ok"] and it["configured"] != it["want"]
     return {
         "items": items,
-        "method": "rpm-ostree" if ostree else "files",
+        "method": _kernel_method(),
         "ours": bool(_load().get("ostree_kargs")) if ostree else
                 os.path.exists(GRUB_CFG) or os.path.exists(MODPROBE_CONF),
         "reboot": any(it["pending"] or it["reverting"] for it in items),
@@ -446,6 +457,8 @@ class Plugin:
 
     async def kernel_apply(self):
         def work():
+            if _kernel_method() == "unsupported":
+                return {"ok": False, "log": "kernel config is not supported on this OS"}
             log = []
             st = _kernel_status()
             ostree = _rpm_ostree()
@@ -496,6 +509,8 @@ class Plugin:
 
     async def kernel_revert(self):
         def work():
+            if _kernel_method() == "unsupported":
+                return {"ok": False, "log": "kernel config is not supported on this OS"}
             log = []
             if os.path.exists(MODPROBE_CONF):
                 os.remove(MODPROBE_CONF)

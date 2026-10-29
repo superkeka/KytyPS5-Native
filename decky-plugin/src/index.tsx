@@ -39,7 +39,7 @@ interface State {
   games: Game[];
   gone: Record<string, { appid: number }>;
   videos: Record<string, boolean>;
-  kernel: { items: KernelItem[]; method: "files" | "rpm-ostree"; ours: boolean; reboot: boolean; all_ok: boolean };
+  kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
   game_running: boolean;
 }
 
@@ -171,7 +171,11 @@ function Content() {
         )}
         {state.ps5_apu && (
           <PanelSectionRow>
-            {state.kernel.reboot ? (
+            {state.kernel.method === "unsupported" ? (
+              <ButtonItem layout="below" description="Not supported on this OS: set it by hand (README)" disabled>
+                Kernel config
+              </ButtonItem>
+            ) : state.kernel.reboot ? (
               <ButtonItem
                 layout="below"
                 description="Reboot to apply the new config"
