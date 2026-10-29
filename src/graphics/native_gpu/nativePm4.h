@@ -753,6 +753,10 @@ public:
 	void SetDrawLog(bool on) { m_draw_log = on; }
 	// Residency at map time (GemBacking::ResidencyAtMap): no per-draw references are collected.
 	void SetCollectRefs(bool on) { m_collect_refs = on; }
+	// Translate builds the first segment's preamble from the state where the buffer starts (the previous
+	// buffer's end) instead of the committed one (where it ends): a chunk of a DCB carries on where the
+	// previous chunk left the registers, and its first draws are drawn with that state.
+	void SetPreambleFromStart(bool on) { m_preamble_from_start = on; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
 	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
@@ -835,6 +839,7 @@ private:
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
 	bool                         m_compute_ring   = false;
+	bool                         m_preamble_from_start = false; // SetPreambleFromStart
 	Pm4Translator(const Pm4Translator&) = default; // Clone
 	uint32_t                     m_direct_min_dw  = 0;
 	uint64_t                     m_time_span_va   = 0;

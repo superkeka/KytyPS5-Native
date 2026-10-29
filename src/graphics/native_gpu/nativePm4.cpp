@@ -3599,7 +3599,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	}
 
 	// Pass succeeded: commit the shadow, build the IB (preamble from the committed shadow, then the
-	// translated body), and return.
+	// translated body), and return. SetPreambleFromStart keeps the state where the buffer starts for it.
+	RegFile start_cx, start_sh, start_uc;
+	if (m_preamble_from_start) {
+		start_cx = m_cx;
+		start_sh = m_sh;
+		start_uc = m_uc;
+	}
 	m_cx        = std::move(cx);
 	m_saved_cx  = std::move(saved_cx);
 	m_cx_pushed = cx_pushed;
@@ -3664,7 +3670,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			Pm4Segment& s = segs[k];
 			s.begin       = static_cast<uint32_t>(r.ib.size());
 			if (k == 0) {
-				EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
+				if (m_preamble_from_start) {
+					EmitPreamble(r.ib, stats, start_cx, start_sh, start_uc, cp_start);
+				} else {
+					EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
+				}
 			} else {
 				r.ib.insert(r.ib.end(), seg_pre[k].begin(), seg_pre[k].end());
 			}
