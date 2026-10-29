@@ -366,9 +366,13 @@ def _sce_sys(path, name):
         try:
             p = subprocess.run([os.path.join(KYTY_DIR, "kyty_emulator"), "--zar-cat", path, "sce_sys/" + name],
                                capture_output=True, timeout=60)
-            _zar_files[key] = p.stdout if p.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as e:
+            decky.logger.error("%s %s: %s", path, name, e)
             return None
+        if p.returncode != 0:
+            decky.logger.error("%s %s: %s", path, name, p.stderr.decode(errors="replace").strip()[-300:])
+            return None
+        _zar_files[key] = p.stdout
     return _zar_files[key]
 
 
@@ -379,21 +383,40 @@ def _scan(folder):
     except OSError:
         return games
     seen = set()
+    s = _load()
+    # What each archive held when it was last read: a .zar that cannot be read for a moment (Kyty being
+    # updated) stays a game, its shortcut is not taken for one of a removed game.
+    zars = s.get("zar_meta", {})
+    zars_before = dict(zars)
     # Folders first: a game both unpacked and packed shows once, as the folder.
     for e in sorted(entries, key=lambda e: e.endswith(".zar")):
         path = os.path.join(folder, e)
-        if e.endswith(".zar") != os.path.isfile(path):
+        zar = e.endswith(".zar")
+        if zar != os.path.isfile(path):
             continue
         try:
             param = json.loads(_sce_sys(path, "param.json") or b"")
         except ValueError:
+            param = None
+        if param is not None:
+            tid, name = param.get("titleId") or e.removesuffix(".zar"), _title(param)
+            if zar:
+                zars[path] = {"title_id": tid, "name": name}
+        elif zar and path in zars:
+            tid, name = zars[path]["title_id"], zars[path]["name"]
+        else:
             continue
-        tid = param.get("titleId") or e.removesuffix(".zar")
         if tid in seen:
             continue
         seen.add(tid)
-        games.append({"title_id": tid, "name": _title(param) or tid, "path": path, "size": _size(path),
+        games.append({"title_id": tid, "name": name or tid, "path": path, "size": _size(path),
                       "icon": _icon(path, tid)})
+    zars = {p: m for p, m in zars.items() if os.path.exists(p)}
+    if zars != zars_before:
+        # Read again: a shortcut saved meanwhile (set_game) stays.
+        s = _load()
+        s["zar_meta"] = zars
+        _save(s)
     return games
 
 
