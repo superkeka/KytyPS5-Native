@@ -1446,6 +1446,10 @@ public:
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_translator.SetPreambleFromStart(on);
 	}
+	void SetNoPreamble(bool on) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_translator.SetNoPreamble(on);
+	}
 	void NoteGuestDcb() {
 		const double now = NowSecShadow();
 		m_trace_guest_dcb.store(now, std::memory_order_relaxed);
@@ -1594,6 +1598,10 @@ public:
 				             static_cast<double>(g_dcb_guest_dw.exchange(0, std::memory_order_relaxed)) / jobs,
 				             static_cast<double>(g_dcb_chunked.exchange(0, std::memory_order_relaxed)) / m_flips,
 				             static_cast<double>(g_dcb_queued_us.exchange(0, std::memory_order_relaxed)) / 1e3 / jobs);
+			}
+			if (m_stream_chunks != 0 || m_stream_fallbacks != 0) {
+				std::fprintf(stderr, "native shadow: streamed DCB chunks so far: %llu, chains ended early for want of a slot: %llu\n",
+				             static_cast<unsigned long long>(m_stream_chunks), static_cast<unsigned long long>(m_stream_fallbacks));
 			}
 			static const char* const kReason[kHoldReasons] = {"cross-ring unsubmitted", "write does not satisfy", "CPU writer",
 			                                                  "partial cover", "no writer yet", "no native form"};
@@ -2076,6 +2084,9 @@ public:
 	}
 	void FlushBatch() {
 		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_stream != StreamState::Off) {
+			StreamFlushLocked(m_acb_rings ? m_ring_batch[0] : m_batch);
+		}
 		if (!m_acb_rings) {
 			SubmitBatchLocked();
 			return;
@@ -2085,6 +2096,38 @@ public:
 		for (uint32_t slot = 0; slot < kTrackerSlots; slot++) {
 			SubmitBufferLocked(m_ring_batch[slot], slot);
 		}
+	}
+
+	// Stream mode (chunked DCBs, KYTY_NATIVE_GPU_CHUNK_STREAM unless =0): the chunks of one DCB run as one
+	// IB, the way the PS5's CP runs a title's chained command buffer as the title writes it. The first
+	// chunk goes in a CS and ends with a WAIT_REG_MEM (PFP) on a counter in the scratch page and an
+	// INDIRECT_BUFFER chain to a trampoline there. Each later chunk is copied to a free slot, the
+	// trampoline gets a chain to it with its exact size, and the counter is raised: the CP, waiting
+	// already, carries on with no preamble, no context switch and no new job. The last chunk ends the
+	// chain (an empty trampoline), the CP returns to the ring and the CS's fence follows.
+	// StreamBegin before the first chunk's flush; StreamFinal once the DCB is translated, so the next
+	// flush ends the chain; StreamActive tells the worker it must still flush to end it.
+	void StreamBegin() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_submitter == nullptr || !m_submitter->Async()) {
+			return;
+		}
+		if (!m_stream_ready) {
+			*reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamFlagOffset) = 0;
+			__sync_synchronize();
+			m_stream_counter = 0;
+			m_stream_ready   = true;
+		}
+		m_stream       = StreamState::Head;
+		m_stream_final = false;
+	}
+	void StreamFinal() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_stream_final = m_stream != StreamState::Off;
+	}
+	bool StreamActive() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		return m_stream != StreamState::Off;
 	}
 
 	// Waits for the last CS submitted to tracker `slot`. True when that ring is idle (or nothing was
@@ -2644,6 +2687,101 @@ private:
 		return target;
 	}
 #endif
+
+	// The CP waits (PFP, so it parses nothing past it) until the stream counter reaches `n`, then chains
+	// to trampoline `n`, 8 dwords that PublishStreamLocked fills.
+	void AppendStreamWaitLocked(std::vector<uint32_t>& ib, uint32_t n) const {
+		const uint64_t flag  = m_submitter->ScratchVa() + kStreamFlagOffset;
+		const uint64_t tramp = m_submitter->ScratchVa() + StreamTrampOffset(n);
+		ib.push_back(StatPkt3(0x3c, 6));                     // WAIT_REG_MEM
+		ib.push_back(5u | (1u << 4u) | (1u << 8u));          // greater or equal, memory, PFP
+		ib.push_back(static_cast<uint32_t>(flag));
+		ib.push_back(static_cast<uint32_t>(flag >> 32u));
+		ib.push_back(n);
+		ib.push_back(0xffffffffu);
+		ib.push_back(4u);                                    // poll interval
+		ib.push_back(StatPkt3(0x3f, 3));                     // INDIRECT_BUFFER
+		ib.push_back(static_cast<uint32_t>(tramp));
+		ib.push_back(static_cast<uint32_t>(tramp >> 32u) & 0xffffu);
+		ib.push_back(8u | (1u << 20u) | (1u << 23u));        // 8 dwords, CHAIN, VALID
+	}
+	static uint32_t StreamTrampOffset(uint32_t n) { return kStreamTrampOffset + 32u * (n % kStreamTramps); }
+	// Trampoline `n` chains to `len` dwords at `va` (or is empty: the chain ends), then the counter lets the
+	// CP past the wait for it.
+	void PublishStreamLocked(uint32_t n, uint64_t va, size_t len) {
+		auto* t = reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + StreamTrampOffset(n));
+		uint32_t k = 0;
+		if (va != 0) {
+			t[k++] = StatPkt3(0x3f, 3);
+			t[k++] = static_cast<uint32_t>(va);
+			t[k++] = static_cast<uint32_t>(va >> 32u) & 0xffffu;
+			t[k++] = static_cast<uint32_t>(len) | (1u << 20u) | (1u << 23u);
+		}
+		while (k < 8) {
+			t[k++] = 0xffff1000u;
+		}
+		__sync_synchronize();
+		*reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamFlagOffset) = n;
+		__sync_synchronize();
+	}
+	void StreamFlushLocked(std::vector<uint32_t>& batch) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_stream == StreamState::Head) {
+			if (m_stream_final || m_disabled || batch.empty()) {
+				m_stream = StreamState::Off; // nothing to stream: an ordinary CS
+				return;
+			}
+			const uint32_t n = ++m_stream_counter;
+			AppendStreamWaitLocked(batch, n);
+			const uint64_t before = m_last_seq;
+			SubmitBufferLocked(batch, 0);
+			if (m_disabled || m_last_seq == before) {
+				m_stream = StreamState::Off; // the CS never ran: no CP waits for the trampoline
+				return;
+			}
+			m_stream_head_seq = m_last_seq;
+			m_stream_handles  = m_gem->CreatedHandles().size();
+			m_stream_pending  = n;
+			m_stream          = StreamState::Cont;
+			m_stream_chunks++;
+			return;
+		}
+		// A buffer created since the head CS is not in its BO list: end the chain there.
+		const bool end = m_stream_final || m_disabled || m_gem->CreatedHandles().size() != m_stream_handles;
+		std::vector<uint32_t> ib = std::move(batch);
+		batch.clear();
+		const size_t content = ib.size();
+		uint32_t     next    = 0;
+		if (!end) {
+			next = m_stream_counter + 1;
+			AppendStreamWaitLocked(ib, next);
+		}
+		while ((ib.size() & 7u) != 0) {
+			ib.push_back(0xffff1000u);
+		}
+		const uint64_t va = ib.empty() ? 0 : m_submitter->WriteStreamIb(ib, m_stream_head_seq, SlotTarget(0));
+		if (!ib.empty() && va == 0) {
+			// No free slot (or too long for one): end the chain and send this part as a CS of its own,
+			// which the ring runs after the head's.
+			PublishStreamLocked(m_stream_pending, 0, 0);
+			m_stream = StreamState::Off;
+			ib.resize(content);
+			batch = std::move(ib);
+			m_stream_fallbacks++;
+			return;
+		}
+		PublishStreamLocked(m_stream_pending, va, ib.size());
+		m_stream_chunks++;
+		if (end) {
+			m_stream = StreamState::Off;
+		} else {
+			m_stream_counter = next;
+			m_stream_pending = next;
+		}
+#else
+		(void)batch;
+#endif
+	}
 
 	void SubmitBufferLocked(std::vector<uint32_t>& batch, uint32_t slot) {
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -3498,6 +3636,20 @@ private:
 	uint32_t      m_cpu_labels_logged = 0;
 	std::set<uint64_t> m_cpu_label_pages;
 	std::vector<uint32_t> m_batch;
+	enum class StreamState { Off, Head, Cont };
+	StreamState m_stream            = StreamState::Off;
+	bool        m_stream_final      = false;
+	bool        m_stream_ready      = false;  // the counter in the scratch page has been zeroed
+	uint32_t    m_stream_counter    = 0;      // the last value the CP has been or will be told to wait for
+	uint32_t    m_stream_pending    = 0;      // the trampoline the CP waits for now
+	uint64_t    m_stream_head_seq   = 0;
+	size_t      m_stream_handles    = 0;
+	uint64_t    m_stream_chunks     = 0;
+	uint64_t    m_stream_fallbacks  = 0;
+	// The stream counter and its trampolines, in the scratch page past the samples and tracker slots.
+	static constexpr uint32_t kStreamFlagOffset  = 2048;
+	static constexpr uint32_t kStreamTrampOffset = 2112;
+	static constexpr uint32_t kStreamTramps      = 60;
 	// Per-ring batches and the last fence on each (KYTY_NATIVE_GPU_ACB_RINGS). Slot 0 is gfx.
 	struct SlotFence {
 		uint64_t seq     = 0;
@@ -3923,6 +4075,11 @@ private:
 		const char* v = std::getenv("KYTY_NATIVE_GPU_CHUNK_DW");
 		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
 	}();
+	// KYTY_NATIVE_GPU_CHUNK=guest: a graphics buffer is cut where the title's own segments meet (the
+	// buffers its DCB calls or chains to, as it wrote them), as the PS5's CP crosses from one to the next,
+	// not at a fixed size. Segments shorter than kGuestChunkMin dwords join the next one.
+	bool m_chunk_guest = EnvIs("KYTY_NATIVE_GPU_CHUNK", "guest");
+	static constexpr uint32_t kGuestChunkMin = 1024;
 	uint64_t                   m_chunks         = 0;
 	uint32_t                   m_chunk_refused  = 0;
 	std::map<uint32_t, double> m_hold_since; // queue -> when its front piece was first found held
@@ -4057,6 +4214,12 @@ private:
 				m_last_cs.store(Shadow::Instance().TakeLastSeq(), std::memory_order_release);
 				m_appended = false;
 			}
+			// A streamed DCB's chain must end even when the last pump added nothing: the CP waits for it.
+			if (Shadow::Instance().StreamActive()) {
+				Shadow::Instance().FlushBatch();
+				m_batch++;
+				m_last_cs.store(Shadow::Instance().TakeLastSeq(), std::memory_order_release);
+			}
 		}
 	}
 
@@ -4082,7 +4245,8 @@ private:
 		}
 		// The size that matters is the inlined one: a title's DCB is often a few dwords of INDIRECT_BUFFER
 		// calls (GT7: 25 dwords standing for ~100K).
-		if (job.buffer != nullptr && m_native && job.queue == 0 && m_chunk_dw != 0 && TranslateChunks(job, done, queue)) {
+		if (job.buffer != nullptr && m_native && job.queue == 0 && (m_chunk_dw != 0 || m_chunk_guest) &&
+		    TranslateChunks(job, done, queue)) {
 			return;
 		}
 		if (job.buffer == nullptr || !m_native ||
@@ -4141,7 +4305,8 @@ private:
 		std::vector<SourcePiece> source;
 		std::span<const uint32_t> whole(job.buffer, job.size_dw);
 		std::string               why;
-		if (FlattenIndirectBuffers(whole, &flat, &why, &source)) {
+		std::vector<uint32_t>     marks;
+		if (FlattenIndirectBuffers(whole, &flat, &why, &source, &marks)) {
 			whole = flat;
 		} else if (!why.empty()) {
 			// Not inlined (a REWIND the title has not validated yet, ...): the buffer goes the usual way,
@@ -4153,6 +4318,7 @@ private:
 		}
 		std::vector<std::pair<uint32_t, uint32_t>> chunks; // [begin, end) at packet boundaries
 		uint32_t                                   begin = 0, cond_until = 0;
+		size_t                                     next_mark = 0;
 		for (uint32_t dw = 0; dw < whole.size();) {
 			const uint32_t header = whole[dw];
 			const uint32_t size   = (header >> 30u) == 3u ? ((header >> 16u) & 0x3fffu) + 2u : 1u;
@@ -4160,7 +4326,12 @@ private:
 				cond_until = std::max(cond_until, dw + size + (whole[dw + 4] & 0x3fffu));
 			}
 			dw += size;
-			if (dw - begin >= m_chunk_dw && dw >= cond_until && dw < whole.size()) {
+			while (next_mark < marks.size() && marks[next_mark] < dw) {
+				next_mark++;
+			}
+			const bool at_cut = m_chunk_guest ? next_mark < marks.size() && marks[next_mark] == dw && dw - begin >= kGuestChunkMin
+			                                  : dw - begin >= m_chunk_dw;
+			if (at_cut && dw >= cond_until && dw < whole.size()) {
 				chunks.emplace_back(begin, dw);
 				begin = dw;
 			}
@@ -4197,6 +4368,20 @@ private:
 			PushPieces(r, done, queue);
 			return true;
 		}
+		// KYTY_NATIVE_GPU_CHUNK_STREAM=0: each chunk a CS of its own with a full preamble, instead of one
+		// streamed IB (Shadow::StreamBegin).
+		static const bool stream = !EnvIs("KYTY_NATIVE_GPU_CHUNK_STREAM", "0");
+		if (stream) {
+			Shadow::Instance().StreamBegin();
+		}
+		struct StreamEnd {
+			bool on;
+			~StreamEnd() {
+				if (on) {
+					Shadow::Instance().StreamFinal();
+				}
+			}
+		} stream_end {stream};
 		for (size_t c = 0; c < chunks.size(); c++) {
 			const auto [cb, ce] = chunks[c];
 			std::vector<SourcePiece> part;
@@ -4210,9 +4395,13 @@ private:
 			// Each chunk's preamble restores the registers as the previous chunk left them: the end state
 			// (what a whole DCB's preamble holds) gave the first draws of a chunk the targets and formats of
 			// its last ones, and GT7's first chunked frame hung with vertex waves stuck exporting.
+			// In a stream the chunks after the first carry on in the same IB: no preamble at all.
+			const bool continues = c > 0 && stream && Shadow::Instance().StreamActive();
 			Shadow::Instance().SetPreambleFromStart(true);
+			Shadow::Instance().SetNoPreamble(continues);
 			const bool ok = Shadow::Instance().Submit(whole.subspan(cb, ce - cb), false, &r, &part);
 			Shadow::Instance().SetPreambleFromStart(false);
+			Shadow::Instance().SetNoPreamble(false);
 			if (!ok || r.segments.empty()) {
 				if (c == 0) {
 					return false;

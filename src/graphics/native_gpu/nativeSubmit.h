@@ -272,6 +272,36 @@ public:
 	void SetAsync(bool async) { m_async = async; }
 	[[nodiscard]] bool Async() const { return m_async; }
 
+	// Streamed DCB (Shadow's stream mode): copies `ib` into a free slot (one whose submission has finished;
+	// none is waited for, since the submission still running may be the one whose CP waits for this very
+	// IB) and returns its VA, or 0 when no slot is free. The slot stays taken until `head_seq`, the CS
+	// whose IB chains into it, completes.
+	uint64_t WriteStreamIb(std::span<const uint32_t> ib, uint64_t head_seq, RingTarget target) {
+		if (!m_async || ib.size() * 4 > kSlotSize) {
+			return 0;
+		}
+		uint32_t slot = kSlots;
+		for (uint32_t i = 0; i < kSlots && slot == kSlots; i++) {
+			if (m_slot[i].seq == 0) {
+				slot = i;
+			}
+		}
+		for (uint32_t i = 0; i < kSlots && slot == kSlots; i++) {
+			if (WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target)) {
+				m_slot[i].seq = 0;
+				slot = i;
+			}
+		}
+		if (slot == kSlots) {
+			return 0;
+		}
+		std::memcpy(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize, ib.data(), ib.size() * 4);
+		m_slot[slot].seq    = head_seq;
+		m_slot[slot].target = target;
+		m_slot[slot].order  = ++m_slot_order;
+		return m_ib_va + slot * kSlotSize;
+	}
+
 	// Waits until every async submission so far has completed. Returns false on a timeout.
 	bool WaitIdle(double timeout_sec) {
 		for (SlotUse& slot: m_slot) {

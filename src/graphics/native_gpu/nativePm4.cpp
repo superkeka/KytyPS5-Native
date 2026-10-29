@@ -779,7 +779,7 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 namespace {
 // 1: inlined something, 0: nothing to inline, -1: cannot.
 int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int depth, std::string* why,
-                std::vector<SourcePiece>* pieces) {
+                std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
 	auto stop = [&](const char* what, size_t dw) {
 		if (why != nullptr && why->empty()) {
 			char text[160];
@@ -849,6 +849,9 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if (!flush(dw)) {
 				return stop("too large", dw);
 			}
+			if (marks != nullptr && depth == 0) {
+				marks->push_back(static_cast<uint32_t>(out->size()));
+			}
 			const uint32_t  base_dw = always_branch ? dw + 7u : dw; // the then target: address at dwords 8-9, size at 10
 			const uint32_t  control = in[base_dw + 3];
 			const auto*     target  = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[base_dw + 2]) << 32u) | (in[base_dw + 1] & ~3u));
@@ -878,8 +881,11 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if (depth >= 16) {
 				return stop("calls nested too deep", dw);
 			}
-			if (FlattenInto({target, size}, out, depth + 1, why, pieces) < 0) {
+			if (FlattenInto({target, size}, out, depth + 1, why, pieces, nullptr) < 0) {
 				return -1;
+			}
+			if (marks != nullptr && depth == 0) {
+				marks->push_back(static_cast<uint32_t>(out->size()));
 			}
 			dw += len;
 			run = dw;
@@ -895,12 +901,15 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 } // namespace
 
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why,
-                            std::vector<SourcePiece>* pieces) {
+                            std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
 	out->clear();
 	if (pieces != nullptr) {
 		pieces->clear();
 	}
-	if (FlattenInto(in, out, 0, why, pieces) <= 0) {
+	if (marks != nullptr) {
+		marks->clear();
+	}
+	if (FlattenInto(in, out, 0, why, pieces, marks) <= 0) {
 		out->clear();
 		if (pieces != nullptr) {
 			pieces->clear();
@@ -3670,7 +3679,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			Pm4Segment& s = segs[k];
 			s.begin       = static_cast<uint32_t>(r.ib.size());
 			if (k == 0) {
-				if (m_preamble_from_start) {
+				if (m_no_preamble) {
+				} else if (m_preamble_from_start) {
 					EmitPreamble(r.ib, stats, start_cx, start_sh, start_uc, cp_start);
 				} else {
 					EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);

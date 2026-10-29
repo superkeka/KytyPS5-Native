@@ -431,9 +431,10 @@ struct SourcePiece {
 	uint32_t len = 0;
 	uint64_t va  = 0;
 };
-// `pieces`, when given, gets where each stretch of `out` came from.
+// `pieces`, when given, gets where each stretch of `out` came from; `marks`, where in `out` each buffer the
+// top level calls or chains to begins and ends (the title's own segments of the command buffer).
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
-                            std::vector<SourcePiece>* pieces = nullptr);
+                            std::vector<SourcePiece>* pieces = nullptr, std::vector<uint32_t>* marks = nullptr);
 
 // What the backend knows about labels beyond the buffer being translated.
 class LabelOracle {
@@ -757,6 +758,8 @@ public:
 	// buffer's end) instead of the committed one (where it ends): a chunk of a DCB carries on where the
 	// previous chunk left the registers, and its first draws are drawn with that state.
 	void SetPreambleFromStart(bool on) { m_preamble_from_start = on; }
+	// No preamble at all: the buffer continues the previous one within the same IB (a streamed chunk).
+	void SetNoPreamble(bool on) { m_no_preamble = on; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
 	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
@@ -840,6 +843,7 @@ private:
 	bool                         m_compute_queue  = false;
 	bool                         m_compute_ring   = false;
 	bool                         m_preamble_from_start = false; // SetPreambleFromStart
+	bool                         m_no_preamble         = false; // SetNoPreamble
 	Pm4Translator(const Pm4Translator&) = default; // Clone
 	uint32_t                     m_direct_min_dw  = 0;
 	uint64_t                     m_time_span_va   = 0;
