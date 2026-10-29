@@ -98,6 +98,12 @@ play_video() {
 cd "$SHARE/data"
 play_video "$CONFIG/boot.webm"
 
+# The Decky plugin leaves this when a newer release is out: Kyty says so in its trophy toast.
+if [ -s "$CONFIG/update-available" ]; then
+	export KYTY_NOTICE_TITLE="KytyPS5-Native update available"
+	export KYTY_NOTICE_TEXT="$(head -1 "$CONFIG/update-available"): update it in the Decky plugin"
+fi
+
 MARKER=$SHARE/data/.exit-$TITLE
 rm -f "$MARKER"
 {

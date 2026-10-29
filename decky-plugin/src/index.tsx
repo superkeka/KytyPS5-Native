@@ -63,6 +63,25 @@ const kernelRevert = callable<[], Result>("kernel_revert");
 const reboot = callable<[], void>("reboot");
 const setGamesDir = callable<[path: string], void>("set_games_dir");
 const setVideo = callable<[kind: string, on: boolean], Result>("set_video");
+const updateFlag = callable<[], string>("update_flag");
+
+// The panel's title, with a mark while an update is out.
+function Title() {
+  const [update, setUpdate] = useState("");
+  useEffect(() => {
+    updateFlag().then(setUpdate);
+  }, []);
+  return (
+    <div className={staticClasses.Title} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+      KytyPS5-Native
+      {update && (
+        <span style={{ fontSize: "11px", padding: "1px 6px", borderRadius: "8px", background: "#1a9fff", color: "white" }}>
+          Update
+        </span>
+      )}
+    </div>
+  );
+}
 
 const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({ title, body });
 
@@ -314,7 +333,7 @@ export default definePlugin(() => {
   const timer = setInterval(auto, 10 * 60 * 1000);
   return {
     name: "KytyPS5-Native",
-    titleView: <div className={staticClasses.Title}>KytyPS5-Native</div>,
+    titleView: <Title />,
     content: <Content />,
     icon: <FaPlaystation />,
     onDismount() {

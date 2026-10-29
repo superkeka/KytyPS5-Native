@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
@@ -40,6 +41,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -243,6 +245,7 @@ struct TrophyNotification {
 	std::string            name;
 	int32_t                grade;
 	std::vector<std::byte> icon_png;
+	std::string            subtitle; // a system message's own; empty: "trophy earned"
 };
 std::mutex                     g_trophy_notification_mutex;
 std::deque<TrophyNotification> g_trophy_notifications;
@@ -666,6 +669,14 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 		g_input_lifecycle_active = true;
 		g_visibility_event.store(type, std::memory_order_release);
 	}
+	// The launch wrapper's notice, a while after the window opens: when the game is on screen.
+	if (const char* title = std::getenv("KYTY_NOTICE_TITLE"); title != nullptr && *title != '\0') {
+		const char* text = std::getenv("KYTY_NOTICE_TEXT");
+		std::thread([title = std::string(title), text = std::string(text != nullptr ? text : "")] {
+			std::this_thread::sleep_for(std::chrono::seconds(20));
+			NotifySystemMessage(title, text);
+		}).detach();
+	}
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
 	DialogIme::SetVisibilityCallback(OnDialogVisibilityChanged);
 	SystemDialog::SetVisibilityCallback(RefreshVisibility);
@@ -850,6 +861,12 @@ void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
 	std::scoped_lock lock(g_trophy_notification_mutex);
 	g_trophy_notifications.push_back(
 	    {std::string(name), grade, std::vector<std::byte>(icon_png.begin(), icon_png.end())});
+	g_trophy_notification_active.store(true, std::memory_order_release);
+}
+
+void NotifySystemMessage(std::string_view title, std::string_view text) {
+	std::scoped_lock lock(g_trophy_notification_mutex);
+	g_trophy_notifications.push_back({std::string(title), 0, {}, std::string(text)});
 	g_trophy_notification_active.store(true, std::memory_order_release);
 }
 
@@ -1694,7 +1711,9 @@ struct SystemOverlay::Impl {
 				trophy_notification = std::move(g_trophy_notifications.front());
 				g_trophy_notifications.pop_front();
 			}
-			trophy_notification_subtitle = PrepareTrophySubtitle(Config::GetConsoleLanguage());
+			trophy_notification_subtitle = trophy_notification->subtitle.empty()
+			                                   ? PrepareTrophySubtitle(Config::GetConsoleLanguage())
+			                                   : trophy_notification->subtitle;
 			trophy_notification_born     = now;
 			trophy_notification_image    = LoadTrophyIcon(trophy_notification->icon_png);
 			PlayTrophySound();

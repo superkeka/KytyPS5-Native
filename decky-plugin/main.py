@@ -25,6 +25,9 @@ KYTY_DIR = os.path.join(SHARE, "kyty")
 CONFIG_DIR = os.path.join(HOME, ".config/KytyPS5-Native")
 SETTINGS = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
 ART_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "art")
+# Present (holding the release tag) while a newer release is out: the panel shows it, and the launch
+# wrapper has Kyty say so when a game starts.
+UPDATE_FLAG = os.path.join(CONFIG_DIR, "update-available")
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
 VIDEOS = {
     "boot": "https://steamdeckrepo.com/post/download/YWW81",
@@ -230,7 +233,17 @@ def _scan(folder):
 class Plugin:
     async def _main(self):
         decky.logger.info("KytyPS5-Native plugin %s", decky.DECKY_PLUGIN_VERSION)
-        asyncio.get_event_loop().create_task(self._default_videos())
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._default_videos())
+        loop.create_task(self._watch_updates())
+
+    async def _watch_updates(self):
+        while True:
+            await self.latest_release()
+            await asyncio.sleep(6 * 3600)
+
+    async def update_flag(self):
+        return _read(UPDATE_FLAG)
 
     # The videos are on by default: fetched once, unless the user turned one off. A few tries, the
     # network may come up after Decky.
@@ -291,10 +304,25 @@ class Plugin:
             plugin = next((u for n, u in assets.items() if n.endswith("-Decky.zip")), "")
             return {"tag": rel.get("tag_name", ""), "kyty_url": kyty, "plugin_url": plugin}
         try:
-            return await asyncio.to_thread(fetch)
+            rel = await asyncio.to_thread(fetch)
         except Exception as e:
             decky.logger.error("latest release: %s", e)
             return {"tag": "", "error": str(e)}
+        kyty = _read(os.path.join(KYTY_DIR, "VERSION"))
+        plugin = _read(os.path.join(decky.DECKY_PLUGIN_DIR, "RELEASE"))
+        newer = (kyty and rel["kyty_url"] and rel["tag"] != kyty) or \
+                (plugin and rel["plugin_url"] and rel["tag"] != plugin)
+        try:
+            if newer:
+                _mkdir_user(CONFIG_DIR)
+                with open(UPDATE_FLAG, "w") as f:
+                    f.write(rel["tag"] + "\n")
+                _chown(UPDATE_FLAG)
+            elif os.path.exists(UPDATE_FLAG):
+                os.remove(UPDATE_FLAG)
+        except OSError as e:
+            decky.logger.error("update flag: %s", e)
+        return rel
 
     # --- KytyPS5-Native ---------------------------------------------------------------------------
 
@@ -330,6 +358,8 @@ class Plugin:
                     os.rename(KYTY_DIR, old)
                 os.rename(new, KYTY_DIR)
                 shutil.rmtree(old, ignore_errors=True)
+            if os.path.exists(UPDATE_FLAG):
+                os.remove(UPDATE_FLAG)
             if not _ps5_apu():
                 return {"ok": True, "log": ""}
             # The root helper: the socket's group is the user's.
