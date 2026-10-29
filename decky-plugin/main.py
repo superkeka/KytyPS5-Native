@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -23,6 +24,7 @@ SHARE = os.path.join(HOME, ".local/share/KytyPS5-Native")
 KYTY_DIR = os.path.join(SHARE, "kyty")
 CONFIG_DIR = os.path.join(HOME, ".config/KytyPS5-Native")
 SETTINGS = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
+ART_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "art")
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
 VIDEOS = {
     "boot": "https://steamdeckrepo.com/post/download/YWW81",
@@ -82,9 +84,17 @@ def _run(*cmd):
     return p.returncode, out
 
 
+def _ssl_context():
+    # Decky's bundled Python has no CA certificates of its own: the system's bundle.
+    for ca in ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"):
+        if os.path.exists(ca):
+            return ssl.create_default_context(cafile=ca)
+    return ssl.create_default_context()
+
+
 def _get(url, path=None):
     req = urllib.request.Request(url, headers={"User-Agent": "KytyPS5-Native-Decky"})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as r:
         if path is None:
             return r.read()
         with open(path, "wb") as f:
@@ -156,13 +166,16 @@ def _kernel_status():
             "configured": opts.get(k, ("", ""))[0],
             "file": opts.get(k, ("", ""))[1],
         })
+    # Reverted in this boot: the old values stay active until a reboot.
+    reverted = _load().get("reverted_boot") == _read("/proc/sys/kernel/random/boot_id")
     for it in items:
         it["ok"] = it["active"] == it["want"]
         it["pending"] = not it["ok"] and it["configured"] == it["want"]
+        it["reverting"] = reverted and it["ok"] and it["configured"] != it["want"]
     return {
         "items": items,
         "ours": os.path.exists(GRUB_CFG) or os.path.exists(MODPROBE_CONF),
-        "reboot": any(it["pending"] for it in items),
+        "reboot": any(it["pending"] or it["reverting"] for it in items),
         "all_ok": all(it["ok"] for it in items),
     }
 
@@ -349,6 +362,9 @@ class Plugin:
                     log.append(f"{it['key']}={it['configured']} is set in {it['file']}: left as it is")
                 elif it["configured"] != it["want"] or it.get("file") == MODPROBE_CONF:
                     mine[it["key"]] = it["want"]
+            s = _load()
+            s.pop("reverted_boot", None)
+            _save(s)
             if mine:
                 with open(MODPROBE_CONF, "w") as f:
                     f.write("# KytyPS5-Native (Decky plugin): KFD queues for PS5 games.\n"
@@ -366,6 +382,9 @@ class Plugin:
             elif os.path.exists(GRUB_CFG):
                 os.remove(GRUB_CFG)
                 log.append(_update_boot()[1][-300:])
+            s = _load()
+            s["reverted_boot"] = _read("/proc/sys/kernel/random/boot_id")
+            _save(s)
             return {"ok": True, "log": "\n".join(x for x in log if x)}
         return await asyncio.to_thread(work)
 
@@ -387,6 +406,27 @@ class Plugin:
         else:
             games.pop(title_id, None)
         _save(s)
+
+    # Artwork made once per game (the frontend composes it) and kept: a shortcut added again reuses it.
+    async def get_cached_art(self, title_id):
+        def work():
+            out = {}
+            for kind in ("capsule", "hero", "wide"):
+                try:
+                    with open(os.path.join(ART_CACHE, title_id, kind + ".png"), "rb") as f:
+                        out[kind] = base64.b64encode(f.read()).decode()
+                except OSError:
+                    return {}
+            return out
+        return await asyncio.to_thread(work)
+
+    async def save_art(self, title_id, kind, data):
+        def work():
+            d = os.path.join(ART_CACHE, title_id)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, kind + ".png"), "wb") as f:
+                f.write(base64.b64decode(data))
+        await asyncio.to_thread(work)
 
     async def get_art(self, path):
         def b64(name):

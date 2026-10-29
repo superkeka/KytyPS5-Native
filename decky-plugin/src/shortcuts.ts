@@ -11,6 +11,9 @@ export interface Game {
 }
 
 const getArt = callable<[path: string], { icon: string; pic: string }>("get_art");
+type Art = { capsule: string; hero: string; wide: string };
+const getCachedArt = callable<[titleId: string], Partial<Art>>("get_cached_art");
+const saveArt = callable<[titleId: string, kind: string, data: string], void>("save_art");
 const setGame = callable<[titleId: string, appid: number, keepSteam: boolean], void>("set_game");
 
 const steam = () => (window as any).SteamClient;
@@ -52,28 +55,47 @@ function canvas(w: number, h: number, draw: (ctx: CanvasRenderingContext2D) => v
 }
 
 // Steam's custom artwork kinds: 0 capsule (600x900), 1 hero (1920x620), 3 wide capsule (920x430).
-async function setArtwork(appid: number, g: Game) {
+async function composeArt(g: Game): Promise<Art | null> {
   const art = await getArt(g.path);
   const icon = await image(art.icon);
   const pic = (await image(art.pic)) ?? icon;
-  if (!icon || !pic) return;
-  const capsule = canvas(600, 900, (ctx) => {
-    ctx.filter = "blur(12px) brightness(0.85)";
-    cover(ctx, pic, 600, 900, 24);
-    ctx.filter = "none";
-    ctx.drawImage(icon, 70, 220, 460, 460);
-  });
-  const hero = canvas(1920, 620, (ctx) => cover(ctx, pic, 1920, 620));
-  const wide = canvas(920, 430, (ctx) => cover(ctx, pic, 920, 430));
-  await steam().Apps.SetCustomArtworkForApp(appid, capsule, "png", 0);
-  await steam().Apps.SetCustomArtworkForApp(appid, hero, "png", 1);
-  await steam().Apps.SetCustomArtworkForApp(appid, wide, "png", 3);
+  if (!icon || !pic) return null;
+  return {
+    capsule: canvas(600, 900, (ctx) => {
+      ctx.filter = "blur(12px) brightness(0.85)";
+      cover(ctx, pic, 600, 900, 24);
+      ctx.filter = "none";
+      ctx.drawImage(icon, 70, 220, 460, 460);
+    }),
+    hero: canvas(1920, 620, (ctx) => cover(ctx, pic, 1920, 620)),
+    wide: canvas(920, 430, (ctx) => cover(ctx, pic, 920, 430)),
+  };
+}
+
+async function setArtwork(appid: number, g: Game) {
+  let art = (await getCachedArt(g.title_id)) as Art;
+  if (!art.capsule) {
+    const made = await composeArt(g);
+    if (!made) return;
+    art = made;
+    for (const kind of ["capsule", "hero", "wide"] as const) await saveArt(g.title_id, kind, art[kind]);
+  }
+  await steam().Apps.SetCustomArtworkForApp(appid, art.capsule, "png", 0);
+  await steam().Apps.SetCustomArtworkForApp(appid, art.hero, "png", 1);
+  await steam().Apps.SetCustomArtworkForApp(appid, art.wide, "png", 3);
+}
+
+// A shortcut already in Steam with this name (one the settings lost, or made by hand): taken over
+// instead of adding another.
+function byName(name: string): number {
+  const app = [...(appStore()?.allApps ?? [])].find((a: any) => a.app_type === 1073741824 && a.display_name === name);
+  return app?.appid ?? 0;
 }
 
 // Adds or updates the shortcut of one game; returns its app id.
 export async function syncGame(g: Game, runner: string, kytyDir: string): Promise<number> {
-  let appid = g.appid;
-  const fresh = !exists(appid);
+  let appid = exists(g.appid) ? g.appid : byName(shortcutName(g));
+  const fresh = !appid;
   if (fresh) {
     appid = await steam().Apps.AddShortcut(shortcutName(g), `"${runner}"`, "", "");
     await sleep(500);
@@ -103,5 +125,5 @@ export async function syncAll(games: Game[], gone: Record<string, { appid: numbe
 
 // True when a game has no shortcut yet or one was removed: an automatic sync is worth it.
 export function needsSync(games: Game[], gone: Record<string, { appid: number }>): boolean {
-  return Object.keys(gone).length > 0 || games.some((g) => !exists(g.appid));
+  return Object.keys(gone).some((t) => exists(gone[t].appid)) || games.some((g) => !exists(g.appid));
 }

@@ -11,13 +11,14 @@ import {
 import { callable, definePlugin, openFilePicker, toaster } from "@decky/api";
 import { useEffect, useState } from "react";
 import { FaPlaystation } from "react-icons/fa";
-import { Game, needsSync, syncAll, syncGame } from "./shortcuts";
+import { Game, needsSync, syncAll } from "./shortcuts";
 
 interface KernelItem {
   key: string;
   label: string;
   ok: boolean;
   pending: boolean;
+  reverting: boolean;
   configured: string;
   file?: string;
 }
@@ -71,7 +72,18 @@ function Content() {
   const [release, setRelease] = useState<Release | null>(null);
   const [busy, setBusy] = useState("");
 
-  const refresh = async () => setState(await getState());
+  const [syncing, setSyncing] = useState(false);
+  // New games in the folder (and the folder itself) get their shortcuts on their own.
+  const refresh = async () => {
+    const s = await getState();
+    setState(s);
+    if (s.kyty_installed && needsSync(s.games, s.gone) && !syncRunning) {
+      setSyncing(true);
+      await sync(s);
+      setSyncing(false);
+      setState(await getState());
+    }
+  };
   useEffect(() => {
     refresh();
     latestRelease().then(setRelease);
@@ -93,7 +105,7 @@ function Content() {
   const kytyUpdate = !!release?.kyty_url && release.tag !== state.kyty_version;
   const pluginUpdate = !!release?.plugin_url && !!state.plugin_release && release.tag !== state.plugin_release;
   const kernelText = (it: KernelItem) =>
-    it.ok ? "on" : it.pending ? "after reboot" : it.configured ? `set to ${it.configured}` : "off";
+    it.reverting ? "on until reboot" : it.ok ? "on" : it.pending ? "after reboot" : it.configured ? `set to ${it.configured}` : "off";
 
   return (
     <>
@@ -165,7 +177,7 @@ function Content() {
         )}
         {state.kernel.reboot && (
           <PanelSectionRow>
-            <ButtonItem layout="below" onClick={() => confirm("Reboot", "Reboot now to use the new kernel settings?", "Reboot", () => reboot())}>
+            <ButtonItem layout="below" onClick={() => confirm("Reboot", "Reboot now for the kernel settings to take effect?", "Reboot", () => reboot())}>
               Reboot
             </ButtonItem>
           </PanelSectionRow>
@@ -206,39 +218,21 @@ function Content() {
           </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={!!busy || !state.kyty_installed}
-            onClick={() =>
-              run("Shortcuts", async () => {
-                await syncAll(state.games, state.gone, state.runner, state.kyty_dir);
-                toast(`${state.games.length} games in Steam`);
-              })
+          <Field
+            label={
+              !state.kyty_installed
+                ? "Install KytyPS5-Native first"
+                : syncing
+                  ? "Adding to Steam..."
+                  : `${state.games.filter((g) => g.appid).length} of ${state.games.length} games in Steam`
             }
-          >
-            {busy === "Shortcuts" ? "Adding..." : "Add games to Steam"}
-          </ButtonItem>
+            description={
+              state.games.length
+                ? state.games.map((g) => g.name).join(", ")
+                : "No games found: a game is a folder with sce_sys/param.json in it"
+            }
+          />
         </PanelSectionRow>
-        {state.games.map((g) => (
-          <PanelSectionRow key={g.title_id}>
-            <ToggleField
-              label={g.name}
-              description="Unload Steam while playing (frees 2-3 GB)"
-              checked={!g.keep_steam}
-              disabled={!!busy || !g.appid}
-              onChange={(unload) =>
-                run("Shortcut", async () => {
-                  await syncGame({ ...g, keep_steam: !unload }, state.runner, state.kyty_dir);
-                })
-              }
-            />
-          </PanelSectionRow>
-        ))}
-        {state.games.length === 0 && (
-          <PanelSectionRow>
-            <Field label="No games found" description="A game is a folder with sce_sys/param.json in it." />
-          </PanelSectionRow>
-        )}
       </PanelSection>
 
       <PanelSection title="Videos">
@@ -262,7 +256,7 @@ function Content() {
 
       <PanelSection title="Plugin">
         <PanelSectionRow>
-          <Field label="Version">{state.plugin_release || state.plugin_version}</Field>
+          <Field label="Version" focusable>{state.plugin_release || state.plugin_version}</Field>
         </PanelSectionRow>
         {pluginUpdate && (
           <PanelSectionRow>
@@ -285,19 +279,28 @@ function Content() {
   );
 }
 
-// New games in the folder get their shortcut on their own (at start and every 10 minutes).
-async function autoSync() {
+let syncRunning = false;
+async function sync(s: State) {
+  if (syncRunning) return;
+  syncRunning = true;
   try {
-    const s = await getState();
-    if (s.kyty_installed && needsSync(s.games, s.gone)) await syncAll(s.games, s.gone, s.runner, s.kyty_dir);
+    await syncAll(s.games, s.gone, s.runner, s.kyty_dir);
   } catch (e) {
     console.error("KytyPS5-Native sync", e);
   }
+  syncRunning = false;
+}
+
+// Also when the panel is closed: at start and every 10 minutes.
+async function autoSync() {
+  const s = await getState();
+  if (s.kyty_installed && needsSync(s.games, s.gone)) await sync(s);
 }
 
 export default definePlugin(() => {
-  setTimeout(autoSync, 15000);
-  const timer = setInterval(autoSync, 10 * 60 * 1000);
+  const auto = () => autoSync().catch((e) => console.error("KytyPS5-Native sync", e));
+  setTimeout(auto, 15000);
+  const timer = setInterval(auto, 10 * 60 * 1000);
   return {
     name: "KytyPS5-Native",
     titleView: <div className={staticClasses.Title}>KytyPS5-Native</div>,
