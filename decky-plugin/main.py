@@ -330,9 +330,12 @@ _sizes = {}
 
 def _size(path):
     try:
-        mtime = os.stat(path).st_mtime
+        st = os.stat(path)
     except OSError:
         return 0
+    if os.path.isfile(path):
+        return st.st_size
+    mtime = st.st_mtime
     cached = _sizes.get(path)
     if cached and cached[0] == mtime:
         return cached[1]
@@ -342,22 +345,70 @@ def _size(path):
     return size
 
 
+# A game is a dump folder or a ZArchive of one (.zar, made by Kyty's launcher: Compress to ZAR).
+# Kyty reads files inside an archive for us (zstd, which Decky's Python has no module for).
+_zar_files = {}
+
+
+def _sce_sys(path, name):
+    """A file of the game's sce_sys, from the folder or from inside the archive; None when missing."""
+    if not path.endswith(".zar"):
+        try:
+            with open(os.path.join(path, "sce_sys", name), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+    try:
+        key = (path, name, os.stat(path).st_mtime)
+    except OSError:
+        return None
+    if key not in _zar_files:
+        try:
+            p = subprocess.run([os.path.join(KYTY_DIR, "kyty_emulator"), "--zar-cat", path, "sce_sys/" + name],
+                               capture_output=True, timeout=60)
+            _zar_files[key] = p.stdout if p.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return _zar_files[key]
+
+
 def _scan(folder):
     games = []
     try:
         entries = sorted(os.listdir(folder))
     except OSError:
         return games
-    for e in entries:
+    seen = set()
+    # Folders first: a game both unpacked and packed shows once, as the folder.
+    for e in sorted(entries, key=lambda e: e.endswith(".zar")):
         path = os.path.join(folder, e)
-        try:
-            with open(os.path.join(path, "sce_sys/param.json"), encoding="utf-8") as f:
-                param = json.load(f)
-        except (OSError, ValueError):
+        if e.endswith(".zar") != os.path.isfile(path):
             continue
-        tid = param.get("titleId") or e
-        games.append({"title_id": tid, "name": _title(param) or tid, "path": path, "size": _size(path)})
+        try:
+            param = json.loads(_sce_sys(path, "param.json") or b"")
+        except ValueError:
+            continue
+        tid = param.get("titleId") or e.removesuffix(".zar")
+        if tid in seen:
+            continue
+        seen.add(tid)
+        games.append({"title_id": tid, "name": _title(param) or tid, "path": path, "size": _size(path),
+                      "icon": _icon(path, tid)})
     return games
+
+
+def _icon(path, tid):
+    """The shortcut's icon file: the folder's own, or one taken out of the archive."""
+    if not path.endswith(".zar"):
+        return os.path.join(path, "sce_sys", "icon0.png")
+    icon = os.path.join(ART_CACHE, f"{tid}-icon0.png")
+    if not os.path.exists(icon):
+        data = _sce_sys(path, "icon0.png")
+        if data:
+            os.makedirs(ART_CACHE, exist_ok=True)
+            with open(icon, "wb") as f:
+                f.write(data)
+    return icon
 
 
 class Plugin:
@@ -630,11 +681,12 @@ class Plugin:
         s["art_version"] = version
         _save(s)
 
-    async def set_game(self, title_id, appid, keep_steam):
+    async def set_game(self, title_id, appid, keep_steam, path=""):
         s = _load()
         games = s.setdefault("games", {})
         if appid:
-            games[title_id] = {"appid": appid, "keep_steam": bool(keep_steam)}
+            # shortcut_path: the game the shortcut starts; a game packed to .zar (or unpacked) gets it again.
+            games[title_id] = {"appid": appid, "keep_steam": bool(keep_steam), "shortcut_path": path}
         else:
             games.pop(title_id, None)
         _save(s)
@@ -662,11 +714,7 @@ class Plugin:
 
     async def get_art(self, path):
         def b64(name):
-            try:
-                with open(os.path.join(path, "sce_sys", name), "rb") as f:
-                    return base64.b64encode(f.read()).decode()
-            except OSError:
-                return ""
+            return base64.b64encode(_sce_sys(path, name) or b"").decode()
         return await asyncio.to_thread(lambda: {"icon": b64("icon0.png"), "pic": b64("pic0.png")})
 
     # --- videos -----------------------------------------------------------------------------------

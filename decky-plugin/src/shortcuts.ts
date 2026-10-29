@@ -1,5 +1,5 @@
 // Steam shortcuts for the games: made through SteamClient (only the frontend has it), with artwork
-// composed from the game's own sce_sys/icon0.png and pic0.png.
+// composed from the game's own sce_sys/icon0.png and pic0.png (from the folder or the .zar).
 import { callable } from "@decky/api";
 
 export interface Game {
@@ -7,6 +7,8 @@ export interface Game {
   name: string;
   path: string;
   size: number;
+  icon: string;
+  shortcut_path?: string;
   appid: number;
   keep_steam: boolean;
 }
@@ -15,7 +17,7 @@ const getArt = callable<[path: string], { icon: string; pic: string }>("get_art"
 type Art = { capsule: string; hero: string; wide: string };
 const getCachedArt = callable<[titleId: string], Partial<Art>>("get_cached_art");
 const saveArt = callable<[titleId: string, kind: string, data: string], void>("save_art");
-const setGame = callable<[titleId: string, appid: number, keepSteam: boolean], void>("set_game");
+const setGame = callable<[titleId: string, appid: number, keepSteam: boolean, path?: string], void>("set_game");
 
 const steam = () => (window as any).SteamClient;
 const appStore = () => (window as any).appStore;
@@ -114,9 +116,9 @@ export async function syncGame(g: Game, runner: string, kytyDir: string, redoArt
   steam().Apps.SetShortcutExe(appid, `"${runner}"`);
   steam().Apps.SetShortcutStartDir(appid, `"${kytyDir}/"`);
   steam().Apps.SetShortcutLaunchOptions(appid, `"${g.path}"${g.keep_steam ? " --keep-steam" : ""}`);
-  steam().Apps.SetShortcutIcon(appid, `${g.path}/sce_sys/icon0.png`);
+  steam().Apps.SetShortcutIcon(appid, g.icon);
   if (fresh || redoArt) await setArtwork(appid, g);
-  await setGame(g.title_id, appid, g.keep_steam);
+  await setGame(g.title_id, appid, g.keep_steam, g.path);
   return appid;
 }
 
@@ -139,7 +141,11 @@ export async function syncAll(
   await removeGone(gone);
 }
 
-// True when a game has no shortcut yet or one was removed: an automatic sync is worth it.
+// True when a game has no shortcut yet, one was removed or the game moved (packed to .zar or unpacked):
+// an automatic sync is worth it.
 export function needsSync(games: Game[], gone: Record<string, { appid: number }>): boolean {
-  return Object.keys(gone).some((t) => exists(gone[t].appid)) || games.some((g) => !exists(g.appid));
+  return (
+    Object.keys(gone).some((t) => exists(gone[t].appid)) ||
+    games.some((g) => !exists(g.appid) || g.shortcut_path !== g.path)
+  );
 }
