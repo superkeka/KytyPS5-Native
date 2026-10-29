@@ -302,6 +302,9 @@ public:
 		return m_ib_va + slot * kSlotSize;
 	}
 
+	// Called before Submit blocks on a slot still in use (Shadow ends an open stream there).
+	void SetBeforeBlockingWait(std::function<void()> f) { m_before_block = std::move(f); }
+
 	// Waits until every async submission so far has completed. Returns false on a timeout.
 	bool WaitIdle(double timeout_sec) {
 		for (SlotUse& slot: m_slot) {
@@ -339,6 +342,11 @@ public:
 			const uint32_t slot = m_async ? PickSlot(target, taken) : 0;
 			taken.set(slot);
 			if (m_async && m_slot[slot].seq != 0) {
+				// The slot's submission may be a streamed DCB whose CP waits for the caller's next chunk:
+				// the caller ends that chain before this thread blocks on it (SetBeforeBlockingWait).
+				if (!WaitSeq(m_slot[slot].seq, 0.0, m_slot[slot].target) && m_before_block) {
+					m_before_block();
+				}
 				if (!WaitSeq(m_slot[slot].seq, timeout_sec, m_slot[slot].target)) {
 					res.timed_out = true;
 					return res;
@@ -856,6 +864,7 @@ private:
 	}
 	bool     m_async     = false;
 	bool     m_gfx_mem_sync = false;
+	std::function<void()> m_before_block; // SetBeforeBlockingWait
 	uint64_t m_slot_order = 0;
 	SlotUse  m_slot[kSlots];
 	uint32_t m_compute_rings = 0; // bitmask from AMDGPU_INFO_HW_IP_INFO

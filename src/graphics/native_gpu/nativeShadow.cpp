@@ -1602,9 +1602,9 @@ public:
 			if (m_stream_chunks != 0 || m_stream_fallbacks != 0) {
 				std::fprintf(stderr,
 				             "native shadow: streamed DCB chunks so far: %llu, chains ended early for want of a slot: %llu, "
-				             "%.1f ms waited for the CP to free a trampoline\n",
+				             "%.1f ms waited for the CP to free a trampoline, %llu ended for a slot wait\n",
 				             static_cast<unsigned long long>(m_stream_chunks), static_cast<unsigned long long>(m_stream_fallbacks),
-				             m_stream_wait_s * 1e3);
+				             m_stream_wait_s * 1e3, static_cast<unsigned long long>(m_stream_breaks));
 			}
 			static const char* const kReason[kHoldReasons] = {"cross-ring unsubmitted", "write does not satisfy", "CPU writer",
 			                                                  "partial cover", "no writer yet", "no native form"};
@@ -2071,7 +2071,12 @@ public:
 		std::lock_guard<std::mutex> lock(m_mutex);
 		std::vector<uint32_t>& batch = m_acb_rings ? m_ring_batch[slot < kTrackerSlots ? slot : 0] : m_batch;
 		if ((batch.size() + ib.size()) * 4 > NativeSubmitter::kSlotSize) {
-			SubmitBufferLocked(batch, m_acb_rings ? slot : 0);
+			// A full gfx batch during a stream is the stream's next part, not a CS of its own behind it.
+			if (&batch == (m_acb_rings ? &m_ring_batch[0] : &m_batch) && m_stream != StreamState::Off) {
+				StreamFlushLocked(batch);
+			} else {
+				SubmitBufferLocked(batch, m_acb_rings ? slot : 0);
+			}
 		}
 		batch.insert(batch.end(), ib.begin(), ib.end());
 #else
@@ -3431,6 +3436,16 @@ private:
 			std::fprintf(stderr, "native shadow: submitter init failed; staying off.\n");
 			return;
 		}
+		// A submission that would wait for a slot while a streamed DCB's CP waits for its next chunk ends
+		// the chain first: the next chunk comes only after this very submission (Stray: a compute IB took a
+		// slot of the stream and the ring timed out). Runs with m_mutex held (SubmitBufferLocked).
+		m_submitter->SetBeforeBlockingWait([this] {
+			if (m_stream == StreamState::Cont) {
+				PublishStreamLocked(m_stream_pending, 0, 0);
+				m_stream = StreamState::Off;
+				m_stream_breaks++;
+			}
+		});
 		InitLodStatsHw();
 		InitPs5Regs();
 		InstallStopDrain();
@@ -3684,6 +3699,7 @@ private:
 	uint64_t    m_stream_chunks     = 0;
 	uint64_t    m_stream_fallbacks  = 0;
 	double      m_stream_wait_s     = 0.0;    // spent waiting for the CP to free a trampoline
+	uint64_t    m_stream_breaks     = 0;      // chains ended because a submission had to wait for a slot
 	// The stream counter and its trampolines, in the scratch page past the samples and tracker slots.
 	static constexpr uint32_t kStreamFlagOffset  = 2048;
 	static constexpr uint32_t kStreamDoneOffset  = 2052; // the last chunk the CP has entered
@@ -4108,16 +4124,23 @@ private:
 		bool                  gfx      = false; // a guest DCB (FlipTrace times it)
 		bool                  acb      = false; // a guest ACB
 	};
-	// KYTY_NATIVE_GPU_CHUNK_DW=N (experiment, off): graphics buffers longer than N dwords go to the GPU
-	// in chunks of about N (TranslateChunks). ASTRO BOT hung twice with it on the way into a level.
+	// KYTY_NATIVE_GPU_CHUNK_DW=N: graphics buffers longer than N dwords go to the GPU in chunks of about N
+	// (TranslateChunks) instead of at the title's segments.
 	uint32_t m_chunk_dw = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_CHUNK_DW");
 		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
 	}();
-	// KYTY_NATIVE_GPU_CHUNK=guest: a graphics buffer is cut where the title's own segments meet (the
-	// buffers its DCB calls or chains to, as it wrote them), as the PS5's CP crosses from one to the next,
-	// not at a fixed size. Segments shorter than kGuestChunkMin dwords join the next one.
-	bool m_chunk_guest = EnvIs("KYTY_NATIVE_GPU_CHUNK", "guest");
+	// KYTY_NATIVE_GPU_CHUNK=guest (the default in primary mode unless KYTY_NATIVE_GPU_CHUNK_DW is set;
+	// =off turns it off): a graphics buffer is cut where the title's own segments meet (the buffers its DCB
+	// calls or chains to, as it wrote them), not at a fixed size, and streamed (docs/native-gpu-streamed-dcbs.md).
+	// Segments shorter than kGuestChunkMin dwords join the next one.
+	bool m_chunk_guest = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_CHUNK");
+		if (v != nullptr && v[0] != '\0') {
+			return std::strcmp(v, "guest") == 0;
+		}
+		return std::getenv("KYTY_NATIVE_GPU_CHUNK_DW") == nullptr && EnvOn("KYTY_NATIVE_GPU_PRIMARY");
+	}();
 	static constexpr uint32_t kGuestChunkMin = 1024;
 	uint64_t                   m_chunks         = 0;
 	uint32_t                   m_chunk_refused  = 0;
@@ -4333,12 +4356,15 @@ private:
 		}
 	}
 
-	// A large graphics buffer (ASTRO BOT's main DCB: ~900K dwords, ~10 ms to translate) goes to the GPU in
-	// chunks of about m_chunk_dw dwords as each is translated, instead of after the whole of it: the
-	// gfx ring otherwise idled until the end, and frames missed the display refresh whenever the
-	// translation ran long. Each chunk is translated like a buffer of its own (the shadow carries the
-	// state across, as between buffers); `then` comes after the last. A chunk never ends inside a
-	// COND_EXEC's range. False (nothing done) when the first chunk is refused: the buffer is Kyty's.
+	// A graphics buffer goes to the GPU in chunks as each is translated, instead of after the whole of it:
+	// the gfx ring otherwise idled for the whole translation, and the title's end-of-frame event came that
+	// much later (GT7 then held its next frame back to the next vblank). Cuts are at the title's own
+	// segments (m_chunk_guest) or every m_chunk_dw dwords. Each chunk is translated like a buffer of its
+	// own (the shadow carries the state across); with the stream (Shadow::StreamBegin) the chunks after
+	// the first run in the same IB without a preamble, else each is a CS whose preamble restores where the
+	// previous chunk left the registers. `then` comes after the last. A chunk never ends inside a
+	// COND_EXEC's range. False (nothing done) when the first chunk is refused, or when the buffer cannot be
+	// inlined yet: it then goes the usual way. docs/native-gpu-streamed-dcbs.md.
 	bool TranslateChunks(Job& job, std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
 		std::vector<uint32_t>     flat;
 		std::vector<SourcePiece> source;
