@@ -2,6 +2,7 @@ import {
   ButtonItem,
   ConfirmModal,
   Field,
+  Navigation,
   PanelSection,
   PanelSectionRow,
   ToggleField,
@@ -74,6 +75,20 @@ async function updatePlugin(release: Release) {
   const decky = (window as any).DeckyBackend;
   if (decky?.call) {
     await decky.call("utilities/install_plugin", release.plugin_url!, "KytyPS5-Native", release.tag, "", 2);
+    // This panel is the old version's and keeps its state: wait for the new one (the user confirms
+    // Decky's prompt first), then close the menu, so the next open shows it.
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        if ((await getState()).plugin_release === release.tag) {
+          toast(`Plugin updated to ${short(release.tag)}`);
+          Navigation.CloseSideMenus();
+          return;
+        }
+      } catch {
+        // the backend restarts with the new version
+      }
+    }
     return;
   }
   const r = await installPlugin(release.plugin_url!, release.tag);
