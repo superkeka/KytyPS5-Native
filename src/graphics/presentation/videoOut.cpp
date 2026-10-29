@@ -392,6 +392,17 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		Common::LockGuard lock(video_out.events->mutex);
 		queues = VideoOutEventQueuesFor(*video_out.events, kind);
 	}
+	static const bool log = [] {
+		const char* v = std::getenv("KYTY_LOG_FLIPS");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (log && !queues.empty()) {
+		struct timespec ts {};
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		std::fprintf(stderr, "vo [%.2f] event %d data %" PRIu64 " queues %zu\n",
+		             static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) * 1e-6, static_cast<int>(kind),
+		             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(trigger_data)), queues.size());
+	}
 	for (const auto& registration: queues) {
 		if (!registration || registration->generation != video_out.generation) {
 			continue;
@@ -961,6 +972,12 @@ static double FlipLogMs() {
 	struct timespec ts {};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return static_cast<double>(ts.tv_sec) * 1e3 + static_cast<double>(ts.tv_nsec) * 1e-6;
+}
+
+// KYTY_LOG_FLIPS=1 also logs what the title asks about flips and vblanks (a status call only when its
+// answer changed), so a frame the title starts late shows what it was waiting for.
+static void VoLog(const char* what, int64_t a = 0, int64_t b = 0, int64_t c = 0) {
+	std::fprintf(stderr, "vo [%.2f] %s %" PRId64 " %" PRId64 " %" PRId64 "\n", FlipLogMs(), what, a, b, c);
 }
 
 bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
@@ -1824,6 +1841,16 @@ KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) 
 	}
 
 	DriverState().GetFlipQueue().GetFlipStatus(*ctx, *status);
+	if (LogFlips()) {
+		static uint64_t last_count = ~0ull;
+		static int      last_pending = -1;
+		if (status->count != last_count || status->flipPendingNum != last_pending) {
+			last_count   = status->count;
+			last_pending = status->flipPendingNum;
+			VoLog("GetFlipStatus count/pending/current", static_cast<int64_t>(status->count), status->flipPendingNum,
+			      status->currentBuffer);
+		}
+	}
 
 	LOGF("\t count = %" PRIu64 "\n"
 	     "\t processTime = %" PRIu64 "\n"
@@ -1850,6 +1877,13 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 
 	VideoOutFlipStatus status {};
 	DriverState().GetFlipQueue().GetFlipStatus(*ctx, status);
+	if (LogFlips()) {
+		static int last = -1;
+		if (status.flipPendingNum != last) {
+			last = status.flipPendingNum;
+			VoLog("IsFlipPending", status.flipPendingNum);
+		}
+	}
 
 	if (Config::GraphicsDebugDumpEnabled()) {
 		LOGF("\t flipPendingNum = %d\n", status.flipPendingNum);
@@ -1873,6 +1907,13 @@ KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* stat
 	ctx->mutex.Lock();
 	*status = ctx->vblank_status;
 	ctx->mutex.Unlock();
+	if (LogFlips()) {
+		static uint64_t last = ~0ull;
+		if (status->count != last) {
+			last = status->count;
+			VoLog("GetVblankStatus count", static_cast<int64_t>(status->count));
+		}
+	}
 
 	LOGF("\t count = %" PRIu64 "\n"
 	     "\t processTime = %" PRIu64 "\n"
@@ -1948,8 +1989,14 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 
 	Common::LockGuard lock(ctx->mutex);
 	const auto        count = ctx->vblank_status.count;
+	if (LogFlips()) {
+		VoLog("WaitVblank enter", static_cast<int64_t>(count));
+	}
 	while (ctx->opened && ctx->vblank_status.count == count) {
 		ctx->vblank_cond.Wait(&ctx->mutex);
+	}
+	if (LogFlips()) {
+		VoLog("WaitVblank exit", static_cast<int64_t>(ctx->vblank_status.count));
 	}
 
 	return OK;
@@ -2125,6 +2172,9 @@ KYTY_SYSV_ABI int VideoOutSetWindowModeMargins(int handle, int top, int bottom) 
 
 KYTY_SYSV_ABI int VideoOutLatencyControlWaitBeforeInput(int handle) {
 	PRINT_NAME();
+	if (LogFlips()) {
+		VoLog("LatencyControlWaitBeforeInput", handle);
+	}
 
 	[[maybe_unused]] auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {

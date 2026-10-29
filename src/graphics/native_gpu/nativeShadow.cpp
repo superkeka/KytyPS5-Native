@@ -48,6 +48,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <ucontext.h>
@@ -71,6 +72,13 @@ double NowSecShadow() {
 std::atomic<uint64_t> g_held_released {0};
 std::atomic<uint64_t> g_held_waited {0};
 std::atomic<uint64_t> g_held_wait_us {0};
+// Graphics buffers through the label pipeline since the last flip report: how many, their size as the
+// guest submitted them (before INDIRECT_BUFFER chains are inlined), how many went in chunks, and how
+// long they sat queued before the worker took them (behind the ACBs translated first).
+std::atomic<uint64_t> g_dcb_jobs {0};
+std::atomic<uint64_t> g_dcb_guest_dw {0};
+std::atomic<uint64_t> g_dcb_chunked {0};
+std::atomic<uint64_t> g_dcb_queued_us {0};
 // By why the piece was first held: 0 cross-ring writer not submitted yet, 1 the write ahead does not
 // satisfy the wait (value or function), 2 the write ahead is a CPU (tracker) write, 3 partial cover,
 // 4 no write ahead and the label not in memory yet, 5 no native form of the wait.
@@ -376,8 +384,48 @@ public:
 		return r != 0 ? r : static_cast<int>(n);
 	}
 
+	// KYTY_NATIVE_GPU_FLIP_STATS: the helper's round trips since the last call, by op (count, total and
+	// longest in ms, waiting for the lock included), on one line; nothing when there were none.
+	void PrintCallStats() {
+		char     line[512];
+		int      n   = 0;
+		uint64_t any = 0;
+		for (uint32_t op = 0; op < kOps; op++) {
+			const uint64_t c = m_calls[op].exchange(0, std::memory_order_relaxed);
+			const uint64_t t = m_call_us[op].exchange(0, std::memory_order_relaxed);
+			const uint64_t m = m_call_max_us[op].exchange(0, std::memory_order_relaxed);
+			if (c != 0 && n < static_cast<int>(sizeof(line)) - 64) {
+				n += std::snprintf(line + n, sizeof(line) - static_cast<size_t>(n), " op %u: %llu, %.2f ms, max %.2f ms;", op,
+				                   static_cast<unsigned long long>(c), static_cast<double>(t) * 1e-3, static_cast<double>(m) * 1e-3);
+			}
+			any += c;
+		}
+		if (any != 0) {
+			std::fprintf(stderr, "native shadow: kyty-lodhw round trips:%s\n", line);
+		}
+	}
+
 private:
+	static constexpr uint32_t kOps = 32;
+	std::array<std::atomic<uint64_t>, kOps> m_calls {};
+	std::array<std::atomic<uint64_t>, kOps> m_call_us {};
+	std::array<std::atomic<uint64_t>, kOps> m_call_max_us {};
+
 	int Call(uint32_t op, uint32_t size, uint64_t va, uint32_t* value) {
+		const double t0 = NowSecShadow();
+		struct Account {
+			LodStatsHw* self;
+			uint32_t    op;
+			double      t0;
+			~Account() {
+				const auto us = static_cast<uint64_t>((NowSecShadow() - t0) * 1e6);
+				self->m_calls[op].fetch_add(1, std::memory_order_relaxed);
+				self->m_call_us[op].fetch_add(us, std::memory_order_relaxed);
+				for (uint64_t m = self->m_call_max_us[op].load(std::memory_order_relaxed);
+				     us > m && !self->m_call_max_us[op].compare_exchange_weak(m, us, std::memory_order_relaxed);) {
+				}
+			}
+		} account {this, (op & 0xffu) % kOps, t0};
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (m_fd < 0) {
 			return -ENOTCONN;
@@ -563,6 +611,9 @@ public:
 		SyncCollectRefs();
 		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
 		const char* const  kind  = acb ? "acb" : "frame";
+		if (!acb) {
+			m_trace_last_dcb.store(NowSecShadow(), std::memory_order_relaxed); // FlipTrace
+		}
 		Pm4Translator&     tr    = acb ? m_acb_translator : m_translator;
 		if (!acb) {
 			LoadAgcStartState();
@@ -616,7 +667,10 @@ public:
 		if (bench_min != 0 && !acb && out != nullptr && dcb.size() >= bench_min && (m_bench_count++ % 120) == 0) {
 			bench_snap = tr.Clone();
 		}
+		const double       t_core      = NowSecShadow();
 		Pm4TranslateResult result      = tr.Translate(dcb);
+		m_phase_ms[acb ? 2 : 0] += (t_core - t_translate) * 1e3;
+		m_phase_ms[acb ? 3 : 1] += (NowSecShadow() - t_core) * 1e3;
 		if (bench_snap != nullptr) {
 			auto run = [&](bool refs, bool direct_runs) {
 				double best = 1e9;
@@ -1221,7 +1275,9 @@ public:
 
 	// KYTY_NATIVE_GPU_FLIP_TRACE=1 (or =gpu, with GPU clocks): one line per flip in flips.csv (the working
 	// directory) with what happened since the previous one, to see what the late frames have that the
-	// others do not.
+	// others do not. Besides the GPU's side: how long before the flip the title's last DCB came, how
+	// late a thread sleeping 1 ms at a time woke at worst (a stall of the whole process or the host: the
+	// title's audio stuttered with the frames), and the process's page faults and context switches.
 	void FlipTrace(double now, double present_s) {
 		static const bool on = [] {
 			const char* v = std::getenv("KYTY_NATIVE_GPU_FLIP_TRACE");
@@ -1230,6 +1286,33 @@ public:
 		if (!on) {
 			return;
 		}
+		static std::atomic<uint64_t> stall_max_us {0};
+		static std::atomic<uint64_t> stalls {0};
+		static const bool            watch = [] {
+			std::thread([] {
+				for (;;) {
+					const double    t0  = NowSecShadow();
+					struct timespec nap = {0, 1000000};
+					nanosleep(&nap, nullptr);
+					const auto late = static_cast<uint64_t>(std::max(0.0, (NowSecShadow() - t0) * 1e6 - 1000.0));
+					if (late > 4000) {
+						stalls.fetch_add(1, std::memory_order_relaxed);
+					}
+					for (uint64_t m = stall_max_us.load(std::memory_order_relaxed);
+					     late > m && !stall_max_us.compare_exchange_weak(m, late, std::memory_order_relaxed);) {
+					}
+				}
+			}).detach();
+			return true;
+		}();
+		(void)watch;
+		static struct rusage ru_prev {};
+		struct rusage        ru {};
+		getrusage(RUSAGE_SELF, &ru);
+		const double stall_ms   = static_cast<double>(stall_max_us.exchange(0, std::memory_order_relaxed)) * 1e-3;
+		const auto   stall_n    = stalls.exchange(0, std::memory_order_relaxed);
+		const double dcb_ago_ms   = (now - m_trace_last_dcb.load(std::memory_order_relaxed)) * 1e3;
+		const double guest_ago_ms = (now - m_trace_guest_dcb.load(std::memory_order_relaxed)) * 1e3;
 		struct Mark {
 			double   t = 0, translate_ms = 0, busy_s = 0, gpu_s = 0;
 			uint64_t dcbs = 0, acbs = 0, dcb_dw = 0, acb_dw = 0, irqs = 0, waits = 0, labels = 0;
@@ -1319,22 +1402,28 @@ public:
 				return;
 			}
 			std::fprintf(f, "flip,t_s,interval_ms,translate_ms,submit_ms,gpu_busy_ms,present_ms,dcbs,dcb_kdw,acbs,acb_kdw,"
-			                "interrupts,gpu_waits,labels,gfx_gpu_ms,gfx_buffers,gfx_wait_ms,gfx_waits\n");
+			                "interrupts,gpu_waits,labels,gfx_gpu_ms,gfx_buffers,gfx_wait_ms,gfx_waits,dcb_ago_ms,stall_max_ms,"
+			                "stalls_4ms,minflt,majflt,nvcsw,nivcsw,guest_dcb_ago_ms\n");
 		} else {
-			std::fprintf(f, "%llu,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.1f,%llu,%.1f,%llu,%llu,%llu,%.2f,%u,%.2f,%u\n",
+			std::fprintf(f, "%llu,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%llu,%.1f,%llu,%.1f,%llu,%llu,%llu,%.2f,%u,%.2f,%u,%.2f,%.2f,%llu,%ld,%ld,%ld,%ld,%.2f\n",
 			             static_cast<unsigned long long>(flip), now, (now - prev.t) * 1e3, cur.translate_ms - prev.translate_ms,
 			             (cur.busy_s - prev.busy_s) * 1e3, (cur.gpu_s - prev.gpu_s) * 1e3, present_s * 1e3,
 			             static_cast<unsigned long long>(cur.dcbs - prev.dcbs), (cur.dcb_dw - prev.dcb_dw) / 1e3,
 			             static_cast<unsigned long long>(cur.acbs - prev.acbs), (cur.acb_dw - prev.acb_dw) / 1e3,
 			             static_cast<unsigned long long>(cur.irqs - prev.irqs), static_cast<unsigned long long>(cur.waits - prev.waits),
-			             static_cast<unsigned long long>(cur.labels - prev.labels), span_ms, spans, wait_ms, waits);
+			             static_cast<unsigned long long>(cur.labels - prev.labels), span_ms, spans, wait_ms, waits, dcb_ago_ms, stall_ms,
+			             static_cast<unsigned long long>(stall_n), ru.ru_minflt - ru_prev.ru_minflt, ru.ru_majflt - ru_prev.ru_majflt,
+			             ru.ru_nvcsw - ru_prev.ru_nvcsw, ru.ru_nivcsw - ru_prev.ru_nivcsw, guest_ago_ms);
 			if ((flip & 63u) == 0) {
 				std::fflush(f);
 			}
 		}
-		prev = cur;
+		prev    = cur;
+		ru_prev = ru;
 		flip++;
 	}
+
+	void NoteGuestDcb() { m_trace_guest_dcb.store(NowSecShadow(), std::memory_order_relaxed); }
 
 	void FlipStats(double present_s) {
 		std::lock_guard<std::mutex> lock(m_mutex);
@@ -1366,8 +1455,12 @@ public:
 			             m_gpu_busy_s.load(std::memory_order_relaxed) * per, static_cast<unsigned long long>(ResidentMiB()));
 			std::fprintf(stderr, "native shadow: flip intervals: %u under 20 ms, %u 20-37 ms, %u longer\n", m_flip_hist[0],
 			             m_flip_hist[1], m_flip_hist[2]);
-			std::fprintf(stderr, "native shadow: pipeline per flip: translate %.2f ms, CS ioctl %.2f ms\n",
-			             (m_translate_ms_total - m_translate_mark) / m_flips, (m_cs_ms_total - m_cs_mark) / m_flips);
+			std::fprintf(stderr,
+			             "native shadow: pipeline per flip: translate %.2f ms (DCBs: inlining %.2f, translator %.2f; ACBs: "
+			             "inlining %.2f, translator %.2f), CS ioctl %.2f ms\n",
+			             (m_translate_ms_total - m_translate_mark) / m_flips, m_phase_ms[0] / m_flips, m_phase_ms[1] / m_flips,
+			             m_phase_ms[2] / m_flips, m_phase_ms[3] / m_flips, (m_cs_ms_total - m_cs_mark) / m_flips);
+			m_phase_ms = {};
 			m_translate_mark = m_translate_ms_total;
 			m_cs_mark        = m_cs_ms_total;
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -1454,6 +1547,13 @@ public:
 			std::fprintf(stderr, "native shadow: held pieces per flip: %.1f released, %.1f after waiting, %.2f ms waited\n",
 			             static_cast<double>(held) / m_flips, static_cast<double>(waited) / m_flips,
 			             static_cast<double>(wait_us) / 1e3 / m_flips);
+			if (const uint64_t jobs = g_dcb_jobs.exchange(0, std::memory_order_relaxed); jobs != 0) {
+				std::fprintf(stderr, "native shadow: graphics buffers per flip: %.2f, %.0f guest dwords each, %.2f chunked, %.2f ms queued each\n",
+				             static_cast<double>(jobs) / m_flips,
+				             static_cast<double>(g_dcb_guest_dw.exchange(0, std::memory_order_relaxed)) / jobs,
+				             static_cast<double>(g_dcb_chunked.exchange(0, std::memory_order_relaxed)) / m_flips,
+				             static_cast<double>(g_dcb_queued_us.exchange(0, std::memory_order_relaxed)) / 1e3 / jobs);
+			}
 			static const char* const kReason[kHoldReasons] = {"cross-ring unsubmitted", "write does not satisfy", "CPU writer",
 			                                                  "partial cover", "no writer yet", "no native form"};
 			for (int r = 0; r < kHoldReasons; r++) {
@@ -1507,6 +1607,8 @@ public:
 					m_labels_mark[i] = m_labels_stats[i];
 				}
 				if (m_irq_event != 0) {
+					LodStatsHw::Instance().PrintCallStats();
+					m_ps5_hw.PrintCallStats();
 					std::fprintf(stderr, "native shadow: tracker interrupts so far: %llu waits woken, %llu ran out (%u ms)\n",
 					             static_cast<unsigned long long>(m_irq_wakes.load()),
 					             static_cast<unsigned long long>(m_irq_timeouts.load()), IrqBackstopMs());
@@ -3419,6 +3521,8 @@ private:
 	mutable bool     m_writable     = false;
 	// KYTY_NATIVE_GPU_FLIP_TRACE=1: never-reset totals FlipTrace takes per-flip differences of.
 	double                  m_trace_busy_s = 0.0;
+	std::atomic<double>     m_trace_last_dcb {0.0};  // when the pipeline took the title's last DCB (FlipTrace)
+	std::atomic<double>     m_trace_guest_dcb {0.0}; // when the title submitted it (ShadowNoteDcbSubmit)
 	std::atomic<double>     m_trace_gpu_busy_s {0.0};
 	std::array<uint64_t, 2> m_trace_dw {};
 	bool          m_check_order = EnvOn("KYTY_NATIVE_GPU_CHECK_ORDER");
@@ -3496,6 +3600,9 @@ private:
 	double        m_gpu_ms_total   = 0.0;
 	double        m_cs_ms_total    = 0.0;
 	double        m_cs_mark        = 0.0; // m_cs_ms_total at the last flip stats
+	// Since the last flip stats: [0] DCB inlining of INDIRECT_BUFFER chains (and the direct-run pieces),
+	// [1] DCB translator, [2] and [3] the same for ACBs.
+	std::array<double, 4> m_phase_ms {};
 	double        m_translate_mark = 0.0;
 	double        m_gpu_only_ms_total = 0.0;
 	double        m_translate_ms_total = 0.0;
@@ -3917,8 +4024,14 @@ private:
 		if (m_acb_rings && job.queue >= 0x20u) {
 			Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
 		}
-		if (job.buffer != nullptr && m_native && job.queue == 0 && m_chunk_dw != 0 && job.size_dw > m_chunk_dw &&
-		    TranslateChunks(job, done, queue)) {
+		if (job.buffer != nullptr && job.queue == 0) {
+			g_dcb_jobs.fetch_add(1, std::memory_order_relaxed);
+			g_dcb_guest_dw.fetch_add(job.size_dw, std::memory_order_relaxed);
+			g_dcb_queued_us.fetch_add(static_cast<uint64_t>((NowSecShadow() - job.enqueued) * 1e6), std::memory_order_relaxed);
+		}
+		// The size that matters is the inlined one: a title's DCB is often a few dwords of INDIRECT_BUFFER
+		// calls (GT7: 25 dwords standing for ~100K).
+		if (job.buffer != nullptr && m_native && job.queue == 0 && m_chunk_dw != 0 && TranslateChunks(job, done, queue)) {
 			return;
 		}
 		if (job.buffer == nullptr || !m_native ||
@@ -3997,7 +4110,14 @@ private:
 		}
 		chunks.emplace_back(begin, static_cast<uint32_t>(whole.size()));
 		if (chunks.size() < 2) {
-			return false;
+			// Small enough to go whole: translated from what was inlined here, not inlined again.
+			Pm4TranslateResult r;
+			if (!Shadow::Instance().Submit(whole, false, &r, &source) || r.segments.empty()) {
+				return false;
+			}
+			done->tail = std::move(r.cpu_tail);
+			PushPieces(r, done, queue);
+			return true;
 		}
 		for (size_t c = 0; c < chunks.size(); c++) {
 			const auto [cb, ce] = chunks[c];
@@ -4028,6 +4148,7 @@ private:
 			}
 		}
 		m_chunks += chunks.size();
+		g_dcb_chunked.fetch_add(1, std::memory_order_relaxed);
 		return true;
 	}
 
@@ -4717,6 +4838,10 @@ void ShadowSetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, u
 	// VGT_HS_OFFCHIP_PARAM: OFFCHIP_BUFFERING [8:0], OFFCHIP_GRANULARITY [10:9].
 	const auto param = static_cast<uint32_t>((offchip_buffering & 0x1ffu) | ((offchip_granularity & 0x3u) << 9u));
 	SetTessellationRings(tf_ring_base, tf_ring_bytes, param);
+}
+
+void ShadowNoteDcbSubmit() {
+	Shadow::Instance().NoteGuestDcb();
 }
 
 void ShadowFlipStats(double present_seconds) {

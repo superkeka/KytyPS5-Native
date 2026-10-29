@@ -5055,6 +5055,7 @@ static TessellationDriverState g_tessellation_driver_state {};
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords, uint32_t queue = 0) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
+	Libs::Graphics::NativeGpu::ShadowNoteDcbSubmit();
 	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
 		// With native labels the continuation gets only what Kyty's command processor still runs. It
 		// runs after the DCB's GPU work, when the title may already have requested the next flips: its

@@ -81,6 +81,8 @@ void ShadowSetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, u
 // KYTY_NATIVE_GPU_FLIP_STATS=1: called at each flip with the time the presenter spent preparing it;
 // logs per-flip averages (flip interval, native submission time, presenter time).
 void ShadowFlipStats(double present_seconds);
+// KYTY_NATIVE_GPU_FLIP_TRACE: the title has just submitted a DCB (agc), before the pipeline takes it.
+void ShadowNoteDcbSubmit();
 
 // True in primary mode with native async compute: Kyty then skips its own dispatches of ACBs too.
 bool NativeAsyncCompute();
