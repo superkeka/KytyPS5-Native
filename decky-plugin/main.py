@@ -676,9 +676,9 @@ class Plugin:
         off = path + ".off"
 
         s = _load()
-        off = set(s.get("videos_off", []))
-        off.discard(kind) if on else off.add(kind)
-        s["videos_off"] = sorted(off)
+        kinds_off = set(s.get("videos_off", []))
+        kinds_off.discard(kind) if on else kinds_off.add(kind)
+        s["videos_off"] = sorted(kinds_off)
         _save(s)
 
         def work():
