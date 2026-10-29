@@ -17,6 +17,10 @@ void               TogglePerformanceOverlay() noexcept;
 // Switches between the compact and the detailed panel, showing the panel if it was hidden.
 void TogglePerformanceOverlayDetails() noexcept;
 
+// 0 hidden, 1 compact, 2 detailed (the game menu's monitoring switch).
+[[nodiscard]] int PerformanceOverlayMode() noexcept;
+void              SetPerformanceOverlayMode(int mode) noexcept;
+
 // Changes when the panel needs a repaint without a guest flip (toggled, or the guest stalled).
 [[nodiscard]] uint64_t PerformanceOverlayRevision() noexcept;
 

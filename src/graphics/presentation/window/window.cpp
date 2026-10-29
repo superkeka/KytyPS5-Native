@@ -17,6 +17,7 @@
 #include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/gameMenu.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -494,6 +495,9 @@ void WindowContext::ProcessEvent(double time_s) {
 				return;
 			default: break;
 		}
+	}
+	if (ProcessGameMenuInput(*event)) {
+		return;
 	}
 	if (ProcessSystemOverlayInput(*event)) {
 		return;

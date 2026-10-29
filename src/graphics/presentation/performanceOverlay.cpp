@@ -634,6 +634,21 @@ void TogglePerformanceOverlayDetails() noexcept {
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 
+int PerformanceOverlayMode() noexcept {
+	if (!Common::DebugCounters::Enabled()) {
+		return 0;
+	}
+	return g_details.load(std::memory_order_acquire) ? 2 : 1;
+}
+
+void SetPerformanceOverlayMode(int mode) noexcept {
+	g_details.store(mode == 2, std::memory_order_release);
+	if ((mode != 0) != Common::DebugCounters::Enabled()) {
+		SetOverlayEnabled(mode != 0);
+	}
+	g_revision.fetch_add(1, std::memory_order_acq_rel);
+}
+
 uint64_t PerformanceOverlayRevision() noexcept {
 	return g_revision.load(std::memory_order_acquire);
 }
