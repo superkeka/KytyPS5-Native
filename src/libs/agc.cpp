@@ -5050,12 +5050,43 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
+// KYTY_LOG_SUBMITS=1: each DCB submission, and the first ACB of each burst (a thread's ACBs more than
+// 2 ms apart), go to stderr with the thread and their CLOCK_MONOTONIC time, the time base of
+// KYTY_LONG_WAITS and the native flip trace, to line up what a submitting thread waited for.
+static void LogSubmit(const char* what, uint32_t queue, uint32_t size_in_dwords) {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_LOG_SUBMITS");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (!on) {
+		return;
+	}
+	struct timespec ts {};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	const double           now  = static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+	thread_local double    last = 0.0;
+	thread_local uint32_t  run  = 0;
+	const bool             acb  = what[0] == 'a';
+	if (acb && now - last < 0.002) {
+		last = now;
+		run++;
+		return;
+	}
+	char name[32] = "?";
+	pthread_getname_np(pthread_self(), name, sizeof(name));
+	std::fprintf(stderr, "submit: %s %.4f thread %s queue %u dwords %u (%u before in the last burst)\n", what, now, name, queue,
+	             size_in_dwords, acb ? run : 0u);
+	last = now;
+	run  = 1;
+}
+
 // `queue`: the guest graphics queue (0 when the call names none); the native path gives each one a gfx
 // ring of its own while amdgpu has rings for them, as the PS5 does a title's main and AGR rings.
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords, uint32_t queue = 0) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
 	Libs::Graphics::NativeGpu::ShadowNoteDcbSubmit();
+	LogSubmit("dcb", queue, size_in_dwords);
 	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
 		// With native labels the continuation gets only what Kyty's command processor still runs. It
 		// runs after the DCB's GPU work, when the title may already have requested the next flips: its
@@ -5126,6 +5157,7 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	}
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
+	LogSubmit("acb", queue, size_in_dwords);
 
 	EXIT_IF(g_renderer == nullptr);
 	if (Libs::Graphics::NativeGpu::ShadowThreaded()) {
