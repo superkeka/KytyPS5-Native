@@ -31,7 +31,9 @@ interface State {
   helper: boolean;
   plugin_version: string;
   plugin_release: string;
+  home: string;
   games_dir: string;
+  games_dir_state: "ok" | "empty" | "missing";
   ps5_apu: boolean;
   games: Game[];
   gone: Record<string, { appid: number }>;
@@ -209,8 +211,13 @@ function Content() {
             description={state.games_dir}
             disabled={!!busy}
             onClick={async () => {
-              const r = await openFilePicker(1 as any, state.games_dir, false, true);
-              await setGamesDir(r.realpath || r.path);
+              const start = state.games_dir_state === "missing" ? state.home : state.games_dir;
+              try {
+                const r = await openFilePicker(1 as any, start, false, true);
+                await setGamesDir(r.realpath || r.path);
+              } catch {
+                return; // closed without a choice
+              }
               await refresh();
             }}
           >
@@ -227,9 +234,13 @@ function Content() {
                   : `${state.games.filter((g) => g.appid).length} of ${state.games.length} games in Steam`
             }
             description={
-              state.games.length
-                ? state.games.map((g) => g.name).join(", ")
-                : "No games found: a game is a folder with sce_sys/param.json in it"
+              state.games_dir_state === "missing"
+                ? "Games folder not found"
+                : state.games_dir_state === "empty"
+                  ? "No games in the folder"
+                  : state.games.length
+                    ? state.games.map((g) => g.name).join(", ")
+                    : "No games found: a game is a folder with sce_sys/param.json in it"
             }
           />
         </PanelSectionRow>

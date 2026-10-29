@@ -257,6 +257,11 @@ class Plugin:
         folder = s.get("games_dir") or os.path.join(HOME, "Games")
         games = _scan(folder)
         known = s.get("games", {})
+        # A missing folder (a drive not mounted) has no games: their shortcuts go, and come back with it.
+        try:
+            folder_state = "ok" if os.listdir(folder) else "empty"
+        except OSError:
+            folder_state = "missing"
         for g in games:
             g.update({"appid": 0, "keep_steam": False, **known.get(g["title_id"], {})})
         return {
@@ -267,7 +272,9 @@ class Plugin:
             "helper": _run("systemctl", "is-active", "kyty-lodhw.service")[1] == "active",
             "plugin_version": decky.DECKY_PLUGIN_VERSION,
             "plugin_release": _read(os.path.join(decky.DECKY_PLUGIN_DIR, "RELEASE")),
+            "home": HOME,
             "games_dir": folder,
+            "games_dir_state": folder_state,
             "games": games,
             "gone": {k: v for k, v in known.items() if k not in {g["title_id"] for g in games} and v.get("appid")},
             "videos": {k: os.path.exists(os.path.join(CONFIG_DIR, k + ".webm")) for k in VIDEOS},
