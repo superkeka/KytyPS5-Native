@@ -7,3 +7,6 @@ _Build/
 cmake-build-debug/
 _PipelineCache/
 CMakeUserPresets.json
+# Python bytecode
+__pycache__/
+*.pyc
