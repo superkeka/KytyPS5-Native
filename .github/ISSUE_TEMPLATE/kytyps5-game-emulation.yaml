@@ -1,28 +1,148 @@
-name: Game Emulation Status Report
-description: Submit a KytyPS5 game compatibility result, including boot, rendering, audio, input, or gameplay behavior.
-title: "[GAME STATUS]: "
+name: Game, bug or performance report
+description: A game that fails, runs slow, looks wrong, or a problem with install or the Decky plugin.
+title: "[GAME]: "
 body:
   - type: markdown
     attributes:
       value: |
-        ## Quick checks
-
-        Before submitting, please:
+        Thanks for testing. Without the system info and the log we cannot tell what went wrong, so please fill in every required field.
         - Search existing issues first.
-        - Re-test with a clean game dump.
-        - Use the latest KytyPS5 build available to you.
-        - Attach the complete log file instead of edited snippets.
+        - Use the latest release if you can.
+        - Attach the full log, not a snippet.
+
+  - type: dropdown
+    id: report-type
+    attributes:
+      label: Report type
+      options:
+        - Slow (low FPS, stutter)
+        - Crash, freeze or hang
+        - Graphics glitch
+        - Audio problem
+        - Input or controller problem
+        - Game status (how far it gets)
+        - Install, update or Decky plugin problem
+        - Other
+    validations:
+      required: true
 
   - type: markdown
     attributes:
       value: |
-        ## Game and build
+        ## KytyPS5-Native
+
+  - type: input
+    id: kyty-version
+    attributes:
+      label: KytyPS5-Native version
+      description: Shown as "Version" in the Decky plugin panel, or in ~/.local/share/KytyPS5-Native/kyty/VERSION. For your own build, the commit.
+      placeholder: "Example: KytyPS5-Native-2026-10-29-e224d22 or b9a29ef"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: launch-method
+    attributes:
+      label: How you started the game
+      options:
+        - Decky plugin shortcut in Game Mode (Steam unloaded, default)
+        - Decky plugin shortcut in Game Mode with --keep-steam
+        - Release archive with kyty_launcher
+        - kyty_emulator --game from a terminal
+        - Other (say in Extra notes)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: native-mode
+    attributes:
+      label: Native mode
+      description: 'Near the top of the log Kyty prints "native GPU: BC-250 (1002:13fe), native mode on", after a "system:" line with the kernel config. Is that line there?'
+      options:
+        - "Yes, native mode on"
+        - "No, the line is missing"
+        - "I set KYTY_NATIVE_GPU=0 (Vulkan path)"
+        - Not sure
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## System
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options:
+        - AMD BC-250
+        - PS5 running Linux
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - SteamOS
+        - Bazzite
+        - CachyOS
+        - Other (say in Extra notes)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: overclock
+    attributes:
+      label: Overclock or unlock
+      description: Any CPU/GPU overclock, 40 CU unlock, changed CPU governor, smu tweaks, custom BIOS.
+      options:
+        - "No, stock"
+        - "Yes (say what in Extra notes)"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        Run this in a terminal (Desktop Mode Konsole or SSH) and paste the whole output below.
+        ```sh
+        cat ~/.local/share/KytyPS5-Native/kyty/VERSION 2>/dev/null
+        grep -E '^(PRETTY_NAME|VERSION_ID|BUILD_ID)=' /etc/os-release
+        uname -r
+        cat /proc/cmdline
+        for d in /sys/class/drm/card*/device; do
+          echo "$d $(cat $d/vendor 2>/dev/null):$(cat $d/device 2>/dev/null)"
+          echo "  vram_total=$(cat $d/mem_info_vram_total 2>/dev/null) gtt_total=$(cat $d/mem_info_gtt_total 2>/dev/null)"
+        done
+        for p in sched_policy vm_update_mode cwsr_enable bc250_gfx_queues; do
+          echo "amdgpu.$p=$(cat /sys/module/amdgpu/parameters/$p 2>/dev/null || echo -)"
+        done
+        echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+        free -m
+        ```
+
+  - type: textarea
+    id: system-info
+    attributes:
+      label: System info
+      description: Output of the command above. It shows OS, kernel, kernel cmdline, BIOS VRAM, GTT and amdgpu settings.
+      render: shell
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ## Game
 
   - type: input
     id: game-title
     attributes:
       label: Game title
-      description: Use the full title shown by the game or launcher.
       placeholder: "Example: Astro Bot"
     validations:
       required: true
@@ -30,150 +150,74 @@ body:
   - type: input
     id: game-id
     attributes:
-      label: Game ID / serial
-      description: Enter the ID or serial when available. If you cannot find it, write "Unknown".
-      placeholder: "Example: PPSA12345 or Unknown"
-    validations:
-      required: true
-
-  - type: input
-    id: kyty-version
-    attributes:
-      label: KytyPS5 version
-      description: Include the exact build you tested so the report can be matched to the right code.
-      placeholder: "Example: v0.0.1"
+      label: Title ID
+      description: From sce_sys/param.json or the log file name. Write "Unknown" if you cannot find it.
+      placeholder: "Example: PPSA12345"
     validations:
       required: true
 
   - type: dropdown
     id: compatibility-status
     attributes:
-      label: Compatibility status
-      description: Select the furthest point the game consistently reaches on this build.
+      label: How far the game gets
       options:
         - "Doesn't boot"
         - Logo
         - Main menu
         - In game
+        - Not a game problem
     validations:
       required: true
-
-  - type: markdown
-    attributes:
-      value: |
-        **Status guide**
-        - **Doesn't boot:** The game does not show its first logo or startup screen.
-        - **Logo:** The game shows a logo or startup screen but does not reach the main menu.
-        - **Main menu:** The game reaches its menus but does not enter gameplay.
-        - **In game:** The game reaches controllable gameplay, even if bugs prevent completion.
-
-  - type: input
-    id: regression-builds
-    attributes:
-      label: Last working build / first broken build
-      description: Optional. Fill this in if the same game worked in an older KytyPS5 build.
-      placeholder: "Example: last worked in v0.0.1, first broke in v0.0.1"
-
-  - type: markdown
-    attributes:
-      value: |
-        ## Test result
 
   - type: textarea
     id: what-happened
     attributes:
-      label: Result details
-      description: Describe what worked, what failed, and any visible or audible problems.
-      placeholder: "Example: The game reaches the main menu, then freezes after selecting Continue. Audio plays correctly until the freeze."
+      label: What happens
+      description: Where in the game, what you did, what you saw. For a crash or hang, say what happened just before.
+      placeholder: "Example: Sky Garden, first area. Runs but slow, no glitches."
     validations:
       required: true
 
-  - type: textarea
-    id: steps-to-reproduce
+  - type: input
+    id: fps
     attributes:
-      label: Steps to reproduce the result
-      description: List the shortest path to the reported status or failure from a fresh KytyPS5 start.
-      placeholder: |
-        1. Open KytyPS5.
-        2. Boot the game.
-        3. Select ...
-    validations:
-      required: true
+      label: FPS and how you measured it
+      description: For slow reports. What you see, what you expected, and the tool (Steam overlay, MangoHud, Kyty overlay, by eye).
+      placeholder: "Example: 25-30 FPS, expected ~50, Steam performance overlay"
 
-  - type: textarea
-    id: expected-behavior
+  - type: input
+    id: regression-builds
     attributes:
-      label: Expected behavior
-      description: Explain what should happen at the same point in the game. If there is no known problem, write "No known issue".
-      placeholder: "Example: The save should load and gameplay should continue normally."
-    validations:
-      required: true
+      label: Last good / first bad version
+      description: Optional. If it worked better on an older version.
+      placeholder: "Example: good on KytyPS5-Native-2026-10-28-a833e1b"
 
   - type: markdown
     attributes:
       value: |
-        ## Host system
-
-  - type: input
-    id: os
-    attributes:
-      label: OS
-      description: Include the operating system name, version, and edition when useful.
-      placeholder: "Example: Windows 11 Pro 25H2"
-    validations:
-      required: true
-
-  - type: input
-    id: cpu
-    attributes:
-      label: CPU
-      description: Include the exact processor model.
-      placeholder: "Example: AMD Ryzen 9 9950X3D"
-    validations:
-      required: true
-
-  - type: input
-    id: gpu
-    attributes:
-      label: GPU
-      description: Include the graphics card model and driver version when available.
-      placeholder: "Example: NVIDIA GeForce RTX 5080, driver 576.80"
-    validations:
-      required: true
-
-  - type: input
-    id: ram-vram
-    attributes:
-      label: RAM / VRAM
-      description: Include both system memory and video memory.
-      placeholder: "Example: 64 GB DDR5 RAM / 16 GB VRAM"
-    validations:
-      required: true
-
-  - type: markdown
-    attributes:
-      value: |
-        ## Evidence
+        ## Logs
 
   - type: textarea
     id: log-file
     attributes:
-      label: Log file upload
-      description: Drag the full KytyPS5 log (_kyty.txt) into this box, or link to the complete unmodified file.
-      placeholder: "Attach the full log file here."
+      label: Kyty log
+      description: |
+        Drag the full log file into this box. Zip it if it is over 25 MB.
+        - Decky shortcut: ~/.local/share/KytyPS5-Native/logs/<title id>.log
+        - kyty_launcher or kyty_emulator: save the terminal output, e.g. `./kyty_launcher 2>&1 | tee kyty.log` or `./kyty_emulator --game /path/to/game 2>&1 | tee kyty.log`. Also attach _kyty.txt if you set the log to File.
+        - Install or plugin problems: also attach the newest file from ~/homebrew/logs/KytyPS5-Native/
+      placeholder: "Attach the log file here."
     validations:
       required: true
 
   - type: textarea
     id: screenshots-video
     attributes:
-      label: Screenshots/video
-      description: Optional. Add images or footage when the problem is visible or audible.
-      placeholder: "Drag and drop media here, or paste links."
+      label: Screenshots or video
+      description: Optional.
 
   - type: textarea
     id: extra-notes
     attributes:
       label: Extra notes
-      description: Optional. Add settings, unusual hardware details, or anything else that may help.
-      placeholder: "Any extra context goes here."
+      description: Optional. Env vars you set, overclock details, other OS, anything else.
