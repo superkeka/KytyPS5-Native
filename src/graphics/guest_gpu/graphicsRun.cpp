@@ -122,12 +122,16 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		command();
 		return;
 	}
-	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
+	// On the heap, not the caller's stack: the caller is often a guest thread, whose stack is guest
+	// memory, and libstdc++ before GCC 15 waits with a futex on the semaphore itself. On the native
+	// backend's guest memory that futex fails with EFAULT and acquire() throws (the release built on
+	// Ubuntu aborted in Gran Turismo 7's audio thread).
+	auto done = std::make_shared<std::binary_semaphore>(0);
+	SendCommand([operation = std::move(command), done]() mutable {
 		operation();
-		done.release();
+		done->release();
 	});
-	done.acquire();
+	done->acquire();
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> commands, uint64_t flip_watermark) {
