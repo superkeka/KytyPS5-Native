@@ -1205,10 +1205,25 @@ public:
 	// cannot see), so whatever is flipped is made resident; until then such writes land in the dummy.
 	void KeepResident(uint64_t addr, uint64_t size) {
 #if KYTY_GEM_BACKING_SUPPORTED
-		std::lock_guard<std::mutex> lock(m_mutex);
+		std::unique_lock<std::mutex> lock(m_mutex);
 		if (m_gem == nullptr || !m_flipped.insert(addr).second) {
 			return;
 		}
+		// Making blocks exportable waits for an idle GPU, but a streamed DCB's CP waits for the worker's next
+		// chunk, and the worker needs this lock to send it (Stray's first flip came in the middle of a stream:
+		// 12 s, then the native path turned itself off). Let the open stream finish, and start no new one.
+		m_stream_hold = true;
+		const double t0 = NowSecShadow();
+		while (m_stream != StreamState::Off && NowSecShadow() - t0 < m_timeout_sec) {
+			lock.unlock();
+			struct timespec nap = {0, 200000};
+			nanosleep(&nap, nullptr);
+			lock.lock();
+		}
+		struct HoldEnd {
+			bool& hold;
+			~HoldEnd() { hold = false; }
+		} hold_end {m_stream_hold};
 		const uint32_t promoted = m_gem->PromoteGuestRange(addr, size);
 		// The presenter imports the buffer's dma-bufs: always-valid blocks under it become ordinary ones.
 		const uint32_t exported = m_gem->ExportGuestRange(addr, size, [this] { WaitIdle(); });
@@ -1223,6 +1238,12 @@ public:
 	// The dummy check needs an idle GPU; in async mode that means waiting for what is in flight.
 	bool WaitIdle() {
 #if KYTY_GEM_BACKING_SUPPORTED
+		// An open stream never finishes while its worker waits here: end its chain first.
+		if (m_stream == StreamState::Cont) {
+			PublishStreamLocked(m_stream_pending, 0, 0);
+			m_stream = StreamState::Off;
+			m_stream_breaks++;
+		}
 		return !m_submitter->Async() || m_submitter->WaitIdle(m_timeout_sec);
 #else
 		return true;
@@ -2115,9 +2136,32 @@ public:
 	// chain (an empty trampoline), the CP returns to the ring and the CS's fence follows.
 	// StreamBegin before the first chunk's flush; StreamFinal once the DCB is translated, so the next
 	// flush ends the chain; StreamActive tells the worker it must still flush to end it.
+	// The last stream events (begin, head CS, publish, end), dumped when the native path is disabled, to
+	// see where a stream stopped. What the CP reached comes from the scratch page.
+	void NoteStream(char what, uint32_t n, uint64_t a, uint64_t b) {
+		StreamEvent& e = m_stream_journal[m_stream_journal_at++ % m_stream_journal.size()];
+		e = StreamEvent {NowSecShadow(), what, n, a, b};
+	}
+	void DumpStreamJournal() {
+		if (m_stream_journal_at == 0 || m_submitter == nullptr) {
+			return;
+		}
+		const auto* sc = m_submitter->ScratchCpu();
+		std::fprintf(stderr, "native shadow: stream journal (state %d, pending %u, counter %u; CP saw counter %u, entered chunk %u):\n",
+		             static_cast<int>(m_stream), m_stream_pending, m_stream_counter,
+		             *reinterpret_cast<const volatile uint32_t*>(sc + kStreamFlagOffset),
+		             *reinterpret_cast<const volatile uint32_t*>(sc + kStreamDoneOffset));
+		const size_t n = std::min<size_t>(m_stream_journal_at, m_stream_journal.size());
+		for (size_t k = m_stream_journal_at - n; k < m_stream_journal_at; k++) {
+			const StreamEvent& e = m_stream_journal[k % m_stream_journal.size()];
+			std::fprintf(stderr, "  %.4f %c n=%u 0x%llx 0x%llx\n", e.t, e.what, e.n, static_cast<unsigned long long>(e.a),
+			             static_cast<unsigned long long>(e.b));
+		}
+	}
 	void StreamBegin() {
 		std::lock_guard<std::mutex> lock(m_mutex);
-		if (m_submitter == nullptr || !m_submitter->Async()) {
+		NoteStream('B', m_stream_counter, static_cast<uint64_t>(m_stream), m_stream_hold ? 1 : 0);
+		if (m_submitter == nullptr || !m_submitter->Async() || m_stream_hold) {
 			return;
 		}
 		if (!m_stream_ready) {
@@ -2749,6 +2793,7 @@ private:
 			const double waited = NowSecShadow() - t0;
 			m_stream_wait_s += waited;
 		}
+		NoteStream('P', n, va, len);
 		auto* t = reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + StreamTrampOffset(n));
 		uint32_t k = 0;
 		if (va != 0) {
@@ -2768,6 +2813,7 @@ private:
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_stream == StreamState::Head) {
 			if (m_stream_final || m_disabled || batch.empty()) {
+				NoteStream('x', 0, batch.size(), m_stream_final ? 1 : 0);
 				m_stream = StreamState::Off; // nothing to stream: an ordinary CS
 				return;
 			}
@@ -2780,6 +2826,7 @@ private:
 				return;
 			}
 			m_stream_head_seq = m_last_seq;
+			NoteStream('H', n, m_last_seq, 0);
 			m_stream_handles  = m_gem->CreatedHandles().size();
 			m_stream_pending  = n;
 			m_stream          = StreamState::Cont;
@@ -3584,6 +3631,7 @@ private:
 	}
 
 	void Disable(const char* reason) {
+		DumpStreamJournal();
 		m_disabled = true;
 		m_active.store(false, std::memory_order_release);
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -3691,6 +3739,7 @@ private:
 	enum class StreamState { Off, Head, Cont };
 	StreamState m_stream            = StreamState::Off;
 	bool        m_stream_final      = false;
+	bool        m_stream_hold       = false;  // KeepResident waits for an idle GPU: no new stream until it is done
 	bool        m_stream_ready      = false;  // the counter in the scratch page has been zeroed
 	uint32_t    m_stream_counter    = 0;      // the last value the CP has been or will be told to wait for
 	uint32_t    m_stream_pending    = 0;      // the trampoline the CP waits for now
@@ -3700,6 +3749,15 @@ private:
 	uint64_t    m_stream_fallbacks  = 0;
 	double      m_stream_wait_s     = 0.0;    // spent waiting for the CP to free a trampoline
 	uint64_t    m_stream_breaks     = 0;      // chains ended because a submission had to wait for a slot
+	struct StreamEvent {
+		double   t    = 0.0;
+		char     what = 0;
+		uint32_t n    = 0;
+		uint64_t a    = 0;
+		uint64_t b    = 0;
+	};
+	std::array<StreamEvent, 64> m_stream_journal {};
+	size_t                      m_stream_journal_at = 0;
 	// The stream counter and its trampolines, in the scratch page past the samples and tracker slots.
 	static constexpr uint32_t kStreamFlagOffset  = 2048;
 	static constexpr uint32_t kStreamDoneOffset  = 2052; // the last chunk the CP has entered
