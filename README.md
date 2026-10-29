@@ -72,10 +72,16 @@ the options.
 ## Requirements
 
 - BC-250 with SteamOS (tested), stock or patched amdgpu
+- Recommended BIOS config for big games (Gran Turismo 7, Astro Bot): VRAM 512 MB. Games live in
+  system memory (GTT) and a bigger split takes it from them: with 2 GB Astro Bot (up to 13.7 GB of
+  RAM) no longer fits. The stock BIOS gives the GPU 8 GB (4 GB on some revisions) with no menu for it:
+  set it with [bc250_memcfg](https://github.com/fanoush/bc250_memcfg) (`sudo ./bc250memcfg UMA_SIZE 512`,
+  no flashing) or in the modded P3.00 "Chipset Menu" BIOS (Chipset > GFX Configuration > UMA Frame
+  Buffer Size)
 - GTT 14 GiB (`ttm.pages_limit=3670016`). Without it games over 8 GiB of guest memory stall loading
 - Recommended: `options amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0`, or the patched amdgpu
 
-The plugin sets both. Kernel modes and how to set them by hand: [`tools/bc250-amdgpu`](tools/bc250-amdgpu/README.md).
+The plugin sets the last two. Kernel modes and how to set them by hand: [`tools/bc250-amdgpu`](tools/bc250-amdgpu/README.md).
 
 ## Build
 
