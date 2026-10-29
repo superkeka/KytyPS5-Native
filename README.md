@@ -73,7 +73,8 @@ the options.
 
 - BC-250 with SteamOS (tested), stock or patched amdgpu
 - Big games (Gran Turismo 7, Astro Bot): the modded P3.00 "Chipset Menu" BIOS with VRAM 512 MB
-  (Chipset > GFX Configuration > UMA Frame Buffer Size). More VRAM takes the RAM games need
+  (Chipset > GFX Configuration > UMA Frame Buffer Size). More VRAM takes the RAM games need.
+  On the stock BIOS: `sudo ./bc250memcfg UMA_SIZE 512` with [bc250_memcfg](https://github.com/fanoush/bc250_memcfg), no flashing
 - GTT 14 GiB (`ttm.pages_limit=3670016`). Without it games over 8 GiB of guest memory stall loading
 - Recommended: `options amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0`, or the patched amdgpu
 
