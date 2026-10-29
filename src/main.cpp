@@ -49,6 +49,7 @@ static void PrintUsage() {
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+	::printf("  --zar-cat <zar> <file>               Write a file from a ZArchive to stdout and exit.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
 	::printf(
 	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
@@ -438,9 +439,33 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+// `kyty_emulator --zar-cat <zar> <file>`: writes a file from a ZArchive to stdout. The Decky plugin and
+// the launch wrapper read a packed game's sce_sys (param.json, icon0.png, pic0.png) with it.
+static int ZarCat(const char* archive, const char* member) {
+	auto file = Common::OpenArchiveFile(Common::MakeArchivePath(archive, member));
+	if (file == nullptr) {
+		std::fprintf(stderr, "%s: no %s\n", archive, member);
+		return 1;
+	}
+	std::vector<char> buf(1u << 20u);
+	for (;;) {
+		uint32_t got = 0;
+		file->Read(buf.data(), static_cast<uint32_t>(buf.size()), &got);
+		if (got == 0) {
+			return 0;
+		}
+		if (std::fwrite(buf.data(), 1, got, stdout) != got) {
+			return 1;
+		}
+	}
+}
+
 static int Main(int argc, char* argv[]) {
 	if (argc == 3 && std::string_view(argv[1]) == "--play-video") {
 		return Libs::Graphics::PlayExitVideo(argv[2]);
+	}
+	if (argc == 4 && std::string_view(argv[1]) == "--zar-cat") {
+		return ZarCat(argv[2], argv[3]);
 	}
 	Libs::Graphics::NativeGpu::ApplyNativeDefaults();
 	VirtualMemory::Init();
