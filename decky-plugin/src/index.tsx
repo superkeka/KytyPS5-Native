@@ -138,6 +138,64 @@ function Content() {
             </ButtonItem>
           </PanelSectionRow>
         )}
+        {state.ps5_apu && (
+          <PanelSectionRow>
+            {state.kernel.reboot ? (
+              <ButtonItem
+                layout="inline"
+                label="Kernel config"
+                description="Reboot to apply"
+                onClick={() => confirm("Reboot", "Reboot now for the kernel config to take effect?", "Reboot", () => reboot())}
+              >
+                Reboot
+              </ButtonItem>
+            ) : !state.kernel.all_ok ? (
+              <ButtonItem
+                layout="inline"
+                label="Kernel config"
+                description="Not set: big games stall, KFD queues off"
+                disabled={!!busy}
+                onClick={() =>
+                  confirm(
+                    "Recommended kernel config",
+                    "Kernel options only, the kernel stays the same: GTT 14 GiB (ttm.pages_limit, big games need it) and " +
+                      "amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0 (the GPU queues PS5 games use). " +
+                      "Now: " + state.kernel.items.map((it) => `${it.label} ${kernelText(it)}`).join(", ") + ". " +
+                      "Files: /etc/default/grub.d/kytyps5-native.cfg, /etc/modprobe.d/kytyps5-native.conf. " +
+                      "Takes effect after a reboot; Revert removes them.",
+                    "Apply",
+                    () =>
+                      run("Kernel", async () => {
+                        const r = await kernelApply();
+                        toast(r.ok ? "Applied, reboot to use it" : r.log || "failed");
+                      }),
+                  )
+                }
+              >
+                Apply
+              </ButtonItem>
+            ) : state.kernel.ours ? (
+              <ButtonItem
+                layout="inline"
+                label="Kernel config"
+                description="Recommended"
+                disabled={!!busy}
+                onClick={() =>
+                  confirm("Revert", "Remove the kernel options this plugin added? Takes effect after a reboot.", "Revert", () =>
+                    run("Kernel", async () => {
+                      const r = await kernelRevert();
+                      toast(r.ok ? "Reverted, reboot to finish" : r.log || "failed");
+                    }),
+                  )
+                }
+              >
+                Revert
+              </ButtonItem>
+            ) : (
+              <Field label="Kernel config" description="Recommended (set outside the plugin)" focusable />
+            )}
+          </PanelSectionRow>
+        )}
         {release?.error && (
           <PanelSectionRow>
             <Field label="No connection to GitHub" description={release.error} />
@@ -145,64 +203,6 @@ function Content() {
         )}
       </PanelSection>
 
-      {state.ps5_apu && <PanelSection title="Kernel">
-        {state.kernel.items.map((it) => (
-          <PanelSectionRow key={it.key}>
-            <Field label={it.label} description={!it.ok && it.file && !it.pending ? it.file : undefined}>
-              {kernelText(it)}
-            </Field>
-          </PanelSectionRow>
-        ))}
-        {!state.kernel.all_ok && !state.kernel.reboot && (
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              disabled={!!busy}
-              onClick={() =>
-                confirm(
-                  "Recommended kernel settings",
-                  "Sets GTT to 14 GiB (big games need it) and amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0 " +
-                    "(the GPU queues PS5 games use). Files: /etc/default/grub.d/kytyps5-native.cfg, " +
-                    "/etc/modprobe.d/kytyps5-native.conf. Takes effect after a reboot; Revert removes them.",
-                  "Apply",
-                  () =>
-                    run("Kernel", async () => {
-                      const r = await kernelApply();
-                      toast(r.ok ? "Applied, reboot to use them" : r.log || "failed");
-                    }),
-                )
-              }
-            >
-              Apply recommended settings
-            </ButtonItem>
-          </PanelSectionRow>
-        )}
-        {state.kernel.reboot && (
-          <PanelSectionRow>
-            <ButtonItem layout="below" onClick={() => confirm("Reboot", "Reboot now for the kernel settings to take effect?", "Reboot", () => reboot())}>
-              Reboot
-            </ButtonItem>
-          </PanelSectionRow>
-        )}
-        {state.kernel.ours && (
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              disabled={!!busy}
-              onClick={() =>
-                confirm("Revert", "Remove the kernel settings this plugin added? Takes effect after a reboot.", "Revert", () =>
-                  run("Kernel", async () => {
-                    const r = await kernelRevert();
-                    toast(r.ok ? "Reverted, reboot to finish" : r.log || "failed");
-                  }),
-                )
-              }
-            >
-              Revert kernel settings
-            </ButtonItem>
-          </PanelSectionRow>
-        )}
-      </PanelSection>}
 
       <PanelSection title="Games">
         <PanelSectionRow>
