@@ -84,6 +84,8 @@ function Title() {
 }
 
 const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({ title, body });
+// Release tags without the project name: 2026-10-29-6957c86.
+const short = (tag: string) => tag.replace(/^KytyPS5-Native-/, "");
 
 // Decky's own installer (as its store): asks, swaps the files and reloads this plugin alone. Without
 // it, the backend swaps them and restarts Decky.
@@ -150,7 +152,7 @@ function Content() {
               !state.ps5_apu ? "Vulkan path (native mode needs the PS5's APU)" : state.helper ? "Native mode, root helper running" : "Root helper not running"
             }
           >
-            {state.kyty_installed ? state.kyty_version || "installed" : "not installed"}
+            {state.kyty_installed ? short(state.kyty_version) || "installed" : "not installed"}
           </Field>
         </PanelSectionRow>
         {!state.kyty_installed && (
@@ -161,7 +163,7 @@ function Content() {
               onClick={() =>
                 run("Installing KytyPS5-Native", async () => {
                   const r = await installKyty(release!.kyty_url!, release!.tag);
-                  toast(r.ok ? `Installed ${release!.tag}` : r.log || "failed");
+                  toast(r.ok ? `Installed ${short(release!.tag)}` : r.log || "failed");
                 })
               }
             >
@@ -173,18 +175,16 @@ function Content() {
           <PanelSectionRow>
             {state.kernel.reboot ? (
               <ButtonItem
-                layout="inline"
-                label="Kernel config"
-                description="Reboot to apply"
+                layout="below"
+                description="Reboot to apply the new config"
                 onClick={() => confirm("Reboot", "Reboot now for the kernel config to take effect?", "Reboot", () => reboot())}
               >
-                Reboot
+                Kernel config
               </ButtonItem>
             ) : !state.kernel.all_ok ? (
               <ButtonItem
-                layout="inline"
-                label="Kernel config"
-                description="Not set: big games stall, KFD queues off"
+                layout="below"
+                description="Not set: press to apply the recommended config"
                 disabled={!!busy}
                 onClick={() =>
                   confirm(
@@ -203,13 +203,12 @@ function Content() {
                   )
                 }
               >
-                Apply
+                Kernel config
               </ButtonItem>
             ) : state.kernel.ours ? (
               <ButtonItem
-                layout="inline"
-                label="Kernel config"
-                description="Recommended"
+                layout="below"
+                description="Recommended: press to revert"
                 disabled={!!busy}
                 onClick={() =>
                   confirm("Revert", "Remove the kernel options this plugin added? Takes effect after a reboot.", "Revert", () =>
@@ -220,20 +219,21 @@ function Content() {
                   )
                 }
               >
-                Revert
+                Kernel config
               </ButtonItem>
             ) : (
-              <Field label="Kernel config" description="Recommended (set outside the plugin)" focusable />
+              <Field label="Kernel config" description="Recommended (set by hand)" focusable />
             )}
           </PanelSectionRow>
         )}
         {state.kyty_installed && (
           <PanelSectionRow>
             <ButtonItem
-              layout="inline"
-              label="Updates"
+              layout="below"
               description={
-                kytyUpdate || pluginUpdate ? `${release!.tag} is out` : `Plugin ${state.plugin_release || state.plugin_version}`
+                kytyUpdate || pluginUpdate
+                  ? `${short(release!.tag)} is out: press to update`
+                  : `Plugin ${short(state.plugin_release) || state.plugin_version}: press to check`
               }
               disabled={!!busy || ((kytyUpdate || pluginUpdate) && state.game_running)}
               onClick={() =>
@@ -245,7 +245,7 @@ function Content() {
                           toast(r.log || "failed");
                           return;
                         }
-                        toast(`KytyPS5-Native ${release!.tag} installed`);
+                        toast(`KytyPS5-Native ${short(release!.tag)} installed`);
                       }
                       if (pluginUpdate) await updatePlugin(release!);
                     })
@@ -254,11 +254,11 @@ function Content() {
                       setRelease(r);
                       const kyty = !!r.kyty_url && r.tag !== state.kyty_version;
                       const plugin = !!r.plugin_url && !!state.plugin_release && r.tag !== state.plugin_release;
-                      toast(r.error ? `No connection to GitHub: ${r.error}` : kyty || plugin ? `${r.tag} is out` : "Up to date");
+                      toast(r.error ? `No connection to GitHub: ${r.error}` : kyty || plugin ? `${short(r.tag)} is out` : "Up to date");
                     })
               }
             >
-              {busy === "Update" ? "Updating..." : busy === "Check" ? "Checking..." : kytyUpdate || pluginUpdate ? "Update" : "Check"}
+              {busy === "Update" ? "Updating..." : busy === "Check" ? "Checking..." : "Updates"}
             </ButtonItem>
           </PanelSectionRow>
         )}
