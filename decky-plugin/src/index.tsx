@@ -306,12 +306,12 @@ function Content() {
         </PanelSectionRow>
       </PanelSection>
 
-      <PanelSection title="Videos">
+      <PanelSection title="Animations">
         {(["boot", "exit"] as const).map((kind) => (
           <PanelSectionRow key={kind}>
             <ToggleField
-              label={kind === "boot" ? "Boot video" : "Exit video"}
-              description={kind === "boot" ? "PS5 boot animation before the game" : "PS5 shutdown animation when you leave the game"}
+              label={kind === "boot" ? "Boot animation" : "Exit animation"}
+              description={kind === "boot" ? "Before the game starts" : "When you leave the game"}
               checked={state.videos[kind]}
               disabled={!!busy}
               onChange={(on) =>
