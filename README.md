@@ -1,4 +1,6 @@
-# KytyPS5-Native (BC-250)
+# KytyPS5-Native
+
+PS5 games natively on the PS5 chip under Linux.
 
 A fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) that runs PS5 games GPU work natively on the
 AMD BC-250. The BC-250 has the PS5's GPU silicon (gfx1013, "Oberon"), so the title's command buffers
