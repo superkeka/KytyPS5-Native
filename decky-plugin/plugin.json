@@ -1,0 +1,11 @@
+{
+  "name": "KytyPS5-Native",
+  "author": "superkeka",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["emulator", "root"],
+    "description": "PS5 games natively on the PS5 chip: kernel settings, KytyPS5-Native updates and Steam shortcuts for your games.",
+    "image": "https://raw.githubusercontent.com/superkeka/KytyPS5-Native/main/docs/screenshots/bc250-astro-bot.jpg"
+  }
+}
