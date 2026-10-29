@@ -9,7 +9,7 @@ default in primary mode.
 On the PS5 a title hands its DCB to the GPU and the CP starts on it at once. Here every DCB is
 translated first (`Pm4Translator::Translate`), and until this change the whole result went to the GPU
 as one CS only after the translation ended. In Gran Turismo 7 a DCB is ~100K dwords; its translation
-took 2–3.5 ms a frame, during which the gfx ring idled.
+took 2-3.5 ms a frame, during which the gfx ring idled.
 
 That delay is what made GT7 stutter. The flip trace (`KYTY_NATIVE_GPU_FLIP_TRACE`, columns
 `dcb_latency_ms`, `game_gap_ms`, `acb_gap_ms`) and the guest wait log (`KYTY_LONG_WAITS`,
@@ -29,7 +29,7 @@ GT7 race on the stock amdgpu, frames over 20 ms:
 
 | | over 20 ms |
 |---|---|
-| whole DCB, one CS | 2.0–3.3 % |
+| whole DCB, one CS | 2.0-3.3 % |
 | chunks, a CS each with a full preamble | 1.19 % (GPU +2 ms a frame) |
 | streamed, 16K-dword chunks | 1.68 % |
 | streamed, the title's segments | 1.49 % |
