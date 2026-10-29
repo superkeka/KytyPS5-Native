@@ -292,6 +292,14 @@ class Plugin:
                         t.extractall(new)
                 with open(os.path.join(new, "VERSION"), "w") as f:
                     f.write(tag + "\n")
+                # Kyty keeps saves, trophies and download data in its working folder, its own folder when
+                # its launcher starts it. They live in data/ (an update replaces kyty/ whole), linked here
+                # so Kyty run that way and the shortcuts (kytyps5-run.sh works in data/) share them.
+                for d in ("_SaveData", "_Trophies", "_DownloadData"):
+                    os.makedirs(os.path.join(SHARE, "data", d), exist_ok=True)
+                    if not os.path.lexists(os.path.join(new, d)):
+                        os.symlink(os.path.join("..", "data", d), os.path.join(new, d))
+                _chown(os.path.join(SHARE, "data"))
                 _chown(new)
                 old = KYTY_DIR + ".old"
                 shutil.rmtree(old, ignore_errors=True)
