@@ -1,6 +1,6 @@
 #!/bin/bash
 # Plays a PS5 game in KytyPS5-Native from a Steam shortcut (the Decky plugin adds them).
-# Usage (Steam launch options): kytyps5-run.sh "<game folder>" [--keep-steam]
+# Usage (Steam launch options): kytyps5-run.sh "<game folder or .zar>" [--keep-steam]
 #
 # By default Steam is unloaded while the game runs: Steam and its web helpers hold 2-3 GB of RAM that a
 # big PS5 game needs (Gran Turismo 7 uses ~12.6 of 14.8 GB). It comes back on any exit. --keep-steam
@@ -14,9 +14,15 @@ EMU=$HERE/kyty_emulator
 GAME=${1:?game folder}
 KEEP_STEAM=0
 [ "${2:-}" = --keep-steam ] && KEEP_STEAM=1
-# The title id (the window name has it): from the game's param.json, else the folder name.
-TITLE=$(grep -o '"titleId" *: *"[^"]*"' "$GAME/sce_sys/param.json" 2>/dev/null | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
-TITLE=${TITLE:-$(basename "$GAME")}
+# The title id (the log and the unit are named by it): from the game's param.json, inside the archive for
+# a .zar, else the folder name.
+if [ -f "$GAME" ]; then
+	PARAM=$("$EMU" --zar-cat "$GAME" sce_sys/param.json 2>/dev/null)
+else
+	PARAM=$(cat "$GAME/sce_sys/param.json" 2>/dev/null)
+fi
+TITLE=$(printf '%s' "$PARAM" | grep -o '"titleId" *: *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+TITLE=${TITLE:-$(basename "$GAME" .zar)}
 CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/KytyPS5-Native
 SHARE=${XDG_DATA_HOME:-$HOME/.local/share}/KytyPS5-Native
 mkdir -p "$SHARE/data" "$SHARE/logs"
