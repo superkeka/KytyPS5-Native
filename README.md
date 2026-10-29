@@ -3,7 +3,7 @@
 PS5 games natively on the PS5 chip under Linux.
 
 A fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) that runs PS5 games GPU work natively on the
-AMD BC-250. The BC-250 has the PS5's GPU silicon (gfx1013, "Oberon"), so the title's command buffers
+AMD BC-250. The BC-250 has the PS5's APU ("Oberon", GPU gfx1013), so the title's command buffers
 run on the hardware after a light translation, and its shaders run with small patches. Vulkan stays for
 presentation and as a fallback. It will likely run on a PS5 under Linux too.
 
