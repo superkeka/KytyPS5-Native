@@ -1,0 +1,14 @@
+[Unit]
+Description=Kyty native GPU helper (LOD statistics, KFD TLB flushes)
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do compgen -G "/dev/dri/renderD*" >/dev/null && exit 0; sleep 1; done; exit 1'
+ExecStart=@BIN@/kyty-lodhw /run/kyty-lodhw.sock @GID@
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

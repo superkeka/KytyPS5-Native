@@ -50,6 +50,20 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
 
 Kernel modes and how to set them: [`tools/bc250-amdgpu`](tools/bc250-amdgpu/README.md).
 
+## Install
+
+Download the latest `KytyPS5-Native-*-Linux-x86_64.tar.gz` from
+[Releases](https://github.com/superkeka/KytyPS5-Native/releases) and unpack it.
+
+```bash
+sudo ./install-helper.sh   # the root helper as a service (LOD statistics, KFD TLB flushes)
+./kyty_launcher
+```
+
+On the BC-250 native mode turns on by itself; `KYTY_NATIVE_GPU=0` turns it off.
+`kyty_emulator --game /path/to/game` runs a game without the launcher, `kyty_emulator --help` lists
+the options. From a Steam shortcut: [`tools/bc250-runs/kyty-steam.sh`](tools/bc250-runs/kyty-steam.sh).
+
 ## Build
 
 On SteamOS inside a [Distrobox](https://distrobox.it/) container with Clang, CMake, Ninja,
@@ -62,16 +76,7 @@ cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build _Build/linux-no-qt --target kyty_emulator --parallel
 ```
 
-## Run
-
-```bash
-KYTY_NATIVE_GPU_GEM=1 KYTY_NATIVE_GPU_PRIMARY=1 \
-  ./_Build/linux-no-qt/kyty_emulator --game /path/to/game --fullscreen
-```
-
-From a Steam shortcut: [`tools/bc250-runs/kyty-steam.sh`](tools/bc250-runs/kyty-steam.sh). The root
-helper [`tools/bc250-lodhw`](tools/bc250-lodhw/kyty-lodhw.c) handles the privileged registers (LOD
-statistics, KFD TLB flushes). `kyty_emulator --help` lists the other options.
+The helper `kyty-lodhw` is built with the emulator.
 
 ## Native backend
 

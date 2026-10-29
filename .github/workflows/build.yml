@@ -27,7 +27,7 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "value=KytyPS5-Native-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
   linux:
     name: Build KytyPS5 (Linux)
@@ -148,6 +148,7 @@ jobs:
           file _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
           test -x _Build/linux/install/kyty_updater
+          test -x _Build/linux/install/kyty-lodhw
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
           readelf -d _Build/linux/install/kyty_launcher | grep -q 'RPATH.*\$ORIGIN/lib'
@@ -170,3 +171,53 @@ jobs:
           name: KytyPS5-Linux-x86_64
           path: _Build/linux/install/**
           if-no-files-found: error
+
+  release:
+    name: Release KytyPS5-Native
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'superkeka/KytyPS5-Native' &&
+      needs.linux.result == 'success'
+    needs: [metadata, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+
+    steps:
+      - name: Download Linux build
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: artifacts/KytyPS5-Linux-x86_64
+
+      - name: Package Linux build
+        shell: bash
+        run: |
+          linux_dir="artifacts/KytyPS5-Linux-x86_64"
+          test -d "$linux_dir"
+          chmod a+x \
+            "$linux_dir/kyty_launcher" \
+            "$linux_dir/kyty_emulator" \
+            "$linux_dir/kyty_updater" \
+            "$linux_dir/kyty-lodhw" \
+            "$linux_dir/install-helper.sh"
+          tar -C "$linux_dir" -czf \
+            "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="$RELEASE_NAME-Linux-x86_64.tar.gz"
+          if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_NAME" "$asset" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_NAME" "$asset" \
+              --generate-notes \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_NAME"
+          fi

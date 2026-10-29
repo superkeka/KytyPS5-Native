@@ -36,3 +36,15 @@ if(BUILD_TESTING)
 	add_test(NAME native_gpu_pm4_translator COMMAND $<TARGET_FILE:native_gpu_pm4_translator_tests>)
 	add_dependencies(kyty_tests native_gpu_pm4_translator_tests)
 endif()
+
+# The root helper (tools/bc250-lodhw): the privileged registers the native backend needs (LOD
+# statistics, KFD TLB flushes). Built with the emulator and shipped next to it with its service
+# and installer (sudo ./install-helper.sh).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	add_executable(kyty-lodhw "${CMAKE_CURRENT_SOURCE_DIR}/tools/bc250-lodhw/kyty-lodhw.c")
+	target_link_libraries(kyty-lodhw PRIVATE Threads::Threads)
+	cmake_language(DEFER CALL add_dependencies kyty_emulator kyty-lodhw)
+	install(TARGETS kyty-lodhw DESTINATION .)
+	install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/tools/bc250-lodhw/install-helper.sh" DESTINATION .)
+	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/tools/bc250-lodhw/kyty-lodhw.service" DESTINATION .)
+endif()
