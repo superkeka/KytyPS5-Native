@@ -230,6 +230,22 @@ def _scan(folder):
 class Plugin:
     async def _main(self):
         decky.logger.info("KytyPS5-Native plugin %s", decky.DECKY_PLUGIN_VERSION)
+        asyncio.get_event_loop().create_task(self._default_videos())
+
+    # The videos are on by default: fetched once, unless the user turned one off. A few tries, the
+    # network may come up after Decky.
+    async def _default_videos(self):
+        for _ in range(10):
+            off = set(_load().get("videos_off", []))
+            missing = [k for k in VIDEOS if k not in off and not os.path.exists(os.path.join(CONFIG_DIR, k + ".webm"))]
+            if not missing:
+                return
+            for k in missing:
+                if os.path.exists(os.path.join(CONFIG_DIR, k + ".webm.off")):
+                    continue
+                r = await self.set_video(k, True)
+                decky.logger.info("default %s video: %s", k, r)
+            await asyncio.sleep(60)
 
     async def _unload(self):
         pass
@@ -450,6 +466,12 @@ class Plugin:
     async def set_video(self, kind, on):
         path = os.path.join(CONFIG_DIR, kind + ".webm")
         off = path + ".off"
+
+        s = _load()
+        off = set(s.get("videos_off", []))
+        off.discard(kind) if on else off.add(kind)
+        s["videos_off"] = sorted(off)
+        _save(s)
 
         def work():
             _mkdir_user(CONFIG_DIR)
