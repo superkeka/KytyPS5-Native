@@ -69,17 +69,26 @@ async function composeArt(g: Game): Promise<Art | null> {
       ctx.drawImage(icon, 70, 220, 460, 460);
     }),
     hero: canvas(1920, 620, (ctx) => cover(ctx, pic, 1920, 620)),
-    wide: canvas(920, 430, (ctx) => cover(ctx, pic, 920, 430)),
+    wide: canvas(920, 430, (ctx) => {
+      ctx.filter = "blur(12px) brightness(0.85)";
+      cover(ctx, pic, 920, 430, 24);
+      ctx.filter = "none";
+      ctx.drawImage(icon, 310, 65, 300, 300);
+    }),
   };
 }
 
+// Raised when the artwork's look changes: shortcuts get it again, the cache keeps one per version.
+export const ART_VERSION = 2;
+
 async function setArtwork(appid: number, g: Game) {
-  let art = (await getCachedArt(g.title_id)) as Art;
+  const key = `${g.title_id}-v${ART_VERSION}`;
+  let art = (await getCachedArt(key)) as Art;
   if (!art.capsule) {
     const made = await composeArt(g);
     if (!made) return;
     art = made;
-    for (const kind of ["capsule", "hero", "wide"] as const) await saveArt(g.title_id, kind, art[kind]);
+    for (const kind of ["capsule", "hero", "wide"] as const) await saveArt(key, kind, art[kind]);
   }
   await steam().Apps.SetCustomArtworkForApp(appid, art.capsule, "png", 0);
   await steam().Apps.SetCustomArtworkForApp(appid, art.hero, "png", 1);
@@ -94,7 +103,7 @@ function byName(name: string): number {
 }
 
 // Adds or updates the shortcut of one game; returns its app id.
-export async function syncGame(g: Game, runner: string, kytyDir: string): Promise<number> {
+export async function syncGame(g: Game, runner: string, kytyDir: string, redoArt = false): Promise<number> {
   let appid = exists(g.appid) ? g.appid : byName(shortcutName(g));
   const fresh = !appid;
   if (fresh) {
@@ -106,7 +115,7 @@ export async function syncGame(g: Game, runner: string, kytyDir: string): Promis
   steam().Apps.SetShortcutStartDir(appid, `"${kytyDir}/"`);
   steam().Apps.SetShortcutLaunchOptions(appid, `"${g.path}"${g.keep_steam ? " --keep-steam" : ""}`);
   steam().Apps.SetShortcutIcon(appid, `${g.path}/sce_sys/icon0.png`);
-  if (fresh) await setArtwork(appid, g);
+  if (fresh || redoArt) await setArtwork(appid, g);
   await setGame(g.title_id, appid, g.keep_steam);
   return appid;
 }
@@ -119,8 +128,14 @@ export async function removeGone(gone: Record<string, { appid: number }>) {
   }
 }
 
-export async function syncAll(games: Game[], gone: Record<string, { appid: number }>, runner: string, kytyDir: string) {
-  for (const g of games) await syncGame(g, runner, kytyDir);
+export async function syncAll(
+  games: Game[],
+  gone: Record<string, { appid: number }>,
+  runner: string,
+  kytyDir: string,
+  redoArt = false,
+) {
+  for (const g of games) await syncGame(g, runner, kytyDir, redoArt);
   await removeGone(gone);
 }
 

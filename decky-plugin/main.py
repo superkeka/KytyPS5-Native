@@ -303,6 +303,7 @@ class Plugin:
             "home": HOME,
             "games_dir": folder,
             "games_dir_state": folder_state,
+            "art_version": s.get("art_version", 1),
             "games": games,
             "gone": {k: v for k, v in known.items() if k not in {g["title_id"] for g in games} and v.get("appid")},
             "videos": {k: os.path.exists(os.path.join(CONFIG_DIR, k + ".webm")) for k in VIDEOS},
@@ -472,6 +473,11 @@ class Plugin:
     async def set_games_dir(self, path):
         s = _load()
         s["games_dir"] = path
+        _save(s)
+
+    async def set_art_version(self, version):
+        s = _load()
+        s["art_version"] = version
         _save(s)
 
     async def set_game(self, title_id, appid, keep_steam):

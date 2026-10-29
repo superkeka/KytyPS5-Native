@@ -11,7 +11,7 @@ import {
 import { callable, definePlugin, openFilePicker, toaster } from "@decky/api";
 import { useEffect, useState } from "react";
 import { FaPlaystation } from "react-icons/fa";
-import { Game, needsSync, syncAll } from "./shortcuts";
+import { ART_VERSION, Game, needsSync, syncAll } from "./shortcuts";
 
 interface KernelItem {
   key: string;
@@ -34,6 +34,7 @@ interface State {
   home: string;
   games_dir: string;
   games_dir_state: "ok" | "empty" | "missing";
+  art_version: number;
   ps5_apu: boolean;
   games: Game[];
   gone: Record<string, { appid: number }>;
@@ -63,6 +64,7 @@ const kernelRevert = callable<[], Result>("kernel_revert");
 const reboot = callable<[], void>("reboot");
 const setGamesDir = callable<[path: string], void>("set_games_dir");
 const setVideo = callable<[kind: string, on: boolean], Result>("set_video");
+const setArtVersion = callable<[version: number], void>("set_art_version");
 
 const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({ title, body });
 // Release tags without the project name: 2026-10-29-6957c86.
@@ -108,7 +110,7 @@ function Content() {
   const refresh = async () => {
     const s = await getState();
     setState(s);
-    if (s.kyty_installed && needsSync(s.games, s.gone) && !syncRunning) {
+    if (s.kyty_installed && (needsSync(s.games, s.gone) || s.art_version !== ART_VERSION) && !syncRunning) {
       setSyncing(true);
       await sync(s);
       setSyncing(false);
@@ -336,7 +338,9 @@ async function sync(s: State) {
   if (syncRunning) return;
   syncRunning = true;
   try {
-    await syncAll(s.games, s.gone, s.runner, s.kyty_dir);
+    const redoArt = s.art_version !== ART_VERSION;
+    await syncAll(s.games, s.gone, s.runner, s.kyty_dir, redoArt);
+    if (redoArt) await setArtVersion(ART_VERSION);
   } catch (e) {
     console.error("KytyPS5-Native sync", e);
   }
@@ -346,7 +350,7 @@ async function sync(s: State) {
 // Also when the panel is closed: at start and every 10 minutes.
 async function autoSync() {
   const s = await getState();
-  if (s.kyty_installed && needsSync(s.games, s.gone)) await sync(s);
+  if (s.kyty_installed && (needsSync(s.games, s.gone) || s.art_version !== ART_VERSION)) await sync(s);
 }
 
 export default definePlugin(() => {
