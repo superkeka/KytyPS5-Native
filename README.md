@@ -51,8 +51,9 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
 3. Decky settings > Developer > Install Plugin from ZIP File
 4. In the plugin: Kernel config > Apply and reboot, then Install, then pick the games folder
 
-Games show up in the Steam library under Non-Steam as "Game (PS5)". The PS button opens the in-game menu (resume, monitoring, exit
-game). The plugin updates KytyPS5-Native and itself.
+Games show up in the Steam library under Non-Steam as "Game (PS5)". The PS / Xbox button,
+Share+Options together or F10 open the in-game menu (resume, monitoring, exit game). The plugin
+keeps KytyPS5-Native and itself up to date.
 
 ### Other systems
 
