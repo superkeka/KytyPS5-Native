@@ -38,8 +38,8 @@ restore() { DISPLAY=:0 xprop -root -f GAMESCOPECTRL_BASELAYER_APPID 32co -set GA
 trap restore EXIT
 # A run stopped from outside can leave the container half torn down ("creating temporary passwd file
 # ... no such file or directory"); a clean stop and start brings it back.
-distrobox enter shadps4-dev -- true >/dev/null 2>&1 || { podman stop -t 5 shadps4-dev; podman start shadps4-dev; } >/dev/null 2>&1
-(cd "$OUT" && distrobox enter shadps4-dev -- env DISPLAY=:1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 ${EXTRA_ENV:-} $ENVS timeout -s INT "$SECS" "$EMU" --game /home/deck/Games/$TITLE --screen-width ${SCREEN%x*} --screen-height ${SCREEN#*x} --fullscreen --no-splash --skip-notice-screen ${OVERLAY---perf-overlay} ${EXTRA_ARGS:-} > run.log 2>&1; echo "exit=$?" >> run.log) &
+distrobox enter kyty-dev -- true >/dev/null 2>&1 || { podman stop -t 5 kyty-dev; podman start kyty-dev; } >/dev/null 2>&1
+(cd "$OUT" && distrobox enter kyty-dev -- env DISPLAY=:1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 ${EXTRA_ENV:-} $ENVS timeout -s INT "$SECS" "$EMU" --game /home/deck/Games/$TITLE --screen-width ${SCREEN%x*} --screen-height ${SCREEN#*x} --fullscreen --no-splash --skip-notice-screen ${OVERLAY---perf-overlay} ${EXTRA_ARGS:-} > run.log 2>&1; echo "exit=$?" >> run.log) &
 EMUPID=$!
 WID=""
 for i in $(seq 1 90); do sleep 1; WID=$(DISPLAY=:1 xdotool search --name "$TITLE" 2>/dev/null | head -1); [ -n "$WID" ] && break; kill -0 $EMUPID 2>/dev/null || break; done

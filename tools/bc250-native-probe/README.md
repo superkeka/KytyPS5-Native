@@ -289,7 +289,7 @@ No other UCONFIG writes appear, so this title never touches the registers suspec
 - CS cost with the buffer listed.
 
 ```sh
-distrobox enter shadps4-dev -- sh -c "cc -O2 -o /tmp/gem_view_probe gem_view_probe.c && /tmp/gem_view_probe"
+distrobox enter kyty-dev -- sh -c "cc -O2 -o /tmp/gem_view_probe gem_view_probe.c && /tmp/gem_view_probe"
 ```
 
 On 2026-10-23 every check passed. A CS listing a 256 MiB GTT buffer took 0.008 ms. The same

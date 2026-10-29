@@ -22,13 +22,13 @@ W=${1:-3840}; H=${2:-2160}
 cd "$OUT"
 # The container must not start inside this launch: its conmon would become a child of Steam's reaper
 # (a subreaper), which waits for it after the game exits, so Steam keeps the game "running".
-if ! podman container inspect -f "{{.State.Running}}" shadps4-dev 2>/dev/null | grep -q true; then
-	systemctl --user reset-failed shadps4-dev-container 2>/dev/null
-	systemd-run --user --unit=shadps4-dev-container -p KillMode=process -p RemainAfterExit=yes --quiet \
-		podman start shadps4-dev >/dev/null 2>&1
-	for i in $(seq 1 30); do podman container inspect -f "{{.State.Running}}" shadps4-dev 2>/dev/null | grep -q true && break; sleep 1; done
+if ! podman container inspect -f "{{.State.Running}}" kyty-dev 2>/dev/null | grep -q true; then
+	systemctl --user reset-failed kyty-dev-container 2>/dev/null
+	systemd-run --user --unit=kyty-dev-container -p KillMode=process -p RemainAfterExit=yes --quiet \
+		podman start kyty-dev >/dev/null 2>&1
+	for i in $(seq 1 30); do podman container inspect -f "{{.State.Running}}" kyty-dev 2>/dev/null | grep -q true && break; sleep 1; done
 fi
-distrobox enter shadps4-dev -- env DISPLAY="${DISPLAY:-:1}" SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 $ENVS "${EXTRA[@]}" "$EMU" --game /home/deck/Games/$TITLE --screen-width $W --screen-height $H --fullscreen --no-splash --skip-notice-screen --perf-overlay "${ARGS[@]}" > run.log 2>&1 &
+distrobox enter kyty-dev -- env DISPLAY="${DISPLAY:-:1}" SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 $ENVS "${EXTRA[@]}" "$EMU" --game /home/deck/Games/$TITLE --screen-width $W --screen-height $H --fullscreen --no-splash --skip-notice-screen --perf-overlay "${ARGS[@]}" > run.log 2>&1 &
 PID=$!
 # The emulator runs in the container, outside Steam's process tree: tag its window for gamescope.
 for i in $(seq 1 60); do

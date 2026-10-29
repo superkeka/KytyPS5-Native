@@ -12,7 +12,7 @@ mkdir -p "$OUT"
 key() { DISPLAY=:1 xdotool keydown "$1"; sleep "${2:-0.15}"; DISPLAY=:1 xdotool keyup "$1"; }
 restore() { DISPLAY=:0 xprop -root -f GAMESCOPECTRL_BASELAYER_APPID 32co -set GAMESCOPECTRL_BASELAYER_APPID 769; }
 trap restore EXIT
-(cd "$OUT" && distrobox enter shadps4-dev -- env DISPLAY=:1 ${EXTRA_ENV:-} KYTY_NATIVE_GPU_GEM=1 KYTY_NATIVE_GPU_SHADOW=1 KYTY_NATIVE_GPU_DUMP_FLIPS="$FLIPS" KYTY_NATIVE_GPU_DUMP_DIR="$OUT" timeout -s INT 200 "$EMU" --game /home/deck/Games/PPSA15552 --no-splash --skip-notice-screen > run.log 2>&1; echo "exit=$?" >> run.log) &
+(cd "$OUT" && distrobox enter kyty-dev -- env DISPLAY=:1 ${EXTRA_ENV:-} KYTY_NATIVE_GPU_GEM=1 KYTY_NATIVE_GPU_SHADOW=1 KYTY_NATIVE_GPU_DUMP_FLIPS="$FLIPS" KYTY_NATIVE_GPU_DUMP_DIR="$OUT" timeout -s INT 200 "$EMU" --game /home/deck/Games/PPSA15552 --no-splash --skip-notice-screen > run.log 2>&1; echo "exit=$?" >> run.log) &
 WID=""
 for i in $(seq 1 40); do sleep 1; WID=$(DISPLAY=:1 xdotool search --name "Dead Cells, PPSA15552" 2>/dev/null | head -1); [ -n "$WID" ] && break; done
 [ -z "$WID" ] && { echo "no window"; wait; exit 1; }
