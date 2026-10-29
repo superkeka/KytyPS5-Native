@@ -74,13 +74,15 @@ async function updatePlugin(release: Release) {
   const decky = (window as any).DeckyBackend;
   if (decky?.call) {
     await decky.call("utilities/install_plugin", release.plugin_url!, "KytyPS5-Native", release.tag, "", 2);
-    // This panel keeps its state: wait for the new version (the user confirms Decky's prompt first);
-    // the caller then reads the state again, so Update does not stay.
+    // This panel is the old version's: wait for the new one (the user confirms Decky's prompt first)
+    // and have Decky show it in its place, as when the panel is opened.
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 2000));
       try {
         if ((await getState()).plugin_release === release.tag) {
           toast(`Plugin updated to ${short(release.tag)}`);
+          const decky = (window as any).DeckyPluginLoader?.deckyState;
+          if (decky?.publicState?.().activePlugin?.name === "KytyPS5-Native") decky.setActivePlugin("KytyPS5-Native");
           return;
         }
       } catch {
