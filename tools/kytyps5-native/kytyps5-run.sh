@@ -25,6 +25,14 @@ LOG=$SHARE/logs/$TITLE.log
 export DISPLAY=${DISPLAY:-:1}
 ROOT_DISPLAY=${KYTYPS5_ROOT_DISPLAY:-:0}
 
+# One game at a time: two Kyty on the native path fight over the same GPU queues. The lock is held
+# for the whole session (the exit video too); a second launch leaves at once, Steam untouched.
+exec 9>"$SHARE/.running"
+if ! flock -n 9; then
+	echo "== $(date) $GAME: another game is running" >> "$LOG"
+	exit 1
+fi
+
 steam_unit_active() { [ "$(systemctl --user is-active steam-launcher.service 2>/dev/null)" = active ]; }
 
 # Unloading Steam: the rest runs in a systemd unit of its own, outside Steam's process tree (Steam is
@@ -32,6 +40,8 @@ steam_unit_active() { [ "$(systemctl --user is-active steam-launcher.service 2>/
 if [ "$KEEP_STEAM" = 0 ] && [ -z "${KYTYPS5_DETACHED:-}" ] && steam_unit_active; then
 	unit=kytyps5-$TITLE
 	systemctl --user reset-failed "$unit" 2>/dev/null
+	# The unit takes the lock itself: let it go here.
+	exec 9>&-
 	exec systemd-run --user --collect --quiet --unit="$unit" -E KYTYPS5_DETACHED=1 -E DISPLAY="$DISPLAY" \
 		-E HOME="$HOME" "$0" "$@"
 fi
@@ -98,11 +108,34 @@ play_video() {
 cd "$SHARE/data"
 play_video "$CONFIG/boot.webm"
 
-# The Decky plugin leaves this when a newer release is out: Kyty says so in its trophy toast.
-if [ -s "$CONFIG/update-available" ]; then
-	export KYTY_NOTICE_TITLE="KytyPS5-Native update available"
-	export KYTY_NOTICE_TEXT="$(head -1 "$CONFIG/update-available"): update it in the Decky plugin"
-fi
+# Notices Kyty shows in its trophy toast once the game is up, a line each.
+NOTICE_TITLES=""
+NOTICE_TEXTS=""
+notice() {
+	NOTICE_TITLES="${NOTICE_TITLES:+$NOTICE_TITLES$'\n'}$1"
+	NOTICE_TEXTS="${NOTICE_TEXTS:+$NOTICE_TEXTS$'\n'}$2"
+}
+# On the PS5's APU: the kernel config the native backend wants (README, Requirements). The patched
+# amdgpu (bc250_gfx_queues) brings its own queue options; GTT and the scheduler still count.
+for dev in /sys/class/drm/card*/device; do
+	case "$(cat "$dev/vendor" 2>/dev/null):$(cat "$dev/device" 2>/dev/null)" in
+	0x1002:0x13fe | 0x1002:0x13da)
+		param() { cat "/sys/module/amdgpu/parameters/$1" 2>/dev/null; }
+		off=""
+		grep -q 'ttm.pages_limit=3670016' /proc/cmdline || off="$off, GTT 14 GiB"
+		[ "$(param sched_policy)" = 2 ] || off="$off, sched_policy=2"
+		if [ ! -e /sys/module/amdgpu/parameters/bc250_gfx_queues ]; then
+			[ "$(param vm_update_mode)" = 0 ] || off="$off, vm_update_mode=0"
+			[ "$(param cwsr_enable)" = 0 ] || off="$off, cwsr_enable=0"
+		fi
+		[ -n "$off" ] && notice "Not the recommended kernel config" "Off: ${off#, }. Kernel config in the Decky plugin"
+		break ;;
+	esac
+done
+# The Decky plugin leaves this when a newer release is out.
+[ -s "$CONFIG/update-available" ] &&
+	notice "KytyPS5-Native update available" "$(head -1 "$CONFIG/update-available"): update it in the Decky plugin"
+[ -n "$NOTICE_TITLES" ] && export KYTY_NOTICE_TITLE="$NOTICE_TITLES" KYTY_NOTICE_TEXT="$NOTICE_TEXTS"
 
 MARKER=$SHARE/data/.exit-$TITLE
 rm -f "$MARKER"

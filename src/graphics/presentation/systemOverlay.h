@@ -31,7 +31,8 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept;
 void                     NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                                               std::span<const std::byte> icon_png);
 // A message in the trophy toast, without a cup: "update available" (KytyPS5-Native). The launch
-// wrapper passes one in KYTY_NOTICE_TITLE / KYTY_NOTICE_TEXT; it shows once the game is up.
+// wrapper passes them in KYTY_NOTICE_TITLE / KYTY_NOTICE_TEXT (a line each); they show once the game
+// is up.
 void                     NotifySystemMessage(std::string_view title, std::string_view text);
 
 class SystemOverlay final {

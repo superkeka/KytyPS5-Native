@@ -669,12 +669,27 @@ void InitializeSystemOverlayInput(SDL_Window* window) {
 		g_input_lifecycle_active = true;
 		g_visibility_event.store(type, std::memory_order_release);
 	}
-	// The launch wrapper's notice, a while after the window opens: when the game is on screen.
-	if (const char* title = std::getenv("KYTY_NOTICE_TITLE"); title != nullptr && *title != '\0') {
-		const char* text = std::getenv("KYTY_NOTICE_TEXT");
-		std::thread([title = std::string(title), text = std::string(text != nullptr ? text : "")] {
+	// The launch wrapper's notices (one per line, titles and texts paired by line), a while after
+	// the window opens: when the game is on screen.
+	if (const char* titles = std::getenv("KYTY_NOTICE_TITLE"); titles != nullptr && *titles != '\0') {
+		const char* texts = std::getenv("KYTY_NOTICE_TEXT");
+		std::thread([titles = std::string(titles), texts = std::string(texts != nullptr ? texts : "")] {
 			std::this_thread::sleep_for(std::chrono::seconds(20));
-			NotifySystemMessage(title, text);
+			size_t title_at = 0;
+			size_t text_at  = 0;
+			while (title_at <= titles.size()) {
+				const size_t title_end = std::min(titles.find('\n', title_at), titles.size());
+				const size_t text_end  = std::min(texts.find('\n', text_at), texts.size());
+				const auto   title     = std::string_view(titles).substr(title_at, title_end - title_at);
+				const auto   text      = text_at <= texts.size()
+				                             ? std::string_view(texts).substr(text_at, text_end - text_at)
+				                             : std::string_view();
+				if (!title.empty()) {
+					NotifySystemMessage(title, text);
+				}
+				title_at = title_end + 1;
+				text_at  = text_end + 1;
+			}
 		}).detach();
 	}
 	CoreIme::SetVisibilityCallback(OnCoreVisibilityChanged);
