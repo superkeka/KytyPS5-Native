@@ -295,6 +295,13 @@ function Content() {
               disabled={!!busy}
               onClick={() =>
                 run("Plugin", async () => {
+                  // Decky's own installer (as its store): asks, swaps the files and reloads this plugin
+                  // alone. Without it, the backend swaps them and restarts Decky.
+                  const decky = (window as any).DeckyBackend;
+                  if (decky?.call) {
+                    await decky.call("utilities/install_plugin", release!.plugin_url!, "KytyPS5-Native", release!.tag, "", 2);
+                    return;
+                  }
                   const r = await installPlugin(release!.plugin_url!, release!.tag);
                   toast(r.ok ? "Updated, Decky restarts" : r.log || "failed");
                 })
