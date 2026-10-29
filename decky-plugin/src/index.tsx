@@ -286,7 +286,7 @@ function Content() {
                 : state.games_dir_state === "empty"
                   ? "No games in the folder"
                   : state.games.length
-                    ? `Total ${(state.games.reduce((sum, g) => sum + g.size, 0) / 1e9).toFixed(1)} GB`
+                    ? `Synced to the Non-Steam library on their own. Total ${(state.games.reduce((sum, g) => sum + g.size, 0) / 1e9).toFixed(1)} GB`
                     : "No games found: a game is a folder with sce_sys/param.json in it"
             }
           />
