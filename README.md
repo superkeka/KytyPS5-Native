@@ -42,15 +42,19 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
   </tr>
 </table>
 
-## Requirements
-
-- BC-250 with SteamOS (tested), stock or patched amdgpu
-- GTT 14 GiB (`ttm.pages_limit=3670016`). Without it games over 8 GiB of guest memory stall loading
-- Recommended: `options amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0`, or the patched amdgpu
-
-Kernel modes and how to set them: [`tools/bc250-amdgpu`](tools/bc250-amdgpu/README.md).
-
 ## Install
+
+### SteamOS (recommended): Decky plugin
+
+1. Install [Decky Loader](https://decky.xyz) and turn on its developer mode
+2. Download the latest `KytyPS5-Native-*-Decky.zip` from [Releases](https://github.com/superkeka/KytyPS5-Native/releases)
+3. Decky settings > Developer > Install Plugin from ZIP File
+4. In the plugin: Kernel config > Apply and reboot, then Install, then pick the games folder
+
+Games show up in the Steam library under Non-Steam as "Game (PS5)". The PS button opens the in-game menu (resume, monitoring, exit
+game). The plugin updates KytyPS5-Native and itself.
+
+### Other systems
 
 Download the latest `KytyPS5-Native-*-Linux-x86_64.tar.gz` from
 [Releases](https://github.com/superkeka/KytyPS5-Native/releases) and unpack it.
@@ -62,7 +66,15 @@ sudo ./install-helper.sh   # the root helper as a service (LOD statistics, KFD T
 
 On the BC-250 native mode turns on by itself; `KYTY_NATIVE_GPU=0` turns it off.
 `kyty_emulator --game /path/to/game` runs a game without the launcher, `kyty_emulator --help` lists
-the options. From a Steam shortcut: [`tools/bc250-runs/kyty-steam.sh`](tools/bc250-runs/kyty-steam.sh).
+the options.
+
+## Requirements
+
+- BC-250 with SteamOS (tested), stock or patched amdgpu
+- GTT 14 GiB (`ttm.pages_limit=3670016`). Without it games over 8 GiB of guest memory stall loading
+- Recommended: `options amdgpu sched_policy=2 vm_update_mode=0 cwsr_enable=0`, or the patched amdgpu
+
+The plugin sets both. Kernel modes and how to set them by hand: [`tools/bc250-amdgpu`](tools/bc250-amdgpu/README.md).
 
 ## Build
 
