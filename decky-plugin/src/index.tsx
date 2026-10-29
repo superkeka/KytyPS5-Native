@@ -180,7 +180,7 @@ function Content() {
             ) : !state.kernel.all_ok ? (
               <ButtonItem
                 layout="below"
-                description="Not set: press to apply the recommended config"
+                description="Recommended config is off. Press to apply it"
                 disabled={!!busy}
                 onClick={() =>
                   confirm(
@@ -204,7 +204,7 @@ function Content() {
             ) : state.kernel.ours ? (
               <ButtonItem
                 layout="below"
-                description="Recommended: press to revert"
+                description="Recommended config is on. Press to revert it"
                 disabled={!!busy}
                 onClick={() =>
                   confirm("Revert", "Remove the kernel options this plugin added? Takes effect after a reboot.", "Revert", () =>
