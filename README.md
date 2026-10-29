@@ -19,6 +19,17 @@ presentation and as a fallback.
 | My First Gran Turismo | 60 fps |
 | Dead Cells | 60 fps |
 
+## Screenshots
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <strong>ASTRO BOT</strong><br>
+      <img src="docs/screenshots/bc250-astro-bot.jpg" width="600" alt="ASTRO BOT running natively on the BC-250">
+    </td>
+  </tr>
+</table>
+
 ## Requirements
 
 - BC-250 with SteamOS (tested), stock or patched amdgpu
@@ -43,7 +54,7 @@ cmake --build _Build/linux-no-qt --target kyty_emulator --parallel
 
 ```bash
 KYTY_NATIVE_GPU_GEM=1 KYTY_NATIVE_GPU_PRIMARY=1 \
-  ./_Build/linux-no-qt/kyty_emulator --game /path/to/PPSA01317 --fullscreen
+  ./_Build/linux-no-qt/kyty_emulator --game /path/to/game --fullscreen
 ```
 
 From a Steam shortcut: [`tools/bc250-runs/kyty-steam.sh`](tools/bc250-runs/kyty-steam.sh). The root
