@@ -47,4 +47,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	install(TARGETS kyty-lodhw DESTINATION .)
 	install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/tools/bc250-lodhw/install-helper.sh" DESTINATION .)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/tools/bc250-lodhw/kyty-lodhw.service" DESTINATION .)
+	# What the Steam shortcuts (the Decky plugin adds them) start: unloads Steam, boot and exit videos.
+	install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/tools/kytyps5-native/kytyps5-run.sh" DESTINATION .)
 endif()
