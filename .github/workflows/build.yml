@@ -172,13 +172,53 @@ jobs:
           path: _Build/linux/install/**
           if-no-files-found: error
 
+  decky:
+    name: Build the Decky plugin
+    needs: metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build and package
+        shell: bash
+        working-directory: decky-plugin
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          out="$RUNNER_TEMP/KytyPS5-Native"
+          mkdir -p "$out/dist"
+          cp plugin.json package.json main.py ../LICENSE "$out/"
+          cp dist/index.js "$out/dist/"
+          # The plugin compares this with the latest release to offer its own update.
+          echo "${{ needs.metadata.outputs.release_tag }}" > "$out/RELEASE"
+          (cd "$RUNNER_TEMP" && zip -qr "$GITHUB_WORKSPACE/KytyPS5-Native-Decky.zip" KytyPS5-Native)
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Native-Decky
+          path: KytyPS5-Native-Decky.zip
+
   release:
     name: Release KytyPS5-Native
     if: >-
       github.event_name == 'push' &&
       github.repository == 'superkeka/KytyPS5-Native' &&
-      needs.linux.result == 'success'
-    needs: [metadata, linux]
+      needs.linux.result == 'success' &&
+      needs.decky.result == 'success'
+    needs: [metadata, linux, decky]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -192,6 +232,12 @@ jobs:
           name: KytyPS5-Linux-x86_64
           path: artifacts/KytyPS5-Linux-x86_64
 
+      - name: Download Decky plugin
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Native-Decky
+          path: artifacts/decky
+
       - name: Package Linux build
         shell: bash
         run: |
@@ -202,20 +248,22 @@ jobs:
             "$linux_dir/kyty_emulator" \
             "$linux_dir/kyty_updater" \
             "$linux_dir/kyty-lodhw" \
-            "$linux_dir/install-helper.sh"
+            "$linux_dir/install-helper.sh" \
+            "$linux_dir/kytyps5-run.sh"
           tar -C "$linux_dir" -czf \
             "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
+          cp artifacts/decky/KytyPS5-Native-Decky.zip "$GITHUB_WORKSPACE/$RELEASE_NAME-Decky.zip"
 
       - name: Create release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          asset="$RELEASE_NAME-Linux-x86_64.tar.gz"
+          assets=("$RELEASE_NAME-Linux-x86_64.tar.gz" "$RELEASE_NAME-Decky.zip")
           if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$RELEASE_NAME" "$asset" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release upload "$RELEASE_NAME" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_NAME" "$asset" \
+            gh release create "$RELEASE_NAME" "${assets[@]}" \
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
