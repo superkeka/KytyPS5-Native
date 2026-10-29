@@ -1317,6 +1317,33 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	const std::vector<SourcePiece> source = std::move(m_source); // SetSource is for this buffer only
 	m_source.clear();
 
+	// The register tables of SET_*_REG_INDIRECT sit in guest memory the title has just written, usually
+	// from another core: read one by one in the walk, each is a chain of cache misses (in GT7 the walk
+	// took twice as long as the same walk on warm caches). Asking for all of them up front lets those
+	// misses overlap. KYTY_NATIVE_GPU_TABLE_PREFETCH=0 turns it off.
+	static const bool table_prefetch = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_TABLE_PREFETCH");
+		return v == nullptr || v[0] != '0';
+	}();
+	for (size_t dw = 0; table_prefetch && dw < dcb.size();) {
+		const uint32_t header = dcb[dw];
+		if ((header >> 30u) != 3u) {
+			dw++;
+			continue;
+		}
+		const uint32_t size = ((header >> 16u) & 0x3fffu) + 2u;
+		const uint32_t op   = (header >> 8u) & 0xffu;
+		if ((op == IT_SET_CONTEXT_REG_INDIRECT || op == IT_SET_SH_REG_INDIRECT || op == IT_SET_UCONFIG_REG_INDIRECT) && size >= 5 &&
+		    dw + 4 < dcb.size()) {
+			const uint64_t addr  = (static_cast<uint64_t>(dcb[dw + 1]) & 0xfffffffcull) | (static_cast<uint64_t>(dcb[dw + 2]) << 32u);
+			const uint64_t bytes = 8ull * (dcb[dw + 4] & 0x3fffu);
+			for (uint64_t line = addr & ~63ull; addr != 0 && line < addr + bytes; line += 64) {
+				__builtin_prefetch(reinterpret_cast<const void*>(line));
+			}
+		}
+		dw += size;
+	}
+
 	// First pass: walk the DCB, refuse on anything unknown, and fold register writes into the
 	// shadow while collecting the body packets. Nothing is emitted until the pass succeeds, so a
 	// refused DCB leaves the shadow and the IB in a usable state for the next one.
