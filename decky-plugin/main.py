@@ -212,6 +212,24 @@ def _title(param):
     return re.sub(r"\s+", " ", name).strip()
 
 
+# Game sizes by folder, kept while the folder's mtime stays (du over a big dump takes a while).
+_sizes = {}
+
+
+def _size(path):
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return 0
+    cached = _sizes.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    code, out = _run("du", "-sb", path)
+    size = int(out.split()[0]) if code == 0 and out else 0
+    _sizes[path] = (mtime, size)
+    return size
+
+
 def _scan(folder):
     games = []
     try:
@@ -226,7 +244,7 @@ def _scan(folder):
         except (OSError, ValueError):
             continue
         tid = param.get("titleId") or e
-        games.append({"title_id": tid, "name": _title(param) or tid, "path": path})
+        games.append({"title_id": tid, "name": _title(param) or tid, "path": path, "size": _size(path)})
     return games
 
 
@@ -265,7 +283,7 @@ class Plugin:
     async def get_state(self):
         s = _load()
         folder = s.get("games_dir") or os.path.join(HOME, "Games")
-        games = _scan(folder)
+        games = await asyncio.to_thread(_scan, folder)
         known = s.get("games", {})
         # A missing folder (a drive not mounted) has no games: their shortcuts go, and come back with it.
         try:

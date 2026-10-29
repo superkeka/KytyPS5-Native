@@ -6,6 +6,7 @@ export interface Game {
   title_id: string;
   name: string;
   path: string;
+  size: number;
   appid: number;
   keep_steam: boolean;
 }

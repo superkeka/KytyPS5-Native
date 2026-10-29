@@ -278,7 +278,7 @@ function Content() {
                 ? "Install KytyPS5-Native first"
                 : syncing
                   ? "Adding to Steam..."
-                  : `${state.games.filter((g) => g.appid).length} of ${state.games.length} games in Steam`
+                  : `${state.games.length} ${state.games.length === 1 ? "game" : "games"} in the library`
             }
             description={
               state.games_dir_state === "missing"
@@ -286,7 +286,7 @@ function Content() {
                 : state.games_dir_state === "empty"
                   ? "No games in the folder"
                   : state.games.length
-                    ? state.games.map((g) => g.name).join(", ")
+                    ? `Total ${(state.games.reduce((sum, g) => sum + g.size, 0) / 1e9).toFixed(1)} GB`
                     : "No games found: a game is a folder with sce_sys/param.json in it"
             }
           />
