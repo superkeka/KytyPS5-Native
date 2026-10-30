@@ -132,13 +132,27 @@ done
 	notice "KytyPS5-Native update available" "$(head -1 "$CONFIG/update-available"): update it in the Decky plugin"
 [ -n "$NOTICE_TITLES" ] && export KYTY_NOTICE_TITLE="$NOTICE_TITLES" KYTY_NOTICE_TEXT="$NOTICE_TEXTS"
 
+# HDR: when gamescope outputs HDR (Steam's display setting), Kyty gets an HDR10 swapchain. With Steam
+# stopped, the gamescope WSI layer (which offers the HDR10 formats) is asked for here; Kyty falls back
+# to SDR when the surface offers no HDR10 format.
+HDR_ARGS=
+if [ "$(DISPLAY=$ROOT_DISPLAY xprop -root GAMESCOPE_DISPLAY_HDR_ENABLED 2>/dev/null | awk '{print $NF}')" = 1 ]; then
+	# The layer talks to gamescope over its own Wayland socket: Steam gives a game its name, this
+	# unit (Steam stopped) reads it where gamescope-session leaves its environment.
+	: "${GAMESCOPE_WAYLAND_DISPLAY:=$(sed -n 's/^GAMESCOPE_WAYLAND_DISPLAY=//p' \
+		"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gamescope-environment" 2>/dev/null)}"
+	if [ -n "$GAMESCOPE_WAYLAND_DISPLAY" ]; then
+		HDR_ARGS=--hdr
+		export ENABLE_GAMESCOPE_WSI=1 GAMESCOPE_WAYLAND_DISPLAY
+	fi
+fi
 MARKER=$SHARE/data/.exit-$TITLE
 rm -f "$MARKER" "$VIDEO_FLAG"
 front "$GAME_APPID"
 {
 	echo "== $(date) $GAME"
 	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" KYTY_GAMESCOPE_APPID=$GAME_APPID "$EMU" --game "$GAME" \
-		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen
+		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS
 	echo "== exit=$?"
 } >> "$LOG" 2>&1 &
 EMUPID=$!
