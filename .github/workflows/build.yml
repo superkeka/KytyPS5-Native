@@ -199,7 +199,7 @@ jobs:
           pnpm build
           out="$RUNNER_TEMP/KytyPS5-Native"
           mkdir -p "$out/dist"
-          cp plugin.json package.json main.py ../LICENSE "$out/"
+          cp plugin.json package.json main.py ../LICENSE ../tools/bc250-lodhw/install-helper.sh "$out/"
           cp dist/index.js "$out/dist/"
           # The plugin compares this with the latest release to offer its own update.
           echo "${{ needs.metadata.outputs.release_tag }}" > "$out/RELEASE"

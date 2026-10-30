@@ -123,6 +123,26 @@ def _ps5_apu():
     return False
 
 
+def _install_helper():
+    """The root helper as a service: the plugin's copy of install-helper.sh (the one in a Kyty release
+    from before 2026-10-30 failed on stock SteamOS, /usr is read-only there) with the installed Kyty's
+    files."""
+    script = os.path.join(decky.DECKY_PLUGIN_DIR, "install-helper.sh")
+    if not os.path.exists(script):
+        script = os.path.join(KYTY_DIR, "install-helper.sh")
+    env = dict(os.environ, SUDO_GID=str(_ids()[1]), KYTY_HELPER_FILES=KYTY_DIR)
+    p = subprocess.run(["sh", script], capture_output=True, text=True, env=env)
+    return p.returncode, (p.stdout + p.stderr).strip()[-400:]
+
+
+def _helper_missing():
+    """Kyty is installed but its helper is not: no unit, or no binary where the unit runs it."""
+    if not _ps5_apu() or not os.path.exists(os.path.join(KYTY_DIR, "kyty-lodhw")):
+        return False
+    m = re.search(r"^ExecStart=(\S+)", _read("/etc/systemd/system/kyty-lodhw.service"), re.M)
+    return not m or not os.path.exists(m.group(1))
+
+
 def _game_running():
     return _run("pgrep", "-x", "kyty_emulator")[0] == 0
 
@@ -440,6 +460,13 @@ class Plugin:
         loop = asyncio.get_event_loop()
         loop.create_task(self._default_videos())
         loop.create_task(self._watch_updates())
+        loop.create_task(self._repair_helper())
+
+    # A helper that did not install (stock SteamOS before 2026-10-30) or went missing goes in again.
+    async def _repair_helper(self):
+        if await asyncio.to_thread(_helper_missing):
+            code, out = await asyncio.to_thread(_install_helper)
+            decky.logger.info("root helper reinstalled (%d): %s", code, out)
 
     async def _watch_updates(self):
         while True:
@@ -564,10 +591,8 @@ class Plugin:
                 os.remove(UPDATE_FLAG)
             if not _ps5_apu():
                 return {"ok": True, "log": ""}
-            # The root helper: the socket's group is the user's.
-            env = dict(os.environ, SUDO_GID=str(_ids()[1]))
-            p = subprocess.run([os.path.join(KYTY_DIR, "install-helper.sh")], capture_output=True, text=True, env=env)
-            return {"ok": True, "log": (p.stdout + p.stderr).strip()[-400:]}
+            code, out = _install_helper()
+            return {"ok": code == 0, "log": out}
         try:
             return await asyncio.to_thread(work)
         except Exception as e:
@@ -634,6 +659,8 @@ class Plugin:
                 return _limine_apply(st)
             gtt = st["items"][0]
             if gtt["configured"] != GTT_PAGES and not gtt["ok"]:
+                # Stock SteamOS has no grub.d; its grub-mkconfig reads grub.d/*.cfg all the same.
+                os.makedirs(os.path.dirname(GRUB_CFG), exist_ok=True)
                 with open(GRUB_CFG, "w") as f:
                     f.write("# KytyPS5-Native (Decky plugin): GTT 14 GiB for PS5 games.\n"
                             f'GRUB_CMDLINE_LINUX="${{GRUB_CMDLINE_LINUX}} ttm.pages_limit={GTT_PAGES}"\n')
