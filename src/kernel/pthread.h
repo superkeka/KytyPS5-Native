@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <type_traits>
+
 // IWYU pragma: no_include <pthread.h>
 
 extern "C" {
@@ -205,6 +207,30 @@ uint64_t KYTY_SYSV_ABI KernelReadTsc();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency();
+
+// Runs fn(arg) on the calling guest thread's host stack (its own pthread stack, idle while guest code runs),
+// as a PS5 system call runs on the kernel's stack: the title's stack and a fiber's buffer (the title's memory,
+// often tens of KiB) only see the call. A direct call on host threads, on the main guest thread and when
+// already on the host stack.
+void PthreadCallOnHostStack(void (*fn)(void*), void* arg);
+
+template <typename F>
+void CallOnHostStack(F&& f) {
+	PthreadCallOnHostStack([](void* p) { (*static_cast<std::remove_reference_t<F>*>(p))(); }, &f);
+}
+
+// An HLE export that does a system call's work (mapping memory into the GPU VM, ...) run by CallOnHostStack:
+// LIB_FUNC("...", OnHostStack<&Fn>::Call).
+template <auto Fn>
+struct OnHostStack;
+template <typename R, typename... A, R(KYTY_SYSV_ABI* Fn)(A...)>
+struct OnHostStack<Fn> {
+	static R KYTY_SYSV_ABI Call(A... a) {
+		R r {};
+		CallOnHostStack([&] { r = Fn(a...); });
+		return r;
+	}
+};
 
 } // namespace LibKernel
 

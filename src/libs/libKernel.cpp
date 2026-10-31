@@ -2230,8 +2230,8 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("WrOLvHU0yQM", Posix::pthread_setspecific);
 	LIB_FUNC("0-KXaS70xy4", Posix::pthread_getspecific);
 	LIB_FUNC("-quPa4SEJUw", Posix::pthread_getstack);
-	LIB_FUNC("YQOfxL4QfeU", LibKernel::Memory::KernelMprotect);
-	LIB_FUNC("UqDGjXA5yUM", LibKernel::Memory::KernelMunmap);
+	LIB_FUNC("YQOfxL4QfeU", LibKernel::OnHostStack<&LibKernel::Memory::KernelMprotect>::Call);
+	LIB_FUNC("UqDGjXA5yUM", LibKernel::OnHostStack<&LibKernel::Memory::KernelMunmap>::Call);
 	LIB_FUNC("AqBioC2vF3I", LibKernel::read);
 	LIB_FUNC("TU-d9PfIHPM", Posix::socket);
 	LIB_FUNC("KuOmgKoqCdY", Posix::bind);
@@ -3127,13 +3127,13 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 }
 
 LIB_DEFINE(InitLibKernel_1_Mem) {
-	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
-	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);
+	LIB_FUNC("mL8NDH86iQI", LibKernel::OnHostStack<&Memory::KernelMapNamedFlexibleMemory>::Call);
+	LIB_FUNC("IWIBBdTHit4", LibKernel::OnHostStack<&Memory::KernelMapFlexibleMemory>::Call);
 	LIB_FUNC("DGMG3JshrZU", Memory::KernelSetVirtualRangeName);
 	LIB_FUNC("mkgXxsoxWHg", Memory::KernelClearVirtualRangeName);
 	// 6xx
-	LIB_FUNC("4h6F1LLbTiw", Memory::KernelMapFlexibleMemory);
-	LIB_FUNC("cQke9UuBQOk", Memory::KernelMunmap);
+	LIB_FUNC("4h6F1LLbTiw", LibKernel::OnHostStack<&Memory::KernelMapFlexibleMemory>::Call);
+	LIB_FUNC("cQke9UuBQOk", LibKernel::OnHostStack<&Memory::KernelMunmap>::Call);
 	LIB_FUNC("pO96TwzOm5E", Memory::KernelGetDirectMemorySize);
 	LIB_FUNC("C0f7TJcbfac", Memory::KernelAvailableDirectMemorySize);
 	LIB_FUNC("tZ2yplY8MBY", Memory::KernelGetPageTableStats);
@@ -3142,27 +3142,27 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("rVjRvHJ0X6c", Memory::KernelVirtualQuery);
 	LIB_FUNC("yDBwVAolDgg", Memory::KernelIsStack);
 	LIB_FUNC("7oxv3PPCumo", Memory::KernelReserveVirtualRange);
-	LIB_FUNC("L-Q3LEjIbgA", Memory::KernelMapDirectMemory);
-	LIB_FUNC("BQQniolj9tQ", Memory::KernelMapDirectMemory2);
-	LIB_FUNC("NcaWUxfMNIQ", Memory::KernelMapNamedDirectMemory);
-	LIB_FUNC("BohYr-F7-is", Memory::KernelSetPrtAperture);
+	LIB_FUNC("L-Q3LEjIbgA", LibKernel::OnHostStack<&Memory::KernelMapDirectMemory>::Call);
+	LIB_FUNC("BQQniolj9tQ", LibKernel::OnHostStack<&Memory::KernelMapDirectMemory2>::Call);
+	LIB_FUNC("NcaWUxfMNIQ", LibKernel::OnHostStack<&Memory::KernelMapNamedDirectMemory>::Call);
+	LIB_FUNC("BohYr-F7-is", LibKernel::OnHostStack<&Memory::KernelSetPrtAperture>::Call);
 	LIB_FUNC("L0v2Go5jOuM", Memory::KernelGetPrtAperture);
-	LIB_FUNC("hwVSPCmp5tM", Memory::KernelCheckedReleaseDirectMemory);
-	LIB_FUNC("MBuItvba6z8", Memory::KernelReleaseDirectMemory);
+	LIB_FUNC("hwVSPCmp5tM", LibKernel::OnHostStack<&Memory::KernelCheckedReleaseDirectMemory>::Call);
+	LIB_FUNC("MBuItvba6z8", LibKernel::OnHostStack<&Memory::KernelReleaseDirectMemory>::Call);
 	LIB_FUNC("jh+8XiK4LeE", Memory::KernelIsAddressSanitizerEnabled);
 	LIB_FUNC("WFcfL2lzido", Memory::KernelQueryMemoryProtection);
 	LIB_FUNC("BHouLQzh0X0", Memory::KernelDirectMemoryQuery);
 	LIB_FUNC("aNz11fnnzi4", Memory::KernelAvailableFlexibleMemorySize);
 	LIB_FUNC("n1-v6FgU7MQ", Memory::KernelConfiguredFlexibleMemorySize);
-	LIB_FUNC("vSMAm3cxYTY", Memory::KernelMprotect);
-	LIB_FUNC("9bfdLIyuwCY", Memory::KernelMtypeprotect);
-	LIB_FUNC("2SKEx6bSq-4", Memory::KernelBatchMap);
-	LIB_FUNC("kBJzF8x4SyE", Memory::KernelBatchMap2);
+	LIB_FUNC("vSMAm3cxYTY", LibKernel::OnHostStack<&Memory::KernelMprotect>::Call);
+	LIB_FUNC("9bfdLIyuwCY", LibKernel::OnHostStack<&Memory::KernelMtypeprotect>::Call);
+	LIB_FUNC("2SKEx6bSq-4", LibKernel::OnHostStack<&Memory::KernelBatchMap>::Call);
+	LIB_FUNC("kBJzF8x4SyE", LibKernel::OnHostStack<&Memory::KernelBatchMap2>::Call);
 	LIB_FUNC("pU-QydtGcGY", Memory::KernelMemoryPoolReserve);
 	LIB_FUNC("qCSfqDILlns", Memory::KernelMemoryPoolExpand);
-	LIB_FUNC("Vzl66WmfLvk", Memory::KernelMemoryPoolCommit);
-	LIB_FUNC("LXo1tpFqJGs", Memory::KernelMemoryPoolDecommit);
-	LIB_FUNC("YN878uKRBbE", Memory::KernelMemoryPoolBatch);
+	LIB_FUNC("Vzl66WmfLvk", LibKernel::OnHostStack<&Memory::KernelMemoryPoolCommit>::Call);
+	LIB_FUNC("LXo1tpFqJGs", LibKernel::OnHostStack<&Memory::KernelMemoryPoolDecommit>::Call);
+	LIB_FUNC("YN878uKRBbE", LibKernel::OnHostStack<&Memory::KernelMemoryPoolBatch>::Call);
 	LIB_FUNC("bvD+95Q6asU", Memory::KernelMemoryPoolGetBlockStats);
 }
 

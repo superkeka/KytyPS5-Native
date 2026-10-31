@@ -818,6 +818,37 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 }
 #endif
 
+thread_local bool g_on_host_stack = false; // PthreadCallOnHostStack is running on this thread
+
+void PthreadCallOnHostStack(void (*fn)(void*), void* arg) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && (defined(__x86_64__) || defined(_M_X64))
+	const uintptr_t host = g_pthread_self != nullptr ? g_pthread_self->guest_host_rsp : 0;
+	if (host == 0 || g_on_host_stack) {
+		fn(arg);
+		return;
+	}
+	// Below what RunOnGuestStack keeps on the host stack, 16-byte aligned for the call. rbx keeps the guest
+	// stack pointer across it (fn preserves rbx).
+	const uintptr_t top = (host - 4096u) & ~static_cast<uintptr_t>(0x0f);
+	if (static std::atomic_flag logged = ATOMIC_FLAG_INIT; !logged.test_and_set()) {
+		std::fprintf(stderr, "pthread: system calls of guest threads run on their host stacks (first one at rsp 0x%llx)\n",
+		             static_cast<unsigned long long>(top));
+	}
+	g_on_host_stack = true;
+	asm volatile("movq %%rsp, %%rbx\n\t"
+	             "movq %[top], %%rsp\n\t"
+	             "callq *%[fn]\n\t"
+	             "movq %%rbx, %%rsp\n\t"
+	             : "+D"(arg)
+	             : [top] "r"(top), [fn] "r"(fn)
+	             : "cc", "memory", "rax", "rbx", "rcx", "rdx", "rsi", "r8", "r9", "r10", "r11", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",
+	               "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+	g_on_host_stack = false;
+#else
+	fn(arg);
+#endif
+}
+
 static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func, void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
 	void*      ret = nullptr;
