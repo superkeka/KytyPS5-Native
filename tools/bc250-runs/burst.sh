@@ -3,7 +3,8 @@
 # what changes from frame to frame (flicker): burst.sh NAME [N] -> /home/deck/kyty-watch/NAME.png
 N=${2:-12}
 OUT=$(mktemp -d /home/deck/kyty-watch/burst-XXXXXX) || exit 1
-for i in $(seq -w 1 "$N"); do
+for n in $(seq 1 "$N"); do
+	i=$(printf %02d "$n")
 	rm -f /tmp/gamescope.png
 	DISPLAY=:0 xprop -root -f GAMESCOPECTRL_DEBUG_REQUEST_SCREENSHOT 32c -set GAMESCOPECTRL_DEBUG_REQUEST_SCREENSHOT 1
 	for k in $(seq 1 100); do [ -s /tmp/gamescope.png ] && break; sleep 0.02; done
