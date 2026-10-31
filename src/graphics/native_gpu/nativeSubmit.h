@@ -53,6 +53,13 @@ public:
 	// 4 KiB of scratch slots, then two 32 KiB rings of GPU clock pairs (Pm4Translator::SetGpuTimes).
 	static constexpr uint64_t kScratchSize = 4096 + 65536;
 	static constexpr uint64_t kSlotSize    = ((kIbSize - kScratchSize) / kSlots) & ~0xfffull;
+	// CP register shadowing's buffer S (Pm4Translator::SetCpShadow) in the gap between the last slot and the
+	// scratch area: the IB buffer is uncached for the GPU, CPU-mapped and in every CS's BO list, and no write of
+	// a 16-bit register offset of any class leaves it (kCpShadowBytes), followed by 4 KiB kept for a pushed
+	// context. Sync mode's IBs stay below it too.
+	static constexpr uint64_t kCpShadowOffset  = kSlots * kSlotSize;
+	static constexpr uint64_t kCpShadowReserve = kCpShadowBytes + 4096;
+	static_assert(kCpShadowOffset + kCpShadowReserve <= kIbSize - kScratchSize, "S fits between the slots and the scratch area");
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;
 
@@ -148,6 +155,26 @@ public:
 	}
 
 	[[nodiscard]] uint64_t ScratchVa() const { return m_ib_va + kIbSize - kScratchSize; }
+	[[nodiscard]] uint64_t CpShadowVa() const { return m_ib_va + kCpShadowOffset; }
+	[[nodiscard]] volatile uint32_t* CpShadowCpu() const {
+		return reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(m_ib_cpu) + kCpShadowOffset);
+	}
+	// amdgpu preempts gfx IBs in the middle (mid command buffer preemption: amdgpu.mcbp=1, or SR-IOV): another
+	// process could then run inside one of our jobs, with our CP shadow enables on.
+	[[nodiscard]] bool MidIbPreemption() const {
+		struct drm_amdgpu_info_device dev;
+		std::memset(&dev, 0, sizeof(dev));
+		struct drm_amdgpu_info request;
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer = reinterpret_cast<uintptr_t>(&dev);
+		request.return_size    = sizeof(dev);
+		request.query          = AMDGPU_INFO_DEV_INFO;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) != 0) {
+			return true; // unknown: assume it does
+		}
+		constexpr uint64_t kPreemption = 0x2; // AMDGPU_IDS_FLAGS_PREEMPTION, set while adev->gfx.mcbp
+		return (dev.ids_flags & kPreemption) != 0;
+	}
 
 	// True when every submission owns the GFX partition of GDS (and its GWS and OA), so guest
 	// packets and shaders that use GDS can run natively.
@@ -280,6 +307,13 @@ public:
 		if (!m_async || ib.size() * 4 > kSlotSize) {
 			return 0;
 		}
+		if (target.ip_type == AMDGPU_HW_IP_GFX && !CpShadowTailOk(ib)) {
+			if (m_tail_refused++ < 4) {
+				std::fprintf(stderr, "NativeSubmitter: a stream part of %zu dwords neither chains on nor ends with shadowing off; refused\n",
+				             ib.size());
+			}
+			return 0;
+		}
 		uint32_t slot = kSlots;
 		for (uint32_t i = 0; i < kSlots && slot == kSlots; i++) {
 			if (m_slot[i].seq == 0) {
@@ -352,7 +386,16 @@ public:
 		// the CP does with the one buffer (an INDIRECT_BUFFER packet holds at most 2^20 dwords, so a
 		// long IB could not be one anyway).
 		EnsureKfdQueue(target);
-		const uint64_t                         room = m_async ? kSlotSize : kIbSize - kScratchSize;
+		// Every gfx job ends with CP register shadowing off (kCpShadowOff), or chains on to a part that does.
+		if (target.ip_type == AMDGPU_HW_IP_GFX && !CpShadowTailOk(ib)) {
+			if (m_tail_refused++ < 4) {
+				std::fprintf(stderr, "NativeSubmitter: a gfx IB of %zu dwords does not end with shadowing off (last 0x%08x); refused\n",
+				             ib.size(), ib.empty() ? 0u : ib.back());
+			}
+			res.err = -EINVAL;
+			return res;
+		}
+		const uint64_t                         room = m_async ? kSlotSize : kCpShadowOffset;
 		std::vector<std::pair<size_t, size_t>> parts;
 		if (ib.size() * 4 <= room) {
 			parts.emplace_back(0, ib.size());
@@ -858,6 +901,7 @@ private:
 	uint32_t m_kfd_calibration = 0; // SetKfdCalibration
 	std::function<bool()>         m_kfd_tlb_flush;  // SetKfdTlbFlush
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
+	uint32_t    m_tail_refused  = 0; // gfx IBs refused by the CpShadowTailOk check
 	struct SlotUse {
 		uint64_t   seq   = 0;
 		uint64_t   order = 0; // when it was last submitted

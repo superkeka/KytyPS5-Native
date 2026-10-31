@@ -142,6 +142,13 @@ std::atomic<uint32_t>& DemandedCrumbs() {
 	return n;
 }
 
+// Control socket "cpshadow": compare CP shadowing's S with the translator's copy at the next quiet point
+// (Shadow::CpShadowCheck).
+std::atomic<bool>& DemandedCpShadowCheck() {
+	static std::atomic<bool> wanted {false};
+	return wanted;
+}
+
 // "pad play FILE [ELAPSED]": replays a padrec.py recording (evdev events of an 8BitDo in DInput mode,
 // "t type code value" with t in seconds since the game was launched) as player 1's input. ELAPSED is
 // how long the game has already been running, so the recording keeps its timing.
@@ -223,7 +230,7 @@ void StartControlSocket() {
 		std::fprintf(stderr, "native shadow: control socket %s failed: %s\n", path, std::strerror(errno));
 		return;
 	}
-	std::fprintf(stderr, "native shadow: control socket %s (dump [N], crumbs N, ping)\n", path);
+	std::fprintf(stderr, "native shadow: control socket %s (dump [N], crumbs N, cpshadow, ping)\n", path);
 	std::thread([fd] {
 		for (;;) {
 			const int c = ::accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
@@ -257,8 +264,11 @@ void StartControlSocket() {
 					count = count != 0 ? count : 8u;
 					DemandedDumps().store(count);
 					std::snprintf(reply, sizeof(reply), "ok dumping the next %u flips\n", count);
+				} else if (line == "cpshadow") {
+					DemandedCpShadowCheck().store(true);
+					std::snprintf(reply, sizeof(reply), "ok comparing the CP shadow with the CPU copy when the gfx ring is next idle (cpshadow_N.txt)\n");
 				} else {
-					std::snprintf(reply, sizeof(reply), "unknown command; try: dump [N], crumbs N, pad play FILE [ELAPSED], ping\n");
+					std::snprintf(reply, sizeof(reply), "unknown command; try: dump [N], crumbs N, cpshadow, pad play FILE [ELAPSED], ping\n");
 				}
 				::send(c, reply, std::strlen(reply), MSG_NOSIGNAL);
 				line.clear();
@@ -465,6 +475,64 @@ bool PrimaryFeature(const char* name) {
 	return EnvOn("KYTY_NATIVE_GPU_PRIMARY");
 }
 
+// KYTY_NATIVE_GPU_CP_SHADOW (Pm4Translator::SetCpShadow): unset or 0 off, "record" the CP keeps S while the copy
+// still restores, 1 or "load" the restores come from S.
+CpShadowMode CpShadowWanted() {
+	static const CpShadowMode mode = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW");
+		if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0) {
+			return CpShadowMode::Off;
+		}
+		if (std::strcmp(v, "record") == 0) {
+			return CpShadowMode::Record;
+		}
+		if (std::strcmp(v, "1") == 0 || std::strcmp(v, "load") == 0) {
+			return CpShadowMode::Load;
+		}
+		std::fprintf(stderr, "native shadow: KYTY_NATIVE_GPU_CP_SHADOW=%s is not one of 0, record, 1 (load); CP shadowing stays off\n", v);
+		return CpShadowMode::Off;
+	}();
+	return mode;
+}
+
+// KYTY_NATIVE_GPU_CP_SHADOW_CLASSES (default all): the classes load mode restores from S, as a list of ctx, sh
+// (graphics SH), cs (compute SH) and uc, or all but some: "-ctx" (or "all,-ctx") leaves only the context class
+// out. A class left out is replayed from the copy after the LOADs (which every class still gets, for its base).
+uint32_t CpShadowLoadClasses() {
+	const char* v = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW_CLASSES");
+	if (v == nullptr || v[0] == '\0' || std::strcmp(v, "all") == 0) {
+		return kCpShadowClasses;
+	}
+	uint32_t classes = v[0] == '-' ? kCpShadowClasses : 0u;
+	for (const char* p = v; *p != '\0';) {
+		const char* end    = std::strchr(p, ',');
+		const bool  remove = *p == '-';
+		const char* name   = remove ? p + 1 : p;
+		const auto  len    = static_cast<size_t>(end != nullptr ? end - name : std::strlen(name));
+		auto        is     = [&](const char* n) { return std::strlen(n) == len && std::strncmp(name, n, len) == 0; };
+		const uint32_t bit = is("all") ? kCpShadowClasses
+		                     : is("ctx") ? kCpShadowContext
+		                     : is("sh")  ? kCpShadowGfxSh
+		                     : is("cs")  ? kCpShadowCsSh
+		                     : is("uc")  ? kCpShadowUconfig
+		                                 : 0u;
+		classes = remove ? classes & ~bit : classes | bit;
+		p       = end != nullptr ? end + 1 : name + len;
+	}
+	return classes;
+}
+
+std::string CpShadowClassNames(uint32_t classes) {
+	std::string out;
+	for (const auto& [bit, name]: {std::pair {kCpShadowContext, "ctx"}, std::pair {kCpShadowGfxSh, "sh"}, std::pair {kCpShadowCsSh, "cs"},
+	                               std::pair {kCpShadowUconfig, "uc"}}) {
+		if ((classes & bit) != 0) {
+			out += (out.empty() ? "" : ",") + std::string(name);
+		}
+	}
+	return out.empty() ? std::string("none") : out;
+}
+
 // KYTY_LOD_STATS_LOG=N: every Nth scan of the LOD statistics banks (one per GET_LOD_STATS).
 void LogLodScan(const LodBankScan& scan) {
 	static const unsigned long every = [] {
@@ -617,6 +685,7 @@ public:
 		Pm4Translator&     tr    = acb ? m_acb_translator : m_translator;
 		if (!acb) {
 			LoadAgcStartState();
+			ActivateCpShadowLocked();
 		}
 		SetStage(Stage::Translate, frame);
 		const double       t_translate = NowSecShadow();
@@ -709,6 +778,8 @@ public:
 		m_write_data_dw += result.stats.write_data_dw;
 		m_direct_ib2 += result.stats.direct_ib2;
 		m_direct_dw += result.stats.direct_dw;
+		m_context_ops += result.stats.context_ops;
+		m_context_checks += result.stats.context_checks;
 		for (size_t i = 0; i < 256; i++) {
 			m_changed_ops[acb ? 1 : 0][i] += result.stats.changed_ops[i];
 			m_ops[acb ? 1 : 0][i] += result.stats.ops[i];
@@ -942,6 +1013,23 @@ public:
 				m_refused++;
 				return false;
 			}
+			// A streamed chunk's resume runs too when the backend puts it in front of the chunk.
+			if (uint32_t bad = 0; m_validate != 0 && !result.cp_shadow_resume.empty() &&
+			                      !ValidateNativeIb(result.cp_shadow_resume, NativeLodStats(), &bad, ib_kind)) {
+				if (m_validate_refused++ < 16) {
+					std::fprintf(stderr, "native shadow: %s %llu left to Kyty by the packet check of its resume: header 0x%08x at dw %u\n", kind,
+					             static_cast<unsigned long long>(frame), result.cp_shadow_resume[bad], bad);
+				}
+				m_refused++;
+				return false;
+			}
+			m_cps_preambles += result.stats.cp_shadow_preambles;
+			m_cps_load_dw += result.stats.cp_shadow_load_dw;
+			m_cps_load_regs += result.stats.cp_shadow_load_regs;
+			m_cps_anchors += result.stats.cp_shadow_anchors;
+			if (result.cp_shadow) {
+				m_cps_sets += result.stats.preamble_cx + result.stats.preamble_sh + result.stats.preamble_uc;
+			}
 			if (!m_breadcrumbs.empty()) {
 				WriteBreadcrumb(acb ? "acb" : "", frame, dcb, result, result.ib);
 			}
@@ -1004,6 +1092,8 @@ public:
 			EmitSample(wrapped, sva + kStatSlots * 8);
 		}
 		EmitTimestamp(wrapped, sva + kTimestampOffset + 8);
+		// Every gfx job ends with CP register shadowing off (kCpShadowOff), a batch of these too.
+		EmitCpShadowOff(wrapped);
 		while ((wrapped.size() & 7u) != 0) {
 			wrapped.push_back(0xffff1000u);
 		}
@@ -1613,6 +1703,34 @@ public:
 			std::fprintf(stderr, "native shadow: held pieces per flip: %.1f released, %.1f after waiting, %.2f ms waited\n",
 			             static_cast<double>(held) / m_flips, static_cast<double>(waited) / m_flips,
 			             static_cast<double>(wait_us) / 1e3 / m_flips);
+			// Whether the title uses libSceAgc's context push/pop/clear (emulated on the CPU), and its checks around them.
+			std::fprintf(stderr, "native shadow: context push/pop/clear per flip: %.2f, libSceAgc's checks around them left out: %.2f\n",
+			             static_cast<double>(m_context_ops) / m_flips, static_cast<double>(m_context_checks) / m_flips);
+			m_context_ops = m_context_checks = 0;
+			if (m_cp_shadow != CpShadowMode::Off) {
+				const uint64_t guards  = m_cp_batch[0].guards + m_cp_batch[1].guards;
+				const uint64_t resumes = m_cps_resumes + m_cp_batch[0].resumes + m_cp_batch[1].resumes;
+				std::fprintf(stderr,
+				             "native shadow: CP shadow (%s) per flip: %.2f shadow preambles with %.0f LOAD dwords (%.0f registers, %.2f anchors) and "
+				             "%.0f SETs; %.2f resumes put in front of a chunk, %.2f shadowing-off guards before another translator's piece, %.2f "
+				             "gfx job ends\n",
+				             m_cp_shadow == CpShadowMode::Record ? "record" : "load", static_cast<double>(m_cps_preambles) / m_flips,
+				             static_cast<double>(m_cps_load_dw) / m_flips, static_cast<double>(m_cps_load_regs) / m_flips,
+				             static_cast<double>(m_cps_anchors) / m_flips, static_cast<double>(m_cps_sets) / m_flips,
+				             static_cast<double>(resumes - m_cps_resumes_mark) / m_flips, static_cast<double>(guards - m_cps_guards_mark) / m_flips,
+				             static_cast<double>(m_cps_job_ends) / m_flips);
+				m_cps_preambles = m_cps_load_dw = m_cps_load_regs = m_cps_anchors = m_cps_sets = m_cps_job_ends = 0;
+				m_cps_resumes_mark = resumes;
+				m_cps_guards_mark  = guards;
+				if (m_cp_checks != 0) {
+					const auto& c = m_cp_check_last;
+					std::fprintf(stderr,
+					             "native shadow: CP shadow check %llu (%s): %u keys, %u equal, %u late tables, %u not shadowed, %u unseen writes, "
+					             "%u outside the keys\n",
+					             static_cast<unsigned long long>(m_cp_checks), m_cp_check_path.c_str(), c.keys, c.equal, c.late, c.unshadowed,
+					             c.unseen, c.outside);
+				}
+			}
 			if (const uint64_t jobs = g_dcb_jobs.exchange(0, std::memory_order_relaxed); jobs != 0) {
 				std::fprintf(stderr, "native shadow: graphics buffers per flip: %.2f, %.0f guest dwords each, %.2f chunked, %.2f ms queued each\n",
 				             static_cast<double>(jobs) / m_flips,
@@ -1881,6 +1999,7 @@ public:
 			             "writer has been submitted\n",
 			             m_compute_mask);
 		}
+		ActivateCpShadowLocked();
 		return true;
 #else
 		(void)oracle;
@@ -2098,23 +2217,40 @@ public:
 	double TimeoutSec() const { return m_timeout_sec; }
 
 	// Native labels: appends a ready segment to the batch FlushBatch submits. `slot` 0 is the gfx
-	// ring; with ACB rings, slot n > 0 is compute ring n - 1.
-	void AppendBatch(std::span<const uint32_t> ib, uint32_t slot = 0) {
+	// ring; with ACB rings, slot n > 0 is compute ring n - 1. `piece`: what CP shadowing needs to know of it.
+	void AppendBatch(std::span<const uint32_t> ib, uint32_t slot = 0, const CpShadowPiece& piece = {}) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		std::lock_guard<std::mutex> lock(m_mutex);
-		std::vector<uint32_t>& batch = m_acb_rings ? m_ring_batch[slot < kTrackerSlots ? slot : 0] : m_batch;
-		if ((batch.size() + ib.size()) * 4 > NativeSubmitter::kSlotSize) {
+		const uint32_t         ring  = m_acb_rings && slot < kTrackerSlots ? slot : 0;
+		std::vector<uint32_t>& batch = m_acb_rings ? m_ring_batch[ring] : m_batch;
+		CpShadowBatch*         cs    = CpShadowBatchLocked(ring);
+		// Room for the job's end (shadowing off) and what CP shadowing puts in front.
+		const size_t extra = (SlotTarget(ring).ip_type == AMDGPU_HW_IP_GFX ? kCpShadowOff.size() : 0u) + (cs != nullptr ? cs->Extra(piece) : 0u);
+		if ((batch.size() + ib.size() + extra) * 4 > NativeSubmitter::kSlotSize) {
 			// A full gfx batch during a stream is the stream's next part, not a CS of its own behind it.
 			if (&batch == (m_acb_rings ? &m_ring_batch[0] : &m_batch) && m_stream != StreamState::Off) {
 				StreamFlushLocked(batch);
 			} else {
-				SubmitBufferLocked(batch, m_acb_rings ? slot : 0);
+				SubmitBufferLocked(batch, ring);
 			}
 		}
-		batch.insert(batch.end(), ib.begin(), ib.end());
+		if (cs != nullptr) {
+			const uint64_t guards = cs->guards;
+			cs->Append(batch, ib, piece);
+			if (cs->guards != guards && !m_cp_foreign_logged) {
+				m_cp_foreign_logged = true;
+				std::fprintf(stderr,
+				             "native shadow: CP shadow: a piece of another translator (a second guest graphics queue, or one "
+				             "translated before shadowing came on) on gfx ring %u; shadowing goes off before it (counted in the flip stats)\n",
+				             ring == 0 ? 0u : 1u);
+			}
+		} else {
+			batch.insert(batch.end(), ib.begin(), ib.end());
+		}
 #else
 		(void)ib;
 		(void)slot;
+		(void)piece;
 #endif
 	}
 
@@ -2266,6 +2402,17 @@ public:
 			if (written != 0) {
 				std::fprintf(stderr, "native shadow: hang dump: %u submissions of slot %u in %s (tracker %u)\n", written, slot,
 				             m_hang_dump.c_str(), TrackerValue(slot));
+			}
+		}
+		// CP shadowing's S as the hang left it (kCpShadow* layout), and the copy's view of it.
+		if (const std::vector<uint32_t> s = ReadCpShadowLocked(); !s.empty()) {
+			if (std::FILE* f = std::fopen((m_hang_dump + "/cpshadow.bin").c_str(), "wb"); f != nullptr) {
+				std::fwrite(s.data(), 4, s.size(), f);
+				std::fclose(f);
+			}
+			if (std::FILE* f = std::fopen((m_hang_dump + "/cpshadow.txt").c_str(), "w"); f != nullptr) {
+				m_translator.CompareCpShadow(s, f);
+				std::fclose(f);
 			}
 		}
 #endif
@@ -2421,6 +2568,69 @@ private:
 	}
 
 public:
+	// CP shadowing's check of S against the copy (control socket "cpshadow"; KYTY_NATIVE_GPU_CP_SHADOW_CHECK=<seconds>
+	// every so often): asked for, and lock-free, for the label pipeline's worker after each round.
+	bool CpShadowCheckDue() const {
+		if (!m_cp_shadow_on.load(std::memory_order_acquire)) {
+			return false;
+		}
+		if (DemandedCpShadowCheck().load(std::memory_order_relaxed)) {
+			return true;
+		}
+		static const double every = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW_CHECK");
+			return v != nullptr ? std::strtod(v, nullptr) : 0.0;
+		}();
+		return every > 0.0 && NowSecShadow() - m_cp_check_t.load(std::memory_order_relaxed) >= every;
+	}
+	// The worker calls it where every translated piece is on the GPU (nothing queued or held, no open stream):
+	// once the gfx ring is idle, S holds what the GPU ran and the copy what the translator expects there. Writes
+	// each difference to KYTY_NATIVE_GPU_DUMP_DIR/cpshadow_<n>.txt and a summary to the log (and the flip
+	// stats). A ring still busy after half a second (a GPU wait for work not submitted yet) is tried later.
+	void CpShadowCheck() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		SlotFence fence;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			if (m_submitter == nullptr || m_cp_shadow == CpShadowMode::Off || m_disabled) {
+				return;
+			}
+			fence = m_slot_fence[0];
+		}
+		m_cp_check_t.store(NowSecShadow(), std::memory_order_relaxed);
+		if (fence.seq != 0 && !m_submitter->WaitSeq(fence.seq, 0.5, {fence.ip_type, fence.ring})) {
+			if (m_cp_check_busy++ < 4) {
+				std::fprintf(stderr, "native shadow: CP shadow check put off: the gfx ring is still busy\n");
+			}
+			return;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		DemandedCpShadowCheck().store(false, std::memory_order_relaxed);
+		const std::vector<uint32_t> s   = ReadCpShadowLocked();
+		const char*                 dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+		char                        path[512];
+		std::snprintf(path, sizeof(path), "%s/cpshadow_%llu.txt", dir != nullptr && dir[0] != '\0' ? dir : ".",
+		              static_cast<unsigned long long>(m_cp_checks));
+		std::FILE* f = std::fopen(path, "w");
+		if (f != nullptr) {
+			std::fprintf(f, "# S (as the GPU left it) against the translator's copy after %llu DCBs; one line per difference\n",
+			             static_cast<unsigned long long>(m_frames));
+		}
+		m_cp_check_last = m_translator.CompareCpShadow(s, f);
+		if (f != nullptr) {
+			std::fclose(f);
+		}
+		m_cp_checks++;
+		m_cp_check_path = f != nullptr ? path : "not written";
+		const auto& c   = m_cp_check_last;
+		std::fprintf(stderr,
+		             "native shadow: CP shadow check %llu: %u keys, %u equal, %u late tables, %u not shadowed, %u unseen writes, "
+		             "%u outside the keys (%s)\n",
+		             static_cast<unsigned long long>(m_cp_checks), c.keys, c.equal, c.late, c.unshadowed, c.unseen, c.outside,
+		             m_cp_check_path.c_str());
+#endif
+	}
+
 	// The guest waits LabelPipeline::Emit has just given `slot`'s ring in a segment that ends with point
 	// `end_seq`.
 	void NoteExitWaits(uint32_t slot, uint64_t end_seq, std::vector<WaitCond> waits) {
@@ -2824,7 +3034,7 @@ private:
 	}
 
 	void AppendToBatchLocked(const std::vector<uint32_t>& ib) {
-		if ((m_batch.size() + ib.size()) * 4 > NativeSubmitter::kSlotSize) {
+		if ((m_batch.size() + ib.size() + kCpShadowOff.size()) * 4 > NativeSubmitter::kSlotSize) {
 			SubmitBatchLocked();
 		}
 		m_batch.insert(m_batch.end(), ib.begin(), ib.end());
@@ -2900,6 +3110,11 @@ private:
 			t[k++] = static_cast<uint32_t>(va);
 			t[k++] = static_cast<uint32_t>(va >> 32u) & 0xffffu;
 			t[k++] = static_cast<uint32_t>(len) | (1u << 20u) | (1u << 23u);
+		} else {
+			// The chain ends here, and with it the head's job: CP register shadowing off (kCpShadowOff).
+			for (; k < kCpShadowOff.size(); k++) {
+				t[k] = kCpShadowOff[k];
+			}
 		}
 		while (k < 8) {
 			t[k++] = 0xffff1000u;
@@ -2919,7 +3134,7 @@ private:
 			const uint32_t n = ++m_stream_counter;
 			AppendStreamWaitLocked(batch, n);
 			const uint64_t before = m_last_seq;
-			SubmitBufferLocked(batch, 0);
+			SubmitBufferLocked(batch, 0, true); // it chains on: the job ends where the stream does
 			if (m_disabled || m_last_seq == before) {
 				m_stream = StreamState::Off; // the CS never ran: no CP waits for the trampoline
 				return;
@@ -2936,13 +3151,23 @@ private:
 		const bool end = m_stream_final || m_disabled || m_gem->CreatedHandles().size() != m_stream_handles;
 		std::vector<uint32_t> ib;
 		AppendStreamDoneLocked(ib, m_stream_pending); // also in an empty chunk, or PublishStreamLocked would wait for it
+		const size_t done_dw = ib.size();
+		// CP shadowing: a chunk of ours without a preamble at the part's front carries on from the stream, unless
+		// what ended the previous part (another translator's piece) left shadowing off.
+		CpShadowBatch*                  cs    = CpShadowBatchLocked(0);
+		const std::span<const uint32_t> front = cs != nullptr ? cs->Front(true, m_cp_stream_on) : std::span<const uint32_t> {};
+		ib.insert(ib.end(), front.begin(), front.end());
+		const size_t content_from = ib.size();
 		ib.insert(ib.end(), batch.begin(), batch.end());
 		batch.clear();
 		const size_t content = ib.size();
+		const bool   part_on = cs != nullptr && cs->EndOn(m_cp_stream_on);
 		uint32_t     next    = 0;
 		if (!end) {
 			next = m_stream_counter + 1;
 			AppendStreamWaitLocked(ib, next);
+		} else {
+			EmitCpShadowOff(ib); // the head's job ends with this part
 		}
 		while ((ib.size() & 7u) != 0) {
 			ib.push_back(0xffff1000u);
@@ -2950,34 +3175,63 @@ private:
 		const uint64_t va = ib.empty() ? 0 : m_submitter->WriteStreamIb(ib, m_stream_head_seq, SlotTarget(0));
 		if (!ib.empty() && va == 0) {
 			// No free slot (or too long for one): end the chain and send this part as a CS of its own,
-			// which the ring runs after the head's.
+			// which the ring runs after the head's. CP shadowing's front for a CS is SubmitBufferLocked's.
 			PublishStreamLocked(m_stream_pending, 0, 0);
 			m_stream = StreamState::Off;
-			ib.resize(content);
-			batch = std::move(ib);
+			batch.assign(ib.begin(), ib.begin() + static_cast<std::ptrdiff_t>(done_dw));
+			batch.insert(batch.end(), ib.begin() + static_cast<std::ptrdiff_t>(content_from), ib.begin() + static_cast<std::ptrdiff_t>(content));
 			m_stream_fallbacks++;
 			return;
 		}
 		PublishStreamLocked(m_stream_pending, va, ib.size());
 		m_stream_chunks++;
+		if (cs != nullptr) {
+			m_cps_resumes += front.empty() ? 0u : 1u;
+			m_cps_job_ends += end ? 1u : 0u;
+			cs->Reset();
+		}
 		if (end) {
-			m_stream = StreamState::Off;
+			m_stream      = StreamState::Off;
+			m_cp_stream_on = false;
 		} else {
 			m_stream_counter = next;
 			m_stream_pending = next;
+			m_cp_stream_on   = part_on;
 		}
 #else
 		(void)batch;
 #endif
 	}
 
-	void SubmitBufferLocked(std::vector<uint32_t>& batch, uint32_t slot) {
+	// `chains`: the batch ends with a stream head's wait and chain, so its job ends where the stream does.
+	void SubmitBufferLocked(std::vector<uint32_t>& batch, uint32_t slot, bool chains = false) {
 #if KYTY_GEM_BACKING_SUPPORTED
+		CpShadowBatch* cs = CpShadowBatchLocked(slot);
 		if (batch.empty() || m_disabled || m_submitter == nullptr || m_stopping.load(std::memory_order_acquire)) {
 			batch.clear();
+			if (cs != nullptr) {
+				cs->Reset();
+			}
 			return;
 		}
 		const NativeSubmitter::RingTarget target = SlotTarget(slot);
+		if (cs != nullptr) {
+			// A CS of its own starts with shadowing off and no bases: a chunk of ours without a preamble at its
+			// front (after a stream break) gets its resume.
+			if (const std::span<const uint32_t> front = cs->Front(false, false); !front.empty()) {
+				batch.insert(batch.begin(), front.begin(), front.end());
+				m_cps_resumes++;
+			}
+			if (chains) {
+				m_cp_stream_on = cs->EndOn(false); // where the stream's first part begins
+			}
+			cs->Reset();
+		}
+		// Every gfx job ends with CP register shadowing off, with the feature off too (kCpShadowOff).
+		if (target.ip_type == AMDGPU_HW_IP_GFX && !chains) {
+			EmitCpShadowOff(batch);
+			m_cps_job_ends += cs != nullptr ? 1u : 0u;
+		}
 		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
 		NativeSubmitter::Result r       = m_submitter->Submit(batch, handles, m_timeout_sec, target);
 		if (!m_hang_dump.empty() && r.submitted && slot < kTrackerSlots) {
@@ -3422,6 +3676,15 @@ private:
 			std::fprintf(stderr, "native shadow: dumped shadow registers of frame %llu to %s\n",
 			             static_cast<unsigned long long>(frame), path);
 		}
+		// With CP shadowing, S too, against the copy.
+		if (const std::vector<uint32_t> s = ReadCpShadowLocked(); !s.empty()) {
+			std::snprintf(path, sizeof(path), "%s/cpshadow_regs_%llu.txt", (dir != nullptr && dir[0] != '\0') ? dir : ".",
+			              static_cast<unsigned long long>(frame));
+			if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+				m_translator.CompareCpShadow(s, f);
+				std::fclose(f);
+			}
+		}
 	}
 
 	// The first native CS pays a large one-off cost while amdgpu validates the userptr ranges and
@@ -3452,6 +3715,111 @@ private:
 		             "native shadow: AgcInit start state, register defaults version %u (title asked for %u): %zu context, %zu SH, "
 		             "%zu UCONFIG (%u UCONFIG left out)\n",
 		             state.version, ver, state.context.size(), state.sh.size(), state.uconfig.size() - skipped, skipped);
+	}
+
+	// KYTY_NATIVE_GPU_CP_SHADOW=record|1 (Pm4Translator::SetCpShadow): turns CP register shadowing on for the DCB
+	// translator (guest graphics queue 0) once all it needs holds, after seeding S with the copy, before any
+	// shadowing job. Tried when native labels come on and before each DCB until it is decided; a reason it can
+	// never hold is logged once and leaves it off. Never for the ACB translator: MEC has no CONTEXT_CONTROL.
+	void ActivateCpShadowLocked() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_cp_shadow_decided) {
+			return;
+		}
+		const CpShadowMode want = CpShadowWanted();
+		const char*        name = want == CpShadowMode::Record ? "record" : "load";
+		auto               refuse = [&](const char* why) {
+			m_cp_shadow_decided = true;
+			std::fprintf(stderr, "native shadow: CP register shadowing (%s) stays off: %s\n", name, why);
+		};
+		if (want == CpShadowMode::Off) {
+			m_cp_shadow_decided = true;
+			return;
+		}
+		if (!ShadowNativeLabels() || m_submitter == nullptr || !m_submitter->Async()) {
+			return refuse("it needs native labels (KYTY_NATIVE_GPU_PRIMARY, THREAD and LABELS) with the asynchronous submitter");
+		}
+		if (!m_labels) {
+			return; // EnableLabels has not run yet: it tries again
+		}
+		if (!m_acb_rings) {
+			return refuse("it needs ACBs on compute rings (KYTY_NATIVE_GPU_ACB_RINGS), not on the gfx ring");
+		}
+		if (EnvOn("KYTY_NATIVE_GPU_NO_PS5_DEFAULTS") || EnvIs("KYTY_NATIVE_GPU_AGC_DEFAULTS", "v11ctx")) {
+			return refuse("it needs the AgcInit start state (KYTY_NATIVE_GPU_NO_PS5_DEFAULTS / AGC_DEFAULTS=v11ctx)");
+		}
+		if (AmdgpuParam("mcbp") == 1) {
+			return refuse("amdgpu.mcbp=1 preempts gfx IBs: another process would run inside our jobs with shadowing on");
+		}
+		// The start state first (a later AgcInit only delays it), and not inside an open stream.
+		if (!m_agc_start_loaded || m_stream != StreamState::Off) {
+			if (!m_cp_shadow_waiting) {
+				m_cp_shadow_waiting = true;
+				std::fprintf(stderr, "native shadow: CP register shadowing (%s) waits for the AgcInit start state\n", name);
+			}
+			return;
+		}
+		if (m_submitter->MidIbPreemption()) {
+			return refuse("amdgpu preempts gfx IBs (MCBP or SR-IOV): another process would run inside our jobs with shadowing on");
+		}
+		std::vector<uint32_t> image(kCpShadowDwords, 0u);
+		m_translator.WriteCpShadowImage(image);
+		volatile uint32_t* s = m_submitter->CpShadowCpu();
+		for (uint64_t i = 0; i < NativeSubmitter::kCpShadowReserve / 4u; i++) {
+			s[i] = i < image.size() ? image[i] : 0u;
+		}
+		__sync_synchronize();
+		const uint64_t va      = m_submitter->CpShadowVa();
+		const uint32_t classes = CpShadowLoadClasses();
+		const bool     rearm   = EnvOn("KYTY_NATIVE_GPU_CP_SHADOW_REARM");
+		SetCpShadowValidation(va);
+		m_translator.SetCpShadow(va, want, classes, rearm);
+		m_cp_shadow         = want;
+		m_cp_shadow_decided = true;
+		m_cp_stream_on      = false;
+		for (const uint32_t slot: {0u, kGfx1Slot}) {
+			const std::vector<uint32_t>& batch = m_acb_rings ? m_ring_batch[slot] : m_batch;
+			if (!batch.empty()) {
+				m_cp_batch[slot == 0 ? 0 : 1].HoldsForeign();
+			}
+		}
+		m_cp_shadow_on.store(true, std::memory_order_release);
+		size_t keys = 0;
+		for (uint32_t v: image) {
+			keys += v != 0 ? 1u : 0u;
+		}
+		std::fprintf(stderr,
+		             "native shadow: CP register shadowing on (%s): S at 0x%llx, seeded with %zu non-zero registers of the copy; %s%s%s\n",
+		             name, static_cast<unsigned long long>(va), keys,
+		             want == CpShadowMode::Record ? "the copy still restores every register (shadowing off at every job end)"
+		                                          : "restores LOAD from S: ",
+		             want == CpShadowMode::Record ? "" : CpShadowClassNames(classes).c_str(),
+		             rearm ? "; CONTEXT_CONTROL again after a title's CLEAR_STATE" : "");
+#endif
+	}
+
+	// The batch state of a gfx ring while CP shadowing is on (ring 0, and the second gfx ring); nullptr otherwise.
+	CpShadowBatch* CpShadowBatchLocked(uint32_t slot) {
+		if (m_cp_shadow == CpShadowMode::Off) {
+			return nullptr;
+		}
+		const uint32_t ring = m_acb_rings ? slot : 0u;
+		return ring == 0 ? &m_cp_batch[0] : ring == kGfx1Slot ? &m_cp_batch[1] : nullptr;
+	}
+
+	// S as the GPU holds it now (CpShadowCheck, dumps).
+	std::vector<uint32_t> ReadCpShadowLocked() const {
+		std::vector<uint32_t> s;
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_submitter != nullptr && m_cp_shadow != CpShadowMode::Off) {
+			const volatile uint32_t* src = m_submitter->CpShadowCpu();
+			s.resize(kCpShadowDwords);
+			for (uint32_t i = 0; i < kCpShadowDwords; i++) {
+				s[i] = src[i];
+			}
+		}
+#endif
+		return s;
 	}
 
 	void Init() {
@@ -3596,8 +3964,10 @@ private:
 			volatile uint8_t* sc = m_submitter->ScratchCpu();
 			*reinterpret_cast<volatile uint32_t*>(sc + kExitAbortOffset) = 0;
 			*reinterpret_cast<volatile uint32_t*>(sc + kExitRunOffset)   = 1;
+			// The empty IB a stopped job ends in: CP register shadowing off first, whether it is on or not
+			// (kCpShadowOff), since the job's own end is never reached.
 			for (uint32_t i = 0; i < 8; i++) {
-				reinterpret_cast<volatile uint32_t*>(sc + kExitStubOffset)[i] = 0xffff1000u;
+				reinterpret_cast<volatile uint32_t*>(sc + kExitStubOffset)[i] = kCpShadowOff[i];
 			}
 			__sync_synchronize();
 		}
@@ -3866,6 +4236,25 @@ private:
 	};
 	std::array<StreamEvent, 64> m_stream_journal {};
 	size_t                      m_stream_journal_at = 0;
+	// CP register shadowing (ActivateCpShadowLocked): the mode it runs in, the batch state of the two gfx rings, and
+	// whether shadowing is on where the open stream's next part begins.
+	CpShadowMode          m_cp_shadow         = CpShadowMode::Off;
+	std::atomic<bool>     m_cp_shadow_on {false};
+	bool                  m_cp_shadow_decided = false;
+	bool                  m_cp_shadow_waiting = false;
+	bool                  m_cp_foreign_logged = false;
+	CpShadowBatch         m_cp_batch[2];
+	bool                  m_cp_stream_on      = false;
+	// Its flip stats (sums since the last report, the resumes and guards as running totals with their marks), and the
+	// checker's last result.
+	uint64_t              m_cps_preambles = 0, m_cps_load_dw = 0, m_cps_load_regs = 0, m_cps_anchors = 0, m_cps_sets = 0;
+	uint64_t              m_cps_job_ends = 0, m_cps_resumes = 0, m_cps_resumes_mark = 0, m_cps_guards_mark = 0;
+	uint64_t              m_context_ops = 0, m_context_checks = 0; // Pm4TranslateStats::context_ops / context_checks
+	uint64_t              m_cp_checks     = 0;
+	uint32_t              m_cp_check_busy = 0;
+	std::atomic<double>   m_cp_check_t {0.0};
+	std::string           m_cp_check_path;
+	Pm4Translator::CpShadowCheck m_cp_check_last;
 	// The stream counter and its trampolines, in the scratch page past the samples and tracker slots.
 	static constexpr uint32_t kStreamFlagOffset  = 2048;
 	static constexpr uint32_t kStreamDoneOffset  = 2052; // the last chunk the CP has entered
@@ -4334,6 +4723,8 @@ private:
 		Pm4Segment            seg; // offsets relative to `ib`
 		std::shared_ptr<Done> done; // on the last piece of a buffer
 		uint64_t              made = 0; // m_emits when it was translated: later emits carry writes it may wait for
+		bool                  cp_own = false; // CP shadowing: translated with shadow preambles (Pm4TranslateResult::cp_shadow)
+		std::vector<uint32_t> cp_resume;      // and, a streamed chunk's first piece, its resume
 	};
 	struct Entry {
 		uint64_t              seq;
@@ -4465,6 +4856,17 @@ private:
 				m_batch++;
 				m_last_cs.store(Shadow::Instance().TakeLastSeq(), std::memory_order_release);
 			}
+			// CP shadowing's check of S against the copy, where every translated piece is on the GPU.
+			if (Shadow::Instance().CpShadowCheckDue()) {
+				bool quiet = m_held == 0;
+				{
+					std::lock_guard<std::mutex> lock(m_mutex);
+					quiet = quiet && m_jobs.empty();
+				}
+				if (quiet && !Shadow::Instance().StreamActive()) {
+					Shadow::Instance().CpShadowCheck();
+				}
+			}
 		}
 	}
 
@@ -4509,7 +4911,11 @@ private:
 	void PushPieces(Pm4TranslateResult& r, const std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
 		for (size_t k = 0; k < r.segments.size(); k++) {
 			Piece p;
-			p.made = m_emits;
+			p.made   = m_emits;
+			p.cp_own = r.cp_shadow;
+			if (k == 0) {
+				p.cp_resume = std::move(r.cp_shadow_resume);
+			}
 			p.seg = std::move(r.segments[k]);
 			p.ib.assign(r.ib.begin() + p.seg.begin, r.ib.begin() + p.seg.end);
 			for (auto& point: p.seg.points) {
@@ -4978,7 +5384,7 @@ private:
 				             p.ib[bad]);
 				Shadow::Instance().DisableNow("packet check");
 			} else {
-				Shadow::Instance().AppendBatch(p.ib, slot);
+				Shadow::Instance().AppendBatch(p.ib, slot, CpShadowPiece {p.cp_own, p.seg.cp_shadow_head, p.cp_resume});
 				m_appended = true;
 				// The waits the GPU now has, for a stop: the held wait when it stays, then the segment's own.
 				std::vector<WaitCond> waits;
