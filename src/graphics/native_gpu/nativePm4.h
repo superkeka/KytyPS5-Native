@@ -214,6 +214,9 @@ struct Pm4TranslateStats {
 	// the save area and back, then a LOAD_CONTEXT_REG.
 	uint32_t cp_shadow_pushes = 0;
 	uint32_t cp_shadow_pops   = 0;
+	// Load mode: FMASK = BASE fixes done on the GPU from S (some of the slot's CB registers came from a verbatim
+	// table, so the GPU may hold other values than the copy).
+	uint32_t cp_shadow_fmask_gpu = 0;
 };
 
 // CP register shadowing (Pm4Translator::SetCpShadow, KYTY_NATIVE_GPU_CP_SHADOW). With the CONTEXT_CONTROL
@@ -231,12 +234,21 @@ constexpr uint64_t kCpShadowBytes = 0x49000;
 // The save area P of a pushed context (SetCpShadowPushPop) right after S: S's context region, 0x000-0x3FF.
 constexpr uint64_t kCpShadowSaveOffset = kCpShadowBytes;
 constexpr uint32_t kCpShadowSaveBytes  = 0x1000;
-// What the backend reserves for S and P, and the packet check guards.
-constexpr uint64_t kCpShadowReserveBytes = kCpShadowSaveOffset + kCpShadowSaveBytes;
+// After P, the register tables of the GPU-side FMASK fix (Pm4Translator::SetCpShadow, load mode): per MRT slot n
+// at kCpShadowFixOffset + 32 * n, {CB_COLORn_FMASK, BASE, CB_COLORn_FMASK_EXT, BASE_EXT} and then {.., FMASK, ..,
+// FMASK_EXT}, the offsets seeded once (CpShadowFixTables), the values copied from S by the GPU. Then a zero word,
+// seeded 0 and never written, copied for a register S has no value for (amdgpu's clear state, 0, on the GPU).
+constexpr uint64_t kCpShadowFixOffset  = kCpShadowSaveOffset + kCpShadowSaveBytes;
+constexpr uint32_t kCpShadowFixBytes   = 0x100;
+constexpr uint64_t kCpShadowZeroOffset = kCpShadowFixOffset + kCpShadowFixBytes;
+std::array<uint32_t, kCpShadowFixBytes / 4u> CpShadowFixTables();
+// What the backend reserves for S, P, the fix tables and the zero word, and the packet check guards.
+constexpr uint64_t kCpShadowReserveBytes = kCpShadowZeroOffset + 16u;
 // The push's and the pop's DMA_DATA: the micro engine, CP_SYNC (the ME waits for the copy), source and
 // destination through L2 (SRC_SEL/DST_SEL 3, as Mesa's CP DMA on GFX9 and up); RAW_WAIT, 4 KiB.
 constexpr uint32_t kCpShadowDmaControl = (1u << 31u) | (3u << 29u) | (3u << 20u);
 constexpr uint32_t kCpShadowDmaCommand = (1u << 30u) | kCpShadowSaveBytes;
+constexpr uint32_t kCpShadowDmaWordCommand = (1u << 30u) | 4u; // one register, for the FMASK fix
 // CONTEXT_CONTROL load and shadow enables of a shadowing job: update (bit 31), context (1), UCONFIG (15),
 // gfx SH (16) and CS SH (24); no global config, no CE RAM.
 constexpr uint32_t kCpShadowEnables = 0x81018002u;
@@ -998,7 +1010,8 @@ public:
 	};
 	CpShadowCheck CompareCpShadow(std::span<const uint32_t> s, std::FILE* report) const;
 	// Who last wrote a register the copy holds (CompareCpShadow; the copy's offsets below 0x400).
-	enum class RegWriter : uint8_t { Seed = 0, Set, Table, Expanded, Insert };
+	// Gpu: the GPU-side FMASK fix (load mode) changed it on the GPU, from values the copy may not hold.
+	enum class RegWriter : uint8_t { Seed = 0, Set, Table, Expanded, Insert, Gpu };
 
 private:
 	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
@@ -1013,6 +1026,10 @@ private:
 	// SetCpShadowPushPop: the push's copy of S's context region to P, and the pop back to `target` from `current`
 	// over the context registers `valid` in S.
 	void     EmitCpShadowPush(std::vector<uint32_t>& ib) const;
+	// fix_fmask on the GPU for MRT slot `slot`: FMASK = BASE (and the _EXT halves) from the values the CP holds (S),
+	// not the copy's; with `check` only when the CP's FMASK is not 0. A register S has no value for (`valid`) is
+	// amdgpu's clear state on the GPU, 0: the zero word is copied for it.
+	void     EmitCpShadowFmaskFix(std::vector<uint32_t>& ib, uint32_t slot, bool check, const std::bitset<RegFile::kDense>& valid) const;
 	void     EmitCpShadowPop(std::vector<uint32_t>& ib, const RegFile& target, const RegFile& current,
 	                         const std::bitset<RegFile::kDense>& valid) const;
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment

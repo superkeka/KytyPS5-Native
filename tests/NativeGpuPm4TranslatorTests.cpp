@@ -2622,6 +2622,7 @@ struct ToyCp {
 	uint32_t                    loads = 0; // LOADs that loaded
 	uint32_t                    dmas  = 0; // DMA_DATA copies
 
+	bool InS(uint64_t va) const { return va >= kTestShadowVa && va < kTestShadowVa + 4ull * s.size(); }
 	static uint32_t Bit(int c) { return c == kCtx ? 1u << 1u : c == kUc ? 1u << 15u : c == kGsh ? 1u << 16u : 1u << 24u; }
 	static uint32_t Region(int c) { return c == kCtx ? kCpShadowContextDw : c == kUc ? kCpShadowUconfigDw : kCpShadowShDw; }
 	static uint32_t Csb(uint32_t off) { return 0xc5b00000u | off; }
@@ -2674,7 +2675,8 @@ struct ToyCp {
 				case IT_SET_CONTEXT_REG_INDIRECT:
 				case IT_SET_SH_REG_INDIRECT:
 				case IT_SET_UCONFIG_REG_INDIRECT: {
-					const auto* pairs = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(b[1]) << 32u) | (b[0] & ~3u));
+					const uint64_t at    = (static_cast<uint64_t>(b[1]) << 32u) | (b[0] & ~3u);
+					const auto*    pairs = InS(at) ? s.data() + (at - kTestShadowVa) / 4u : reinterpret_cast<const uint32_t*>(at); // a table of ours in S's area
 					const int   c     = op == IT_SET_CONTEXT_REG_INDIRECT ? kCtx : op == IT_SET_UCONFIG_REG_INDIRECT ? kUc : (cs ? kCsh : kGsh);
 					for (uint32_t k = 0; k < (b[3] & 0x3fffu); k++) {
 						Write(c, pairs[2 * k] & 0xffffu, pairs[2 * k + 1]); // read when the CP gets here
@@ -2719,9 +2721,14 @@ struct ToyCp {
 					dmas++;
 					break;
 				}
-				case 0x22u: // COND_EXEC: no stop armed, the dwords it guards are skipped
-					dw += b[3];
+				case 0x22u: { // COND_EXEC: on a word in S's area (the FMASK fix) as the CP does; an exit guard's abort
+				             // word is 0 (no stop armed), so the dwords it guards are skipped
+					const uint64_t at = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
+					if (!InS(at) || s[(at - kTestShadowVa) / 4u] == 0u) {
+						dw += b[3];
+					}
 					break;
+				}
 				default: break;
 			}
 			dw += size;
@@ -2748,6 +2755,8 @@ struct ToyCp {
 		t.WriteCpShadowImage(std::span<uint32_t>(s.data(), kCpShadowDwords),
 		                     std::span<uint32_t>(s.data() + Libs::Graphics::NativeGpu::kCpShadowSaveOffset / 4u,
 		                                         Libs::Graphics::NativeGpu::kCpShadowSaveBytes / 4u));
+		const auto fix = Libs::Graphics::NativeGpu::CpShadowFixTables();
+		std::copy(fix.begin(), fix.end(), s.begin() + Libs::Graphics::NativeGpu::kCpShadowFixOffset / 4u);
 	}
 };
 
@@ -3332,7 +3341,8 @@ void TestCpShadowPushPopGpu() {
 			SetCpShadowValidation(0);
 		}
 		cp.Job(AsJob(r.ib));
-		Check(cp.cx[0x10F] == (gpu ? 0xAu : 0xBu), gpu ? "GPU pop: the pushed viewport comes back" : "CPU pop: the inner one stays (the bug)");
+		// The CPU pop in load mode SETs a register a verbatim table wrote even when the copy sees no change.
+		Check(cp.cx[0x10F] == 0xAu, gpu ? "GPU pop: the pushed viewport comes back" : "load mode's CPU pop: SET again, as the copy has it");
 		Check(!gpu || (cp.dmas == 2 && cp.s[kCpShadowContextDw + 0x10Fu] == 0xAu && cp.s[kCpShadowSaveOffset / 4u + 0x10Fu] == 0xAu),
 		      "two copies: P holds the pushed value, and S holds it again after the pop");
 	}
@@ -3460,6 +3470,206 @@ void TestCpShadowPushPopGpu() {
 	}
 }
 
+// Load mode: the CPU's inserts on CB registers the copy took from a verbatim table (the CP reads the table when it
+// runs: here the pairs change after the translation, as a GPU write would change them). The FMASK fix runs on the GPU
+// from the values the CP holds (a late BASE; a late FMASK that is not 0 stays), once until they change, with the
+// zero word for a register S has no value for; the GPU's FMASK is SET again by a context switch, and the fix follows
+// a GPU pop to what the GPU holds again. With CP shadowing off (or in record mode) it stays on the CPU as before.
+// And the packet check of the fix's DMA_DATA and COND_EXEC.
+void TestCpShadowCbInserts() {
+	using Libs::Graphics::NativeGpu::kCpShadowDmaControl;
+	using Libs::Graphics::NativeGpu::kCpShadowDmaWordCommand;
+	using Libs::Graphics::NativeGpu::kCpShadowFixOffset;
+	using Libs::Graphics::NativeGpu::kCpShadowZeroOffset;
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	constexpr uint32_t IT_DMA_DATA = 0x50, IT_COND_EXEC = 0x22;
+	constexpr uint32_t kBase0 = 0x318, kFmask0 = 0x321, kMask = 0x08E, kBaseExt0 = 0x390, kFmaskExt0 = 0x3A0;
+	const uint64_t     cx_va   = kTestShadowVa + 0x1000u;
+	const uint64_t     zero_va = kTestShadowVa + kCpShadowZeroOffset;
+	const uint64_t     fix_va  = kTestShadowVa + kCpShadowFixOffset;
+	auto draw  = [](std::vector<uint32_t>& d) { Append(d, IT_DRAW_INDEX_AUTO, {3u, 0u}, false); };
+	auto op    = [](std::vector<uint32_t>& d, uint32_t o) { d.insert(d.end(), {0xc0001200u, o}); }; // 1 push, 2 pop, 3 push + clear
+	auto count = [](const std::vector<Packet>& pkts, uint32_t code) {
+		return static_cast<uint32_t>(std::count_if(pkts.begin(), pkts.end(), [&](const Packet& p) { return p.op == code; }));
+	};
+	auto dmas_from = [](const std::vector<Packet>& pkts, uint64_t from) {
+		std::vector<uint64_t> to;
+		for (const auto& p: pkts) {
+			if (p.op == 0x50u && p.body.size() == 6 && (p.body[1] | (static_cast<uint64_t>(p.body[2]) << 32u)) == from) {
+				to.push_back(p.body[3] | (static_cast<uint64_t>(p.body[4]) << 32u));
+			}
+		}
+		return to;
+	};
+	auto valid = [](const std::vector<uint32_t>& ib) {
+		SetCpShadowValidation(kTestShadowVa);
+		const bool ok = ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx);
+		SetCpShadowValidation(0);
+		return ok;
+	};
+	const Regs start = {{kMask, 0xFu}, {kBase0, 0x1000u}, {kFmask0, 0u}, {kBaseExt0, 0u}, {kFmaskExt0, 0u}};
+
+	// A late BASE (0x100 when translated, 0x2000 when run), and the second time a late FMASK (0, then 0x3000).
+	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Record, CpShadowMode::Off}) {
+		for (const bool late_fmask: {false, true}) {
+			Pm4Translator t;
+			if (mode != CpShadowMode::Off) {
+				t.SetCpShadow(kTestShadowVa, mode);
+			}
+			Start(t, start, {}, {});
+			ToyCp cp;
+			cp.Seed(t);
+			std::vector<uint32_t> pairs = {kBase0, 0x100u};
+			if (late_fmask) {
+				pairs.insert(pairs.end(), {kFmask0, 0u});
+			}
+			std::vector<uint32_t> dcb;
+			AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+			draw(dcb);
+			draw(dcb);
+			auto r = t.Translate(dcb);
+			pairs[1] = 0x2000u;
+			if (late_fmask) {
+				pairs[3] = 0x3000u;
+			}
+			const auto pkts = Decode(r.ib);
+			if (mode != CpShadowMode::Load) {
+				Check(r.ok && count(pkts, IT_DMA_DATA) == 0 && SetsReg(pkts, IT_SET_CONTEXT_REG, kFmask0) && r.stats.fmask_fixed == 1 &&
+				          r.stats.cp_shadow_fmask_gpu == 0,
+				      mode == CpShadowMode::Off ? "CP shadowing off: the CPU's FMASK fix, as before" : "record mode: the CPU's FMASK fix, as before");
+				continue;
+			}
+			// Without a late FMASK the copy's 0 is the GPU's: no check, two copies (BASE, BASE_EXT); with one, four.
+			Check(r.ok && r.stats.cp_shadow_fmask_gpu == 1 && r.stats.fmask_fixed == 0 && count(pkts, IT_DMA_DATA) == (late_fmask ? 4u : 2u) &&
+			          count(pkts, IT_COND_EXEC) == (late_fmask ? 1u : 0u) && !SetsReg(pkts, IT_SET_CONTEXT_REG, kFmask0),
+			      "load mode: one FMASK fix on the GPU for both draws, no SET from the copy");
+			Check(dmas_from(pkts, cx_va + 4u * kBase0) == std::vector<uint64_t>({fix_va + 4u}) &&
+			          dmas_from(pkts, cx_va + 4u * kBaseExt0) == std::vector<uint64_t>({fix_va + 12u}),
+			      "BASE and BASE_EXT from S into the first table's values");
+			Check(valid(r.ib), "the packet check takes the fix");
+			cp.Job(AsJob(r.ib));
+			Check(cp.cx[kBase0] == 0x2000u && cp.cx[kFmask0] == (late_fmask ? 0x3000u : 0x2000u) && cp.s[kCpShadowContextDw + kFmask0] == cp.cx[kFmask0],
+			      late_fmask ? "a late FMASK that is not 0 stays" : "FMASK = the BASE the CP holds, not the copy's, in S too");
+		}
+	}
+
+	// A BASE_EXT S has no value for (no key: amdgpu's clear state, 0, on the GPU): the zero word is copied for it.
+	{
+		Pm4Translator t;
+		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		Start(t, {{kMask, 0xFu}, {kBase0, 0x1000u}, {kFmask0, 0u}}, {}, {});
+		ToyCp cp;
+		cp.Seed(t);
+		std::vector<uint32_t> pairs = {kBase0, 0x100u};
+		std::vector<uint32_t> dcb;
+		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+		draw(dcb);
+		auto r = t.Translate(dcb);
+		pairs[1] = 0x2000u;
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && dmas_from(pkts, zero_va) == std::vector<uint64_t>({fix_va + 12u}) && dmas_from(pkts, cx_va + 4u * kBaseExt0).empty(),
+		      "BASE_EXT without a value in S: the zero word");
+		Check(valid(r.ib), "the packet check takes a copy of the zero word");
+		cp.Job(AsJob(r.ib));
+		Check(cp.cx[kFmask0] == 0x2000u && cp.cx[kFmaskExt0] == 0u, "FMASK = BASE, FMASK_EXT = 0");
+	}
+
+	// The Demon's Souls case: a late BASE, a draw, a push, the title's own target inside the window, a draw, the pop,
+	// a draw. The GPU pop gives back the late BASE and the FMASK the GPU set for it; the copy has neither, so the
+	// last fix is the GPU's again. The CPU pop SETs the copy's BASE, and the fix follows it on the CPU.
+	for (const bool gpu: {true, false}) {
+		Pm4Translator t;
+		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		t.SetCpShadowPushPop(gpu);
+		Start(t, start, {}, {});
+		ToyCp cp;
+		cp.Seed(t);
+		std::vector<uint32_t> pairs = {kBase0, 0x100u};
+		std::vector<uint32_t> dcb;
+		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+		draw(dcb);
+		op(dcb, 1u);
+		Append(dcb, IT_SET_CONTEXT_REG, {kBase0, 0x4000u}, false);
+		Append(dcb, IT_SET_CONTEXT_REG, {kFmask0, 0u}, false);
+		draw(dcb);
+		op(dcb, 2u);
+		draw(dcb);
+		auto r = t.Translate(dcb);
+		pairs[1] = 0x2000u;
+		// Inside the window FMASK_EXT is still the one the GPU's first fix set, so that fix is the GPU's too (on the
+		// copy's BASE and FMASK, no check). The CPU pop SETs it back, and the last fix is the CPU's.
+		Check(r.ok && r.stats.cp_shadow_fmask_gpu == (gpu ? 3u : 2u) && r.stats.fmask_fixed == (gpu ? 0u : 1u),
+		      gpu ? "GPU pop: every fix on the GPU" : "CPU pop: the fixes before it on the GPU, the one after on the CPU");
+		Check(valid(r.ib), "the packet check takes it");
+		cp.Job(AsJob(r.ib));
+		Check(cp.cx[kBase0] == (gpu ? 0x2000u : 0x100u) && cp.cx[kFmask0] == cp.cx[kBase0],
+		      gpu ? "GPU pop: FMASK = the late BASE the pop gave back" : "CPU pop: FMASK = the BASE it SET");
+	}
+
+	// A push with a clear after a GPU fix: the clear SETs the late BASE and the GPU's FMASK to the defaults although
+	// the copy holds those values already; the pop in the next buffer gives back both, and the fix after it is the GPU's.
+	{
+		Pm4Translator t;
+		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		t.SetCpShadowPushPop(true);
+		Start(t, start, {}, {});
+		ToyCp cp;
+		cp.Seed(t);
+		std::vector<uint32_t> pairs = {kBase0, 0x1000u};
+		std::vector<uint32_t> dcb;
+		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+		draw(dcb);
+		op(dcb, 3u);
+		auto r = t.Translate(dcb);
+		pairs[1] = 0x2000u;
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && r.stats.cp_shadow_fmask_gpu == 1 && SetsReg(pkts, IT_SET_CONTEXT_REG, kBase0) && SetsReg(pkts, IT_SET_CONTEXT_REG, kFmask0) &&
+		          SetsReg(pkts, IT_SET_CONTEXT_REG, kFmaskExt0),
+		      "the clear SETs BASE, FMASK and FMASK_EXT although the copy sees no change");
+		cp.Job(AsJob(r.ib));
+		Check(cp.cx[kBase0] == 0x1000u && cp.cx[kFmask0] == 0u && cp.cx[kFmaskExt0] == 0u, "the GPU holds the defaults after the clear");
+		std::vector<uint32_t> dcb2;
+		op(dcb2, 2u);
+		draw(dcb2);
+		auto r2 = t.Translate(dcb2);
+		Check(r2.ok && r2.stats.cp_shadow_pops == 1 && r2.stats.cp_shadow_fmask_gpu == 1 && r2.stats.fmask_fixed == 0,
+		      "the pop, then the GPU's fix (the pushed BASE came from a table)");
+		Check(valid(r2.ib), "the packet check takes it");
+		cp.Job(AsJob(r2.ib));
+		Check(cp.cx[kBase0] == 0x2000u && cp.cx[kFmask0] == 0x2000u, "after the pop: the late BASE and its FMASK");
+	}
+
+	// The packet check: the fix's COND_EXEC only on a value dword over one of its tables, its DMA_DATA only from a
+	// context register of S or the zero word into a value dword.
+	{
+		auto cond = [&](uint64_t on, uint64_t table) {
+			std::vector<uint32_t> ib = {Pkt3(IT_COND_EXEC, 4, false), static_cast<uint32_t>(on), static_cast<uint32_t>(on >> 32u), 0u, 5u,
+			                            Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false), static_cast<uint32_t>(table), static_cast<uint32_t>(table >> 32u),
+			                            0x80000000u, 2u};
+			return valid(ib);
+		};
+		auto word = [&](uint64_t from, uint64_t to) {
+			std::vector<uint32_t> ib = {Pkt3(IT_DMA_DATA, 6, false), kCpShadowDmaControl, static_cast<uint32_t>(from), static_cast<uint32_t>(from >> 32u),
+			                            static_cast<uint32_t>(to), static_cast<uint32_t>(to >> 32u), kCpShadowDmaWordCommand};
+			return valid(ib);
+		};
+		Check(cond(fix_va + 20u, fix_va + 16u) && cond(fix_va + 32u * 7u + 20u, fix_va + 32u * 7u + 16u), "the fix's COND_EXEC passes");
+		Check(!cond(fix_va + 16u, fix_va + 16u) && !cond(fix_va + 20u, fix_va + 8u) && !cond(fix_va + 20u, fix_va + 0xF8u) &&
+		          !cond(cx_va + 4u * kFmask0, fix_va + 16u),
+		      "on an offset dword, over a table not at an entry or out of the area, or on S itself: refused");
+		std::vector<uint32_t> other = {Pkt3(IT_COND_EXEC, 4, false), static_cast<uint32_t>(fix_va + 20u), static_cast<uint32_t>((fix_va + 20u) >> 32u),
+		                               0u, 5u};
+		Append(other, IT_SET_CONTEXT_REG, {0x10u, 1u, 2u, 3u}, false);
+		Check(!valid(other), "a COND_EXEC on the fix tables over anything else is refused");
+		Check(word(cx_va + 4u * kBase0, fix_va + 4u) && word(zero_va, fix_va + 12u) && word(cx_va + 4u * 0x3FFu, fix_va + 0xFCu),
+		      "the fix's DMA_DATA passes");
+		Check(!word(cx_va + 4u * kBase0, fix_va) && !word(cx_va + 4u * kBase0, fix_va + 8u) && !word(cx_va + 4u * kBase0, fix_va + 0x104u) &&
+		          !word(cx_va + 0x1000u, fix_va + 4u) && !word(zero_va + 4u, fix_va + 4u) && !word(cx_va + 4u * kBase0, zero_va) &&
+		          !word(cx_va + 4u * kBase0, cx_va + 4u * kFmask0),
+		      "into an offset dword, past the tables, from outside S's context region, into the zero word or into S: refused");
+	}
+}
+
 int main() {
 	// The cases count the packets a DCB turns into; the preamble's start values (PIXEL_PIPE_STAT_CONTROL,
 	// the CP draw state) are board settings with their own switches, left out here.
@@ -3541,6 +3751,7 @@ int main() {
 	TestCpShadowStartKeys();
 	TestCpShadowPushPopCpu();
 	TestCpShadowPushPopGpu();
+	TestCpShadowCbInserts();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
