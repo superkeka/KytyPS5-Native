@@ -1027,6 +1027,8 @@ public:
 			m_cps_load_dw += result.stats.cp_shadow_load_dw;
 			m_cps_load_regs += result.stats.cp_shadow_load_regs;
 			m_cps_anchors += result.stats.cp_shadow_anchors;
+			m_cps_pushes += result.stats.cp_shadow_pushes;
+			m_cps_pops += result.stats.cp_shadow_pops;
 			if (result.cp_shadow) {
 				m_cps_sets += result.stats.preamble_cx + result.stats.preamble_sh + result.stats.preamble_uc;
 			}
@@ -1713,13 +1715,15 @@ public:
 				std::fprintf(stderr,
 				             "native shadow: CP shadow (%s) per flip: %.2f shadow preambles with %.0f LOAD dwords (%.0f registers, %.2f anchors) and "
 				             "%.0f SETs; %.2f resumes put in front of a chunk, %.2f shadowing-off guards before another translator's piece, %.2f "
-				             "gfx job ends\n",
+				             "gfx job ends; %.2f context pushes and %.2f pops on the GPU\n",
 				             m_cp_shadow == CpShadowMode::Record ? "record" : "load", static_cast<double>(m_cps_preambles) / m_flips,
 				             static_cast<double>(m_cps_load_dw) / m_flips, static_cast<double>(m_cps_load_regs) / m_flips,
 				             static_cast<double>(m_cps_anchors) / m_flips, static_cast<double>(m_cps_sets) / m_flips,
 				             static_cast<double>(resumes - m_cps_resumes_mark) / m_flips, static_cast<double>(guards - m_cps_guards_mark) / m_flips,
-				             static_cast<double>(m_cps_job_ends) / m_flips);
+				             static_cast<double>(m_cps_job_ends) / m_flips, static_cast<double>(m_cps_pushes) / m_flips,
+				             static_cast<double>(m_cps_pops) / m_flips);
 				m_cps_preambles = m_cps_load_dw = m_cps_load_regs = m_cps_anchors = m_cps_sets = m_cps_job_ends = 0;
+				m_cps_pushes = m_cps_pops = 0;
 				m_cps_resumes_mark = resumes;
 				m_cps_guards_mark  = guards;
 				if (m_cp_checks != 0) {
@@ -3762,18 +3766,27 @@ private:
 		if (m_submitter->MidIbPreemption()) {
 			return refuse("amdgpu preempts gfx IBs (MCBP or SR-IOV): another process would run inside our jobs with shadowing on");
 		}
+		// S from the copy, and P with the context a pop restores, so a pop whose push ran before shadowing (or none)
+		// restores the copy's view rather than zeros.
 		std::vector<uint32_t> image(kCpShadowDwords, 0u);
-		m_translator.WriteCpShadowImage(image);
+		std::vector<uint32_t> save(kCpShadowSaveBytes / 4u, 0u);
+		m_translator.WriteCpShadowImage(image, save);
 		volatile uint32_t* s = m_submitter->CpShadowCpu();
 		for (uint64_t i = 0; i < NativeSubmitter::kCpShadowReserve / 4u; i++) {
-			s[i] = i < image.size() ? image[i] : 0u;
+			const uint64_t p = i - kCpShadowSaveOffset / 4u;
+			s[i]             = i < image.size() ? image[i] : i >= kCpShadowSaveOffset / 4u && p < save.size() ? save[p] : 0u;
 		}
 		__sync_synchronize();
 		const uint64_t va      = m_submitter->CpShadowVa();
 		const uint32_t classes = CpShadowLoadClasses();
 		const bool     rearm   = EnvOn("KYTY_NATIVE_GPU_CP_SHADOW_REARM");
+		// KYTY_NATIVE_GPU_CP_SHADOW_PUSHPOP=0 keeps libSceAgc's push/pop on the CPU in load mode too;
+		// KYTY_NATIVE_GPU_CP_SHADOW_POP_RANGE=all makes the pop LOAD all of 0x000-0x3FF.
+		const bool pushpop = !EnvIs("KYTY_NATIVE_GPU_CP_SHADOW_PUSHPOP", "0");
+		const bool pop_all = EnvIs("KYTY_NATIVE_GPU_CP_SHADOW_POP_RANGE", "all");
 		SetCpShadowValidation(va);
 		m_translator.SetCpShadow(va, want, classes, rearm);
+		m_translator.SetCpShadowPushPop(pushpop, pop_all);
 		m_cp_shadow         = want;
 		m_cp_shadow_decided = true;
 		m_cp_stream_on      = false;
@@ -3789,11 +3802,14 @@ private:
 			keys += v != 0 ? 1u : 0u;
 		}
 		std::fprintf(stderr,
-		             "native shadow: CP register shadowing on (%s): S at 0x%llx, seeded with %zu non-zero registers of the copy; %s%s%s\n",
+		             "native shadow: CP register shadowing on (%s): S at 0x%llx, seeded with %zu non-zero registers of the copy; %s%s%s%s\n",
 		             name, static_cast<unsigned long long>(va), keys,
 		             want == CpShadowMode::Record ? "the copy still restores every register (shadowing off at every job end)"
 		                                          : "restores LOAD from S: ",
 		             want == CpShadowMode::Record ? "" : CpShadowClassNames(classes).c_str(),
+		             m_translator.CpShadowGpuPushPop()
+		                 ? (pop_all ? "; context push/pop on the GPU through S (the pop LOADs all of 0x000-0x3FF)" : "; context push/pop on the GPU through S")
+		                 : "; context push/pop on the CPU",
 		             rearm ? "; CONTEXT_CONTROL again after a title's CLEAR_STATE" : "");
 #endif
 	}
@@ -4249,6 +4265,7 @@ private:
 	// checker's last result.
 	uint64_t              m_cps_preambles = 0, m_cps_load_dw = 0, m_cps_load_regs = 0, m_cps_anchors = 0, m_cps_sets = 0;
 	uint64_t              m_cps_job_ends = 0, m_cps_resumes = 0, m_cps_resumes_mark = 0, m_cps_guards_mark = 0;
+	uint64_t              m_cps_pushes = 0, m_cps_pops = 0;
 	uint64_t              m_context_ops = 0, m_context_checks = 0; // Pm4TranslateStats::context_ops / context_checks
 	uint64_t              m_cp_checks     = 0;
 	uint32_t              m_cp_check_busy = 0;

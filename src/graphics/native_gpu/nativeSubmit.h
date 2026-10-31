@@ -58,7 +58,7 @@ public:
 	// a 16-bit register offset of any class leaves it (kCpShadowBytes), followed by 4 KiB kept for a pushed
 	// context. Sync mode's IBs stay below it too.
 	static constexpr uint64_t kCpShadowOffset  = kSlots * kSlotSize;
-	static constexpr uint64_t kCpShadowReserve = kCpShadowBytes + 4096;
+	static constexpr uint64_t kCpShadowReserve = kCpShadowReserveBytes; // S, then the save area P of a pushed context
 	static_assert(kCpShadowOffset + kCpShadowReserve <= kIbSize - kScratchSize, "S fits between the slots and the scratch area");
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;
