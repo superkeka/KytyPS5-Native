@@ -655,9 +655,10 @@ public:
 	// the caller, who schedules its segments; false means it is not run natively (refused, or the
 	// native path is off) and Kyty has to run it.
 	// `source`: where `dcb`'s dwords sit in guest memory when it is not the guest's buffer itself (a chunk of
-	// one LabelPipeline flattened), for direct runs.
+	// one LabelPipeline flattened), for direct runs. `agr`: a DCB of the AGR queue, through its own translator
+	// (CreateAgrTranslatorLocked).
 	bool Submit(std::span<const uint32_t> dcb, bool acb = false, Pm4TranslateResult* out = nullptr,
-	            const std::vector<SourcePiece>* source = nullptr) {
+	            const std::vector<SourcePiece>* source = nullptr, bool agr = false) {
 		const double                t_enter = NowSecShadow();
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double                t_locked = NowSecShadow();
@@ -686,7 +687,7 @@ public:
 		if (!acb) {
 			m_trace_last_dcb.store(NowSecShadow(), std::memory_order_relaxed); // FlipTrace
 		}
-		Pm4Translator&     tr    = acb ? m_acb_translator : m_translator;
+		Pm4Translator&     tr    = acb ? m_acb_translator : agr && m_agr_translator != nullptr ? *m_agr_translator : m_translator;
 		if (!acb) {
 			LoadAgcStartState();
 			ActivateCpShadowLocked();
@@ -821,9 +822,12 @@ public:
 			// since the previous one. The pipeline thread publishes it here; the command processor
 			// (the completion thread when submissions are pipelined, otherwise this same thread,
 			// after Submit returns) takes it by buffer address and writes the usage records.
-			Pm4Translator& other = acb ? m_translator : m_acb_translator;
 			for (auto& scan: result.lod_scans) {
-				scan.Merge(other.TakeLodScan());
+				for (Pm4Translator* other: {&m_translator, &m_acb_translator, m_agr_translator.get()}) {
+					if (other != nullptr && other != &tr) {
+						scan.Merge(other->TakeLodScan());
+					}
+				}
 				LogLodScan(scan);
 				LodStatsReports().Push(scan.addr, scan.banks);
 			}
@@ -933,6 +937,9 @@ public:
 			std::set<uint64_t> skip = m_gds_shaders;
 			skip.insert(m_skip_ps.begin(), m_skip_ps.end());
 			m_translator.SetSkippedPixelShaders(skip);
+			if (m_agr_translator != nullptr) {
+				m_agr_translator->SetSkippedPixelShaders(skip);
+			}
 			m_refused++;
 			return false;
 		}
@@ -1292,6 +1299,9 @@ public:
 
 	void AddDisplayRange(uint64_t addr, uint64_t size) {
 		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_agr_translator != nullptr) {
+			m_agr_translator->AddDisplayRange(addr, size);
+		}
 		if (!m_translator.AddDisplayRange(addr, size)) {
 			return;
 		}
@@ -2011,11 +2021,64 @@ public:
 			             "writer has been submitted\n",
 			             m_compute_mask);
 		}
+		CreateAgrTranslatorLocked();
 		ActivateCpShadowLocked();
 		return true;
 #else
 		(void)oracle;
 		return false;
+#endif
+	}
+
+	// The AGR queue (kGuestAgrQueue) is a guest graphics queue of its own, as on the PS5, with registers of its
+	// own: a second DCB translator with the first one's settings and the register defaults seeded so far
+	// (LoadAgcStartState gives it AgcInit's start state too). CP shadowing stays queue 0's, S holds one queue's
+	// registers: in queue 0's ring the AGR queue's pieces are another translator's (shadowing off before them,
+	// and queue 0's next piece restores its registers from S), each restoring its own with its preamble, the
+	// state where its buffer starts (as a chunk's: the end state would give a buffer's first draws the
+	// registers its later SETs give its last ones). Its barriers have a fence of their own, the unused +12
+	// dword of slot kGfx1Slot's tracker; no GPU times.
+	void CreateAgrTranslatorLocked() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		m_agr_translator = m_translator.Clone();
+		(void)m_agr_translator->TakeLodScan(); // a LOD window open in the copy is the DCB translator's
+		m_agr_translator->SetCpShadow(0, CpShadowMode::Off);
+		m_agr_translator->SetPreambleFromStart(true);
+		if (m_translator.FenceAddress() != 0) {
+			m_agr_translator->SetFenceAddress(m_submitter->ScratchVa() + kTrackerOffset + kGfx1Slot * kTrackerStride + 12);
+		}
+		m_agr_translator->SetGpuTimes(0, 0, 0);
+#endif
+	}
+
+	// The AGR queue runs as a queue of its own (LabelPipeline::AgrQueueOwn) only while queue 0's pieces restore
+	// their registers after another translator's: CP shadowing in load mode gives every piece of queue 0's a
+	// preamble or a resume. Without it a streamed chunk carries on from where the chunk before it left the
+	// registers, so the AGR queue's buffers stay in queue 0 as before. 1 yes, 0 no, -1 not decided yet (CP
+	// shadowing waits for AgcInit's start state). It first does what a DCB's translation does (Submit): the
+	// first AGR buffer can come before the first DCB.
+	int AgrTranslatorReady() {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_agr_translator == nullptr || !m_enabled || m_disabled) {
+			return 0;
+		}
+		LoadAgcStartState();
+		ActivateCpShadowLocked();
+		if (!m_cp_shadow_decided) {
+			return -1;
+		}
+		return m_translator.CpShadow() == CpShadowMode::Load ? 1 : 0;
+	}
+	// The AGR queue's tracker: its ring's slot (kGfx1Slot on a second gfx ring, else queue 0's slot 0).
+	void UseAgrTracker(uint32_t slot) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_agr_translator == nullptr || m_label_oracle == nullptr || m_submitter == nullptr || slot >= kTrackerSlots) {
+			return;
+		}
+		m_agr_translator->SetNativeLabels(m_label_oracle, m_submitter->ScratchVa() + kTrackerOffset + static_cast<uint64_t>(slot) * kTrackerStride);
+#else
+		(void)slot;
 #endif
 	}
 
@@ -3493,6 +3556,9 @@ private:
 		m_collect_refs = collect;
 		m_translator.SetCollectRefs(collect);
 		m_acb_translator.SetCollectRefs(collect);
+		if (m_agr_translator != nullptr) {
+			m_agr_translator->SetCollectRefs(collect);
+		}
 		std::fprintf(stderr, collect ? "native shadow: residency by reference: per-draw references and the CPU-write scan are on\n"
 		                             : "native shadow: residency at map time (PS5): no per-draw references, no CPU-write scan\n");
 #endif
@@ -3723,6 +3789,9 @@ private:
 		m_agc_start_loaded     = true;
 		const auto     state   = Gen5::AgcStartStateDefaults(ver);
 		const uint32_t skipped = m_translator.LoadStartState(state.context, state.sh, state.uconfig);
+		if (m_agr_translator != nullptr) {
+			m_agr_translator->LoadStartState(state.context, state.sh, state.uconfig);
+		}
 		std::fprintf(stderr,
 		             "native shadow: AgcInit start state, register defaults version %u (title asked for %u): %zu context, %zu SH, "
 		             "%zu UCONFIG (%u UCONFIG left out)\n",
@@ -4224,6 +4293,7 @@ private:
 	bool          m_disabled    = false;
 	Pm4Translator m_translator;
 	Pm4Translator m_acb_translator; // async compute buffers (KYTY_NATIVE_GPU_ACB)
+	std::unique_ptr<Pm4Translator> m_agr_translator; // the AGR queue's DCBs (kGuestAgrQueue; CreateAgrTranslatorLocked)
 	AcbMode       m_acb_mode = AcbMode::Off;
 	uint64_t      m_acbs           = 0;
 	uint64_t      m_acbs_completed = 0;
@@ -4668,12 +4738,21 @@ public:
 		if (gpu_waits && (!Shadow::GfxSlot(slot) || !m_gfx_shared)) {
 			return Plan::Native;
 		}
-		const Plan plan = PlanWaitHeld(wait);
+		bool       own_writer = false;
+		const Plan plan       = PlanWaitHeld(wait, &own_writer);
+		// On a ring two guest queues share, a wait goes into the IB as a GPU wait only behind a writer of its own
+		// queue: the other queue's pieces may be emitted between now and this piece (a held piece ahead of it in
+		// its queue, a split earlier in this buffer) and change what the ring and memory show now. Ready decides
+		// the rest when the piece is emitted.
+		if (Ring0Shared(slot) && !own_writer) {
+			return Plan::Split;
+		}
 		return gpu_waits && plan == Plan::Met ? Plan::Native : plan;
 	}
 
 private:
-	Plan PlanWaitHeld(const WaitCond& wait) {
+	// `own_writer`: the plan comes from a write of the same queue's pieces still pending (ahead of the waiter).
+	Plan PlanWaitHeld(const WaitCond& wait, bool* own_writer) {
 		auto decide = [&](const LabelWrite& w) -> std::optional<Plan> {
 			uint64_t  v = 0;
 			const int c = w.Covers(wait.addr, wait.wide, &v, wait.mask);
@@ -4686,6 +4765,7 @@ private:
 			for (auto p = q->second.rbegin(); p != q->second.rend(); ++p) {
 				for (auto w = p->seg.writes.rbegin(); w != p->seg.writes.rend(); ++w) {
 					if (auto plan = decide(*w)) {
+						*own_writer = *plan == Plan::Native;
 						return *plan;
 					}
 				}
@@ -4725,6 +4805,7 @@ private:
 		double                picked   = 0.0;
 		bool                  gfx      = false; // a guest DCB (FlipTrace times it)
 		bool                  acb      = false; // a guest ACB
+		int                   joins    = 1;     // the queues it is in: Finish runs it once the last one reaches it
 	};
 	// KYTY_NATIVE_GPU_CHUNK_DW=N: graphics buffers longer than N dwords go to the GPU in chunks of about N
 	// (TranslateChunks) instead of at the title's segments.
@@ -4802,15 +4883,26 @@ private:
 	// order, as the PS5 maps each of a title's compute queues onto one hardware queue (more queues
 	// than indexes share them).
 	uint32_t SlotOf(uint32_t queue) const {
-		if (queue < 0x20u || queue >= 0x58u) {
-			// Guest graphics queues take the gfx rings in the order they appear, as the PS5 gives a title
-			// its main ring and its "AGR" ring; a further one shares the first ring.
-			auto [it, fresh] = m_gfx_index.try_emplace(queue, static_cast<uint32_t>(m_gfx_index.size()));
+		if (!IsGuestComputeQueue(queue)) {
+			// Guest graphics queue 0 is the title's main ring and kGuestAgrQueue its "AGR" ring, as the PS5
+			// gives a title two; the AGR queue has a gfx ring of its own with a second one (the BC-250's
+			// patched amdgpu), else it shares queue 0's, and so does any further graphics queue.
+			const uint32_t index = queue == 0 ? 0u : queue == kGuestAgrQueue ? 1u : 2u;
+			auto [it, fresh]     = m_gfx_index.try_emplace(queue, index);
 			const bool own = it->second == 0 || (it->second == 1 && m_acb_rings && Shadow::Instance().SecondGfxRing());
 			if (fresh) {
-				// Decided when the first one appears: by then the submitter knows the gfx rings.
-				m_gfx_shared = it->second == 0 ? !Shadow::Instance().GfxQueueWaitsOnGpu() : (m_gfx_shared || !own);
-				std::fprintf(stderr, "native shadow: guest graphics queue 0x%x runs on gfx ring %u%s\n", queue, own ? it->second : 0u,
+				// Decided when each first appears: by then the submitter knows the gfx rings. Once a guest
+				// queue shares queue 0's ring, the waits of queue 0's buffers translated before it stay GPU
+				// waits; those after it are held while no writer is known to be ahead. A queue 0 GPU wait
+				// for the AGR queue's first buffer, on the ring before it, would stop the ring: with
+				// KYTY_NATIVE_GPU_AGR_QUEUE=1 the AGR queue counts as sharing ring 0 from queue 0's first
+				// buffer on (every title imports the AGR calls, so that alone says nothing).
+				const bool agr_expected = it->second == 0 && EnvIs("KYTY_NATIVE_GPU_AGR_QUEUE", "1") &&
+				                          !(m_acb_rings && Shadow::Instance().SecondGfxRing());
+				m_ring0_shared = m_ring0_shared || !own || agr_expected;
+				m_gfx_shared   = !Shadow::Instance().GfxQueueWaitsOnGpu() || m_ring0_shared;
+				std::fprintf(stderr, "native shadow: guest graphics queue 0x%x runs on gfx ring %u%s%s\n", queue,
+				             own && it->second == 1 ? 1u : 0u, own ? "" : ", in queue 0's ring",
 				             m_gfx_shared ? " (gfx waits with no known writer ahead stay held on the CPU)" : " (gfx waits on the GPU)");
 			}
 			return own && it->second == 1 ? Shadow::kGfx1Slot : 0;
@@ -4828,6 +4920,32 @@ private:
 		}
 		return it->second + 1u;
 	}
+
+	// The AGR queue's buffers (kGuestAgrQueue) run as a guest graphics queue of their own when Shadow restores
+	// queue 0's registers after them (AgrTranslatorReady), else in queue 0 behind the main ring's buffers, as
+	// before; the first one decides, for all of them (the AGR queue's registers carry on from buffer to
+	// buffer). KYTY_NATIVE_GPU_AGR_QUEUE=0: always in queue 0.
+	bool AgrQueueOwn() {
+		if (m_agr_own < 0) {
+			const bool off   = EnvIs("KYTY_NATIVE_GPU_AGR_QUEUE", "0");
+			const int  ready = off || !m_native ? 0 : Shadow::Instance().AgrTranslatorReady();
+			m_agr_own        = ready == 1 ? 1 : 0;
+			const bool late  = m_agr_own == 1 && !m_ring0_shared && !(m_acb_rings && Shadow::Instance().SecondGfxRing());
+			std::fprintf(stderr, "native shadow: AGR buffers run %s%s\n",
+			             m_agr_own == 1 ? "as a guest graphics queue of their own (the PS5's second graphics ring)"
+			             : off          ? "in guest graphics queue 0 (KYTY_NATIVE_GPU_AGR_QUEUE=0)"
+			             : ready < 0    ? "in guest graphics queue 0 (CP shadowing was not on yet at the first one)"
+			                            : "in guest graphics queue 0 (a queue of their own needs CP shadowing in load mode)",
+			             late ? "; queue 0's waits already on the GPU stay there (KYTY_NATIVE_GPU_AGR_QUEUE=1 holds them from "
+			                    "the first buffer on)"
+			                  : "");
+		}
+		return m_agr_own == 1;
+	}
+
+	// Gfx ring 0 runs the AGR queue's pieces besides queue 0's: a wait there must not be one the other guest
+	// queue's work behind it in the ring could be needed for.
+	bool Ring0Shared(uint32_t slot) const { return slot == 0 && m_ring0_shared; }
 
 	static uint64_t ReadLabel(const WaitCond& w) {
 		return w.wide ? *reinterpret_cast<const volatile uint64_t*>(w.addr) : *reinterpret_cast<const volatile uint32_t*>(w.addr);
@@ -4907,27 +5025,52 @@ private:
 		done->size_dw  = job.size_dw;
 		done->enqueued = job.enqueued;
 		done->picked   = picked;
-		done->gfx      = job.queue == 0 && job.buffer != nullptr;
-		done->acb      = job.queue != 0 && job.buffer != nullptr;
+		// KYTY_NATIVE_GPU_AGR_TEST=1: what goes to queue 0 goes through the AGR queue instead, which runs the AGR
+		// queue's path (its translator, the holds of a shared ring) on titles that never submit to it. Kyty's own
+		// submissions too: they keep their place behind the buffers submitted before them (GuestGpu::Enqueue).
+		static const bool agr_test = EnvOn("KYTY_NATIVE_GPU_AGR_TEST");
+		if (agr_test && job.queue == 0) {
+			job.queue = kGuestAgrQueue;
+		}
+		// The PS5 gives a title two graphics rings: any other guest graphics queue is the main one's, and the
+		// AGR queue's buffers join it too unless they run as a queue of their own (AgrQueueOwn: its first
+		// buffer decides, not one of Kyty's own submissions the test sends there).
+		if (!IsGuestComputeQueue(job.queue) && job.queue != 0 &&
+		    (job.queue != kGuestAgrQueue || !(job.buffer != nullptr ? AgrQueueOwn() : m_agr_own == 1))) {
+			job.queue = 0;
+		}
+		// Kyty's own submissions keep their place behind every buffer submitted before them (GuestGpu::Enqueue; a
+		// suspend point lets the title go on with its next frame): with the AGR queue of its own, behind both guest
+		// graphics queues. It goes in both, and Finish runs it once both have reached it.
+		if (job.buffer == nullptr && job.queue == 0 && m_agr_own == 1) {
+			done->joins = 2;
+			m_pending[kGuestAgrQueue].push_back(Piece {{}, {}, done});
+		}
+		const bool compute = IsGuestComputeQueue(job.queue);
+		done->gfx      = !compute && job.buffer != nullptr;
+		done->acb      = compute && job.buffer != nullptr;
 		auto& queue    = m_pending[job.queue];
 		Pm4TranslateResult r;
 		m_translating = job.queue;
-		if (m_acb_rings && job.queue >= 0x20u) {
+		if (m_acb_rings && compute) {
 			Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
+		} else if (job.queue == kGuestAgrQueue) {
+			Shadow::Instance().UseAgrTracker(SlotOf(job.queue)); // before its waits are planned
 		}
-		if (job.buffer != nullptr && job.queue == 0) {
+		if (job.buffer != nullptr && !compute) {
 			g_dcb_jobs.fetch_add(1, std::memory_order_relaxed);
 			g_dcb_guest_dw.fetch_add(job.size_dw, std::memory_order_relaxed);
 			g_dcb_queued_us.fetch_add(static_cast<uint64_t>((NowSecShadow() - job.enqueued) * 1e6), std::memory_order_relaxed);
 		}
 		// The size that matters is the inlined one: a title's DCB is often a few dwords of INDIRECT_BUFFER
 		// calls (GT7: 25 dwords standing for ~100K).
-		if (job.buffer != nullptr && m_native && job.queue == 0 && (m_chunk_dw != 0 || m_chunk_guest) &&
+		if (job.buffer != nullptr && m_native && (job.queue == 0 || job.queue == kGuestAgrQueue) && (m_chunk_dw != 0 || m_chunk_guest) &&
 		    TranslateChunks(job, done, queue)) {
 			return;
 		}
 		if (job.buffer == nullptr || !m_native ||
-		    !Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), job.queue != 0, &r) ||
+		    !Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), compute, &r, nullptr,
+		                               job.queue == kGuestAgrQueue) ||
 		    r.segments.empty()) {
 			done->whole = true;
 			queue.push_back(Piece {{}, {}, std::move(done)});
@@ -4985,6 +5128,9 @@ private:
 	// COND_EXEC's range. False (nothing done) when the first chunk is refused, or when the buffer cannot be
 	// inlined yet: it then goes the usual way. docs/native-gpu-streamed-dcbs.md.
 	bool TranslateChunks(Job& job, std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
+		// The AGR queue's buffers are cut the same way, each chunk a piece of its own with its preamble (its translator
+		// restores where a buffer starts): the stream is queue 0's.
+		const bool agr = job.queue == kGuestAgrQueue;
 		std::vector<uint32_t>     flat;
 		std::vector<SourcePiece> source;
 		std::span<const uint32_t> whole(job.buffer, job.size_dw);
@@ -5031,7 +5177,7 @@ private:
 				std::fclose(f);
 			}
 		};
-		const bool compare_this = compare && !compared && chunks.size() >= 2;
+		const bool compare_this = compare && !compared && chunks.size() >= 2 && !agr;
 		if (compare_this) {
 			compared = true;
 			dump("chunkcmp_whole.bin", Shadow::Instance().TranslateWholeCopy(whole, source));
@@ -5045,7 +5191,7 @@ private:
 		if (chunks.size() < 2) {
 			// Small enough to go whole: translated from what was inlined here, not inlined again.
 			Pm4TranslateResult r;
-			if (!Shadow::Instance().Submit(whole, false, &r, &source) || r.segments.empty()) {
+			if (!Shadow::Instance().Submit(whole, false, &r, &source, agr) || r.segments.empty()) {
 				return false;
 			}
 			done->tail = std::move(r.cpu_tail);
@@ -5054,7 +5200,8 @@ private:
 		}
 		// KYTY_NATIVE_GPU_CHUNK_STREAM=0: each chunk a CS of its own with a full preamble, instead of one
 		// streamed IB (Shadow::StreamBegin).
-		static const bool stream = !EnvIs("KYTY_NATIVE_GPU_CHUNK_STREAM", "0");
+		static const bool stream_on = !EnvIs("KYTY_NATIVE_GPU_CHUNK_STREAM", "0");
+		const bool        stream    = stream_on && !agr;
 		if (stream) {
 			// Another chunked DCB of the same round (Stray submits several a flip) still has its chain open:
 			// its last pieces go into it first, which ends it.
@@ -5086,11 +5233,15 @@ private:
 			// its last ones, and GT7's first chunked frame hung with vertex waves stuck exporting.
 			// In a stream the chunks after the first carry on in the same IB: no preamble at all.
 			const bool continues = c > 0 && stream && Shadow::Instance().StreamActive();
-			Shadow::Instance().SetPreambleFromStart(true);
-			Shadow::Instance().SetNoPreamble(continues);
-			const bool ok = Shadow::Instance().Submit(whole.subspan(cb, ce - cb), false, &r, &part);
-			Shadow::Instance().SetPreambleFromStart(false);
-			Shadow::Instance().SetNoPreamble(false);
+			if (!agr) {
+				Shadow::Instance().SetPreambleFromStart(true);
+				Shadow::Instance().SetNoPreamble(continues);
+			}
+			const bool ok = Shadow::Instance().Submit(whole.subspan(cb, ce - cb), false, &r, &part, agr);
+			if (!agr) {
+				Shadow::Instance().SetPreambleFromStart(false);
+				Shadow::Instance().SetNoPreamble(false);
+			}
 			if (!ok || r.segments.empty()) {
 				if (c == 0) {
 					return false;
@@ -5163,11 +5314,14 @@ private:
 		// With independent queues the wait reads memory as on PS5: a label that already holds a
 		// satisfying value lets it through, even if a write to it is still on its way. Holding for that
 		// write (against a stale value) deadlocked the gfx ring against a KFD queue that waited for the
-		// gfx ring's later write.
-		if (native && Shadow::Instance().KfdQueuesOn() && wait.Met(ReadLabel(wait))) {
+		// gfx ring's later write. Not while the other guest queue on this ring has a write to it ahead
+		// in the ring: by the time the wait runs that write may have replaced the value, and the next
+		// satisfying one could be queued behind the waiter.
+		const bool shared = Ring0Shared(slot);
+		if (native && Shadow::Instance().KfdQueuesOn() && wait.Met(ReadLabel(wait)) && !(shared && same)) {
 			return Release::Native;
 		}
-		switch (PlanRingWait(cover, satisfies, gpu, same, submitted, wait.Met(ReadLabel(wait)), native, gfx_writer)) {
+		switch (PlanRingWait(cover, satisfies, gpu, same, submitted, wait.Met(ReadLabel(wait)), native, gfx_writer, shared)) {
 			case RingWaitRelease::GpuWait: return Release::Native;
 			case RingWaitRelease::Barrier: return Release::Observed;
 			case RingWaitRelease::Hold:
@@ -5578,9 +5732,9 @@ private:
 				}
 				break;
 			case TrackerPoint::Kind::Interrupt:
-				// The queue's EOP event: the graphics queue's is 0, an ACB's its guest queue number.
+				// The queue's EOP event: the graphics queues' is 0, an ACB's its guest queue number.
 				if (HostCallbacks().interrupt) {
-					HostCallbacks().interrupt(static_cast<int>(e.queue), p.ctx);
+					HostCallbacks().interrupt(IsGuestComputeQueue(e.queue) ? static_cast<int>(e.queue) : 0, p.ctx);
 				}
 				break;
 			case TrackerPoint::Kind::CpuWrite: {
@@ -5688,6 +5842,9 @@ private:
 	}
 
 	void Finish(Done& done) {
+		if (--done.joins > 0) {
+			return;
+		}
 		const double start = NowSecShadow();
 		if (done.whole) {
 			done.then(std::span<const uint32_t>(done.buffer, done.size_dw));
@@ -5736,8 +5893,10 @@ private:
 	std::unordered_map<uint64_t, std::pair<LabelWrite, uint64_t>> m_last_write; // label -> its last write emitted, and when
 	uint64_t                                m_emits = 0; // Emit calls so far
 	mutable std::map<uint32_t, uint32_t>    m_queue_index; // guest compute queue -> its KFD queue index (SlotOf)
-	mutable std::map<uint32_t, uint32_t>    m_gfx_index;   // guest graphics queue -> the order it appeared in (SlotOf)
+	mutable std::map<uint32_t, uint32_t>    m_gfx_index;   // guest graphics queue -> its index: 0 main, 1 AGR, 2 others (SlotOf)
 	mutable bool                            m_gfx_shared = true; // gfx waits with no known writer ahead held (SlotOf decides)
+	mutable bool                            m_ring0_shared = false; // more than one guest queue runs on gfx ring 0 (SlotOf)
+	int                                     m_agr_own = -1; // AgrQueueOwn: -1 until the first AGR buffer decides
 	std::array<LabelEvent, 1024>            m_label_trace {}; // KYTY_NATIVE_GPU_LABEL_TRACE ring
 	uint64_t                                m_label_trace_next = 0;
 	bool                                    m_wake        = false; // the tracker moved; recheck held labels

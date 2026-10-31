@@ -2155,6 +2155,14 @@ void TestPlanRingWait() {
 	      "gfx writer pending, memory already satisfies (stale): hold until it lands");
 	Check(PlanRingWait(1, false, true, false, false, false, true, true) == RingWaitRelease::Hold,
 	      "a gfx write that does not satisfy keeps the segment held");
+	// A ring two guest queues share (the AGR queue in queue 0's gfx ring): another ring's writer may itself
+	// wait for the other guest queue's work behind this waiter, so the wait stays held until it lands.
+	Check(PlanRingWait(1, true, true, false, true, false, true, false, true) == RingWaitRelease::Hold,
+	      "shared ring, other ring's writer submitted: hold until it lands");
+	Check(PlanRingWait(1, true, true, true, false, false, true, false, true) == RingWaitRelease::GpuWait,
+	      "shared ring, writer ahead in the same ring: real GPU wait");
+	Check(PlanRingWait(0, false, false, false, false, true, true, false, true) == RingWaitRelease::Barrier,
+	      "shared ring, the other ring's write landed and memory holds it: a barrier");
 }
 
 void TestSplitIbAtPackets() {
@@ -2944,6 +2952,62 @@ void TestCpShadowLateTable() {
 		      mode == CpShadowMode::Load ? "load mode: the next buffer restores the GPU's value from S"
 		                                 : "record and off: the copy's replay restores the stale value, as today");
 	}
+}
+
+// The AGR queue in queue 0's gfx ring, as Shadow sets it up (CreateAgrTranslatorLocked): a copy of the DCB
+// translator made before CP shadowing comes on, which stays queue 0's. Between queue 0's jobs the AGR queue's
+// run with shadowing off; each queue draws with its own registers, S keeps queue 0's.
+void TestAgrQueueSharesRing0() {
+	Pm4Translator main;
+	auto          agr = main.Clone();
+	main.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	agr->SetCpShadow(0, CpShadowMode::Off);
+	agr->SetPreambleFromStart(true);
+	for (Pm4Translator* t: {&main, agr.get()}) {
+		Start(*t, {{0x10Fu, 0x11u}}, {{0x00Cu, 0x21u}}, {{0x24Au, 0x31u}});
+	}
+	ToyCp cp;
+	cp.Seed(main);
+	std::vector<uint32_t> set_main;
+	Append(set_main, IT_SET_CONTEXT_REG, {0x10Fu, 0xAu}, false);
+	Append(set_main, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	std::vector<uint32_t> set_agr;
+	Append(set_agr, IT_SET_CONTEXT_REG, {0x10Fu, 0x7u}, false);
+	Append(set_agr, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	std::vector<uint32_t> draw;
+	Append(draw, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	const auto r1 = main.Translate(set_main);
+	const auto a1 = agr->Translate(set_agr);
+	Check(r1.ok && r1.cp_shadow && a1.ok && !a1.cp_shadow, "queue 0 translates with shadow preambles, the AGR queue without");
+	cp.Job(AsJob(r1.ib));
+	Check(cp.cx[0x10F] == 0xAu && cp.s[kCpShadowContextDw + 0x10Fu] == 0xAu, "queue 0 draws with its register, and S holds it");
+	cp.Job(AsJob(a1.ib));
+	Check(cp.cx[0x10F] == 0x7u && cp.s[kCpShadowContextDw + 0x10Fu] == 0xAu, "the AGR queue draws with its own, S keeps queue 0's");
+	cp.Job(AsJob(main.Translate(draw).ib));
+	Check(cp.cx[0x10F] == 0xAu, "queue 0's next buffer restores its register from S");
+	cp.Job(AsJob(agr->Translate(draw).ib));
+	Check(cp.cx[0x10F] == 0x7u && cp.s[kCpShadowContextDw + 0x10Fu] == 0xAu, "the AGR queue's next buffer restores its own");
+	// With native labels, as the backend runs it, its preamble holds the registers where the buffer starts: a SET
+	// after the first draw is not that draw's.
+	TestOracle o;
+	agr->SetNativeLabels(&o, kTrackerVa);
+	std::vector<uint32_t> late_set;
+	Append(late_set, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	Append(late_set, IT_SET_CONTEXT_REG, {0x10Fu, 0x9u}, false);
+	Append(late_set, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	const auto a3          = agr->Translate(late_set);
+	uint32_t   first_draws = 0;
+	for (const auto& p: Decode(a3.ib)) {
+		if (p.op == IT_DRAW_INDEX_AUTO) {
+			break;
+		}
+		const uint32_t start = p.body.empty() ? 0u : p.body[0] & 0xffffu;
+		if (p.op == IT_SET_CONTEXT_REG && start <= 0x10Fu && 0x10Fu < start + p.body.size() - 1u) {
+			first_draws = p.body[1u + 0x10Fu - start];
+		}
+	}
+	Check(a3.ok && !a3.segments.empty() && first_draws == 0x7u,
+	      "the AGR queue's first draw of a buffer has the value it starts with, not the one SET after it");
 }
 
 // Record mode: the CP keeps S, the copy still restores every register as before.
@@ -3774,6 +3838,7 @@ int main() {
 	TestCpShadowPreamble();
 	TestCpShadowImage();
 	TestCpShadowLateTable();
+	TestAgrQueueSharesRing0();
 	TestCpShadowRecord();
 	TestCpShadowHeldSegment();
 	TestCpShadowKeepsFirstSegment();

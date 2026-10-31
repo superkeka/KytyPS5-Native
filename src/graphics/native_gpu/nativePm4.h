@@ -518,10 +518,14 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 // the label's previous writer says nothing about this use (ASTRO BOT cycles three label sets; a
 // compute wait given to the GPU on the strength of the last frame's gfx writer deadlocked against a
 // gfx wait on that compute ring's later write).
+// `shared_ring`: the waiter's ring runs more than one guest queue (the AGR queue in queue 0's gfx ring).
+// A wait there on another ring's write stays held until that write lands, then becomes a barrier: the
+// writer may itself wait for the other guest queue's work queued behind this waiter, which on the PS5
+// runs on a ring of its own.
 enum class RingWaitRelease { Hold, GpuWait, Barrier };
 
 RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
-                             bool label_in_memory, bool native_wait, bool gfx_writer = false);
+                             bool label_in_memory, bool native_wait, bool gfx_writer = false, bool shared_ring = false);
 
 // Guest compute queues are 0x20 + n (7 pipes x 8 queues). `available_rings` is the
 // AMDGPU_INFO_HW_IP_INFO bitmask. Returns one of its set bits; queues spread across the rings the
@@ -790,6 +794,7 @@ public:
 	// Guest WAIT_REG_MEMs become a full GPU barrier on a fence of ours at `va` (4 bytes in a buffer
 	// that every submission maps); 0 drops them as before.
 	void SetFenceAddress(uint64_t va) { m_fence_va = va; }
+	[[nodiscard]] uint64_t FenceAddress() const { return m_fence_va; }
 	// Exit guards: how a stop ends a title's GPU work where it stands, as the PS5 kernel stops a title's
 	// queues, instead of running it on with made-up inputs. Each segment starts with a guard, and each
 	// guest wait it gives the GPU is followed by one; a stop sets the words, then releases the waits.

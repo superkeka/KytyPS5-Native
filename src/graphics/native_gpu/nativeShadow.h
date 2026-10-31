@@ -38,10 +38,19 @@ void ShadowSubmitDcb(const uint32_t* dcb, uint32_t size_in_dwords);
 // ring and waits between the rings are real GPU waits.
 void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords);
 
+// Guest queues: 0x20 + n (7 pipes x 8 queues) are a title's compute queues, any other number a graphics
+// queue. kGuestAgrQueue is the title's second graphics ring, the one the PS5 kernel gives it next to the
+// main ring ("AGR", gfx pipe 0 queue 1, its own registers): sceAgcDriverAgrSubmitDcb's buffers. No queue
+// context carries that number.
+constexpr uint32_t kGuestAgrQueue = 0x100;
+constexpr bool     IsGuestComputeQueue(uint32_t queue) { return queue >= 0x20u && queue < 0x58u; }
+
 // KYTY_NATIVE_GPU_THREAD=1: submissions go through a pipeline (ShadowEnqueue) instead of running on the
 // caller's thread: `then` (handing the buffer to Kyty's command processor) runs once the native GPU
-// work has completed, in submission order. `queue` is 0 for a DCB (and for Kyty's own submissions, with
-// a null buffer, which only keep their place in that order), the guest compute queue for an ACB.
+// work has completed, in submission order within each guest queue (one queue's buffer held on a guest
+// wait lets the others' finish first). `queue` is 0 for a DCB (and for Kyty's own submissions, with a
+// null buffer, which only keep their place in that order), kGuestAgrQueue for an AGR DCB, the guest
+// compute queue for an ACB.
 bool ShadowThreaded();
 // True on the pipeline thread that hands finished buffers to Kyty.
 bool ShadowOnPipelineThread();
@@ -54,8 +63,8 @@ void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, uint32_t que
 // still has to run (flips, waits for a flip), or nothing at all, instead of the whole guest buffer,
 // which Kyty then never reads again. Buffers the native path refuses still go to Kyty whole.
 bool ShadowNativeLabels();
-// What native labels signal on the host: a queue's EOP interrupt (event id: 0 for graphics, else the
-// guest compute queue) and the reference clock written for timestamp labels.
+// What native labels signal on the host: a queue's EOP interrupt (event id: 0 for the graphics queues,
+// else the guest compute queue) and the reference clock written for timestamp labels.
 void ShadowSetHost(std::function<void(int event_id, uint32_t context_id)> interrupt,
                    std::function<uint64_t()> reference_clock);
 // Requests a DCB's flip (AgcDcbSetFlip) once the GPU has passed it, from the tracker thread.
