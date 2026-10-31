@@ -2849,6 +2849,16 @@ private:
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_QUEUE_RINGS"); v != nullptr && v[0] != '\0') {
 			rings &= static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
 		}
+		// KFD's queue priority for every guest compute queue's queue: KFD makes it CP_HQD_QUEUE_PRIORITY and maps it to
+		// the pipe priority (0-6 low, 7-10 medium, 11-15 high). 0 by default: the PS5 kernel gives a title's compute
+		// queues pipe priority 0. KYTY_NATIVE_GPU_KFD_PRIORITY=<0-15> sets another (7 was the default before).
+		uint32_t priority = 0;
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_KFD_PRIORITY"); v != nullptr && v[0] != '\0') {
+			priority = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+		}
+		for (uint32_t ring = 0; ring < NativeSubmitter::MaxKfdQueues(); ring++) {
+			m_submitter->SetKfdQueuePriority(ring, priority);
+		}
 		// The helper's KFD TLB flush is set before the queues are created: each queue flushes once its
 		// buffers are mapped (KfdQueue::Create), and every GEM_VA change flushes after.
 		if (!LodStatsHw::Instance().On()) {
@@ -2931,8 +2941,9 @@ private:
 	//             may reload the queue from its MQD on any remap
 	//   golden    the helper's local golden table (/etc/kyty/ps5-golden.conf)
 	// "all" (or 1) is gfx_pipe,accum,kfd_gds. The game's VMIDs are this VM's gfx VMID (by PASID,
-	// followed per flip) and, with KFD queues, 8-15. Nothing is written before a setting is asked for;
-	// the helper puts every register back when the connection closes (exit or crash).
+	// followed per flip) and, with KFD queues, 8-15. Unset, primary mode writes hqd,kfd_gds, the compute
+	// queues as the PS5 kernel sets them up (with the OA and GWS their GDS resource state asks for); 0
+	// writes nothing. The helper puts every register back when the connection closes (exit or crash).
 	static constexpr uint32_t kPs5GfxPipe = 1u, kPs5Accum = 2u, kPs5KfdGds = 4u, kPs5ShMem = 8u, kPs5Hqd = 16u, kPs5Golden = 32u;
 	// Absolute dword offsets (GC segment 0 is 0x1260).
 	static constexpr uint32_t kPs5GfxPipeControl = 0x1260 + 0x100d, kPs5ShMemBases = 0x1260 + 0x10aa,
@@ -2945,6 +2956,9 @@ private:
 	void InitPs5Regs() {
 #if KYTY_GEM_BACKING_SUPPORTED
 		const char* v = std::getenv("KYTY_NATIVE_GPU_PS5_REGS");
+		if ((v == nullptr || v[0] == '\0') && EnvOn("KYTY_NATIVE_GPU_PRIMARY")) {
+			v = "hqd,kfd_gds";
+		}
 		if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0) {
 			return;
 		}
