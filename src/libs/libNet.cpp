@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -241,7 +242,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
-	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
+	LIB_FUNC("Nd91WaWmG2w", ::Libs::LibKernel::OnHostStack<&LibNet::NetResolverStartNtoa>::Call);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
 	LIB_FUNC("v6M4txecCuo", LibNet::NetEtherNtostr);

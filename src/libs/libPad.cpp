@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "common/logging/log.h"
+#include "kernel/pthread.h"
 #include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -180,7 +181,7 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("hGbf2QTBmqc", PadGetExtControllerInformationStub);
 	LIB_FUNC("2JgFB2n9oUM", Controller::PadSetTriggerEffect);
 	LIB_FUNC("YndgXqQVV7c", Controller::PadReadState);
-	LIB_FUNC("q1cHNfGycLI", Controller::PadRead);
+	LIB_FUNC("q1cHNfGycLI", ::Libs::LibKernel::OnHostStack<&Controller::PadRead>::Call);
 	LIB_FUNC("yFVnOdGxvZY", Controller::PadSetVibration);
 	LIB_FUNC("W2G-yoyMF5U", PadSetVibrationMode);
 	LIB_FUNC("Yq0zOH7YNOM", PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse);

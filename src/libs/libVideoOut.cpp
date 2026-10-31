@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
@@ -18,8 +19,8 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("WkYtyOg30do", VideoOut::VideoOutSetFlipMaster);
 	LIB_FUNC("MBlv8YWoyOk", VideoOut::VideoOutAddBufferAttributeOption);
 	LIB_FUNC("PjS5uASwcV8", VideoOut::VideoOutSetBufferAttribute2);
-	LIB_FUNC("rKBUtgRrtbk", VideoOut::VideoOutRegisterBuffers2);
-	LIB_FUNC("HuViW4HnrOw", VideoOut::VideoOutSubmitChangeBufferAttribute2);
+	LIB_FUNC("rKBUtgRrtbk", ::Libs::LibKernel::OnHostStack<&VideoOut::VideoOutRegisterBuffers2>::Call);
+	LIB_FUNC("HuViW4HnrOw", ::Libs::LibKernel::OnHostStack<&VideoOut::VideoOutSubmitChangeBufferAttribute2>::Call);
 	LIB_FUNC("N5KDtkIjjJ4", VideoOut::VideoOutUnregisterBuffers);
 	LIB_FUNC("CBiu4mCE1DA", VideoOut::VideoOutSetFlipRate);
 	LIB_FUNC("HXzjK9yI30k", VideoOut::VideoOutAddFlipEvent);

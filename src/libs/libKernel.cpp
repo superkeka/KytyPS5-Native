@@ -3105,11 +3105,11 @@ LIB_DEFINE(InitCoredump_1) {
 LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("1G3lF1Gg1k8", FileSystem::KernelOpen);
 	LIB_FUNC("UK2Tl2DWUns", FileSystem::KernelClose);
-	LIB_FUNC("Cg4srZ6TKbU", FileSystem::KernelRead);
+	LIB_FUNC("Cg4srZ6TKbU", ::Libs::LibKernel::OnHostStack<&FileSystem::KernelRead>::Call);
 	LIB_FUNC("4wSze92BhLI", FileSystem::KernelWrite);
 	LIB_FUNC("kAt6VDbHmro", FileSystem::KernelWritev);
-	LIB_FUNC("+r3rMFwItV4", FileSystem::KernelPread);
-	LIB_FUNC("yTj62I7kw4s", FileSystem::KernelPreadv);
+	LIB_FUNC("+r3rMFwItV4", ::Libs::LibKernel::OnHostStack<&FileSystem::KernelPread>::Call);
+	LIB_FUNC("yTj62I7kw4s", ::Libs::LibKernel::OnHostStack<&FileSystem::KernelPreadv>::Call);
 	LIB_FUNC("nKWi-N2HBV4", FileSystem::KernelPwrite);
 	LIB_FUNC("mBd4AfLP+u8", FileSystem::KernelPwritev);
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
@@ -3430,7 +3430,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("La9uyZv4Kvw", LibKernel::KernelGetAvailableCpumask);
 	LIB_FUNC("g0VTBxfJyu0", LibKernel::KernelGetCurrentCpu);
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
-	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);
+	LIB_FUNC("Xjoosiw+XPI", ::Libs::LibKernel::OnHostStack<&LibKernel::KernelUuidCreate>::Call);
 	LIB_FUNC("DLORcroUqbc", LibKernel::KernelGetOpenPsId);
 	LIB_FUNC("zE-wXIZjLoM", LibKernel::KernelDebugRaiseExceptionOnReleaseMode);
 	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressWait);

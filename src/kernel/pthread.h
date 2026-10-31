@@ -226,9 +226,13 @@ struct OnHostStack;
 template <typename R, typename... A, R(KYTY_SYSV_ABI* Fn)(A...)>
 struct OnHostStack<Fn> {
 	static R KYTY_SYSV_ABI Call(A... a) {
-		R r {};
-		CallOnHostStack([&] { r = Fn(a...); });
-		return r;
+		if constexpr (std::is_void_v<R>) {
+			CallOnHostStack([&] { Fn(a...); });
+		} else {
+			R r {};
+			CallOnHostStack([&] { r = Fn(a...); });
+			return r;
+		}
 	}
 };
 

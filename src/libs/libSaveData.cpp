@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/fileSystem.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/saveDataMountSlots.h"
@@ -1379,14 +1380,14 @@ LIB_VERSION("SaveData_native", 1, "SaveData_native", 1, 1);
 
 LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("TywrFKCoLGY", ::Libs::SaveData::SaveDataInitialize3);
-	LIB_FUNC("dyIhnXq-0SM", ::Libs::SaveData::SaveDataDirNameSearch);
-	LIB_FUNC("PHnuI4LhuRk", ::Libs::SaveData::SaveDataDirNameSearch);
-	LIB_FUNC("ZP4e7rlzOUk", ::Libs::SaveData::SaveDataMount3);
+	LIB_FUNC("dyIhnXq-0SM", ::Libs::LibKernel::OnHostStack<&::Libs::SaveData::SaveDataDirNameSearch>::Call);
+	LIB_FUNC("PHnuI4LhuRk", ::Libs::LibKernel::OnHostStack<&::Libs::SaveData::SaveDataDirNameSearch>::Call);
+	LIB_FUNC("ZP4e7rlzOUk", ::Libs::LibKernel::OnHostStack<&::Libs::SaveData::SaveDataMount3>::Call);
 	LIB_FUNC("gjRZNnw0JPE", ::Libs::SaveData::SaveDataCreateTransactionResource);
 	LIB_FUNC("lJUQuaKqoKY", ::Libs::SaveData::SaveDataDeleteTransactionResource);
 	LIB_FUNC("sDCBrmc61XU", ::Libs::SaveData::SaveDataPrepare);
 	LIB_FUNC("ie7qhZ4X0Cc", ::Libs::SaveData::SaveDataCommit);
-	LIB_FUNC("oQySEUfgXRA", ::Libs::SaveData::SaveDataSetupSaveDataMemory2);
+	LIB_FUNC("oQySEUfgXRA", ::Libs::LibKernel::OnHostStack<&::Libs::SaveData::SaveDataSetupSaveDataMemory2>::Call);
 	LIB_FUNC("QwOO7vegnV8", ::Libs::SaveData::SaveDataGetSaveDataMemory2);
 	LIB_FUNC("cduy9v4YmT4", ::Libs::SaveData::SaveDataSetSaveDataMemory2);
 	LIB_FUNC("wiT9jeC7xPw", ::Libs::SaveData::SaveDataSyncSaveDataMemory);
@@ -1397,13 +1398,13 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("z1JA8-iJt3k", ::Libs::SaveData::SaveDataBackup);
 	LIB_FUNC("uW4vfTwMQVo", ::Libs::SaveData::SaveDataUmount2);
 	LIB_FUNC("S1GkePI17zQ", ::Libs::SaveData::SaveDataDelete);
-	LIB_FUNC("85zul--eGXs", ::Libs::SaveData::SaveDataSetParam);
-	LIB_FUNC("XgvSuIdnMlw", ::Libs::SaveData::SaveDataGetParam);
+	LIB_FUNC("85zul--eGXs", ::Libs::LibKernel::OnHostStack<&::Libs::SaveData::SaveDataSetParam>::Call);
+	LIB_FUNC("XgvSuIdnMlw", ::Libs::LibKernel::OnHostStack<&::Libs::SaveData::SaveDataGetParam>::Call);
 	LIB_FUNC("65VH0Qaaz6s", ::Libs::SaveData::SaveDataGetMountInfo);
 	LIB_FUNC("c88Yy54Mx0w", ::Libs::SaveData::SaveDataSaveIcon);
 	LIB_FUNC("Z7z6HXWORJY", ::Libs::SaveData::SaveDataSaveIconByPath);
 	LIB_FUNC("cGjO3wM3V28", ::Libs::SaveData::SaveDataLoadIcon);
-	LIB_FUNC("X4MYzukPc3g", ::Libs::SaveData::SaveDataDirNameSearch);
+	LIB_FUNC("X4MYzukPc3g", ::Libs::LibKernel::OnHostStack<&::Libs::SaveData::SaveDataDirNameSearch>::Call);
 	LIB_FUNC("yKDy8S5yLA0", ::Libs::SaveData::SaveDataTerminate);
 }
 
@@ -1412,12 +1413,12 @@ LIB_DEFINE(InitSaveDataNative_1) {
 LIB_DEFINE(InitSaveData_1) {
 	LIB_FUNC("TywrFKCoLGY", SaveData::SaveDataInitialize3);
 	LIB_FUNC("dyIhnXq-0SM", SaveData::SaveDataDirNameSearch);
-	LIB_FUNC("ZP4e7rlzOUk", SaveData::SaveDataMount3);
+	LIB_FUNC("ZP4e7rlzOUk", ::Libs::LibKernel::OnHostStack<&SaveData::SaveDataMount3>::Call);
 	LIB_FUNC("gjRZNnw0JPE", SaveData::SaveDataCreateTransactionResource);
 	LIB_FUNC("lJUQuaKqoKY", SaveData::SaveDataDeleteTransactionResource);
 	LIB_FUNC("sDCBrmc61XU", SaveData::SaveDataPrepare);
 	LIB_FUNC("ie7qhZ4X0Cc", SaveData::SaveDataCommit);
-	LIB_FUNC("oQySEUfgXRA", SaveData::SaveDataSetupSaveDataMemory2);
+	LIB_FUNC("oQySEUfgXRA", ::Libs::LibKernel::OnHostStack<&SaveData::SaveDataSetupSaveDataMemory2>::Call);
 	LIB_FUNC("QwOO7vegnV8", SaveData::SaveDataGetSaveDataMemory2);
 	LIB_FUNC("cduy9v4YmT4", SaveData::SaveDataSetSaveDataMemory2);
 	LIB_FUNC("wiT9jeC7xPw", SaveData::SaveDataSyncSaveDataMemory);
@@ -1428,8 +1429,8 @@ LIB_DEFINE(InitSaveData_1) {
 	LIB_FUNC("z1JA8-iJt3k", SaveData::SaveDataBackup);
 	LIB_FUNC("uW4vfTwMQVo", SaveData::SaveDataUmount2);
 	LIB_FUNC("S1GkePI17zQ", SaveData::SaveDataDelete);
-	LIB_FUNC("85zul--eGXs", SaveData::SaveDataSetParam);
-	LIB_FUNC("XgvSuIdnMlw", SaveData::SaveDataGetParam);
+	LIB_FUNC("85zul--eGXs", ::Libs::LibKernel::OnHostStack<&SaveData::SaveDataSetParam>::Call);
+	LIB_FUNC("XgvSuIdnMlw", ::Libs::LibKernel::OnHostStack<&SaveData::SaveDataGetParam>::Call);
 	LIB_FUNC("65VH0Qaaz6s", SaveData::SaveDataGetMountInfo);
 	LIB_FUNC("c88Yy54Mx0w", SaveData::SaveDataSaveIcon);
 	LIB_FUNC("Z7z6HXWORJY", SaveData::SaveDataSaveIconByPath);

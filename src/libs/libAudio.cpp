@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "kernel/pthread.h"
 #include "libs/ajm/aac_decoder.h"
 #include "libs/acm.h"
 #include "libs/audio3d.h"
@@ -125,10 +126,10 @@ namespace AudioOut = Audio::AudioOut;
 
 LIB_DEFINE(InitAudio_1_AudioOut) {
 	LIB_FUNC("JfEPXVxhFqA", AudioOut::AudioOutInit);
-	LIB_FUNC("ekNvsT22rsY", AudioOut::AudioOutOpen);
+	LIB_FUNC("ekNvsT22rsY", ::Libs::LibKernel::OnHostStack<&AudioOut::AudioOutOpen>::Call);
 	LIB_FUNC("b+uAV89IlxE", AudioOut::AudioOutSetVolume);
-	LIB_FUNC("w3PdaSTSwGE", AudioOut::AudioOutOutputs);
-	LIB_FUNC("QOQtbeDqsT4", AudioOut::AudioOutOutput);
+	LIB_FUNC("w3PdaSTSwGE", ::Libs::LibKernel::OnHostStack<&AudioOut::AudioOutOutputs>::Call);
+	LIB_FUNC("QOQtbeDqsT4", ::Libs::LibKernel::OnHostStack<&AudioOut::AudioOutOutput>::Call);
 	LIB_FUNC("s1--uE9mBFw", AudioOut::AudioOutClose);
 	LIB_FUNC("GrQ9s4IrNaQ", AudioOut::AudioOutGetPortState);
 	LIB_FUNC("R5hemoKKID8", AudioOut::AudioOutGetSystemState);
@@ -534,7 +535,7 @@ LIB_DEFINE(InitAudio_1_Ajm) {
 	LIB_FUNC("Q3dyFuwGn64", Ajm::AjmModuleRegister);
 	LIB_FUNC("Wi7DtlLV+KI", Ajm::AjmModuleUnregister);
 	LIB_FUNC("MHur6qCsUus", Ajm::AjmFinalize);
-	LIB_FUNC("AxoDrINp4J8", Ajm::AjmInstanceCreate);
+	LIB_FUNC("AxoDrINp4J8", ::Libs::LibKernel::OnHostStack<&Ajm::AjmInstanceCreate>::Call);
 	LIB_FUNC("RbLbuKv8zho", Ajm::AjmInstanceDestroy);
 	LIB_FUNC("bkRHEYG6lEM", Ajm::AjmMemoryRegister);
 	LIB_FUNC("pIpGiaYkHkM", Ajm::AjmMemoryUnregister);
@@ -546,9 +547,9 @@ LIB_DEFINE(InitAudio_1_Ajm) {
 	LIB_FUNC("AxhcqVv5AYU", Ajm::AjmStrError);
 	LIB_FUNC("ezM2OhNxzck", Ajm::AjmBatchJobInitialize);
 	LIB_FUNC("uJ3m8INuikg", Ajm::AjmBatchJobClearContext);
-	LIB_FUNC("39WxhR-ePew", Ajm::AjmBatchJobDecode);
-	LIB_FUNC("5LLWbpP5xi8", Ajm::AjmBatchJobDecodeSingle);
-	LIB_FUNC("SJ3i0DXP8vg", Ajm::AjmBatchJobDecodeSplit);
+	LIB_FUNC("39WxhR-ePew", ::Libs::LibKernel::OnHostStack<&Ajm::AjmBatchJobDecode>::Call);
+	LIB_FUNC("5LLWbpP5xi8", ::Libs::LibKernel::OnHostStack<&Ajm::AjmBatchJobDecodeSingle>::Call);
+	LIB_FUNC("SJ3i0DXP8vg", ::Libs::LibKernel::OnHostStack<&Ajm::AjmBatchJobDecodeSplit>::Call);
 	LIB_FUNC("SlVIGK1Kl38", Ajm::AjmBatchJobEncode);
 	LIB_FUNC("TBWW4aPfWcA", Ajm::AjmBatchJobGetInfo);
 	LIB_FUNC("uSrXaxT+oPQ", Ajm::AjmBatchJobGetCodecInfo);

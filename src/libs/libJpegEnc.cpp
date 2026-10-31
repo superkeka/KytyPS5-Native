@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "common/logging/log.h"
+#include "kernel/pthread.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
@@ -233,7 +234,7 @@ LIB_DEFINE(InitJpegEnc_1) {
 
 	LIB_FUNC("o6ZgXfFdWXQ", JpegEnc::JpegEncQueryMemorySize);
 	LIB_FUNC("K+rocojkr-I", JpegEnc::JpegEncCreate);
-	LIB_FUNC("QbrU0cUghEM", JpegEnc::JpegEncEncode);
+	LIB_FUNC("QbrU0cUghEM", ::Libs::LibKernel::OnHostStack<&JpegEnc::JpegEncEncode>::Call);
 	LIB_FUNC("j1LyMdaM+C0", JpegEnc::JpegEncDelete);
 }
 

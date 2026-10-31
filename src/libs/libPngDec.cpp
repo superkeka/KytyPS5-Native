@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "common/logging/log.h"
+#include "kernel/pthread.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 #include "stb_image.h"
@@ -373,7 +374,7 @@ LIB_DEFINE(InitPngDec_1) {
 
 	LIB_FUNC("-6srIGbLTIU", PngDec::PngDecQueryMemorySize);
 	LIB_FUNC("m0uW+8pFyaw", PngDec::PngDecCreate);
-	LIB_FUNC("WC216DD3El4", PngDec::PngDecDecode);
+	LIB_FUNC("WC216DD3El4", ::Libs::LibKernel::OnHostStack<&PngDec::PngDecDecode>::Call);
 	LIB_FUNC("QbD+eENEwo8", PngDec::PngDecDelete);
 	LIB_FUNC("U6h4e5JRPaQ", PngDec::PngDecParseHeader);
 }
