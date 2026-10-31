@@ -204,6 +204,121 @@ struct Pm4TranslateStats {
 	uint32_t preamble_cx       = 0; // context registers emitted in the IB preamble
 	uint32_t preamble_sh       = 0; // SH registers emitted in the IB preamble
 	uint32_t preamble_uc       = 0; // UCONFIG registers emitted in the IB preamble
+	// CP register shadowing (Pm4Translator::SetCpShadow): preambles that turn it on, the dwords of their
+	// LOAD_*_REG packets and the registers those load, and the classes that had no key to load (an anchor).
+	uint32_t cp_shadow_preambles = 0;
+	uint32_t cp_shadow_load_dw   = 0;
+	uint32_t cp_shadow_load_regs = 0;
+	uint32_t cp_shadow_anchors   = 0;
+	// Context pushes and pops done on the GPU through S (SetCpShadowPushPop): DMA_DATA of S's context region to
+	// the save area and back, then a LOAD_CONTEXT_REG.
+	uint32_t cp_shadow_pushes = 0;
+	uint32_t cp_shadow_pops   = 0;
+	// Load mode: FMASK = BASE fixes done on the GPU from S (some of the slot's CB registers came from a verbatim
+	// table, so the GPU may hold other values than the copy), and display-DCC inserts left out because the copy's
+	// CB_COLORn_INFO came from one.
+	uint32_t cp_shadow_fmask_gpu   = 0;
+	uint32_t cp_shadow_dcc_skipped = 0;
+};
+
+// CP register shadowing (Pm4Translator::SetCpShadow, KYTY_NATIVE_GPU_CP_SHADOW). With the CONTEXT_CONTROL
+// shadow enables on, the CP writes every register write it runs (SETs, 0x9F/0x63/0x64 tables, in IB2s too)
+// into a shadow buffer S as well, at the class's base, set by the job's last LOAD_*_REG that loads, plus the
+// register's offset in its space (probe shadow): SH registers at S + 0, context at S + 0x1000, UCONFIG at
+// S + 0x9000 (Mesa's layout). The values below are dword offsets in S.
+constexpr uint32_t kCpShadowShDw      = 0;
+constexpr uint32_t kCpShadowContextDw = 0x400;
+constexpr uint32_t kCpShadowUconfigDw = 0x2400;
+// What the translator writes and compares: offsets below 0x400 of every class.
+constexpr uint32_t kCpShadowDwords = 0x2800;
+// Where a 16-bit register offset of any class can reach (S + 0x9000 + 4 * 0xffff < S + 0x49000).
+constexpr uint64_t kCpShadowBytes = 0x49000;
+// The save area P of a pushed context (SetCpShadowPushPop) right after S: S's context region, 0x000-0x3FF.
+constexpr uint64_t kCpShadowSaveOffset = kCpShadowBytes;
+constexpr uint32_t kCpShadowSaveBytes  = 0x1000;
+// After P, the register tables of the GPU-side FMASK fix (Pm4Translator::SetCpShadow, load mode): per MRT slot n
+// at kCpShadowFixOffset + 32 * n, {CB_COLORn_FMASK, BASE, CB_COLORn_FMASK_EXT, BASE_EXT} and then {.., FMASK, ..,
+// FMASK_EXT}, the offsets seeded once (CpShadowFixTables), the values copied from S by the GPU. Then a zero word,
+// seeded 0 and never written, copied for a register S has no value for (amdgpu's clear state, 0, on the GPU).
+constexpr uint64_t kCpShadowFixOffset  = kCpShadowSaveOffset + kCpShadowSaveBytes;
+constexpr uint32_t kCpShadowFixBytes   = 0x100;
+constexpr uint64_t kCpShadowZeroOffset = kCpShadowFixOffset + kCpShadowFixBytes;
+std::array<uint32_t, kCpShadowFixBytes / 4u> CpShadowFixTables();
+// What the backend reserves for S, P, the fix tables and the zero word, and the packet check guards.
+constexpr uint64_t kCpShadowReserveBytes = kCpShadowZeroOffset + 16u;
+// The push's and the pop's DMA_DATA: the micro engine, CP_SYNC (the ME waits for the copy), source and
+// destination through L2 (SRC_SEL/DST_SEL 3, as Mesa's CP DMA on GFX9 and up); RAW_WAIT, 4 KiB.
+constexpr uint32_t kCpShadowDmaControl = (1u << 31u) | (3u << 29u) | (3u << 20u);
+constexpr uint32_t kCpShadowDmaCommand = (1u << 30u) | kCpShadowSaveBytes;
+constexpr uint32_t kCpShadowDmaWordCommand = (1u << 30u) | 4u; // one register, for the FMASK fix
+// CONTEXT_CONTROL load and shadow enables of a shadowing job: update (bit 31), context (1), UCONFIG (15),
+// gfx SH (16) and CS SH (24); no global config, no CE RAM.
+constexpr uint32_t kCpShadowEnables = 0x81018002u;
+// Register classes (SetCpShadow's `load_classes`): context, graphics SH (below 0x200), compute SH (0x200 up)
+// and UCONFIG.
+constexpr uint32_t kCpShadowContext = 1u;
+constexpr uint32_t kCpShadowGfxSh   = 2u;
+constexpr uint32_t kCpShadowCsSh    = 4u;
+constexpr uint32_t kCpShadowUconfig = 8u;
+constexpr uint32_t kCpShadowClasses = 15u;
+
+// Off: the preambles replay the CPU copy, as before. Record: every preamble turns shadowing on and LOADs
+// the keys from S, so the CP has a base for every class and keeps S current, then replays the copy as
+// before; what the GPU draws stays the same. Load: the keys come from S, and only what S cannot restore is
+// SET from the copy.
+enum class CpShadowMode { Off, Record, Load };
+
+// Shadowing and loading off: CONTEXT_CONTROL 0x80000000 / 0x80000000 and five filler NOPs, 8 dwords. Every gfx
+// job ends with it, whether CP shadowing is on or not: the enables are ring-global, amdgpu's CONTEXT_CONTROL
+// before each job leaves them alone, and another process's SETs would be shadowed at our address in its own
+// VM (a gfx VM fault that freezes the board). The empty stream trampoline and the exit guards' stub are it.
+constexpr std::array<uint32_t, 8> kCpShadowOff = {0xc0012800u, 0x80000000u, 0x80000000u, 0xffff1000u,
+                                                  0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u};
+void EmitCpShadowOff(std::vector<uint32_t>& ib);
+// True when the last packet of `ib` before trailing fillers is that CONTEXT_CONTROL, or an INDIRECT_BUFFER chain
+// that is not an exit guard's (a streamed DCB's head and parts chain on, and their last part ends with it).
+bool CpShadowTailOk(std::span<const uint32_t> ib);
+// The shadow buffer the packet check lets LOAD_*_REG name, and with it the shadowing CONTEXT_CONTROL (0: none).
+void SetCpShadowValidation(uint64_t va);
+
+// A piece of a gfx ring's batch as CP shadowing sees it (Shadow::AppendBatch).
+struct CpShadowPiece {
+	bool                      own  = false; // the shadowing translator made it (Pm4TranslateResult::cp_shadow)
+	bool                      head = false; // it starts with a shadow preamble (Pm4Segment::cp_shadow_head)
+	std::span<const uint32_t> resume;       // own without a head: what restores where it starts (cp_shadow_resume)
+};
+
+// Assembles one gfx ring's batch while CP shadowing is on. A piece another translator made must not run with
+// our shadowing on (its SETs would land in S); a piece of ours without a preamble (a streamed chunk) carries
+// on from the piece before it, which holds only inside a job of ours whose shadowing is on, so after a foreign
+// piece it gets its resume. At the front of a batch that depends on how the batch is flushed: a CS of its own
+// starts with shadowing off and no bases, a stream part carries on from the stream's previous part.
+class CpShadowBatch {
+public:
+	// Appends `ib` to `batch`, with shadowing off before a foreign piece and the resume before a piece of ours
+	// without a head that follows one; at the batch front the resume is kept for the flush.
+	void Append(std::vector<uint32_t>& batch, std::span<const uint32_t> ib, const CpShadowPiece& piece);
+	// The dwords Append and the flush may add for `piece` besides its own, and for what is kept so far.
+	[[nodiscard]] size_t Extra(const CpShadowPiece& piece) const;
+	// What goes in front of the batch when it is flushed: as a CS of its own (`stream_part` false), or as the next
+	// part of a stream whose shadowing is `stream_on` where the part begins.
+	[[nodiscard]] std::span<const uint32_t> Front(bool stream_part, bool stream_on) const;
+	// Whether shadowing is on at the end of the batch, `start_on` if it holds no piece.
+	[[nodiscard]] bool EndOn(bool start_on) const { return m_any ? m_on : start_on; }
+	[[nodiscard]] bool Empty() const { return !m_any; }
+	void               Reset();
+	// The batch already holds pieces appended before shadowing was on: they leave it off.
+	void               HoldsForeign() {
+		m_any = true;
+		m_on  = false;
+	}
+	uint64_t           guards  = 0; // shadowing turned off before a foreign piece
+	uint64_t           resumes = 0; // resumes put in front of a piece of ours inside the batch
+
+private:
+	bool                  m_any = false;
+	bool                  m_on  = false;
+	std::vector<uint32_t> m_front; // the front piece's resume, until the flush
 };
 
 // A guest memory range the GPU may touch while running a translated DCB, for the backend's lazy
@@ -363,6 +478,9 @@ struct Pm4Segment {
 	// Compute rings: the EXEC_COUNT dwords of the segment's exit guards, as IB offsets (the backend
 	// needs none of them; tests read them).
 	std::vector<uint32_t>     guards;
+	// CP shadowing: the segment starts with a shadow preamble (its exit guard aside), so it restores its
+	// state wherever it runs. A streamed chunk's first segment has none.
+	bool                      cp_shadow_head = false;
 };
 
 // Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
@@ -563,6 +681,11 @@ struct Pm4TranslateResult {
 	// copied out of the guest buffer.
 	std::vector<Pm4Segment> segments;
 	std::vector<uint32_t>   cpu_tail;
+	// CP shadowing: translated with shadow preambles. With SetNoPreamble the first segment has none, and this
+	// is the one it would have had (the state where the buffer starts): the backend puts it in front when the
+	// segment does not carry on from the piece before it in the same job.
+	bool                    cp_shadow = false;
+	std::vector<uint32_t>   cp_shadow_resume;
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -837,9 +960,80 @@ public:
 	// experiment writing other UCONFIG registers froze the whole board (see the probe README).
 	static bool UconfigAllowed(uint32_t normalized_offset);
 
+	// CP register shadowing (KYTY_NATIVE_GPU_CP_SHADOW) into the shadow buffer at `va` (kCpShadow* layout). Every
+	// preamble becomes a shadow preamble: shadowing and loading off, CLEAR_STATE, PFP_SYNC_ME, the enables on,
+	// then LOAD_*_REG of all four classes from S over the copy's keys (a class with none LOADs one anchor
+	// register, so no class runs with shadowing on and no base), then SETs. Record: the copy's replay as before.
+	// Load: only what S cannot restore (VGT_PRIMITIVE_TYPE/INDEX_TYPE, RSRC3/RSRC4, STATIC_THREAD_MGMT, SH 0x280,
+	// PA_SC_SHADER_CONTROL, offsets from 0x400) and the classes left out of `load_classes`, which are replayed;
+	// a buffer's first segment then restores the state where the buffer starts, as a chunk's does. `rearm`: a
+	// CONTEXT_CONTROL with the enables right after a title's CLEAR_STATE 0, in case the clear turns them off.
+	// The keys, and every decision made on the CPU, stay the copy's. A compute ring ignores it (MEC has no
+	// CONTEXT_CONTROL).
+	void SetCpShadow(uint64_t va, CpShadowMode mode, uint32_t load_classes = kCpShadowClasses, bool rearm = false) {
+		m_cp_shadow_va      = va;
+		m_cp_shadow_mode    = va != 0 ? mode : CpShadowMode::Off;
+		m_cp_shadow_classes = load_classes & kCpShadowClasses;
+		m_cp_shadow_rearm   = rearm;
+	}
+	[[nodiscard]] CpShadowMode CpShadow() const { return m_compute_ring ? CpShadowMode::Off : m_cp_shadow_mode; }
+	// libSceAgc's context push and pop (CLEAR_STATE CMD 1/2/3) on the GPU through S, in load mode with the context
+	// class LOADed (KYTY_NATIVE_GPU_CP_SHADOW_PUSHPOP, on unless 0). The first push of a window copies S's context
+	// region to the save area P (shadowing stays on: S, and every preamble inside the window, follow the inner
+	// state); a push while one is pushed does nothing, as the PS5's first pushed state is the one a pop restores.
+	// The pop copies P back, LOADs the context from S and SETs what S does not restore, with no CPU diff, so a
+	// value a late table set before the push comes back. The pop LOADs every context register S has a value for
+	// (the seed and every register written since), or all of 0x000-0x3FF with `whole_range`
+	// (KYTY_NATIVE_GPU_CP_SHADOW_POP_RANGE=all): a register never written since the seed is 0 in S, not amdgpu's
+	// clear state. Without it (and in record mode) the push and pop stay on the CPU.
+	void SetCpShadowPushPop(bool gpu, bool whole_range = false) {
+		m_cp_shadow_pushpop = gpu;
+		m_cp_shadow_pop_all = whole_range;
+	}
+	[[nodiscard]] bool CpShadowGpuPushPop() const {
+		return CpShadow() == CpShadowMode::Load && m_cp_shadow_pushpop && (m_cp_shadow_classes & kCpShadowContext) != 0;
+	}
+	// S as the CP would hold it for the copy: every key below 0x400 at its place, with the values the IB writes
+	// (PatchContext/PatchSh applied); `save` (kCpShadowSaveBytes / 4 dwords, when given) the context a pop
+	// restores (the pushed one, or the current one when none is). Seeds S and P once, before any shadowing job
+	// runs; from then on every context register of the seed counts as having its value in S.
+	void WriteCpShadowImage(std::span<uint32_t> s, std::span<uint32_t> save = {});
+	// The copy's keys against S as the GPU left it (an idle gfx ring), by who last wrote each register: a
+	// verbatim table (the GPU read it later than the translator: a late table), a SET form or an insert (a
+	// write the CP did not shadow, or a buffer that never ran), nothing since the seed (a table the translator
+	// read with other offsets). Then S outside the keys. Each difference is a line in `report` (when given).
+	struct CpShadowCheck {
+		uint32_t keys       = 0;
+		uint32_t equal      = 0;
+		uint32_t late       = 0;
+		uint32_t unshadowed = 0;
+		uint32_t unseen     = 0;
+		uint32_t outside    = 0; // non-zero outside the keys, the preamble's own writes not counted
+	};
+	CpShadowCheck CompareCpShadow(std::span<const uint32_t> s, std::FILE* report) const;
+	// Who last wrote a register the copy holds (CompareCpShadow; the copy's offsets below 0x400).
+	// Gpu: the GPU-side FMASK fix (load mode) changed it on the GPU, from values the copy may not hold.
+	enum class RegWriter : uint8_t { Seed = 0, Set, Table, Expanded, Insert, Gpu };
+
 private:
 	void     EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
 	                      const RegFile& uc, const Pm4CpDrawState& cp) const;
+	void     EmitShadowPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
+	                            const RegFile& uc, const Pm4CpDrawState& cp) const;
+	// The preamble's tess rings, PIXEL_PIPE_STAT_CONTROL and CP draw state.
+	void     EmitPreambleState(std::vector<uint32_t>& ib, const RegFile& uc, const Pm4CpDrawState& cp) const;
+	// SETs of the copy: every key of the classes in `replay`, the keys S cannot restore of the others.
+	void     EmitRegisterSets(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
+	                          const RegFile& uc, uint32_t replay) const;
+	// SetCpShadowPushPop: the push's copy of S's context region to P, and the pop back to `target` from `current`
+	// over the context registers `valid` in S.
+	void     EmitCpShadowPush(std::vector<uint32_t>& ib) const;
+	// fix_fmask on the GPU for MRT slot `slot`: FMASK = BASE (and the _EXT halves) from the values the CP holds (S),
+	// not the copy's; with `check` only when the CP's FMASK is not 0. A register S has no value for (`valid`) is
+	// amdgpu's clear state on the GPU, 0: the zero word is copied for it.
+	void     EmitCpShadowFmaskFix(std::vector<uint32_t>& ib, uint32_t slot, bool check, const std::bitset<RegFile::kDense>& valid) const;
+	void     EmitCpShadowPop(std::vector<uint32_t>& ib, const RegFile& target, const RegFile& current,
+	                         const std::bitset<RegFile::kDense>& valid) const;
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
 
 	RegFile                      m_cx; // context registers (SET_CONTEXT_REG space)
@@ -909,6 +1103,20 @@ private:
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;
+	uint64_t                     m_cp_shadow_va      = 0; // SetCpShadow
+	CpShadowMode                 m_cp_shadow_mode    = CpShadowMode::Off;
+	uint32_t                     m_cp_shadow_classes = kCpShadowClasses;
+	bool                         m_cp_shadow_rearm   = false;
+	// RegWriter of each register of m_cx, m_sh and m_uc below 0x400 (committed with them).
+	std::array<uint8_t, RegFile::kDense> m_writer_cx {};
+	std::array<uint8_t, RegFile::kDense> m_writer_sh {};
+	std::array<uint8_t, RegFile::kDense> m_writer_uc {};
+	bool                                 m_cp_shadow_pushpop = false; // SetCpShadowPushPop
+	bool                                 m_cp_shadow_pop_all = false;
+	std::array<uint8_t, RegFile::kDense> m_saved_writer_cx {}; // m_writer_cx at the GPU push
+	// Context registers S has a value for: the seed's, and every one written since (committed with the copy).
+	std::bitset<RegFile::kDense>         m_cp_valid_cx;
+	std::bitset<RegFile::kDense>         m_saved_valid_cx; // m_cp_valid_cx at the GPU push
 };
 
 } // namespace Libs::Graphics::NativeGpu
