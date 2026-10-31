@@ -475,12 +475,16 @@ bool PrimaryFeature(const char* name) {
 	return EnvOn("KYTY_NATIVE_GPU_PRIMARY");
 }
 
-// KYTY_NATIVE_GPU_CP_SHADOW (Pm4Translator::SetCpShadow): unset or 0 off, "record" the CP keeps S while the copy
-// still restores, 1 or "load" the restores come from S.
+// KYTY_NATIVE_GPU_CP_SHADOW (Pm4Translator::SetCpShadow): 0 off, "record" the CP keeps S while the copy still
+// restores, 1 or "load" the restores come from S. Unset: load in primary mode (the register state as the CP ran it,
+// as on a PS5; Demon's Souls' late tables need it), off otherwise.
 CpShadowMode CpShadowWanted() {
 	static const CpShadowMode mode = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW");
-		if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0) {
+		if (v == nullptr || v[0] == '\0') {
+			return EnvOn("KYTY_NATIVE_GPU_PRIMARY") ? CpShadowMode::Load : CpShadowMode::Off;
+		}
+		if (std::strcmp(v, "0") == 0) {
 			return CpShadowMode::Off;
 		}
 		if (std::strcmp(v, "record") == 0) {
