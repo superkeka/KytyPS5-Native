@@ -143,6 +143,18 @@ public:
 		Free(&m_ring);
 	}
 
+	// Destroys the queue (KFD dequeues it, a wave or a WAIT_REG_MEM in flight included: kfd_probe stopwait)
+	// and keeps its buffers. Its doorbell then rings nothing. True when KFD did.
+	bool Stop() {
+		if (!m_has_queue) {
+			return false;
+		}
+		struct kfd_ioctl_destroy_queue_args d {};
+		d.queue_id  = m_queue_id;
+		m_has_queue = false;
+		return KfdIoctl(AMDKFD_IOC_DESTROY_QUEUE, &d) == 0;
+	}
+
 	KfdQueue(const KfdQueue&)            = delete;
 	KfdQueue& operator=(const KfdQueue&) = delete;
 

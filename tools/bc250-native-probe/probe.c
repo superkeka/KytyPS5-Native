@@ -2127,6 +2127,297 @@ static bool DangerWaitForms(Device* d, Common* c) {
 	return ok;
 }
 
+// COND_EXEC (0x22: address, address high, 0, EXEC_COUNT): when the dword at the address is 0 the CP
+// discards the next EXEC_COUNT dwords. Kyty's exit guards what follows each GPU wait with such an
+// abort word. Each step (CONDEXEC_STEP=k runs one) builds: [wait on a label the CPU releases] [PFP_SYNC_ME]
+// COND_EXEC on the word over [filler NOPs] [IB2 call writing C] [WRITE_DATA A], then WRITE_DATA B. The
+// CPU clears the word 50 ms in and releases the label 50 ms later: if A lands, the CP had already
+// decided the COND_EXEC (the PFP parses ahead of an ME wait). B shows the CP went on past the guard.
+static bool DangerCondExec(Device* d, Common* c) {
+	(void)c;
+	printf("== danger condexec: COND_EXEC on an abort word, gfx ring and compute ring 1\n");
+	Bo  mem, big, ib2;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0720000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &big, MEM_GTT_USWC, 512 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &big, 0x0084000000ull, 0);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &ib2, MEM_GTT_USWC, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &ib2, 0x0083000000ull, 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		BoDestroy(d, &big);
+		BoDestroy(d, &ib2);
+		return false;
+	}
+	static const struct {
+		const char* name;
+		bool        compute;
+		uint32_t    word;   // the abort word at submission (0: skip)
+		int         wait;   // 0 none, 1 ME wait, 2 ME wait + PFP_SYNC_ME, 3 PFP wait
+		uint32_t    filler; // single-dword NOPs guarded before A
+		bool        ib2;    // the guarded part calls an IB2 that writes C
+		bool        lands;  // A should land
+	} steps[] = {
+	    {"gfx, word 1: the guarded write runs", false, 1, 0, 0, true, true},
+	    {"gfx, word 0: the guarded write and IB2 call are skipped", false, 0, 0, 0, true, false},
+	    {"gfx, word 0, EXEC_COUNT 20000 over filler NOPs", false, 0, 0, 20000, false, false},
+	    {"gfx, word 0, EXEC_COUNT 70000 over filler NOPs", false, 0, 0, 70000, false, false},
+	    {"gfx, ME wait, word cleared while it waits", false, 1, 1, 0, false, false},
+	    {"gfx, ME wait + PFP_SYNC_ME, word cleared while it waits", false, 1, 2, 0, true, false},
+	    {"gfx, PFP wait, word cleared while it waits", false, 1, 3, 0, false, false},
+	    {"compute ring 1, word 0", true, 0, 0, 0, false, false},
+	    {"compute ring 1, wait, word cleared while it waits", true, 1, 1, 0, false, false},
+	};
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem, &ib2};
+	bool               ok    = true;
+	const char*        one   = getenv("CONDEXEC_STEP"); // a CP that misparses stops the ring: one step per run
+	for (size_t k = 0; k < ARRAY_SIZE(steps) && ok; k++) {
+		if (one != NULL && (size_t)atoi(one) != k) {
+			continue;
+		}
+		const bool     cs   = steps[k].compute;
+		const uint64_t word = mem.va, label = mem.va + 0x40, a = mem.va + 0x100, b = mem.va + 0x104, cc = mem.va + 0x108;
+		m[0]               = steps[k].word;
+		m[0x40 / 4]        = 0;
+		m[0x100 / 4]       = 0;
+		m[0x104 / 4]       = 0;
+		m[0x108 / 4]       = 0;
+		uint32_t* q        = (uint32_t*)ib2.cpu;
+		*q++               = Pkt3Gfx(0x37u, 4); // WRITE_DATA C
+		*q++               = (5u << 8) | (1u << 20);
+		*q++               = (uint32_t)cc;
+		*q++               = (uint32_t)(cc >> 32);
+		*q++               = 0xc0de0000u | (uint32_t)k;
+		while (((q - (uint32_t*)ib2.cpu) & 7) != 0) {
+			*q++ = 0xffff1000u;
+		}
+		__sync_synchronize();
+		uint32_t* const ib0 = (uint32_t*)big.cpu;
+		uint32_t*       p   = ib0;
+#define CE_PKT(op, body) (cs ? Pkt3((op), (body)) : Pkt3Gfx((op), (body)))
+		if (steps[k].wait != 0) {
+			*p++ = CE_PKT(0x3cu, 6); // WAIT_REG_MEM == 1
+			*p++ = steps[k].wait == 3 ? 0x113u : 0x13u;
+			*p++ = (uint32_t)label;
+			*p++ = (uint32_t)(label >> 32);
+			*p++ = 1u;
+			*p++ = 0xffffffffu;
+			*p++ = 4u;
+		}
+		if (steps[k].wait == 2) {
+			*p++ = Pkt3Gfx(0x42u, 1); // PFP_SYNC_ME
+			*p++ = 0;
+		}
+		*p++                 = CE_PKT(0x22u, 4); // COND_EXEC
+		*p++                 = (uint32_t)word;
+		*p++                 = (uint32_t)(word >> 32);
+		*p++                 = 0;
+		uint32_t* const cnt  = p++;
+		uint32_t* const from = p;
+		for (uint32_t i = 0; i < steps[k].filler; i++) {
+			*p++ = 0xffff1000u;
+		}
+		if (steps[k].ib2) {
+			p = PutIb2(p, ib2.va, 8);
+		}
+		*p++ = CE_PKT(0x37u, 4); // WRITE_DATA A
+		*p++ = (5u << 8) | (1u << 20);
+		*p++ = (uint32_t)a;
+		*p++ = (uint32_t)(a >> 32);
+		*p++ = 0xa0000000u | (uint32_t)k;
+		*cnt = (uint32_t)(p - from);
+		*p++ = CE_PKT(0x37u, 4); // WRITE_DATA B
+		*p++ = (5u << 8) | (1u << 20);
+		*p++ = (uint32_t)b;
+		*p++ = (uint32_t)(b >> 32);
+		*p++ = 0xb0000000u | (uint32_t)k;
+		while (((p - ib0) & 7) != 0) {
+			*p++ = 0xffff1000u;
+		}
+#undef CE_PKT
+		__sync_synchronize();
+		const uint32_t ip   = cs ? AMDGPU_HW_IP_COMPUTE : AMDGPU_HW_IP_GFX;
+		const uint32_t ring = cs ? 1u : 0u;
+		uint64_t       seq  = 0;
+		r                   = SubmitVa(d, ip, ring, &big, big.va, (uint32_t)(p - ib0) * 4u, bos, 2, &seq);
+		bool early          = false;
+		if (r == 0 && steps[k].wait != 0) {
+			usleep(50000);
+			early = m[0x100 / 4] != 0 || m[0x104 / 4] != 0;
+			m[0]  = 0; // abort
+			__sync_synchronize();
+			usleep(50000);
+			m[0x40 / 4] = 1; // release the wait
+			__sync_synchronize();
+		}
+		const int     w      = r == 0 ? WaitOn(d, ip, ring, seq, 1.0) : r;
+		const int64_t st     = ContextState(d);
+		const bool    landed = m[0x100 / 4] == (0xa0000000u | (uint32_t)k);
+		const bool    after  = m[0x104 / 4] == (0xb0000000u | (uint32_t)k);
+		const bool    callee = m[0x108 / 4] == (0xc0de0000u | (uint32_t)k);
+		printf("  %s: %s, ctx 0x%" PRIx64 ", EXEC_COUNT %u: A %s (%s), B %s%s%s\n", steps[k].name, w == 1 ? "TIMEOUT" : ErrStr(w),
+		       (uint64_t)st, *cnt, landed ? "landed" : "skipped", landed == steps[k].lands ? "as expected" : "NOT as expected",
+		       after ? "landed" : "MISSING", steps[k].ib2 ? (callee ? ", IB2 C landed" : ", IB2 C skipped") : "",
+		       early ? ", a marker landed before the release" : "");
+		fflush(stdout);
+		if (w != 0 || st != 0) {
+			_exit(3); // freeing buffers would wait on the stopped ring
+		}
+		ok = ok && after && !early && landed == steps[k].lands;
+	}
+	BoDestroy(d, &mem);
+	BoDestroy(d, &big);
+	BoDestroy(d, &ib2);
+	return ok;
+}
+
+// The exit guard as Kyty emits it: COND_EXEC over a 4-dword INDIRECT_BUFFER with CHAIN to an empty IB, on an
+// abort word that is 0 while the title runs. The CP skips the chain then; once the word is 1 it chains to
+// the empty IB, whose end returns to the ring: the rest of the IB (A, B) never runs and the job ends. Each
+// step (GUARD_STEP=k runs one): [wait on a label the CPU releases] [PFP_SYNC_ME] guard, A, B; the CPU sets
+// the word 50 ms in (or before submitting) and releases the label 50 ms later.
+static bool DangerExitGuard(Device* d, Common* c) {
+	(void)c;
+	printf("== danger exitguard: COND_EXEC + INDIRECT_BUFFER chain to an empty IB on an abort word\n");
+	Bo  mem, ib, stub;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0720000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &ib, MEM_GTT_USWC, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &ib, 0x0084000000ull, 0);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &stub, MEM_GTT_USWC, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &stub, 0x0083000000ull, 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		BoDestroy(d, &ib);
+		BoDestroy(d, &stub);
+		return false;
+	}
+	for (uint32_t i = 0; i < 8; i++) {
+		((uint32_t*)stub.cpu)[i] = 0xffff1000u;
+	}
+	static const struct {
+		const char* name;
+		bool        compute;
+		int         wait;  // 0 none (the word is set before submitting), 1 ME wait + PFP_SYNC_ME, 2 PFP wait
+		uint32_t    abort; // the word once set
+	} steps[] = {
+	    {"gfx, word 0: the guard passes", false, 0, 0},
+	    {"gfx, word 1: the guard leaves the IB", false, 0, 1},
+	    {"gfx, ME wait + PFP_SYNC_ME, word set while it waits", false, 1, 1},
+	    {"gfx, PFP wait, word set while it waits", false, 2, 1},
+	    {"compute ring 1, word 1", true, 0, 1},
+	    {"compute ring 1, wait, word set while it waits", true, 1, 1},
+	};
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem, &stub};
+	bool               ok    = true;
+	const char*        one   = getenv("GUARD_STEP");
+	for (size_t k = 0; k < ARRAY_SIZE(steps) && ok; k++) {
+		if (one != NULL && (size_t)atoi(one) != k) {
+			continue;
+		}
+		const bool     cs   = steps[k].compute;
+		const uint64_t word = mem.va, label = mem.va + 0x40, a = mem.va + 0x100, b = mem.va + 0x104;
+		m[0]               = steps[k].wait != 0 ? 0 : steps[k].abort;
+		m[0x40 / 4]        = 0;
+		m[0x100 / 4]       = 0;
+		m[0x104 / 4]       = 0;
+		__sync_synchronize();
+		uint32_t* const ib0 = (uint32_t*)ib.cpu;
+		uint32_t*       p   = ib0;
+#define EG_PKT(op, body) (cs ? Pkt3((op), (body)) : Pkt3Gfx((op), (body)))
+		if (steps[k].wait != 0) {
+			*p++ = EG_PKT(0x3cu, 6); // WAIT_REG_MEM == 1
+			*p++ = steps[k].wait == 2 && !cs ? 0x113u : 0x13u;
+			*p++ = (uint32_t)label;
+			*p++ = (uint32_t)(label >> 32);
+			*p++ = 1u;
+			*p++ = 0xffffffffu;
+			*p++ = 4u;
+			if (steps[k].wait == 1 && !cs) {
+				*p++ = Pkt3Gfx(0x42u, 1); // PFP_SYNC_ME
+				*p++ = 0;
+			}
+		}
+		*p++ = EG_PKT(0x22u, 4); // COND_EXEC over the chain
+		*p++ = (uint32_t)word;
+		*p++ = (uint32_t)(word >> 32);
+		*p++ = 0;
+		*p++ = 4;
+		*p++ = EG_PKT(0x3fu, 3); // INDIRECT_BUFFER, CHAIN, to the empty IB
+		*p++ = (uint32_t)stub.va;
+		*p++ = (uint32_t)(stub.va >> 32) & 0xffffu;
+		*p++ = 8u | (1u << 20) | (1u << 23);
+		for (int i = 0; i < 2; i++) {
+			const uint64_t at = i == 0 ? a : b;
+			*p++              = EG_PKT(0x37u, 4); // WRITE_DATA A, B
+			*p++              = (5u << 8) | (1u << 20);
+			*p++              = (uint32_t)at;
+			*p++              = (uint32_t)(at >> 32);
+			*p++              = (i == 0 ? 0xa0000000u : 0xb0000000u) | (uint32_t)k;
+		}
+		while (((p - ib0) & 7) != 0) {
+			*p++ = 0xffff1000u;
+		}
+#undef EG_PKT
+		__sync_synchronize();
+		const uint32_t ip   = cs ? AMDGPU_HW_IP_COMPUTE : AMDGPU_HW_IP_GFX;
+		const uint32_t ring = cs ? 1u : 0u;
+		uint64_t       seq  = 0;
+		r                   = SubmitVa(d, ip, ring, &ib, ib.va, (uint32_t)(p - ib0) * 4u, bos, 2, &seq);
+		bool early          = false;
+		if (r == 0 && steps[k].wait != 0) {
+			usleep(50000);
+			early = m[0x100 / 4] != 0 || m[0x104 / 4] != 0;
+			m[0]  = steps[k].abort;
+			__sync_synchronize();
+			usleep(50000);
+			m[0x40 / 4] = 1;
+			__sync_synchronize();
+		}
+		const int     w     = r == 0 ? WaitOn(d, ip, ring, seq, 1.0) : r;
+		const int64_t st    = ContextState(d);
+		const bool    ran_a = m[0x100 / 4] == (0xa0000000u | (uint32_t)k);
+		const bool    ran_b = m[0x104 / 4] == (0xb0000000u | (uint32_t)k);
+		const bool    want  = steps[k].abort == 0;
+		printf("  %s: job %s, ctx 0x%" PRIx64 ": A %s, B %s (%s)%s\n", steps[k].name, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st,
+		       ran_a ? "ran" : "skipped", ran_b ? "ran" : "skipped", ran_a == want && ran_b == want ? "as expected" : "NOT as expected",
+		       early ? ", a marker landed before the release" : "");
+		fflush(stdout);
+		if (w != 0 || st != 0) {
+			_exit(3);
+		}
+		ok = ok && !early && ran_a == want && ran_b == want;
+	}
+	BoDestroy(d, &mem);
+	BoDestroy(d, &ib);
+	BoDestroy(d, &stub);
+	return ok;
+}
+
 // P5 of the direct-execution plan: does the CPU see a label that a RELEASE_MEM wrote with only the
 // guest's own event (no GLM/GL2 write-back, which the translator adds today)? Per GPU mapping type of
 // cached GTT: the gfx ring writes the label (BOTTOM_OF_PIPE_TS, DATA_SEL 1, no cache actions), then
@@ -3274,7 +3565,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
+	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib condexec exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
 }
 
 int main(int argc, char** argv) {
@@ -3363,6 +3654,10 @@ int main(int argc, char** argv) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb030u - 0xb000u) / 4, "SPI_SHADER_USER_DATA_PS_0");
 		} else if (strcmp(danger, "condib") == 0) {
 			ok = DangerCondIb(&d, &c);
+		} else if (strcmp(danger, "condexec") == 0) {
+			ok = DangerCondExec(&d, &c);
+		} else if (strcmp(danger, "exitguard") == 0) {
+			ok = DangerExitGuard(&d, &c);
 		} else if (strcmp(danger, "atomicmem") == 0) {
 			ok = DangerAtomicMem(&d, &c);
 		} else if (strcmp(danger, "mecforms") == 0) {

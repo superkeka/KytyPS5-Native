@@ -305,6 +305,33 @@ public:
 	// Called before Submit blocks on a slot still in use (Shadow ends an open stream there).
 	void SetBeforeBlockingWait(std::function<void()> f) { m_before_block = std::move(f); }
 
+	// A stop (Shadow::StopGpu): destroys every KFD queue, the relay included, so the title's compute work
+	// stops where it stands, as the PS5 kernel stops a title's queues. Returns how many KFD destroyed.
+	uint32_t DestroyKfdQueues() {
+		uint32_t n = 0;
+		for (KfdQueue* q: m_kfd_queue) {
+			n += q != nullptr && q->Stop() ? 1u : 0u;
+		}
+		n += m_kfd_relay != nullptr && m_kfd_relay->Stop() ? 1u : 0u;
+		return n;
+	}
+	// True once every CS submission (not a KFD queue's) has completed, waiting up to `timeout_sec` each.
+	bool CsIdle(double timeout_sec) {
+		for (const SlotUse& slot: m_slot) {
+			if (slot.seq != 0 && Queue(slot.target) == nullptr && !WaitSeq(slot.seq, timeout_sec, slot.target)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	// The exit guard (Pm4Translator::SetExitGuard) each part of a gfx IB too long for one slot starts
+	// with after the first: a part begins where the CP returns to the ring, past the guard it left at.
+	void SetGfxPartGuard(uint64_t abort_va, uint64_t stub_va) {
+		m_part_guard = {(3u << 30u) | (3u << 16u) | (0x22u << 8u), static_cast<uint32_t>(abort_va), static_cast<uint32_t>(abort_va >> 32u), 0u, 4u,
+		                (3u << 30u) | (2u << 16u) | (0x3fu << 8u), static_cast<uint32_t>(stub_va), static_cast<uint32_t>(stub_va >> 32u) & 0xffffu,
+		                8u | (1u << 20u) | (1u << 23u)};
+	}
+
 	// Waits until every async submission so far has completed. Returns false on a timeout.
 	bool WaitIdle(double timeout_sec) {
 		for (SlotUse& slot: m_slot) {
@@ -330,8 +357,9 @@ public:
 		if (ib.size() * 4 <= room) {
 			parts.emplace_back(0, ib.size());
 		} else if (m_async) {
-			parts = SplitIbAtPackets(ib, room / 4 - 8);
+			parts = SplitIbAtPackets(ib, room / 4 - 8 - m_part_guard.size());
 		}
+		const bool part_guards = parts.size() > 1 && target.ip_type == AMDGPU_HW_IP_GFX && !m_part_guard.empty();
 		if (parts.empty() || parts.size() > kSlots || (parts.size() > 1 && Queue(target) != nullptr)) {
 			res.err = -E2BIG;
 			return res;
@@ -354,8 +382,13 @@ public:
 				m_slot[slot].seq = 0;
 			}
 			auto* dst = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize);
-			std::memcpy(dst, ib.data() + at, len * 4);
-			size_t padded = len;
+			size_t padded = 0;
+			if (part_guards && at != 0) {
+				std::memcpy(dst, m_part_guard.data(), m_part_guard.size() * 4);
+				padded = m_part_guard.size();
+			}
+			std::memcpy(dst + padded, ib.data() + at, len * 4);
+			padded += len;
 			while (parts.size() > 1 && (padded & 7u) != 0) {
 				dst[padded++] = 0xffff1000u;
 			}
@@ -865,6 +898,7 @@ private:
 	bool     m_async     = false;
 	bool     m_gfx_mem_sync = false;
 	std::function<void()> m_before_block; // SetBeforeBlockingWait
+	std::vector<uint32_t> m_part_guard;   // SetGfxPartGuard
 	uint64_t m_slot_order = 0;
 	SlotUse  m_slot[kSlots];
 	uint32_t m_compute_rings = 0; // bitmask from AMDGPU_INFO_HW_IP_INFO
