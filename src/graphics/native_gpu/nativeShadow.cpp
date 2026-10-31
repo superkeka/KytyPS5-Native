@@ -1034,7 +1034,7 @@ public:
 			m_cps_pushes += result.stats.cp_shadow_pushes;
 			m_cps_pops += result.stats.cp_shadow_pops;
 			m_cps_fmask_gpu += result.stats.cp_shadow_fmask_gpu;
-			m_cps_dcc_skipped += result.stats.cp_shadow_dcc_skipped;
+			m_cps_dcc_table += result.stats.cp_shadow_dcc_table;
 			if (result.cp_shadow) {
 				m_cps_sets += result.stats.preamble_cx + result.stats.preamble_sh + result.stats.preamble_uc;
 			}
@@ -1722,16 +1722,16 @@ public:
 				             "native shadow: CP shadow (%s) per flip: %.2f shadow preambles with %.0f LOAD dwords (%.0f registers, %.2f anchors) and "
 				             "%.0f SETs; %.2f resumes put in front of a chunk, %.2f shadowing-off guards before another translator's piece, %.2f "
 				             "gfx job ends; %.2f context pushes and %.2f pops on the GPU; %.2f FMASK fixes on the GPU, %.2f display-DCC "
-				             "inserts left out (INFO from a verbatim table)\n",
+				             "inserts on an INFO from a verbatim table\n",
 				             m_cp_shadow == CpShadowMode::Record ? "record" : "load", static_cast<double>(m_cps_preambles) / m_flips,
 				             static_cast<double>(m_cps_load_dw) / m_flips, static_cast<double>(m_cps_load_regs) / m_flips,
 				             static_cast<double>(m_cps_anchors) / m_flips, static_cast<double>(m_cps_sets) / m_flips,
 				             static_cast<double>(resumes - m_cps_resumes_mark) / m_flips, static_cast<double>(guards - m_cps_guards_mark) / m_flips,
 				             static_cast<double>(m_cps_job_ends) / m_flips, static_cast<double>(m_cps_pushes) / m_flips,
 				             static_cast<double>(m_cps_pops) / m_flips, static_cast<double>(m_cps_fmask_gpu) / m_flips,
-				             static_cast<double>(m_cps_dcc_skipped) / m_flips);
+				             static_cast<double>(m_cps_dcc_table) / m_flips);
 				m_cps_preambles = m_cps_load_dw = m_cps_load_regs = m_cps_anchors = m_cps_sets = m_cps_job_ends = 0;
-				m_cps_pushes = m_cps_pops = m_cps_fmask_gpu = m_cps_dcc_skipped = 0;
+				m_cps_pushes = m_cps_pops = m_cps_fmask_gpu = m_cps_dcc_table = 0;
 				m_cps_resumes_mark = resumes;
 				m_cps_guards_mark  = guards;
 				if (m_cp_checks != 0) {
@@ -4278,7 +4278,7 @@ private:
 	// checker's last result.
 	uint64_t              m_cps_preambles = 0, m_cps_load_dw = 0, m_cps_load_regs = 0, m_cps_anchors = 0, m_cps_sets = 0;
 	uint64_t              m_cps_job_ends = 0, m_cps_resumes = 0, m_cps_resumes_mark = 0, m_cps_guards_mark = 0;
-	uint64_t              m_cps_pushes = 0, m_cps_pops = 0, m_cps_fmask_gpu = 0, m_cps_dcc_skipped = 0;
+	uint64_t              m_cps_pushes = 0, m_cps_pops = 0, m_cps_fmask_gpu = 0, m_cps_dcc_table = 0;
 	uint64_t              m_context_ops = 0, m_context_checks = 0; // Pm4TranslateStats::context_ops / context_checks
 	uint64_t              m_cp_checks     = 0;
 	uint32_t              m_cp_check_busy = 0;

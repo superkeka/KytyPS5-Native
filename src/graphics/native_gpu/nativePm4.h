@@ -215,10 +215,10 @@ struct Pm4TranslateStats {
 	uint32_t cp_shadow_pushes = 0;
 	uint32_t cp_shadow_pops   = 0;
 	// Load mode: FMASK = BASE fixes done on the GPU from S (some of the slot's CB registers came from a verbatim
-	// table, so the GPU may hold other values than the copy), and display-DCC inserts left out because the copy's
-	// CB_COLORn_INFO came from one.
+	// table, so the GPU may hold other values than the copy), and display-DCC inserts made from a CB_COLORn_INFO
+	// the copy took from one.
 	uint32_t cp_shadow_fmask_gpu   = 0;
-	uint32_t cp_shadow_dcc_skipped = 0;
+	uint32_t cp_shadow_dcc_table   = 0;
 };
 
 // CP register shadowing (Pm4Translator::SetCpShadow, KYTY_NATIVE_GPU_CP_SHADOW). With the CONTEXT_CONTROL
