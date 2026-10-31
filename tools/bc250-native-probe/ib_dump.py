@@ -15,7 +15,8 @@ NAMES = {
     0x42: "PFP_SYNC_ME", 0x46: "EVENT_WRITE", 0x49: "RELEASE_MEM", 0x50: "DMA_DATA", 0x58: "ACQUIRE_MEM",
     0x63: "SET_SH_REG_INDIRECT", 0x64: "SET_UCONFIG_REG_INDIRECT", 0x69: "SET_CONTEXT_REG",
     0x76: "SET_SH_REG", 0x79: "SET_UCONFIG_REG", 0x7A: "SET_UCONFIG_REG_INDEX", 0x93: "WAIT_REG_MEM_64",
-    0x9F: "SET_CONTEXT_REG_INDIRECT",
+    0x9F: "SET_CONTEXT_REG_INDIRECT", 0x5E: "LOAD_UCONFIG_REG", 0x5F: "LOAD_SH_REG", 0x61: "LOAD_CONTEXT_REG",
+    0x22: "COND_EXEC", 0x3F: "INDIRECT_BUFFER",
 }
 REGS = {0x69, 0x76, 0x79, 0x7A}
 
@@ -59,6 +60,11 @@ def main():
                 extra = f" coher_cntl 0x{body[0]:x} gcr 0x{body[6] if len(body) > 6 else 0:x}"
             elif op in (0x3C, 0x93):
                 extra = " " + " ".join(f"0x{v:x}" for v in body[:6])
+            elif op == 0x28 and len(body) >= 2:
+                extra = f" load 0x{body[0]:08x} shadow 0x{body[1]:08x}"
+            elif op in (0x5E, 0x5F, 0x61) and len(body) >= 2:
+                ranges = ",".join(f"0x{body[k]:x}+{body[k + 1]}" for k in range(2, len(body) - 1, 2))
+                extra = f"{' (compute)' if h & 2 else ''} from 0x{(body[1] << 32) | body[0]:x}: {ranges}"
             print(f"{i:6d}: {name}{extra}")
         i += size
     print("packets:", ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])))
