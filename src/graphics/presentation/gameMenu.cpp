@@ -185,9 +185,15 @@ void DrawGameMenu(vk::Extent2D extent) {
 	const ImVec2 display(static_cast<float>(extent.width), static_cast<float>(extent.height));
 	const float  scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
 	ImGui::GetBackgroundDrawList()->AddRectFilled({0.0f, 0.0f}, display, IM_COL32(0, 0, 0, 170));
+	constexpr const char* hint = "Cross / Enter: select    Circle / Esc: back    PS / F10: close";
+	// As wide as the controls line under the items needs, so it is not cut at the edge.
+	ImGui::PushFont(nullptr, 17.0f * scale);
+	const float hint_width = ImGui::CalcTextSize(hint).x + 2.0f * 24.0f * scale;
+	ImGui::PopFont();
 	ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
-	ImGui::SetNextWindowSize({std::max(std::min(460.0f * scale, display.x - 32.0f), 1.0f), 0.0f},
-	                         ImGuiCond_Always);
+	ImGui::SetNextWindowSize(
+	    {std::max(std::min(std::max(460.0f * scale, hint_width), display.x - 32.0f), 1.0f), 0.0f},
+	    ImGuiCond_Always);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24.0f * scale, 22.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {12.0f * scale, 12.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * scale);
@@ -230,7 +236,7 @@ void DrawGameMenu(vk::Extent2D extent) {
 	}
 	ImGui::Separator();
 	ImGui::PushFont(nullptr, 17.0f * scale);
-	ImGui::TextDisabled("Cross / Enter: select    Circle / Esc: back    PS / F10: close");
+	ImGui::TextDisabled("%s", hint);
 	ImGui::PopFont();
 	ImGui::End();
 	ImGui::PopFont();
