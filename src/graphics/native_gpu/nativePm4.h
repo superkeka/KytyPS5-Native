@@ -357,6 +357,12 @@ struct Pm4Segment {
 	uint32_t                  wait_len    = 0;
 	std::vector<TrackerPoint> points;
 	std::vector<LabelWrite>   writes;
+	// The guest waits this segment gives the GPU, in order (the held wait not among them): what a stop
+	// has to release, and only while the segment has not finished (SetExitGuard).
+	std::vector<WaitCond>     gpu_waits;
+	// Compute rings: the EXEC_COUNT dwords of the segment's exit guards, as IB offsets (the backend
+	// needs none of them; tests read them).
+	std::vector<uint32_t>     guards;
 };
 
 // Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
@@ -410,10 +416,10 @@ uint32_t ComputeRingForQueue(uint32_t guest_queue, uint32_t available_rings);
 // Without them the GE writes tess factors at GPU address 0, faults, and the gfx ring hangs.
 void SetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint32_t hs_offchip_param);
 
-// The native GPU waits put into IBs most recently (EmitNativeWait), for draining the rings when the
-// process is told to stop: a ring stuck on a WAIT_REG_MEM whose writer will never be submitted cannot be
-// preempted by amdgpu, and with GPU recovery off that hangs the board.
-std::vector<WaitCond> RecentGpuWaits();
+// The longest stretch a compute exit guard's COND_EXEC skips (probe condexec: 20005 dwords skip,
+// 70005 do not).
+constexpr uint32_t kExitGuardMaxSkip = 20000;
+
 // A value that satisfies `w`, given the label's `current` value (only the masked bits change).
 uint64_t SatisfyingValue(const WaitCond& w, uint64_t current);
 
@@ -661,6 +667,20 @@ public:
 	// Guest WAIT_REG_MEMs become a full GPU barrier on a fence of ours at `va` (4 bytes in a buffer
 	// that every submission maps); 0 drops them as before.
 	void SetFenceAddress(uint64_t va) { m_fence_va = va; }
+	// Exit guards: how a stop ends a title's GPU work where it stands, as the PS5 kernel stops a title's
+	// queues, instead of running it on with made-up inputs. Each segment starts with a guard, and each
+	// guest wait it gives the GPU is followed by one; a stop sets the words, then releases the waits.
+	// On the gfx ring a guard is COND_EXEC on `abort_va` (0 while the title runs) over an INDIRECT_BUFFER
+	// that chains to `stub_va`, 8 filler NOPs: the IB ends there and the CP returns to the ring. The PFP
+	// decides a COND_EXEC before an ME wait ahead of it is released (probe condexec), so an ME wait gets
+	// PFP_SYNC_ME before its guard. A chain on MEC took the board down (probe exitguard), so on a compute
+	// ring a guard is COND_EXEC on `run_va` (1 while the title runs) skipping to the next guard or the
+	// segment's end, with one at least every few thousand dwords. 0: none.
+	void SetExitGuard(uint64_t abort_va, uint64_t run_va, uint64_t stub_va) {
+		m_exit_abort_va = abort_va;
+		m_exit_run_va   = run_va;
+		m_exit_stub_va  = stub_va;
+	}
 
 	// Native labels: label writes run on the GPU (or at tracker points that write `tracker_va`),
 	// waits pass through, become barriers or cut the IB as `oracle` decides; Kyty's command processor
@@ -854,6 +874,9 @@ private:
 	std::vector<GpuWaitInfo>     m_time_wait_info;
 	std::vector<SourcePiece>     m_source;
 	uint64_t                     m_fence_va       = 0;
+	uint64_t                     m_exit_abort_va  = 0; // SetExitGuard
+	uint64_t                     m_exit_run_va    = 0;
+	uint64_t                     m_exit_stub_va   = 0;
 	LabelOracle*                 m_labels         = nullptr;
 	uint64_t                     m_tracker_va     = 0;
 	bool                         m_native_waits   = true;

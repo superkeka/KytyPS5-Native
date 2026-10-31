@@ -88,6 +88,12 @@ void ShadowFlipStats(double present_seconds);
 // KYTY_NATIVE_GPU_FLIP_TRACE: the title has just submitted a DCB (agc), before the pipeline takes it.
 void ShadowNoteDcbSubmit();
 
+// Stops the title's native GPU work where it stands before the process goes (the game menu's exit,
+// exec, a fatal error; SIGTERM, SIGINT and SIGHUP do it themselves), as the PS5 kernel stops a title's
+// queues: left on the rings, a job waiting for a label nobody will write times out, and the GPU reset
+// that follows takes the BC-250 down. Once; `why` goes to the log.
+void ShadowStopGpu(const char* why);
+
 // True in primary mode with native async compute: Kyty then skips its own dispatches of ACBs too.
 bool NativeAsyncCompute();
 

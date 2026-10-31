@@ -2171,6 +2171,111 @@ void TestSplitIbAtPackets() {
 	Check(SplitIbAtPackets(ib, 4).empty(), "a packet longer than a piece cannot be cut");
 }
 
+// SetExitGuard: a stop leaves the title's GPU work where it stands. On the gfx ring every segment starts
+// with COND_EXEC on the abort word over a chain to the empty IB, and every guest wait the GPU gets is
+// followed by one (an ME wait by PFP_SYNC_ME first: the PFP decides a COND_EXEC ahead of the ME). On a
+// compute ring each guard skips to the next one or the segment's end on the run word.
+void TestExitGuards() {
+	constexpr uint64_t kAbort = 0x400000fff808ull, kRun = 0x400000fff80cull, kStub = 0x400000ffffe0ull;
+	static uint32_t    label = 0;
+	const uint64_t     addr  = reinterpret_cast<uint64_t>(&label);
+	auto guards_at = [&](const std::vector<uint32_t>& ib) {
+		std::vector<uint32_t> at;
+		for (uint32_t dw = 0; dw + 9 <= ib.size(); dw++) {
+			if (ib[dw] == Pkt3(0x22u, 4, false) && ib[dw + 1] == static_cast<uint32_t>(kAbort) && ib[dw + 4] == 4u &&
+			    ib[dw + 5] == Pkt3(0x3Fu, 3, false) && ib[dw + 6] == static_cast<uint32_t>(kStub) &&
+			    ib[dw + 8] == (8u | (1u << 20u) | (1u << 23u))) {
+				at.push_back(dw);
+			}
+		}
+		return at;
+	};
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetWaitsVerbatim(true);
+		t.SetFenceAddress(kFenceVa);
+		t.SetExitGuard(kAbort, kRun, kStub);
+		o.plan = LabelOracle::Plan::Native;
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		AppendWait(dcb, addr, 1);
+		Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+		Append(dcb, 0x3Cu, {3u | (1u << 4u) | (1u << 8u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 2u, 0xffffffffu, 4u},
+		       false);
+		Append(dcb, IT_DISPATCH_DIRECT, {3u, 1u, 1u, 1u}, false);
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.segments.size() == 1, "guarded buffer translated");
+		const auto at = guards_at(r.ib);
+		Check(at.size() == 3 && at[0] == r.segments[0].begin, "a guard opens the segment and one follows each GPU wait");
+		Check(r.ib[at[1] - 2] == ((3u << 30u) | (0x42u << 8u)) && r.ib[at[1] - 9] == Pkt3(0x3Cu, 6, false),
+		      "an ME wait, then PFP_SYNC_ME, then its guard");
+		Check(r.ib[at[2] - 7] == Pkt3(0x3Cu, 6, false) && r.ib[at[2] - 6] == (3u | (1u << 4u) | (1u << 8u)), "a PFP wait's guard follows it at once");
+		Check(r.segments[0].gpu_waits.size() == 2 && r.segments[0].gpu_waits[0].ref == 1u && r.segments[0].gpu_waits[1].ref == 2u,
+		      "the segment names the waits it gives the GPU, in order");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "guarded IB passes the gfx-ring check");
+
+		// A held wait's segment opens with a guard too, and its native wait is followed by one.
+		o.plan  = LabelOracle::Plan::Split;
+		auto rs = t.Translate(dcb);
+		Check(rs.segments.size() >= 2, "held segments");
+		const auto ats = guards_at(rs.ib);
+		for (const auto& seg: rs.segments) {
+			Check(std::find(ats.begin(), ats.end(), seg.begin) != ats.end(), "every segment starts with a guard");
+		}
+		Check(rs.segments[1].held && std::find(ats.begin(), ats.end(), rs.segments[1].wait_dw + rs.segments[1].wait_len + 2u) != ats.end(),
+		      "the held wait is followed by PFP_SYNC_ME and a guard");
+		Check(ValidateNativeIb(rs.ib, false, &bad, NativeIbKind::Gfx), "held guarded IB passes the gfx-ring check");
+
+		// Without SetExitGuard nothing changes.
+		Pm4Translator plain;
+		plain.SetNativeLabels(&o, kTrackerVa);
+		o.plan = LabelOracle::Plan::Native;
+		Check(guards_at(plain.Translate(dcb).ib).empty(), "no guards unless asked for");
+	}
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetComputeQueue(true);
+		t.SetComputeRing(true);
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		t.SetExitGuard(kAbort, kRun, kStub);
+		o.plan = LabelOracle::Plan::Native;
+		std::vector<uint32_t> acb;
+		Append(acb, IT_SET_SH_REG, {0x240u, 0x11u}, true);
+		AppendWait(acb, addr, 1);
+		for (uint32_t i = 0; i < 2000; i++) { // 8000 dwords: a spacer guard every few thousand
+			Append(acb, IT_SET_SH_REG, {0x241u, i, i}, true);
+		}
+		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+		auto r = t.Translate(acb);
+		Check(r.ok && r.segments.size() == 1, "guarded compute buffer translated");
+		const auto& g = r.segments[0].guards;
+		Check(g.size() >= 4 && g[0] == r.segments[0].begin + 4u, "a compute segment opens with a guard, spacers follow");
+		for (size_t i = 0; i < g.size(); i++) {
+			Check(r.ib[g[i] - 4u] == Pkt3(0x22u, 4, true) && r.ib[g[i] - 3u] == static_cast<uint32_t>(kRun), "a compute guard is COND_EXEC on the run word");
+			const uint32_t until = i + 1 < g.size() ? g[i + 1] - 4u : r.segments[0].end;
+			Check(r.ib[g[i]] == until - g[i] - 1u && r.ib[g[i]] <= Libs::Graphics::NativeGpu::kExitGuardMaxSkip,
+			      "each compute guard skips exactly to the next guard or the segment's end");
+		}
+		Check(FindFirst(Decode(r.ib), 0x42u) == nullptr && FindFirst(Decode(r.ib), 0x3Fu) == nullptr, "no PFP_SYNC_ME and no chain on MEC");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "guarded compute IB passes the compute-ring check");
+
+		// The splitter keeps a COND_EXEC with what it skips.
+		using Libs::Graphics::NativeGpu::SplitIbAtPackets;
+		const auto parts = SplitIbAtPackets(r.ib, 6000);
+		for (const auto& [from, len]: parts) {
+			for (uint32_t gi: g) {
+				Check(!(gi - 4u >= from && gi - 4u < from + len && gi + 1u + r.ib[gi] > from + len), "no part ends inside a guard's skip");
+			}
+		}
+	}
+}
+
 void TestComputeRingForQueue() {
 	Check(ComputeRingForQueue(0x20, 0x5u) == 0u && ComputeRingForQueue(0x21, 0x5u) == 2u &&
 	          ComputeRingForQueue(0x22, 0x5u) == 0u,
@@ -2532,6 +2637,7 @@ int main() {
 	TestPlanRingWait();
 	TestComputeRingForQueue();
 	TestSplitIbAtPackets();
+	TestExitGuards();
 	TestFlattenIndirectBuffers();
 	TestLodBankScan();
 	TestLodUsageReport();

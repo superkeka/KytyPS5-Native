@@ -1772,6 +1772,18 @@ public:
 		if (m_acb_rings && KfdQueuesWanted()) {
 			EnableKfdQueues();
 		}
+		// Exit guards (KYTY_NATIVE_GPU_EXIT_GUARDS=0 leaves them out): in every gfx IB, and in compute IBs
+		// on rings a stop cannot take away; KFD queues it destroys.
+		if (!EnvIs("KYTY_NATIVE_GPU_EXIT_GUARDS", "0")) {
+			const uint64_t sv = m_submitter->ScratchVa();
+			m_translator.SetExitGuard(sv + kExitAbortOffset, sv + kExitRunOffset, sv + kExitStubOffset);
+			if (!m_kfd_queues) {
+				m_acb_translator.SetExitGuard(sv + kExitAbortOffset, sv + kExitRunOffset, sv + kExitStubOffset);
+			}
+			m_submitter->SetGfxPartGuard(sv + kExitAbortOffset, sv + kExitStubOffset);
+			std::fprintf(stderr, "native shadow: exit guards in %s IBs: a stop leaves the title's GPU work where it stands\n",
+			             m_kfd_queues ? "gfx" : "gfx and compute");
+		}
 		// Tracker points as the PS5 takes a title's EOP interrupts: each tracker release raises one,
 		// and the tracker sleeps on it instead of polling its slots every millisecond. KYTY_NATIVE_GPU_IRQ=0
 		// keeps the polling.
@@ -2402,42 +2414,129 @@ private:
 	}
 
 	[[noreturn]] void DrainAndExit(int sig) {
-#if KYTY_GEM_BACKING_SUPPORTED
-		{
-			std::lock_guard<std::mutex> lock(m_mutex);
-			m_disabled = true; // nothing more is submitted
-		}
-		uint32_t released = 0;
-		bool     idle     = m_submitter == nullptr;
-		for (int round = 0; round < 40 && !idle; round++) {
-			for (const WaitCond& w: RecentGpuWaits()) {
-				uint64_t cur = 0;
-				if (m_gem->ReadGuest(w.addr, &cur, w.wide ? 8 : 4) == 0 || w.Met(cur)) {
-					continue;
-				}
-				const uint64_t v = SatisfyingValue(w, cur);
-				if (round == 0) {
-					std::fprintf(stderr, "native shadow: pending GPU wait on 0x%llx (%s, func %u, ref 0x%llx, mask 0x%llx): holds 0x%llx\n",
-					             static_cast<unsigned long long>(w.addr), w.wide ? "64-bit" : "32-bit", w.function,
-					             static_cast<unsigned long long>(w.ref), static_cast<unsigned long long>(w.mask),
-					             static_cast<unsigned long long>(cur));
-				}
-				m_gem->WriteGuest(w.addr, &v, w.wide ? 8 : 4);
-				released++;
-			}
-			idle = m_submitter->WaitIdle(0.05);
-		}
-		std::fprintf(stderr, "native shadow: signal %d: %u pending GPU waits released, rings %s; exiting\n", sig, released,
-		             idle ? "idle" : "STILL BUSY");
-		if (m_ps5_regs != 0) {
-			// The helper would do it when the connection closes; here it shows in this log too.
-			std::lock_guard<std::mutex> lock(m_ps5_mutex);
-			std::fprintf(stderr, "native shadow: %d PS5 registers put back (kyty-lodhw logs each)\n", m_ps5_hw.RestoreRegs());
-		}
-#endif
+		char why[32];
+		std::snprintf(why, sizeof(why), "signal %d", sig);
+		StopGpu(why);
 		::_exit(128 + sig);
 	}
 
+public:
+	// The guest waits LabelPipeline::Emit has just given `slot`'s ring in a segment that ends with point
+	// `end_seq`.
+	void NoteExitWaits(uint32_t slot, uint64_t end_seq, std::vector<WaitCond> waits) {
+		std::lock_guard<std::mutex> lock(m_exit_mutex);
+		while (!m_exit_waits.empty() && Reached(m_exit_waits.front().end_seq, m_exit_waits.front().slot)) {
+			m_exit_waits.pop_front();
+		}
+		// A KFD queue may wait for long ahead of the gfx ring's entries: sweep them all now and then.
+		if (m_exit_waits.size() > 8192) {
+			std::erase_if(m_exit_waits, [this](const ExitWaits& e) { return Reached(e.end_seq, e.slot); });
+		}
+		m_exit_waits.push_back(ExitWaits {slot, end_seq, std::move(waits)});
+	}
+
+	// Stops the title's GPU work where it stands, as the PS5 kernel stops a title's queues when it ends,
+	// and returns once the rings have left it behind (or after 2 s). Nothing more is submitted; the exit
+	// guards (Pm4Translator::SetExitGuard) are armed, so the CP leaves each IB at its next guard; the KFD
+	// queues are destroyed (KFD dequeues them, waits and all); a streamed DCB's chain is ended; then each
+	// ring's first guest wait not met yet, in a segment the GPU has not finished, gets a value that
+	// satisfies it, one per ring and round, until the ring is idle. What followed it never runs.
+	// Before the guards every recent wait was released at once: the CP ran on with register tables and
+	// arguments the title had not written yet, and the writes went into memory reused since (ASTRO BOT
+	// stopped while loading: "Illegal register access", a GPU reset the BC-250 did not survive).
+	// Once per process; a second caller returns when the first is done.
+	void StopGpu(const char* why) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::lock_guard<std::mutex> once(m_stop_mutex);
+		if (m_stopped || m_submitter == nullptr || !m_enabled) {
+			m_stopped = true;
+			return;
+		}
+		m_stopped = true;
+		m_stopping.store(true, std::memory_order_release);
+		const double t0 = NowSecShadow();
+		// Another thread may hold the lock while it waits on the GPU, for the very ring this releases.
+		std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
+		for (int i = 0; i < 100 && !lock.try_lock(); i++) {
+			struct timespec nap = {0, 1000000};
+			nanosleep(&nap, nullptr);
+		}
+		if (lock.owns_lock()) {
+			m_disabled = true;
+			m_active.store(false, std::memory_order_release);
+		}
+		volatile uint8_t* sc = m_submitter->ScratchCpu();
+		*reinterpret_cast<volatile uint32_t*>(sc + kExitAbortOffset) = 1;
+		*reinterpret_cast<volatile uint32_t*>(sc + kExitRunOffset)   = 0;
+		__sync_synchronize();
+		const uint32_t kfd = m_submitter->DestroyKfdQueues();
+		const double   t_kfd = NowSecShadow();
+		bool stream_ended = false;
+		if (lock.owns_lock() && m_stream == StreamState::Cont) {
+			PublishStreamLocked(m_stream_pending, 0, 0, false);
+			m_stream     = StreamState::Off;
+			stream_ended = true;
+		}
+		std::vector<ExitWaits> pending;
+		{
+			std::lock_guard<std::mutex> l(m_exit_mutex);
+			pending.assign(m_exit_waits.begin(), m_exit_waits.end());
+		}
+		auto on_kfd = [this](uint32_t slot) { return !GfxSlot(slot) && m_submitter->OnKfdQueue(slot - 1); };
+		uint32_t unfinished = 0; // segments with GPU waits the GPU had not finished
+		for (const ExitWaits& e: pending) {
+			unfinished += !on_kfd(e.slot) && !Reached(e.end_seq, e.slot) ? 1u : 0u;
+		}
+		uint32_t released = 0;
+		bool     idle     = false;
+		for (;;) {
+			idle = m_submitter->CsIdle(0.0);
+			if (idle || NowSecShadow() - t0 > 2.0) {
+				break;
+			}
+			std::set<uint32_t> slots_done;
+			for (const ExitWaits& e: pending) {
+				if (slots_done.count(e.slot) != 0 || on_kfd(e.slot) || Reached(e.end_seq, e.slot)) {
+					continue;
+				}
+				for (const WaitCond& w: e.waits) {
+					uint64_t cur = 0;
+					if (m_gem->ReadGuest(w.addr, &cur, w.wide ? 8 : 4) == 0 || w.Met(cur)) {
+						continue;
+					}
+					const uint64_t v = SatisfyingValue(w, cur);
+					m_gem->WriteGuest(w.addr, &v, w.wide ? 8 : 4);
+					if (released++ < 16) {
+						std::fprintf(stderr, "native shadow: stop: ring slot %u waits on 0x%llx (%s, func %u, ref 0x%llx): held 0x%llx, released\n",
+						             e.slot, static_cast<unsigned long long>(w.addr), w.wide ? "64-bit" : "32-bit", w.function,
+						             static_cast<unsigned long long>(w.ref), static_cast<unsigned long long>(cur));
+					}
+					slots_done.insert(e.slot);
+					break;
+				}
+			}
+			struct timespec nap = {0, 2000000};
+			nanosleep(&nap, nullptr);
+		}
+		std::fprintf(stderr,
+		             "native shadow: stop (%s): %u KFD queues destroyed in %.1f ms%s, %u unfinished segments with GPU waits, %u guest "
+		             "waits released, rings %s after %.0f ms\n",
+		             why, kfd, (t_kfd - t0) * 1e3, stream_ended ? ", stream chain ended" : "", unfinished, released,
+		             idle ? "idle" : "STILL BUSY", (NowSecShadow() - t0) * 1e3);
+		if (!idle) {
+			std::fprintf(stderr, "native shadow: stop: %s\n", m_submitter->QueueState({}).c_str());
+		}
+		if (m_ps5_regs != 0) {
+			// The helper would do it when the connection closes; here it shows in this log too.
+			std::lock_guard<std::mutex> l(m_ps5_mutex);
+			std::fprintf(stderr, "native shadow: %d PS5 registers put back (kyty-lodhw logs each)\n", m_ps5_hw.RestoreRegs());
+		}
+#else
+		(void)why;
+#endif
+	}
+
+private:
 	// KYTY_NATIVE_GPU_KFD_QUEUES=1: the compute rings become KFD user-mode queues, rung by doorbell
 	// like the PS5's compute queues. Their VMIDs (8-15, KFD's) get the same GDS partition as the CS jobs
 	// (base 0), which amdgpu leaves empty there; the kyty-lodhw helper writes it, as the PS5 kernel
@@ -2779,9 +2878,9 @@ private:
 	// CP past the wait for it. The CPU translates far ahead of the GPU (Stray: well over kStreamTramps
 	// chunks), so first it waits until the CP has left behind the chunk that last used this trampoline;
 	// overwritten early, the CP followed the newer chain and the gfx ring hung.
-	void PublishStreamLocked(uint32_t n, uint64_t va, size_t len) {
+	void PublishStreamLocked(uint32_t n, uint64_t va, size_t len, bool wait_for_cp = true) {
 		const auto* done = reinterpret_cast<const volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamDoneOffset);
-		if (n > kStreamTramps) {
+		if (n > kStreamTramps && wait_for_cp) {
 			const double t0 = NowSecShadow();
 			while (static_cast<int32_t>(*done - (n - kStreamTramps)) < 0) {
 				if (NowSecShadow() - t0 > m_timeout_sec) {
@@ -2874,7 +2973,7 @@ private:
 
 	void SubmitBufferLocked(std::vector<uint32_t>& batch, uint32_t slot) {
 #if KYTY_GEM_BACKING_SUPPORTED
-		if (batch.empty() || m_disabled || m_submitter == nullptr) {
+		if (batch.empty() || m_disabled || m_submitter == nullptr || m_stopping.load(std::memory_order_acquire)) {
 			batch.clear();
 			return;
 		}
@@ -3493,6 +3592,15 @@ private:
 				m_stream_breaks++;
 			}
 		});
+		{
+			volatile uint8_t* sc = m_submitter->ScratchCpu();
+			*reinterpret_cast<volatile uint32_t*>(sc + kExitAbortOffset) = 0;
+			*reinterpret_cast<volatile uint32_t*>(sc + kExitRunOffset)   = 1;
+			for (uint32_t i = 0; i < 8; i++) {
+				reinterpret_cast<volatile uint32_t*>(sc + kExitStubOffset)[i] = 0xffff1000u;
+			}
+			__sync_synchronize();
+		}
 		InitLodStatsHw();
 		InitPs5Regs();
 		InstallStopDrain();
@@ -3763,6 +3871,23 @@ private:
 	static constexpr uint32_t kStreamDoneOffset  = 2052; // the last chunk the CP has entered
 	static constexpr uint32_t kStreamTrampOffset = 2112;
 	static constexpr uint32_t kStreamTramps      = 60;
+	// Exit guards (Pm4Translator::SetExitGuard): the gfx ring's abort word (0 while the title runs), the
+	// compute rings' run word (1), and the empty IB a gfx guard chains to, past the trampolines.
+	static constexpr uint32_t kExitAbortOffset = 2056;
+	static constexpr uint32_t kExitRunOffset   = 2060;
+	static constexpr uint32_t kExitStubOffset  = 4064;
+	// The guest waits each emitted segment gives the GPU, until the GPU has passed the segment's end
+	// point (StopGpu releases those of the segments it has not).
+	struct ExitWaits {
+		uint32_t              slot    = 0;
+		uint64_t              end_seq = 0;
+		std::vector<WaitCond> waits;
+	};
+	std::mutex            m_exit_mutex;
+	std::deque<ExitWaits> m_exit_waits;
+	std::mutex            m_stop_mutex;
+	bool                  m_stopped = false;
+	std::atomic<bool>     m_stopping {false}; // nothing more is submitted, whoever holds m_mutex
 	// Per-ring batches and the last fence on each (KYTY_NATIVE_GPU_ACB_RINGS). Slot 0 is gfx.
 	struct SlotFence {
 		uint64_t seq     = 0;
@@ -4855,6 +4980,15 @@ private:
 			} else {
 				Shadow::Instance().AppendBatch(p.ib, slot);
 				m_appended = true;
+				// The waits the GPU now has, for a stop: the held wait when it stays, then the segment's own.
+				std::vector<WaitCond> waits;
+				if (p.seg.held && how == Release::Native) {
+					waits.push_back(p.seg.wait);
+				}
+				waits.insert(waits.end(), p.seg.gpu_waits.begin(), p.seg.gpu_waits.end());
+				if (!waits.empty() && !p.seg.points.empty()) {
+					Shadow::Instance().NoteExitWaits(slot, m_slot_seq[slot], std::move(waits));
+				}
 			}
 		}
 		for (uint64_t seq: m_relay) {
@@ -5265,6 +5399,10 @@ void ShadowSubmitAcb(const uint32_t* acb, uint32_t size_in_dwords) {
 		return;
 	}
 	Shadow::Instance().Submit(std::span<const uint32_t>(acb, size_in_dwords), true);
+}
+
+void ShadowStopGpu(const char* why) {
+	Shadow::Instance().StopGpu(why);
 }
 
 bool NativeAsyncCompute() {

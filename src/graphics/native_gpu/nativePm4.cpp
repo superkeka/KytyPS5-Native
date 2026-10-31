@@ -409,35 +409,7 @@ bool GuestWaitControlOk(uint32_t control) {
 	       ((control >> 8u) & 0x3u) <= 1u;
 }
 
-
-// Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
-// on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
-// the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
-struct NotedWait {
-	std::atomic<uint64_t> addr {0}; // written last: 0 while the entry is being filled
-	WaitCond              wait;
-};
-std::array<NotedWait, 512> g_noted_waits;
-std::atomic<uint32_t>      g_noted_next {0};
-
-void NoteGpuWait(const WaitCond& w) {
-	auto& e = g_noted_waits[g_noted_next.fetch_add(1, std::memory_order_relaxed) % g_noted_waits.size()];
-	e.addr.store(0, std::memory_order_relaxed);
-	e.wait = w;
-	e.addr.store(w.addr, std::memory_order_release);
-}
 } // namespace
-
-std::vector<WaitCond> RecentGpuWaits() {
-	std::vector<WaitCond> out;
-	for (const auto& e: g_noted_waits) {
-		const uint64_t addr = e.addr.load(std::memory_order_acquire);
-		if (addr != 0 && e.wait.addr == addr) {
-			out.push_back(e.wait);
-		}
-	}
-	return out;
-}
 
 uint64_t SatisfyingValue(const WaitCond& w, uint64_t current) {
 	const uint64_t ref = w.ref & w.mask;
@@ -453,6 +425,9 @@ uint64_t SatisfyingValue(const WaitCond& w, uint64_t current) {
 
 namespace {
 
+// Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
+// on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
+// the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
 bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) {
 	if (w.function != 3) {
 		return false;
@@ -470,8 +445,32 @@ bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) 
 		ib.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
 		ib.push_back(0);
 	}
-	NoteGpuWait(w);
 	return true;
+}
+
+// The gfx ring's exit guard (Pm4Translator::SetExitGuard): COND_EXEC on the abort word over a chain to
+// the empty IB. 9 dwords.
+void EmitGfxExitGuard(std::vector<uint32_t>& ib, uint64_t abort_va, uint64_t stub_va) {
+	ib.push_back(Pkt3(IT_COND_EXEC, 4, false));
+	ib.push_back(static_cast<uint32_t>(abort_va));
+	ib.push_back(static_cast<uint32_t>(abort_va >> 32u));
+	ib.push_back(0u);
+	ib.push_back(4u);
+	ib.push_back(Pkt3(IT_INDIRECT_BUFFER, 3, false));
+	ib.push_back(static_cast<uint32_t>(stub_va));
+	ib.push_back(static_cast<uint32_t>(stub_va >> 32u) & 0xffffu);
+	ib.push_back(8u | (1u << 20u) | (1u << 23u)); // 8 dwords, CHAIN, VALID
+}
+
+// A compute ring's exit guard: COND_EXEC on the run word; its EXEC_COUNT (the last dword, returned as an
+// offset into `ib`) is set once the IB is assembled.
+uint32_t EmitComputeExitGuard(std::vector<uint32_t>& ib, uint64_t run_va) {
+	ib.push_back(Pkt3(IT_COND_EXEC, 4, true));
+	ib.push_back(static_cast<uint32_t>(run_va));
+	ib.push_back(static_cast<uint32_t>(run_va >> 32u));
+	ib.push_back(0u);
+	ib.push_back(0u);
+	return static_cast<uint32_t>(ib.size()) - 1u;
 }
 
 // R_ZERO NOP payloads Kyty's command processor runs as flips (pm4Handlers.cpp CpOpMarker): a flip, a
@@ -697,9 +696,27 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				}
 				break;
 			// The translator's IB2 into the guest's buffer (SetDirectRuns): a call, not a chain, on the gfx
-			// ring. Its packets are the ones the translator passed on as written.
+			// ring. Its packets are the ones the translator passed on as written. A chain only as an exit
+			// guard's, which the COND_EXEC case takes with it.
 			case IT_INDIRECT_BUFFER:
 				if (compute || size != 4 || (b[2] & (1u << 20u)) != 0 || (b[2] & (1u << 23u)) == 0) {
+					return bad();
+				}
+				break;
+			// An exit guard (Pm4Translator::SetExitGuard). On the gfx ring over its chain to the empty IB, 8
+			// dwords; on MEC skipping what follows, no further than kExitGuardMaxSkip.
+			case IT_COND_EXEC:
+				if (size != 5 || b[2] != 0u || header != Pkt3(IT_COND_EXEC, 4, compute)) {
+					return bad();
+				}
+				if (!compute) {
+					const uint32_t* c = b + 4;
+					if (b[3] != 4u || dw + 9u > ib.size() || c[0] != Pkt3(IT_INDIRECT_BUFFER, 3, false) ||
+					    c[3] != (8u | (1u << 20u) | (1u << 23u))) {
+						return bad();
+					}
+					dw += 4u; // the chain
+				} else if (b[3] > kExitGuardMaxSkip || dw + size + b[3] > ib.size()) {
 					return bad();
 				}
 				break;
@@ -943,7 +960,11 @@ std::vector<std::pair<size_t, size_t>> SplitIbAtPackets(std::span<const uint32_t
 	while (dw < ib.size()) {
 		const uint32_t h = ib[dw];
 		// A type-3 header with count 0x3fff is the one-dword filler NOP; type-2 packets are one dword.
-		const size_t len = (h >> 30u) == 3u && h != 0xffff1000u ? ((h >> 16u) & 0x3fffu) + 2u : 1u;
+		size_t len = (h >> 30u) == 3u && h != 0xffff1000u ? ((h >> 16u) & 0x3fffu) + 2u : 1u;
+		// A COND_EXEC with the dwords it may skip is one piece: the skip must not reach past an IB's end.
+		if (len == 5u && ((h >> 8u) & 0xffu) == IT_COND_EXEC && dw + 4u < ib.size()) {
+			len += ib[dw + 4u];
+		}
 		if (len > max_dw) {
 			return {};
 		}
@@ -2225,6 +2246,25 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		seg_effects = false;
 	};
+	// Exit guards (SetExitGuard) after the guest waits this buffer gives the GPU. On a compute ring the
+	// body offsets of their EXEC_COUNT dwords, set at assembly, and where the stretch the next one ends began.
+	const bool            gfx_guards = m_exit_abort_va != 0 && m_exit_stub_va != 0 && !m_compute_ring;
+	const bool            cs_guards  = m_exit_run_va != 0 && m_compute_ring;
+	std::vector<uint32_t> body_guards;
+	size_t                guard_from = 0;
+	// `pfp_ahead`: the wait leaves the PFP parsing past it (an ME wait).
+	auto guard_after_wait = [&](bool pfp_ahead) {
+		if (gfx_guards) {
+			if (pfp_ahead) {
+				body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
+				body.push_back(0);
+			}
+			EmitGfxExitGuard(body, m_exit_abort_va, m_exit_stub_va);
+		} else if (cs_guards) {
+			body_guards.push_back(EmitComputeExitGuard(body, m_exit_run_va));
+			guard_from = body.size();
+		}
+	};
 	// Cuts the IB at a guest wait nobody known satisfies yet: the rest starts held, with its own
 	// preamble, a barrier block and the guest wait (the backend NOPs one of the two).
 	auto split_at_wait = [&](const WaitCond& w) {
@@ -2248,6 +2288,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		// wait is not what this packet reads.
 		if (label_gpu(w.addr, 4)) {
 			s.wait_len = EmitNativeWait(body, w, m_compute_ring) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
+		}
+		guard_from = body.size();
+		if (s.wait_len != 0) {
+			guard_after_wait(!w.pfp); // a PFP wait's native form ends with PFP_SYNC_ME
 		}
 		seg_effects = true;
 		stats.waits_split++;
@@ -2337,6 +2381,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	stats.total_dw = static_cast<uint32_t>(dcb.size());
 	while (dw < dcb.size()) {
+		// A compute ring's guards skip a few thousand dwords at most: one more before the next packet.
+		if (cs_guards && body.size() - guard_from > 3000u) {
+			body_guards.push_back(EmitComputeExitGuard(body, m_exit_run_va));
+			guard_from = body.size();
+		}
 		const size_t   body_before = body.size();
 		const size_t   segs_before = segs.size();
 		bool           in_place    = false; // passed on as written without a copy in body (direct runs)
@@ -2969,9 +3018,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					                        (m_compute_ring ? MecGuestWaitOk(bptr[0]) : m_waits_verbatim && GuestWaitControlOk(bptr[0]));
 					if (as_written) {
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-						NoteGpuWait(w);
 					}
 					const bool emitted = plan == LabelOracle::Plan::Native && (as_written || EmitNativeWait(body, w, m_compute_ring));
+					if (emitted) {
+						segs.back().gpu_waits.push_back(w);
+						guard_after_wait(!pfp);
+					}
 					if (timed) {
 						EmitClockCopy(body, wait_pair + 8);
 						m_time_wait_info[m_time_waits % m_time_pairs] = {addr, ref, stats.draws, met};
@@ -3719,6 +3771,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			Pm4Segment& s = segs[k];
 			s.begin       = static_cast<uint32_t>(r.ib.size());
+			if (gfx_guards) {
+				EmitGfxExitGuard(r.ib, m_exit_abort_va, m_exit_stub_va);
+			} else if (cs_guards) {
+				s.guards.push_back(EmitComputeExitGuard(r.ib, m_exit_run_va));
+			}
 			if (k == 0) {
 				if (m_no_preamble) {
 				} else if (m_preamble_from_start) {
@@ -3760,6 +3817,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			if (s.held) {
 				s.barrier_dw = move(s.barrier_dw);
 				s.wait_dw    = move(s.wait_dw);
+			}
+			if (cs_guards) {
+				// Each guard skips to the next one (a compute IB has no direct runs: body offsets only shift),
+				// the last to the end. A stretch too long for EXEC_COUNT keeps a guard that skips nothing.
+				for (uint32_t g: body_guards) {
+					if (g >= from && g < to) {
+						s.guards.push_back(move(g));
+					}
+				}
+				for (size_t i = 0; i < s.guards.size(); i++) {
+					const uint32_t until = i + 1 < s.guards.size() ? s.guards[i + 1] - 4u : s.end;
+					const uint32_t skip  = until - (s.guards[i] + 1u);
+					r.ib[s.guards[i]]    = skip <= kExitGuardMaxSkip ? skip : 0u;
+				}
 			}
 			r.segments.push_back(std::move(s));
 		}
