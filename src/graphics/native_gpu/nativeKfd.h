@@ -13,6 +13,8 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <span>
+#include <utility>
 
 #include <fcntl.h>
 #include <linux/kfd_ioctl.h>
@@ -161,7 +163,14 @@ public:
 	// Runs the `dwords` of IB at GPU VA `ib_va`, then writes the returned sequence number to the fence.
 	// False when the ring stayed full for `timeout_sec`.
 	bool Submit(uint64_t ib_va, uint32_t dwords, double timeout_sec, uint64_t* seq) {
-		constexpr uint32_t kPacket = 8 + 4 + 8; // ACQUIRE_MEM + INDIRECT_BUFFER + RELEASE_MEM
+		const std::pair<uint64_t, uint32_t> ib[1] = {{ib_va, dwords}};
+		return Submit(ib, timeout_sec, seq);
+	}
+	// One submission of several IBs run back to back (an ACB longer than a submitter slot, cut at packet
+	// boundaries), with one sequence for them all: the queue carries its state from one IB to the next as it
+	// does through one long IB.
+	bool Submit(std::span<const std::pair<uint64_t, uint32_t>> ibs, double timeout_sec, uint64_t* seq) {
+		const uint32_t     kPacket = 8 + 4 * static_cast<uint32_t>(ibs.size()) + 8; // ACQUIRE_MEM + INDIRECT_BUFFERs + RELEASE_MEM
 		const double       end     = Now() + timeout_sec;
 		while (m_wptr + kPacket - Rptr() > m_ring_dwords - 8) {
 			if (Now() > end) {
@@ -195,10 +204,12 @@ public:
 			Push(1u | (1u << 4u) | (1u << 5u) | (1u << 7u) | (1u << 8u) | (1u << 9u) | (1u << 14u) | (1u << 15u));
 		}
 		// INDIRECT_BUFFER: address (dword aligned), size and VALID; the queue's own VMID runs it.
-		Push(Pkt3(0x3f, 3));
-		Push(static_cast<uint32_t>(ib_va) & ~3u);
-		Push(static_cast<uint32_t>(ib_va >> 32u));
-		Push(dwords | (1u << 23u));
+		for (const auto& [ib_va, dwords]: ibs) {
+			Push(Pkt3(0x3f, 3));
+			Push(static_cast<uint32_t>(ib_va) & ~3u);
+			Push(static_cast<uint32_t>(ib_va >> 32u));
+			Push(dwords | (1u << 23u));
+		}
 		// RELEASE_MEM end of pipe, the 32-bit data written past the caches: the queue's own sequence, which
 		// only says the IB finished (its slot can be reused). With KYTY_NATIVE_GPU_KFD_IB_SYNC=1 amdgpu's
 		// fence form (CACHE_FLUSH_AND_INV_TS_EVENT, GLM and GL2 written back in sequence); else bottom of
