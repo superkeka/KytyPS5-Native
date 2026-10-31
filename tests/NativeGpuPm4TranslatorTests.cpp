@@ -2577,6 +2577,673 @@ void TestLodBankSources() {
 	Check(!s.banks.test(9), "a T# without MIP_STATS_CNT_EN is not a sampled bank");
 }
 
+// CP register shadowing (Pm4Translator::SetCpShadow).
+using Libs::Graphics::NativeGpu::CpShadowBatch;
+using Libs::Graphics::NativeGpu::CpShadowMode;
+using Libs::Graphics::NativeGpu::CpShadowPiece;
+using Libs::Graphics::NativeGpu::CpShadowTailOk;
+using Libs::Graphics::NativeGpu::EmitCpShadowOff;
+using Libs::Graphics::NativeGpu::kCpShadowBytes;
+using Libs::Graphics::NativeGpu::kCpShadowContextDw;
+using Libs::Graphics::NativeGpu::kCpShadowDwords;
+using Libs::Graphics::NativeGpu::kCpShadowOff;
+using Libs::Graphics::NativeGpu::kCpShadowShDw;
+using Libs::Graphics::NativeGpu::kCpShadowUconfigDw;
+using Libs::Graphics::NativeGpu::SetCpShadowValidation;
+
+constexpr uint64_t kTestShadowVa = 0x400003F80000ull; // where the backend puts S (NativeSubmitter::CpShadowVa)
+constexpr uint32_t IT_PFP_SYNC_ME = 0x42;
+constexpr uint32_t IT_LOAD_UC     = 0x5E;
+constexpr uint32_t IT_LOAD_SH     = 0x5F;
+constexpr uint32_t IT_LOAD_CX     = 0x61;
+
+using Regs = std::vector<std::pair<uint32_t, uint32_t>>;
+// libSceAgc's start state (Pm4Translator::LoadStartState) of a test.
+void Start(Pm4Translator& t, const Regs& cx, const Regs& sh, const Regs& uc) {
+	t.LoadStartState(cx, sh, uc);
+}
+
+// A toy gfx CP for CP shadowing: the registers of the three classes, S at kTestShadowVa in Mesa's layout,
+// CONTEXT_CONTROL's load and shadow enables, and a shadow base per class (context, UCONFIG, gfx SH, CS SH) that a
+// LOAD with that class's loading on sets. Every job starts without bases, which is stricter than the board, and
+// a shadowed write of a class without a base fails the test (on the board it goes near VA 0: a VM fault).
+// CLEAR_STATE CMD 0 resets the context to a fake clear state; any other command fails (it never reaches the GPU).
+// A COND_EXEC is false (no stop armed): the exit guards' chains are skipped.
+struct ToyCp {
+	enum Cls { kCtx = 0, kUc = 1, kGsh = 2, kCsh = 3 };
+	std::array<uint32_t, 0x400> cx {};
+	std::array<uint32_t, 0x400> sh {};
+	std::array<uint32_t, 0x400> uc {};
+	std::vector<uint32_t>       s = std::vector<uint32_t>(kCpShadowBytes / 4u, 0u);
+	uint32_t                    load   = 0;
+	uint32_t                    shadow = 0;
+	std::array<bool, 4>         base {};
+	uint32_t                    loads = 0; // LOADs that loaded
+
+	static uint32_t Bit(int c) { return c == kCtx ? 1u << 1u : c == kUc ? 1u << 15u : c == kGsh ? 1u << 16u : 1u << 24u; }
+	static uint32_t Region(int c) { return c == kCtx ? kCpShadowContextDw : c == kUc ? kCpShadowUconfigDw : kCpShadowShDw; }
+	static uint32_t Csb(uint32_t off) { return 0xc5b00000u | off; }
+	std::array<uint32_t, 0x400>& Regs(int c) { return c == kCtx ? cx : c == kUc ? uc : sh; }
+	void Write(int c, uint32_t off, uint32_t v) {
+		Check(off < 0x400u, "toy CP: a register below 0x400");
+		Regs(c)[off] = v;
+		if ((shadow & Bit(c)) != 0) {
+			Check(base[c], "a shadowed write has its class's base in this job (else a VM fault near VA 0)");
+			s[Region(c) + off] = v;
+		}
+	}
+	void Run(std::span<const uint32_t> ib) {
+		for (size_t dw = 0; dw < ib.size();) {
+			const uint32_t h = ib[dw];
+			Check((h >> 30u) == 3u, "toy CP: a type-3 packet");
+			const uint32_t size = PacketSizeDw(h);
+			Check(dw + size <= ib.size(), "toy CP: the packet fits");
+			const uint32_t  op = (h >> 8u) & 0xffu;
+			const uint32_t* b  = ib.data() + dw + 1;
+			const uint32_t  n  = size - 1u;
+			const bool      cs = (h & 2u) != 0;
+			switch (op) {
+				case IT_CONTEXT_CONTROL:
+					load   = (b[0] >> 31u) != 0 ? b[0] & 0x7fffffffu : load;
+					shadow = (b[1] >> 31u) != 0 ? b[1] & 0x7fffffffu : shadow;
+					break;
+				case IT_CLEAR_STATE:
+					Check(n >= 1 && b[0] == 0u, "toy CP: only CLEAR_STATE 0 reaches the GPU");
+					for (uint32_t i = 0; i < 0x400u; i++) {
+						cx[i] = Csb(i); // S untouched (probe shadow-pushpop)
+					}
+					break;
+				case IT_SET_CONTEXT_REG:
+					for (uint32_t i = 1; i < n; i++) {
+						Write(kCtx, (b[0] & 0xffffu) + i - 1u, b[i]);
+					}
+					break;
+				case IT_SET_SH_REG:
+					for (uint32_t i = 1; i < n; i++) {
+						Write(cs ? kCsh : kGsh, (b[0] & 0xffffu) + i - 1u, b[i]); // the class follows the header (probe shadow)
+					}
+					break;
+				case IT_SET_UCONFIG_REG:
+				case IT_SET_UCONFIG_REG_INDEX:
+					for (uint32_t i = 1; i < n; i++) {
+						Write(kUc, (b[0] & 0xffffu) + i - 1u, b[i]);
+					}
+					break;
+				case IT_SET_CONTEXT_REG_INDIRECT:
+				case IT_SET_SH_REG_INDIRECT:
+				case IT_SET_UCONFIG_REG_INDIRECT: {
+					const auto* pairs = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(b[1]) << 32u) | (b[0] & ~3u));
+					const int   c     = op == IT_SET_CONTEXT_REG_INDIRECT ? kCtx : op == IT_SET_UCONFIG_REG_INDIRECT ? kUc : (cs ? kCsh : kGsh);
+					for (uint32_t k = 0; k < (b[3] & 0x3fffu); k++) {
+						Write(c, pairs[2 * k] & 0xffffu, pairs[2 * k + 1]); // read when the CP gets here
+					}
+					break;
+				}
+				case IT_LOAD_UC:
+				case IT_LOAD_SH:
+				case IT_LOAD_CX: {
+					const int c = op == IT_LOAD_CX ? kCtx : op == IT_LOAD_UC ? kUc : (cs ? kCsh : kGsh);
+					if ((load & Bit(c)) == 0) {
+						break; // loading off: neither loads nor moves the base (probe shadow, SHADOW_LOAD=0)
+					}
+					const uint64_t va = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
+					Check(va == kTestShadowVa + 4ull * Region(c), "toy CP: a LOAD from its class's region of S");
+					base[c] = true;
+					loads++;
+					for (uint32_t i = 2; i + 1 < n; i += 2) {
+						for (uint32_t j = 0; j < b[i + 1]; j++) {
+							Check(b[i] + j < 0x400u, "toy CP: a LOAD range below 0x400");
+							Regs(c)[b[i] + j] = s[Region(c) + b[i] + j];
+						}
+					}
+					break;
+				}
+				case 0x3Fu: // INDIRECT_BUFFER: an IB2 call runs and comes back, a chain ends this IB
+					if ((b[2] & (1u << 20u)) != 0) {
+						return;
+					}
+					Run(std::span<const uint32_t>(reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(b[1]) << 32u) | b[0]),
+					                              b[2] & 0xfffffu));
+					break;
+				case 0x22u: // COND_EXEC: no stop armed, the dwords it guards are skipped
+					dw += b[3];
+					break;
+				default: break;
+			}
+			dw += size;
+		}
+	}
+	// One job of ours: no bases at its start, shadowing off at its end.
+	void Job(std::span<const uint32_t> ib) {
+		base = {};
+		Run(ib);
+		Check(shadow == 0u, "a job ends with shadowing off (else another process's SETs land at our VA)");
+	}
+	// gamescope between our jobs: RADV's preamble, then its own state.
+	void Foreign() {
+		std::vector<uint32_t> ib = {0xc0012800u, 0x80000000u, 0x80000000u, 0xc0001200u, 0u};
+		Append(ib, IT_SET_CONTEXT_REG, {0x10Fu, 0xdead0001u}, false);
+		Append(ib, IT_SET_SH_REG, {0x00Cu, 0xdead0002u}, false);
+		Append(ib, IT_SET_SH_REG, {0x240u, 0xdead0003u}, true);
+		Append(ib, IT_SET_UCONFIG_REG, {0x24Au, 0xdead0004u}, false);
+		Job(ib);
+	}
+	// S as the backend seeds it when CP shadowing comes on.
+	void Seed(const Pm4Translator& t) {
+		std::fill(s.begin(), s.end(), 0u);
+		t.WriteCpShadowImage(std::span<uint32_t>(s.data(), kCpShadowDwords));
+	}
+};
+
+// A job from a piece of ours: the piece and the end every gfx job gets.
+std::vector<uint32_t> AsJob(std::span<const uint32_t> piece) {
+	std::vector<uint32_t> job(piece.begin(), piece.end());
+	EmitCpShadowOff(job);
+	return job;
+}
+
+std::vector<uint32_t> Segment(const Pm4TranslateResult& r, size_t k) {
+	return std::vector<uint32_t>(r.ib.begin() + r.segments[k].begin, r.ib.begin() + r.segments[k].end);
+}
+
+// The LOAD ranges of the first LOAD of `op` (with the compute header when `cs`) in `pkts`, as (offset, count).
+std::vector<std::pair<uint32_t, uint32_t>> LoadRanges(const std::vector<Packet>& pkts, uint32_t op, bool cs) {
+	std::vector<std::pair<uint32_t, uint32_t>> out;
+	for (const auto& p: pkts) {
+		if (p.op == op && p.compute == cs) {
+			for (size_t i = 2; i + 1 < p.body.size(); i += 2) {
+				out.emplace_back(p.body[i], p.body[i + 1]);
+			}
+			break;
+		}
+	}
+	return out;
+}
+
+bool SetsReg(const std::vector<Packet>& pkts, uint32_t op, uint32_t off) {
+	for (const auto& p: pkts) {
+		if (p.op == op && !p.body.empty() && (p.body[0] & 0xffffu) <= off && off < (p.body[0] & 0xffffu) + p.body.size() - 1u) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The end of every gfx job, and the tail check the submitter runs on each one.
+void TestCpShadowExits() {
+	Check(kCpShadowOff[0] == Pkt3(IT_CONTEXT_CONTROL, 2, false) && kCpShadowOff[1] == 0x80000000u && kCpShadowOff[2] == 0x80000000u &&
+	          std::all_of(kCpShadowOff.begin() + 3, kCpShadowOff.end(), [](uint32_t v) { return v == 0xffff1000u; }),
+	      "the postamble, empty trampoline and exit stub: CONTEXT_CONTROL off/off and five fillers");
+	std::vector<uint32_t> ib;
+	Append(ib, IT_SET_CONTEXT_REG, {0x10u, 1u}, false);
+	Check(!CpShadowTailOk(ib) && !CpShadowTailOk({}), "an IB without the postamble is refused");
+	EmitCpShadowOff(ib);
+	Check(ib.size() == 11 && CpShadowTailOk(ib), "with it, it passes");
+	ib.push_back(0xffff1000u);
+	Check(CpShadowTailOk(ib), "padding after it too");
+	std::vector<uint32_t> chain = {0xc0053c00u, 0x115u, 0x1000u, 0u, 1u, ~0u, 4u, Pkt3(0x3Fu, 3, false), 0x2000u, 0x4000u, 8u | (1u << 20u) | (1u << 23u)};
+	Check(CpShadowTailOk(chain), "a stream head's wait and chain passes: its job ends where the stream does");
+	std::vector<uint32_t> guard = {Pkt3(0x22u, 4, false), 0x808u, 0x4000u, 0u, 4u, Pkt3(0x3Fu, 3, false), 0x1000u, 0x4000u,
+	                               8u | (1u << 20u) | (1u << 23u)};
+	Check(!CpShadowTailOk(guard), "an exit guard's chain does not: without a stop the IB goes on behind it");
+	std::vector<uint32_t> call = {Pkt3(0x3Fu, 3, false), 0x2000u, 0x4000u, 8u | (1u << 23u)};
+	Check(!CpShadowTailOk(call), "nor does an IB2 call");
+}
+
+// The shadow preamble: its packets in order, the LOAD runs from the copy's keys, what is SET instead, the anchors,
+// and the packet check.
+void TestCpShadowPreamble() {
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	// A buffer from an empty copy: every class LOADs its anchor.
+	std::vector<uint32_t> draw;
+	Append(draw, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto r0 = t.Translate(draw);
+	auto p0 = Decode(r0.ib);
+	Check(r0.ok && r0.cp_shadow && r0.stats.cp_shadow_anchors == 4 && LoadRanges(p0, IT_LOAD_UC, false) == decltype(LoadRanges(p0, 0, false)) {{0x24Au, 1u}} &&
+	          LoadRanges(p0, IT_LOAD_CX, false) == decltype(LoadRanges(p0, 0, false)) {{0x080u, 1u}} &&
+	          LoadRanges(p0, IT_LOAD_SH, false) == decltype(LoadRanges(p0, 0, false)) {{0x00Cu, 1u}} &&
+	          LoadRanges(p0, IT_LOAD_SH, true) == decltype(LoadRanges(p0, 0, false)) {{0x240u, 1u}},
+	      "a class without a key LOADs an anchor, so it has a base");
+	Start(t, {{0x10u, 1u}, {0x11u, 2u}, {0x12u, 3u}, {0x20u, 4u}, {0x310u, 0x5u}},
+	                 {{0x00Cu, 5u}, {0x00Du, 6u}, {0x00Eu, 7u}, {0x00Fu, 8u}, {0x007u, 9u}, {0x240u, 10u}, {0x216u, 0xffffu}, {0x280u, 1u}},
+	                 {{0x242u, 4u}, {0x24Au, 0u}, {0x24Bu, 1u}, {0x25Bu, 2u}});
+	auto r = t.Translate(draw);
+	Check(r.ok && r.cp_shadow && r.stats.cp_shadow_preambles == 1 && r.stats.cp_shadow_anchors == 0, "a shadow preamble");
+	const auto pkts = Decode(r.ib);
+	Check(pkts.size() >= 9 && pkts[0].op == IT_CONTEXT_CONTROL && pkts[0].body == std::vector<uint32_t>({0x80000000u, 0x80000000u}) &&
+	          pkts[1].op == IT_CLEAR_STATE && pkts[1].body[0] == 0u && pkts[2].op == IT_PFP_SYNC_ME && pkts[3].op == IT_CONTEXT_CONTROL &&
+	          pkts[3].body == std::vector<uint32_t>({0x81018002u, 0x81018002u}) && pkts[4].op == IT_LOAD_UC && !pkts[4].compute &&
+	          pkts[5].op == IT_LOAD_CX && pkts[6].op == IT_LOAD_SH && !pkts[6].compute && pkts[7].op == IT_LOAD_SH && pkts[7].compute,
+	      "shadowing off, CLEAR_STATE, PFP_SYNC_ME, the enables, then the four LOADs back to back");
+	Check(pkts[4].body[0] == static_cast<uint32_t>(kTestShadowVa + 0x9000u) && pkts[4].body[1] == 0x4000u &&
+	          pkts[5].body[0] == static_cast<uint32_t>(kTestShadowVa + 0x1000u) && pkts[6].body[0] == static_cast<uint32_t>(kTestShadowVa) &&
+	          pkts[7].body[0] == static_cast<uint32_t>(kTestShadowVa),
+	      "each LOAD names its class's region of S");
+	using Ranges = std::vector<std::pair<uint32_t, uint32_t>>;
+	Check(LoadRanges(pkts, IT_LOAD_UC, false) == Ranges({{0x24Au, 2u}, {0x25Bu, 1u}}) && LoadRanges(pkts, IT_LOAD_CX, false) == Ranges({{0x10u, 3u}, {0x20u, 1u}}) &&
+	          LoadRanges(pkts, IT_LOAD_SH, false) == Ranges({{0x00Cu, 4u}}) && LoadRanges(pkts, IT_LOAD_SH, true) == Ranges({{0x240u, 1u}}),
+	      "the keys in runs, SH split at 0x200, the registers S does not restore left out");
+	Check(r.stats.cp_shadow_load_regs == 3 + 4 + 4 + 1 && r.stats.cp_shadow_load_dw == 7 + 7 + 5 + 5, "LOAD counts");
+	Check(!SetsReg(pkts, IT_SET_CONTEXT_REG, 0x10u) && !SetsReg(pkts, IT_SET_SH_REG, 0x00Cu) && !SetsReg(pkts, IT_SET_SH_REG, 0x240u) &&
+	          !SetsReg(pkts, IT_SET_UCONFIG_REG, 0x24Au),
+	      "no SET of a register it LOADs");
+	bool rsrc3 = false, mgmt = false, nop = false, prim = false, sc = false;
+	size_t first_set = pkts.size();
+	for (size_t i = 0; i < pkts.size(); i++) {
+		const auto& p = pkts[i];
+		if (p.op == IT_SET_CONTEXT_REG || p.op == IT_SET_SH_REG || p.op == IT_SET_UCONFIG_REG || p.op == IT_SET_UCONFIG_REG_INDEX) {
+			first_set = std::min(first_set, i);
+		}
+		rsrc3 = rsrc3 || (p.op == IT_SET_SH_REG && !p.compute && p.body == std::vector<uint32_t>({0x007u, 9u}));
+		mgmt  = mgmt || (p.op == IT_SET_SH_REG && p.compute && p.body == std::vector<uint32_t>({0x216u, 0xffffu}));
+		nop   = nop || (p.op == IT_SET_SH_REG && p.compute && p.body == std::vector<uint32_t>({0x280u, 1u}));
+		prim  = prim || (p.op == IT_SET_UCONFIG_REG_INDEX && p.body == std::vector<uint32_t>({0x10000242u, 4u}));
+		sc    = sc || (p.op == IT_SET_CONTEXT_REG && p.body == std::vector<uint32_t>({0x310u, 5u}));
+	}
+	Check(rsrc3 && mgmt && nop && prim && sc && first_set > 7, "RSRC3, STATIC_THREAD_MGMT, SH 0x280, the INDEX form and "
+	                                                         "PA_SC_SHADER_CONTROL are SET, after the LOADs");
+	Check(r.stats.preamble_cx == 1 && r.stats.preamble_sh == 3 && r.stats.preamble_uc == 1, "only those are counted as SETs");
+	// The packet check: LOADs and the enables only from the registered S, on the gfx ring.
+	uint32_t bad = 0;
+	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx) && ((r.ib[bad] >> 8u) & 0xffu) == IT_CONTEXT_CONTROL,
+	      "no shadow buffer registered: the shadowing CONTEXT_CONTROL is refused");
+	SetCpShadowValidation(kTestShadowVa);
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "registered: the shadow preamble passes on the gfx ring");
+	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "and not on a compute ring");
+	SetCpShadowValidation(kTestShadowVa + 0x100000u);
+	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx) && ((r.ib[bad] >> 8u) & 0xffu) == IT_LOAD_UC, "nor from another S");
+	SetCpShadowValidation(kTestShadowVa);
+	auto rejects = [&](std::vector<uint32_t> ib, const char* what) {
+		uint32_t at = ~0u;
+		Check(!ValidateNativeIb(ib, false, &at, NativeIbKind::Gfx) && at == 0u, what);
+	};
+	const uint32_t sh_lo = static_cast<uint32_t>(kTestShadowVa), cx_lo = sh_lo + 0x1000u;
+	rejects({Pkt3(IT_LOAD_CX, 4, false), cx_lo, 0x4000u, 0x3F0u, 0x20u}, "a LOAD range past 0x400 is refused");
+	rejects({Pkt3(IT_LOAD_CX, 4, false), cx_lo, 0x4000u, 0x10u, 0u}, "an empty range is refused");
+	rejects({Pkt3(IT_LOAD_CX, 2, false), cx_lo, 0x4000u}, "a LOAD without ranges is refused");
+	rejects({Pkt3(IT_LOAD_SH, 4, true), sh_lo, 0x4000u, 0x00Cu, 1u}, "LOAD_SH with the compute header below 0x200 is refused");
+	rejects({Pkt3(IT_LOAD_SH, 4, false), sh_lo, 0x4000u, 0x1F0u, 0x20u}, "LOAD_SH with the graphics header past 0x200 is refused");
+	rejects({Pkt3(IT_LOAD_CX, 4, true), cx_lo, 0x4000u, 0x10u, 1u}, "LOAD_CONTEXT_REG with the compute header is refused");
+	rejects({Pkt3(IT_CONTEXT_CONTROL, 2, false), 0x80018003u, 0x80018003u}, "any other CONTEXT_CONTROL is refused");
+	SetCpShadowValidation(0);
+}
+
+// S's seed: every key below 0x400 at its place, with the values the IB writes.
+void TestCpShadowImage() {
+	Pm4Translator t;
+	t.SetNoCmaskClear(true, 0x10u); // MRT4 without DCC loses FAST_CLEAR
+	Start(t, {{0x358u, (1u << 13u) | 0x40u}, {0x10u, 3u}}, {{0x00Cu, 5u}, {0x241u, 6u}}, {{0x24Au, 7u}});
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x410u, 9u}, false); // above the dense range
+	Check(t.Translate(dcb).ok, "a buffer with a context register above 0x400");
+	std::vector<uint32_t> s(kCpShadowDwords, 0u);
+	t.WriteCpShadowImage(s);
+	Check(s[kCpShadowContextDw + 0x358u] == 0x40u && s[kCpShadowContextDw + 0x10u] == 3u, "context at S + 0x1000, PatchContext applied");
+	Check(s[kCpShadowShDw + 0x00Cu] == 5u && s[kCpShadowShDw + 0x241u] == 6u && s[kCpShadowUconfigDw + 0x24Au] == 7u,
+	      "SH at S + 0, compute SH in the same region, UCONFIG at S + 0x9000");
+	uint32_t nonzero = 0;
+	for (uint32_t v: s) {
+		nonzero += v != 0 ? 1u : 0u;
+	}
+	Check(nonzero == 5, "nothing else, offsets of 0x400 and up included");
+}
+
+// The Demon's Souls mechanism: a verbatim table the title fills after the buffer was translated. The CP runs
+// what the table holds by then; the next buffer's restore takes it from S in load mode, and today's replay of
+// the copy (record and off) puts the translate-time value back.
+void TestCpShadowLateTable() {
+	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Record, CpShadowMode::Off}) {
+		Pm4Translator t;
+		t.SetCpShadow(mode == CpShadowMode::Off ? 0u : kTestShadowVa, mode);
+		Start(t, {{0x10Fu, 0x11u}}, {}, {});
+		ToyCp cp;
+		cp.Seed(t);
+		std::vector<uint32_t> pairs = {0x10Fu, 0xAu}; // PA_CL_VPORT_XSCALE = A when translated
+		std::vector<uint32_t> dcb1;
+		AppendIndirect(dcb1, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+		Append(dcb1, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+		auto r1 = t.Translate(dcb1);
+		Check(r1.ok && r1.stats.loads_verbatim == 1, "the table runs as written");
+		pairs[1] = 0xBu; // filled behind a GPU gate, after the translation
+		cp.Job(AsJob(r1.ib));
+		Check(cp.cx[0x10F] == 0xBu, "the CP draws with what the table holds when it runs");
+		Check(mode == CpShadowMode::Off || cp.s[kCpShadowContextDw + 0x10Fu] == 0xBu, "and shadows it");
+		cp.Foreign();
+		std::vector<uint32_t> dcb2;
+		Append(dcb2, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+		auto r2 = t.Translate(dcb2);
+		cp.Job(AsJob(r2.ib));
+		Check(cp.cx[0x10F] == (mode == CpShadowMode::Load ? 0xBu : 0xAu),
+		      mode == CpShadowMode::Load ? "load mode: the next buffer restores the GPU's value from S"
+		                                 : "record and off: the copy's replay restores the stale value, as today");
+	}
+}
+
+// Record mode: the CP keeps S, the copy still restores every register as before.
+void TestCpShadowRecord() {
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Record);
+	Start(t, {{0x10u, 1u}, {0x11u, 2u}}, {{0x00Cu, 5u}, {0x240u, 6u}}, {{0x24Au, 7u}});
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x12u, 3u}, false);
+	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto       r    = t.Translate(dcb);
+	const auto pkts = Decode(r.ib);
+	Check(r.ok && FindFirst(pkts, IT_LOAD_CX) != nullptr && SetsReg(pkts, IT_SET_CONTEXT_REG, 0x10u) && SetsReg(pkts, IT_SET_SH_REG, 0x00Cu) &&
+	          SetsReg(pkts, IT_SET_SH_REG, 0x240u) && SetsReg(pkts, IT_SET_UCONFIG_REG, 0x24Au),
+	      "the LOADs, then today's replay of every key");
+	// Today's state choice: a whole buffer's head replays the state where it ends.
+	Check(r.stats.preamble_cx == 3 && LoadRanges(pkts, IT_LOAD_CX, false) == decltype(LoadRanges(pkts, 0, false)) {{0x10u, 3u}},
+	      "a whole buffer: the end state, as today");
+	ToyCp cp;
+	cp.Seed(t);
+	cp.Job(AsJob(r.ib));
+	Check(cp.cx[0x10] == 1u && cp.cx[0x12] == 3u && cp.sh[0x240] == 6u && cp.uc[0x24A] == 7u && cp.s[kCpShadowContextDw + 0x12u] == 3u,
+	      "the registers end where they do today, and S follows");
+}
+
+// Held segments restore the keys at the cut from S.
+void TestCpShadowHeldSegment() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	static uint32_t       label = 0;
+	std::vector<uint32_t> pairs = {0x00Cu, 0xAu};
+	std::vector<uint32_t> dcb;
+	AppendIndirect(dcb, IT_SET_SH_REG_INDIRECT, pairs, 0x80000000u);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendWait(dcb, reinterpret_cast<uint64_t>(&label), 1);
+	Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+	ToyCp cp;
+	cp.Seed(t);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 2 && r.segments[0].cp_shadow_head && r.segments[1].held && r.segments[1].cp_shadow_head,
+	      "both segments start with a shadow preamble");
+	const auto held = Decode(Segment(r, 1));
+	Check(LoadRanges(held, IT_LOAD_SH, false) == decltype(LoadRanges(held, 0, false)) {{0x00Cu, 1u}}, "the held one LOADs the keys at the cut");
+	pairs[1] = 0xBu;
+	cp.Job(AsJob(Segment(r, 0)));
+	cp.Foreign();
+	cp.Job(AsJob(Segment(r, 1)));
+	Check(cp.sh[0x00C] == 0xBu, "after another process ran, the held segment restores the GPU's value");
+}
+
+// A first segment that only writes registers stays: a LOAD from S would not see its writes otherwise.
+void TestCpShadowKeepsFirstSegment() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	static uint32_t       label = 0;
+	std::vector<uint32_t> first;
+	Append(first, IT_SET_SH_REG, {0x240u, 0x33u}, true);
+	AppendWait(first, reinterpret_cast<uint64_t>(&label), 1);
+	Append(first, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	ToyCp cp;
+	cp.Seed(t);
+	auto r = t.Translate(first);
+	Check(r.ok && r.segments.size() == 2 && !r.segments[0].held && r.segments[1].held, "the register-only first segment is kept");
+	cp.Job(AsJob(Segment(r, 0)));
+	cp.Foreign();
+	cp.Job(AsJob(Segment(r, 1)));
+	Check(cp.sh[0x240] == 0x33u, "and its write reaches the GPU and S");
+}
+
+// A streamed chunk has no preamble; its resume is the one it would have had, and the batch puts it in front only
+// where the chunk does not carry on from a job of ours with shadowing on.
+void TestCpShadowResume() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	Start(t, {{0x10u, 1u}}, {{0x00Cu, 2u}}, {{0x24Au, 3u}});
+	static uint32_t       label = 0;
+	std::vector<uint32_t> chunk;
+	Append(chunk, IT_SET_CONTEXT_REG, {0x11u, 4u}, false);
+	Append(chunk, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	AppendWait(chunk, reinterpret_cast<uint64_t>(&label), 1);
+	Append(chunk, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	t.SetPreambleFromStart(true);
+	t.SetNoPreamble(true);
+	auto r = t.Translate(chunk);
+	t.SetNoPreamble(false);
+	t.SetPreambleFromStart(false);
+	const auto seg0 = Decode(Segment(r, 0));
+	Check(r.ok && r.segments.size() == 2 && !r.segments[0].cp_shadow_head && FindFirst(seg0, IT_CONTEXT_CONTROL) == nullptr &&
+	          r.segments[1].cp_shadow_head,
+	      "no preamble in the first segment, the held one keeps its own");
+	const auto res = Decode(r.cp_shadow_resume);
+	Check(res.size() == 8 && res[3].op == IT_CONTEXT_CONTROL && LoadRanges(res, IT_LOAD_CX, false) == decltype(LoadRanges(res, 0, false)) {{0x10u, 1u}},
+	      "the resume restores the state where the chunk starts");
+	Check((r.cp_shadow_resume.size() & 7u) == 0, "in whole 8-dword units, as the pieces it goes in front of");
+	Check(r.stats.cp_shadow_preambles == 1, "only the held segment's preamble is in the IB");
+
+	// The batch rules.
+	const std::vector<uint32_t> head = AsJob(std::span<const uint32_t>(r.cp_shadow_resume)); // an own piece with a head
+	const std::vector<uint32_t> foreign = {0xc0012800u, 0x80000000u, 0x80000000u, 0xc0001200u, 0u, Pkt3(IT_SET_SH_REG, 2, true), 0x241u, 0xdeadu};
+	const std::vector<uint32_t> piece   = Segment(r, 0);
+	const CpShadowPiece         own_head {true, true, {}};
+	const CpShadowPiece         own_cont {true, false, r.cp_shadow_resume};
+	const CpShadowPiece         other {false, false, {}};
+	{
+		CpShadowBatch         b;
+		std::vector<uint32_t> batch;
+		b.Append(batch, head, own_head);
+		b.Append(batch, foreign, other);
+		Check(batch.size() == head.size() + 8 + foreign.size() && std::equal(kCpShadowOff.begin(), kCpShadowOff.end(), batch.begin() + head.size()) &&
+		          b.guards == 1,
+		      "shadowing off in front of another translator's piece");
+		const size_t at = batch.size();
+		b.Append(batch, piece, own_cont);
+		Check(batch.size() == at + r.cp_shadow_resume.size() + piece.size() && b.resumes == 1 && b.EndOn(false) &&
+		          std::equal(r.cp_shadow_resume.begin(), r.cp_shadow_resume.end(), batch.begin() + at),
+		      "and the resume in front of a chunk of ours after it");
+		Check(b.Front(false, false).empty(), "nothing kept for the flush");
+		ToyCp cp;
+		cp.Seed(t);
+		cp.Job(AsJob(batch));
+		Check(cp.sh[0x241] == 0xdeadu && cp.s[kCpShadowShDw + 0x241u] == 0u && cp.cx[0x11] == 4u && cp.cx[0x10] == 1u,
+		      "on the CP: the foreign piece's SET is not shadowed, the chunk runs with its state restored");
+	}
+	{
+		CpShadowBatch         b;
+		std::vector<uint32_t> batch;
+		b.Append(batch, piece, own_cont);
+		Check(batch.size() == piece.size() && b.Extra(own_head) == r.cp_shadow_resume.size(), "at the front the resume is kept");
+		Check(b.Front(true, true).empty(), "a stream part that carries on with shadowing on needs none");
+		Check(b.Front(true, false).size() == r.cp_shadow_resume.size() && b.Front(false, false).size() == r.cp_shadow_resume.size(),
+		      "after a stream break, or as a CS of its own, the resume goes first");
+		std::vector<uint32_t> job(b.Front(false, false).begin(), b.Front(false, false).end());
+		job.insert(job.end(), batch.begin(), batch.end());
+		ToyCp cp;
+		cp.Seed(t);
+		cp.Job(AsJob(job));
+		Check(cp.cx[0x11] == 4u, "a CS that starts with a chunk of ours runs it with every base set");
+		b.Reset();
+		Check(b.Empty() && b.Front(false, false).empty(), "a flushed batch keeps nothing");
+	}
+	{
+		CpShadowBatch         b;
+		std::vector<uint32_t> batch;
+		b.Append(batch, foreign, other);
+		Check(batch.size() == 8 + foreign.size() && !b.EndOn(true), "a foreign piece at the front gets shadowing off first");
+		b.HoldsForeign();
+		b.Append(batch, foreign, other);
+		Check(batch.size() == 8 + 2 * foreign.size(), "but not again while it is off");
+	}
+}
+
+// After a title's CLEAR_STATE 0 the keys are the defaults: a register outside them keeps the clear state.
+void TestCpShadowClearState() {
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load, Libs::Graphics::NativeGpu::kCpShadowClasses, true);
+	Start(t, {{0x10u, 1u}}, {}, {});
+	ToyCp cp;
+	cp.Seed(t);
+	std::vector<uint32_t> dcb1;
+	Append(dcb1, IT_SET_CONTEXT_REG, {0x30u, 5u}, false);
+	dcb1.insert(dcb1.end(), {0xc0001200u, 0u});
+	Append(dcb1, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto r1 = t.Translate(dcb1);
+	const auto p1 = Decode(r1.ib);
+	size_t clear = 0, rearm = 0;
+	for (size_t i = 0; i < p1.size(); i++) {
+		if (p1[i].op == IT_CLEAR_STATE) {
+			clear = i; // the title's is the last one
+		}
+	}
+	rearm = clear + 1;
+	Check(r1.ok && rearm < p1.size() && p1[rearm].op == IT_CONTEXT_CONTROL && p1[rearm].body == std::vector<uint32_t>({0x81018002u, 0x81018002u}),
+	      "KYTY_NATIVE_GPU_CP_SHADOW_REARM: the enables again right after the title's CLEAR_STATE");
+	cp.Job(AsJob(r1.ib));
+	Check(cp.s[kCpShadowContextDw + 0x30u] == 5u && cp.cx[0x30] == ToyCp::Csb(0x30u), "the clear resets the register, S keeps the SET");
+	cp.Foreign();
+	std::vector<uint32_t> dcb2;
+	Append(dcb2, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto r2 = t.Translate(dcb2);
+	Check(LoadRanges(Decode(r2.ib), IT_LOAD_CX, false) == decltype(LoadRanges(p1, 0, false)) {{0x10u, 1u}}, "the next restore LOADs the defaults only");
+	cp.Job(AsJob(r2.ib));
+	Check(cp.cx[0x30] == ToyCp::Csb(0x30u) && cp.cx[0x10] == 1u, "so the cleared register stays at the clear state, as today");
+}
+
+// A compute ring never shadows: MEC has no CONTEXT_CONTROL.
+void TestCpShadowComputeRing() {
+	Pm4Translator t;
+	t.SetComputeQueue(true);
+	t.SetComputeRing(true);
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	std::vector<uint32_t> acb;
+	Append(acb, IT_SET_SH_REG, {0x240u, 0x11u}, true);
+	Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	t.Translate(acb);
+	auto       r    = t.Translate(acb);
+	const auto pkts = Decode(r.ib);
+	Check(r.ok && !r.cp_shadow && t.CpShadow() == CpShadowMode::Off && FindFirst(pkts, IT_CONTEXT_CONTROL) == nullptr &&
+	          FindFirst(pkts, IT_LOAD_SH) == nullptr && r.stats.preamble_sh == 1,
+	      "the compute-ring translator keeps its SH replay");
+}
+
+// KYTY_NATIVE_GPU_CP_SHADOW_CLASSES: a class left out is replayed from the copy after the LOADs (which it still gets).
+void TestCpShadowClasses() {
+	using namespace Libs::Graphics::NativeGpu;
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load, kCpShadowGfxSh | kCpShadowCsSh | kCpShadowUconfig);
+	Start(t, {{0x10u, 1u}, {0x11u, 2u}}, {{0x00Cu, 5u}}, {{0x24Au, 7u}});
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto       r    = t.Translate(dcb);
+	const auto pkts = Decode(r.ib);
+	Check(r.ok && FindFirst(pkts, IT_LOAD_CX) != nullptr && SetsReg(pkts, IT_SET_CONTEXT_REG, 0x10u) && SetsReg(pkts, IT_SET_CONTEXT_REG, 0x11u) &&
+	          !SetsReg(pkts, IT_SET_SH_REG, 0x00Cu) && !SetsReg(pkts, IT_SET_UCONFIG_REG, 0x24Au),
+	      "context from the replay, the rest from S");
+}
+
+// The checker: S against the copy, by who last wrote each register.
+void TestCpShadowCompare() {
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Record);
+	Start(t, {{0x20u, 2u}}, {{0x007u, 3u}}, {});
+	std::vector<uint32_t> pairs = {0x10Fu, 0xAu};
+	std::vector<uint32_t> dcb;
+	AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+	Append(dcb, IT_SET_SH_REG, {0x007u, 4u}, false);
+	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	ToyCp cp;
+	cp.Seed(t);
+	auto r = t.Translate(dcb);
+	pairs[1] = 0xBu; // late
+	cp.Job(AsJob(r.ib));
+	std::vector<uint32_t> s(cp.s.begin(), cp.s.begin() + kCpShadowDwords);
+	s[kCpShadowShDw + 0x007u]      = 3u;          // as if the CP did not shadow the SET of RSRC3
+	s[kCpShadowContextDw + 0x20u]  = 0x99u;       // a register the translator saw no write of since the seed
+	s[kCpShadowContextDw + 0x150u] = 0x77u;       // one only a late table wrote
+	s[kCpShadowUconfigDw + 0x24Eu] = 0x1234u;     // the tess ring the preamble writes
+	const auto c = t.CompareCpShadow(s, nullptr);
+	Check(c.late == 1 && c.unshadowed == 1 && c.unseen == 1 && c.outside == 1 && c.keys == 3 && c.equal == 0,
+	      "a late table, a write not shadowed, an unseen write and a register outside the keys");
+	std::vector<uint32_t> same(cp.s.begin(), cp.s.begin() + kCpShadowDwords);
+	same[kCpShadowContextDw + 0x10Fu] = 0xAu;
+	const auto c2 = t.CompareCpShadow(same, nullptr);
+	Check(c2.keys == 3 && c2.equal == 3 && c2.outside == 0, "S that matches the copy");
+}
+
+// Load mode: a whole buffer's head restores the state where the buffer starts, as on the PS5, not the
+// registers the same buffer sets later (today's replay of the end state).
+void TestCpShadowStartKeys() {
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	Start(t, {{0x20u, 2u}}, {}, {});
+	ToyCp cp;
+	cp.Seed(t);
+	std::vector<uint32_t> dcb1;
+	Append(dcb1, IT_SET_CONTEXT_REG, {0x10u, 0x11u}, false);
+	Append(dcb1, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto r1 = t.Translate(dcb1);
+	using Ranges = std::vector<std::pair<uint32_t, uint32_t>>;
+	Check(r1.ok && LoadRanges(Decode(r1.ib), IT_LOAD_CX, false) == Ranges({{0x20u, 1u}}), "the first buffer LOADs the start keys only");
+	cp.Job(AsJob(r1.ib));
+	cp.Foreign();
+	std::vector<uint32_t> dcb2;
+	Append(dcb2, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	Append(dcb2, IT_SET_CONTEXT_REG, {0x30u, 0x33u}, false);
+	Append(dcb2, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto r2 = t.Translate(dcb2);
+	Check(r2.ok && LoadRanges(Decode(r2.ib), IT_LOAD_CX, false) == Ranges({{0x10u, 1u}, {0x20u, 1u}}),
+	      "the next one LOADs the keys the previous buffer left, not 0x30 it sets itself");
+	cp.Job(AsJob(r2.ib));
+	Check(cp.cx[0x10] == 0x11u && cp.cx[0x20] == 2u && cp.cx[0x30] == 0x33u && cp.s[kCpShadowContextDw + 0x30u] == 0x33u,
+	      "after another process ran: the earlier registers from S, the new one from its SET");
+}
+
+// libSceAgc's push/pop stays on the CPU with CP shadowing: no PUSH_STATE / POP_STATE reaches the GPU, the only
+// CONTEXT_CONTROLs are the preamble's, and the pop's SET is shadowed like any other.
+void TestCpShadowPushPopCpu() {
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	static uint32_t flags[2] = {0, 1};
+	const uint64_t  fa       = reinterpret_cast<uint64_t>(flags);
+	auto            piece    = [&](std::vector<uint32_t>& d, uint32_t op) {
+        const uint64_t f = fa + (op == 1 ? 0u : 4u);
+        d.insert(d.end(), {0xc0032200u, static_cast<uint32_t>(f), static_cast<uint32_t>(f >> 32u), 0u, 8u});
+        d.insert(d.end(), {0xc0064900u, 0x28u | (5u << 8u) | (3u << 25u), (1u << 16u) | (4u << 24u), 0u, 0u, 0u, 0u, 0x08100000u | op});
+	};
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x10u, 0x1111u}, false);
+	piece(dcb, 1);
+	dcb.insert(dcb.end(), {0xc0012800u, 0u, 0x80018001u, 0xc0001200u, 1u});
+	Append(dcb, IT_SET_CONTEXT_REG, {0x10u, 0x2222u}, false);
+	dcb.insert(dcb.end(), {0xc0012800u, 0u, 0x80018003u});
+	piece(dcb, 2);
+	dcb.insert(dcb.end(), {0xc0001200u, 2u});
+	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	Start(t, {{0x10u, 0u}}, {}, {});
+	ToyCp cp;
+	cp.Seed(t);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.context_ops == 2, "push and pop done on the CPU");
+	uint32_t controls = 0;
+	for (const auto& p: Decode(r.ib)) {
+		if (p.op == IT_CONTEXT_CONTROL) {
+			controls++;
+			Check(p.body == std::vector<uint32_t>({0x80000000u, 0x80000000u}) || p.body == std::vector<uint32_t>({0x81018002u, 0x81018002u}),
+			      "only the preamble's two CONTEXT_CONTROLs, never the title's");
+		}
+	}
+	Check(controls == 2, "one shadow preamble");
+	SetCpShadowValidation(kTestShadowVa);
+	Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "the packet check takes it");
+	SetCpShadowValidation(0);
+	cp.Job(AsJob(r.ib)); // the toy CP fails on a CLEAR_STATE other than 0
+	Check(cp.cx[0x10] == 0x1111u && cp.s[kCpShadowContextDw + 0x10u] == 0x1111u, "the pop's SET reaches the register and S");
+}
+
 int main() {
 	// The cases count the packets a DCB turns into; the preamble's start values (PIXEL_PIPE_STAT_CONTROL,
 	// the CP draw state) are board settings with their own switches, left out here.
@@ -2643,6 +3310,20 @@ int main() {
 	TestLodUsageReport();
 	TestLodStatsHandoff();
 	TestLodBankSources();
+	TestCpShadowExits();
+	TestCpShadowPreamble();
+	TestCpShadowImage();
+	TestCpShadowLateTable();
+	TestCpShadowRecord();
+	TestCpShadowHeldSegment();
+	TestCpShadowKeepsFirstSegment();
+	TestCpShadowResume();
+	TestCpShadowClearState();
+	TestCpShadowComputeRing();
+	TestCpShadowClasses();
+	TestCpShadowCompare();
+	TestCpShadowStartKeys();
+	TestCpShadowPushPopCpu();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }

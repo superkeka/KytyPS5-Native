@@ -56,6 +56,11 @@ constexpr uint32_t IT_SET_SH_REG               = 0x76;
 constexpr uint32_t IT_SET_UCONFIG_REG          = 0x79;
 constexpr uint32_t IT_SET_UCONFIG_REG_INDEX    = 0x7A;
 constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT = 0x9F;
+// CP register shadowing (SetCpShadow): the registers of each range back from the shadow buffer, which also
+// sets the class's shadow base (only with that class's load enable on).
+constexpr uint32_t IT_LOAD_UCONFIG_REG         = 0x5E;
+constexpr uint32_t IT_LOAD_SH_REG              = 0x5F;
+constexpr uint32_t IT_LOAD_CONTEXT_REG         = 0x61;
 
 // IT_NOP marker codes carried in the register field (Kyty custom codes in pm4.h).
 constexpr uint32_t R_ZERO           = 0x00;
@@ -177,6 +182,8 @@ void EmitSet(std::vector<uint32_t>& ib, uint32_t op, uint32_t offset, uint32_t v
 std::atomic<uint64_t> g_tf_ring_base {0};
 std::atomic<uint32_t> g_tf_ring_bytes {0};
 std::atomic<uint32_t> g_hs_offchip_param {0};
+// SetCpShadowValidation: the shadow buffer LOAD_*_REG may name (0: none).
+std::atomic<uint64_t> g_cp_shadow_va {0};
 
 void EmitSetUconfig(std::vector<uint32_t>& ib, uint32_t offset, uint32_t value) {
 	switch (offset) {
@@ -501,6 +508,78 @@ bool IsWork(uint32_t op) {
 	}
 }
 
+// What a shadow preamble restores with LOAD_*_REG (Pm4Translator::SetCpShadow); the rest of the copy is SET.
+// PA_SC_SHADER_CONTROL takes the PS5's RCIU CAM override, which may not apply to a LOAD's writes.
+bool CpShadowLoadsContext(uint32_t off) {
+	return off < RegFile::kDense && off != kPaScShaderControl;
+}
+// PAL never shadows RSRC4/RSRC3 of PS, VS, GS and HS nor COMPUTE_STATIC_THREAD_MGMT_SE0..3 (unverified here: the
+// checker shows it), and SH 0x280 is the guest's NOP.
+bool CpShadowLoadsSh(uint32_t off) {
+	switch (off) {
+		case 0x001:
+		case 0x007:
+		case 0x041:
+		case 0x046:
+		case 0x081:
+		case 0x087:
+		case 0x101:
+		case 0x107:
+		case 0x216:
+		case 0x217:
+		case 0x219:
+		case 0x21A:
+		case kShNop: return false;
+		default: return off < RegFile::kDense;
+	}
+}
+// The CP keeps its own VGT_PRIMITIVE_TYPE and VGT_INDEX_TYPE, which only SET_UCONFIG_REG_INDEX updates.
+bool CpShadowLoadsUconfig(uint32_t off) {
+	return off < RegFile::kDense && off != 0x242u && off != 0x243u;
+}
+
+// LOAD_*_REG from S's region at `base` of the keys of `regs` in [lo, hi) that `loads` takes, in runs. A class
+// with none LOADs `anchor` (value 0 unless the GPU wrote it): the CP takes a class's base only from a LOAD that
+// loads, and a shadowed write through a base this job never set goes near VA 0 (a VM fault).
+void EmitCpShadowLoad(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, uint32_t op, bool compute, uint64_t base, const RegFile& regs,
+                      uint32_t lo, uint32_t hi, bool (*loads)(uint32_t), uint32_t anchor) {
+	const size_t at = ib.size();
+	ib.push_back(0u); // the header, once the length is known
+	ib.push_back(static_cast<uint32_t>(base));
+	ib.push_back(static_cast<uint32_t>(base >> 32u));
+	uint32_t run_off = 0, run_len = 0;
+	auto     flush = [&]() {
+        if (run_len != 0) {
+            ib.push_back(run_off);
+            ib.push_back(run_len);
+            stats.cp_shadow_load_regs += run_len;
+            run_len = 0;
+        }
+	};
+	for (const auto& kv: regs) {
+		const uint32_t off = kv.first;
+		if (off < lo || off >= hi || !loads(off)) {
+			continue;
+		}
+		if (run_len != 0 && run_off + run_len == off) {
+			run_len++;
+			continue;
+		}
+		flush();
+		run_off = off;
+		run_len = 1;
+	}
+	flush();
+	if (ib.size() == at + 3) {
+		ib.push_back(anchor);
+		ib.push_back(1u);
+		stats.cp_shadow_load_regs++;
+		stats.cp_shadow_anchors++;
+	}
+	ib[at] = Pkt3(op, static_cast<uint32_t>(ib.size() - at - 1), compute);
+	stats.cp_shadow_load_dw += static_cast<uint32_t>(ib.size() - at);
+}
+
 } // namespace
 
 // First time each guest side effect is handled. A board run then shows which forms the title uses.
@@ -755,6 +834,44 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 					return bad();
 				}
 				break;
+			// CONTEXT_CONTROL only in the translator's two forms: shadowing and loading off (every preamble, every
+			// job's end), and CP shadowing's enables while a shadow buffer is registered. The title's is dropped.
+			case IT_CONTEXT_CONTROL: {
+				const bool off    = b[0] == 0x80000000u && b[1] == 0x80000000u;
+				const bool shadow = g_cp_shadow_va.load(std::memory_order_relaxed) != 0 && b[0] == kCpShadowEnables &&
+				                    b[1] == kCpShadowEnables;
+				if (compute || header != Pkt3(IT_CONTEXT_CONTROL, 2, false) || (!off && !shadow)) {
+					return bad();
+				}
+				break;
+			}
+			// CP shadowing's LOAD_*_REG (Pm4Translator::SetCpShadow): the gfx ring only, from the registered shadow
+			// buffer's region of the class, runs of registers below 0x400, LOAD_SH_REG with the compute header only
+			// for compute SH registers (0x200 up) and with the graphics one only below.
+			case IT_LOAD_UCONFIG_REG:
+			case IT_LOAD_CONTEXT_REG:
+			case IT_LOAD_SH_REG: {
+				const uint32_t op     = (header >> 8u) & 0xffu;
+				const uint64_t s      = g_cp_shadow_va.load(std::memory_order_relaxed);
+				const bool     cs     = (header & 2u) != 0;
+				const uint32_t region = op == IT_LOAD_UCONFIG_REG ? kCpShadowUconfigDw
+				                        : op == IT_LOAD_CONTEXT_REG ? kCpShadowContextDw
+				                                                    : kCpShadowShDw;
+				const uint64_t base   = s + 4ull * region;
+				if (compute || s == 0 || size < 5 || (size & 1u) == 0 || (header & ~2u) != Pkt3(op, size - 1u, false) ||
+				    (cs && op != IT_LOAD_SH_REG) || b[0] != static_cast<uint32_t>(base) || b[1] != static_cast<uint32_t>(base >> 32u)) {
+					return bad();
+				}
+				for (uint32_t i = 2; i + 1 < size - 1u; i += 2) {
+					const uint32_t off = b[i], count = b[i + 1];
+					const uint32_t lo  = op != IT_LOAD_SH_REG ? 0u : (cs ? kShComputeBase : 0u);
+					const uint32_t hi  = op != IT_LOAD_SH_REG ? RegFile::kDense : (cs ? RegFile::kDense : kShComputeBase);
+					if (count == 0 || off < lo || off >= hi || count > hi - off) {
+						return bad();
+					}
+				}
+				break;
+			}
 			// Graphics-only. An illegal opcode on a compute ring.
 			case IT_CLEAR_STATE:
 			case IT_SET_PREDICATION:
@@ -763,7 +880,6 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			case IT_DRAW_INDEX_INDIRECT:
 			case IT_INDEX_BASE:
 			case IT_DRAW_INDEX_2:
-			case IT_CONTEXT_CONTROL:
 			case IT_DRAW_INDEX_AUTO:
 			case IT_NUM_INSTANCES:
 			case IT_PFP_SYNC_ME:
@@ -951,6 +1067,72 @@ void SetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint32_
 	g_tf_ring_base.store(tf_ring_base, std::memory_order_relaxed);
 	g_hs_offchip_param.store(hs_offchip_param, std::memory_order_relaxed);
 	g_tf_ring_bytes.store(tf_ring_bytes, std::memory_order_release);
+}
+
+void SetCpShadowValidation(uint64_t va) {
+	g_cp_shadow_va.store(va, std::memory_order_relaxed);
+}
+
+void EmitCpShadowOff(std::vector<uint32_t>& ib) {
+	ib.insert(ib.end(), kCpShadowOff.begin(), kCpShadowOff.end());
+}
+
+bool CpShadowTailOk(std::span<const uint32_t> ib) {
+	size_t n = ib.size();
+	while (n > 0 && ib[n - 1] == kFiller) {
+		n--;
+	}
+	if (n >= 3 && ib[n - 3] == kCpShadowOff[0] && ib[n - 2] == kCpShadowOff[1] && ib[n - 1] == kCpShadowOff[2]) {
+		return true;
+	}
+	// A chain: the CP leaves this IB for good. An exit guard's chain runs only once a stop is armed, so behind
+	// its COND_EXEC the IB would go on.
+	return n >= 4 && ib[n - 4] == Pkt3(IT_INDIRECT_BUFFER, 3, false) && (ib[n - 1] & (1u << 20u)) != 0 &&
+	       !(n >= 9 && ib[n - 9] == Pkt3(IT_COND_EXEC, 4, false));
+}
+
+void CpShadowBatch::Append(std::vector<uint32_t>& batch, std::span<const uint32_t> ib, const CpShadowPiece& piece) {
+	if (!piece.own) {
+		// At the front the batch may carry on a stream with shadowing on: turn it off there too.
+		if (!m_any || m_on) {
+			EmitCpShadowOff(batch);
+			guards++;
+		}
+		m_on = false;
+	} else if (!piece.head) {
+		if (!m_any) {
+			m_front.assign(piece.resume.begin(), piece.resume.end());
+		} else if (!m_on) {
+			batch.insert(batch.end(), piece.resume.begin(), piece.resume.end());
+			resumes++;
+		}
+		m_on = true;
+	} else {
+		m_on = true; // its preamble turns shadowing off, then on with every base set
+	}
+	m_any = true;
+	batch.insert(batch.end(), ib.begin(), ib.end());
+}
+
+size_t CpShadowBatch::Extra(const CpShadowPiece& piece) const {
+	const size_t kept = m_front.size();
+	if (!piece.own) {
+		return kept + kCpShadowOff.size();
+	}
+	return kept + (piece.head ? 0u : piece.resume.size());
+}
+
+std::span<const uint32_t> CpShadowBatch::Front(bool stream_part, bool stream_on) const {
+	if (!m_any || m_front.empty() || (stream_part && stream_on)) {
+		return {};
+	}
+	return m_front;
+}
+
+void CpShadowBatch::Reset() {
+	m_any = false;
+	m_on  = false;
+	m_front.clear();
 }
 
 std::vector<std::pair<size_t, size_t>> SplitIbAtPackets(std::span<const uint32_t> ib, size_t max_dw) {
@@ -1145,6 +1327,45 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
 	ib.push_back(0u);
 
+	EmitPreambleState(ib, uc, cp);
+	EmitRegisterSets(ib, stats, cx, sh, uc, kCpShadowClasses);
+}
+
+void Pm4Translator::EmitShadowPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx,
+                                       const RegFile& sh, const RegFile& uc, const Pm4CpDrawState& cp) const {
+	// As every preamble: shadowing and loading off (so the clear and nothing before the LOADs reaches S), the
+	// context back to amdgpu's clear state. Then, as Mesa's shadowing preamble (ac_create_shadowing_ib_preamble):
+	// PFP_SYNC_ME so the shadow writes before it have landed when the LOADs read S, the enables, and the LOADs of
+	// all four classes back to back before any SET, so every class has its base in this job.
+	ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
+	ib.push_back(0x80000000u);
+	ib.push_back(0x80000000u);
+	ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
+	ib.push_back(0u);
+	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
+	ib.push_back(0u);
+	ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
+	ib.push_back(kCpShadowEnables);
+	ib.push_back(kCpShadowEnables);
+	const uint64_t s = m_cp_shadow_va;
+	// The probe's order: UCONFIG, context, graphics SH, compute SH (the compute header, into the SH region).
+	// Anchors: GE_INDX_OFFSET, PA_SC_WINDOW_OFFSET, SPI_SHADER_USER_DATA_PS_0, COMPUTE_USER_DATA_0.
+	EmitCpShadowLoad(ib, stats, IT_LOAD_UCONFIG_REG, false, s + 4ull * kCpShadowUconfigDw, uc, 0, RegFile::kDense, CpShadowLoadsUconfig,
+	                 0x24Au);
+	EmitCpShadowLoad(ib, stats, IT_LOAD_CONTEXT_REG, false, s + 4ull * kCpShadowContextDw, cx, 0, RegFile::kDense, CpShadowLoadsContext,
+	                 0x080u);
+	EmitCpShadowLoad(ib, stats, IT_LOAD_SH_REG, false, s + 4ull * kCpShadowShDw, sh, 0, kShComputeBase, CpShadowLoadsSh, 0x00Cu);
+	EmitCpShadowLoad(ib, stats, IT_LOAD_SH_REG, true, s + 4ull * kCpShadowShDw, sh, kShComputeBase, RegFile::kDense, CpShadowLoadsSh,
+	                 0x240u);
+	stats.cp_shadow_preambles++;
+	EmitPreambleState(ib, uc, cp);
+	// Record: the copy's replay as without shadowing (now shadowed into S as well). Load: what S does not restore,
+	// and the classes left out of the LOAD set.
+	EmitRegisterSets(ib, stats, cx, sh, uc,
+	                 m_cp_shadow_mode == CpShadowMode::Record ? kCpShadowClasses : (~m_cp_shadow_classes & kCpShadowClasses));
+}
+
+void Pm4Translator::EmitPreambleState(std::vector<uint32_t>& ib, const RegFile& uc, const Pm4CpDrawState& cp) const {
 	// The title's tessellation rings (SetTessellationRings), in the *_UMD registers user mode drivers own.
 	if (const uint32_t tf_bytes = g_tf_ring_bytes.load(std::memory_order_acquire); tf_bytes != 0) {
 		const uint64_t tf_base = g_tf_ring_base.load(std::memory_order_relaxed);
@@ -1198,10 +1419,15 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 		ib.push_back(static_cast<uint32_t>(cp.draw_base));
 		ib.push_back(static_cast<uint32_t>(cp.draw_base >> 32u));
 	}
+}
 
+void Pm4Translator::EmitRegisterSets(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
+                                     const RegFile& uc, uint32_t replay) const {
 	for (const auto& [offset, value]: cx) {
-		EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
-		stats.preamble_cx++;
+		if ((replay & kCpShadowContext) != 0 || !CpShadowLoadsContext(offset)) {
+			EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
+			stats.preamble_cx++;
+		}
 	}
 	if (m_ps5_reg_overrides && cx.count(kPaScShaderControl) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kPaScShaderControl, PatchContext(kPaScShaderControl, 0), false);
@@ -1210,13 +1436,112 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
 	}
 	for (const auto& [offset, value]: sh) {
-		EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), offset >= kShComputeBase);
-		stats.preamble_sh++;
+		const uint32_t cls = offset >= kShComputeBase ? kCpShadowCsSh : kCpShadowGfxSh;
+		if ((replay & cls) != 0 || !CpShadowLoadsSh(offset)) {
+			EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), offset >= kShComputeBase);
+			stats.preamble_sh++;
+		}
 	}
 	for (const auto& [offset, value]: uc) {
-		EmitSetUconfig(ib, offset, value);
-		stats.preamble_uc++;
+		if ((replay & kCpShadowUconfig) != 0 || !CpShadowLoadsUconfig(offset)) {
+			EmitSetUconfig(ib, offset, value);
+			stats.preamble_uc++;
+		}
 	}
+}
+
+void Pm4Translator::WriteCpShadowImage(std::span<uint32_t> s) const {
+	if (s.size() < kCpShadowDwords) {
+		return;
+	}
+	for (const auto& [offset, value]: m_cx) {
+		if (offset < RegFile::kDense) {
+			s[kCpShadowContextDw + offset] = PatchContext(offset, value);
+		}
+	}
+	for (const auto& [offset, value]: m_sh) {
+		if (offset < RegFile::kDense) {
+			s[kCpShadowShDw + offset] = PatchSh(offset, value);
+		}
+	}
+	for (const auto& [offset, value]: m_uc) {
+		if (offset < RegFile::kDense) {
+			s[kCpShadowUconfigDw + offset] = value;
+		}
+	}
+}
+
+Pm4Translator::CpShadowCheck Pm4Translator::CompareCpShadow(std::span<const uint32_t> s, std::FILE* report) const {
+	CpShadowCheck c;
+	if (s.size() < kCpShadowDwords) {
+		return c;
+	}
+	static const char* const kWriter[] = {"nothing since the seed", "a SET", "a verbatim table", "an expanded table",
+	                                      "an insert of the translator's"};
+	auto key = [&](const char* cls, uint32_t region, uint32_t off, uint32_t raw, uint32_t want, uint8_t writer) {
+		c.keys++;
+		const uint32_t got = s[region + off];
+		if (got == want) {
+			c.equal++;
+			return;
+		}
+		const auto     w    = static_cast<RegWriter>(writer);
+		const char*    kind = w == RegWriter::Table ? "late table" : w == RegWriter::Seed ? "unseen write" : "not shadowed";
+		(w == RegWriter::Table ? c.late : w == RegWriter::Seed ? c.unseen : c.unshadowed)++;
+		if (report != nullptr) {
+			std::fprintf(report, "%s 0x%03x: S 0x%08x, copy 0x%08x", cls, off, got, raw);
+			if (want != raw) {
+				std::fprintf(report, " (0x%08x as the IB writes it)", want);
+			}
+			std::fprintf(report, ", last written by %s: %s\n", kWriter[writer < 5 ? writer : 0], kind);
+		}
+	};
+	for (const auto& [off, value]: m_cx) {
+		if (off < RegFile::kDense) {
+			key("cx", kCpShadowContextDw, off, value, PatchContext(off, value), m_writer_cx[off]);
+		}
+	}
+	for (const auto& [off, value]: m_sh) {
+		if (off < RegFile::kDense) {
+			key("sh", kCpShadowShDw, off, value, PatchSh(off, value), m_writer_sh[off]);
+		}
+	}
+	for (const auto& [off, value]: m_uc) {
+		if (off < RegFile::kDense) {
+			key("uc", kCpShadowUconfigDw, off, value, value, m_writer_uc[off]);
+		}
+	}
+	// Registers the copy holds no key for. The preamble's own writes are expected there: PA_SC_SHADER_CONTROL and
+	// DB_RENDER_OVERRIDE when absent, the anchors, the tess rings, VGT_INDEX_TYPE's start value, and the title's
+	// SQ_THREAD_TRACE_USERDATA tags (passed as written, never kept). Anything else only a late table wrote.
+	auto ours = [&](uint32_t region, uint32_t off) {
+		if (region == kCpShadowContextDw) {
+			return off == kPaScShaderControl || off == kDbRenderOverride || off == 0x080u;
+		}
+		if (region == kCpShadowShDw) {
+			return off == 0x00Cu || off == 0x240u;
+		}
+		return off == 0x24Au || off == 0x24Eu || off == 0x24Fu || off == 0x250u || off == 0x261u || off == 0x243u ||
+		       (off >= 0x340u && off <= 0x347u);
+	};
+	auto outside = [&](const char* cls, uint32_t region, const RegFile& regs) {
+		for (uint32_t off = 0; off < RegFile::kDense; off++) {
+			const uint32_t got = s[region + off];
+			if (got == 0 || regs.count(off) != 0) {
+				continue;
+			}
+			const bool expected = ours(region, off);
+			c.outside += expected ? 0u : 1u;
+			if (report != nullptr) {
+				std::fprintf(report, "%s 0x%03x: S 0x%08x, not in the copy%s\n", cls, off, got,
+				             expected ? " (the preamble writes it, or a tag)" : ": only a late table wrote it");
+			}
+		}
+	};
+	outside("cx", kCpShadowContextDw, m_cx);
+	outside("sh", kCpShadowShDw, m_sh);
+	outside("uc", kCpShadowUconfigDw, m_uc);
+	return c;
 }
 
 void LodBankScan::Merge(const LodBankScan& o) {
@@ -1408,6 +1733,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	auto sh = m_sh;
 	auto uc = m_uc;
 	auto cp = m_cp;
+	// CP shadowing (SetCpShadow): the preambles turn it on and LOAD from S. Who last wrote each register since
+	// S was seeded is kept for CompareCpShadow, committed with the copy (nothing is tracked with it off).
+	const bool cp_shadow = CpShadow() != CpShadowMode::Off;
+	auto       wcx       = m_writer_cx;
+	auto       wsh       = m_writer_sh;
+	auto       wuc       = m_writer_uc;
+	auto       writer    = [cp_shadow](std::array<uint8_t, RegFile::kDense>& w, uint32_t off, RegWriter kind) {
+        if (cp_shadow && off < RegFile::kDense) {
+            w[off] = static_cast<uint8_t>(kind);
+        }
+	};
 	// Memory this DCB writes with WRITE_DATA / DMA_DATA before the GPU gets further. The CP reads an
 	// indirect register table when it runs the packet; the translator reads it now, so a table written
 	// earlier in the same DCB would be read before it is written.
@@ -1941,6 +2277,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			const uint32_t ext = reg(cx, kCbColor0BaseExt + i);
 			cx[kCbColor0Fmask + step]  = base;
 			cx[kCbColor0FmaskExt + i] = ext;
+			writer(wcx, kCbColor0Fmask + step, RegWriter::Insert);
+			writer(wcx, kCbColor0FmaskExt + i, RegWriter::Insert);
 			EmitSet(body, IT_SET_CONTEXT_REG, kCbColor0Fmask + step, base, false);
 			EmitSet(body, IT_SET_CONTEXT_REG, kCbColor0FmaskExt + i, ext, false);
 			stats.fmask_fixed++;
@@ -1955,12 +2293,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			if (cur == nullptr || *cur != value) {
 				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
 				mark_cx(off);
+				writer(wcx, off, RegWriter::Insert);
 			}
 		}
 		for (const auto& [off, value]: cx) {
 			if (next.count(off) == 0 && value != 0) {
 				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, 0), false);
 				mark_cx(off);
+				writer(wcx, off, RegWriter::Insert);
 			}
 		}
 		cx = next;
@@ -2047,11 +2387,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				m_display_dcc_off |= 1u << i;
 				cx[off] = info & ~kDccEnable;
 				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, cx[off]), false);
+				writer(wcx, off, RegWriter::Insert);
 				NoteOnce(17, "render target in a video-out buffer drawn without DCC");
 			} else if (!display && ((m_display_dcc_off >> i) & 1u) != 0) {
 				if (info == (m_display_dcc_info[i] & ~kDccEnable)) {
 					cx[off] = m_display_dcc_info[i];
 					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, cx[off]), false);
+					writer(wcx, off, RegWriter::Insert);
 				}
 				m_display_dcc_off &= ~(1u << i);
 			}
@@ -2273,9 +2615,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		seg_body.push_back(static_cast<uint32_t>(body.size()));
 		seg_pre.emplace_back();
 		seg_keep.push_back(true);
-		EmitPreamble(seg_pre.back(), stats, cx, sh, uc, cp);
+		// The keys at the cut; with CP shadowing their values come from S when the segment runs.
+		if (cp_shadow) {
+			EmitShadowPreamble(seg_pre.back(), stats, cx, sh, uc, cp);
+		} else {
+			EmitPreamble(seg_pre.back(), stats, cx, sh, uc, cp);
+		}
 		auto& s = segs.back();
 		s.held  = true;
+		s.cp_shadow_head = cp_shadow;
 		s.wait  = w;
 		s.barrier_dw = static_cast<uint32_t>(body.size());
 		emit_barrier(w.pfp);
@@ -2389,6 +2737,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		const size_t   body_before = body.size();
 		const size_t   segs_before = segs.size();
 		bool           in_place    = false; // passed on as written without a copy in body (direct runs)
+		bool           reg_write   = false; // it writes registers: with CP shadowing its segment is not dropped
 		const uint32_t header = dcb[dw];
 		if ((header >> 30u) != 3u) {
 			return fail(0xffffffffu, dw); // not a type-3 packet
@@ -2671,6 +3020,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
 					context_state_op(bptr[0]);
+					reg_write = true;
 				}
 				// A plain NOP (AgcCbNop, workload markers) runs in place with direct runs, as the PS5's CP skips
 				// it: dropping it cut the title's run in two (ASTRO BOT: 44k -> 63k dwords a flip run from the
@@ -2696,8 +3046,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				for (uint32_t i = 1; i < body_count; i++) {
 					cx[base + (i - 1)] = bptr[i];
 					mark_cx(base + (i - 1));
+					writer(wcx, base + (i - 1), RegWriter::Set);
 					unchanged = unchanged && PatchContext(base + (i - 1), bptr[i]) == bptr[i];
 				}
+				reg_write = body_count >= 2;
 				if (direct && unchanged) {
 					in_place = true;
 				} else {
@@ -2720,8 +3072,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					for (uint32_t i = 1; i < body_count; i++) {
 						sh[base + (i - 1)] = bptr[i];
 						mark_sh(base + (i - 1));
+						writer(wsh, base + (i - 1), RegWriter::Set);
 						unchanged = unchanged && PatchSh(base + (i - 1), bptr[i]) == bptr[i];
 					}
+					reg_write = body_count >= 2;
 					// A shader address needs its PGM_LO and PGM_HI: once per range that touches either.
 					for (uint32_t lo: {0x8u, 0x88u, 0xC8u, 0x108u, 0x148u, 0x20Cu}) {
 						if (lo + 1 >= base && lo <= last) {
@@ -2793,7 +3147,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (allowed) {
 						for (uint32_t i = 1; i < body_count; i++) {
 							uc[base + (i - 1)] = bptr[i];
+							writer(wuc, base + (i - 1), RegWriter::Set);
 						}
+						reg_write = body_count >= 2;
 					}
 				}
 				if (allowed) {
@@ -2836,6 +3192,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (num == 0 || addr == 0) {
 					break;
 				}
+				reg_write = true;
 				const auto* pairs = reinterpret_cast<const uint32_t*>(addr);
 				// The gfx CP runs these packets itself (AMD's LOAD_CONTEXT/SH/UCONFIG_REG_INDEX, bit for bit;
 				// probe --danger regindex-*: the table is loaded). The packet goes as written when every pair
@@ -2891,6 +3248,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						break;
 					}
 				}
+				const RegWriter table_writer = verbatim ? RegWriter::Table : RegWriter::Expanded;
 				for (uint32_t i = 0; i < num; i++) {
 					const uint32_t raw   = pairs[2 * i];
 					const uint32_t value = pairs[2 * i + 1];
@@ -2901,6 +3259,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (op == IT_SET_CONTEXT_REG_INDIRECT) {
 						cx[off] = value;
 						mark_cx(off);
+						writer(wcx, off, table_writer);
 						if (!verbatim) {
 							EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
 						}
@@ -2912,6 +3271,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						sh[off] = value;
 						mark_sh(off);
 						note_shader(off);
+						writer(wsh, off, table_writer);
 						if (!verbatim) {
 							EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, value), off >= kShComputeBase);
 						}
@@ -2934,6 +3294,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							continue;
 						}
 						uc[off] = value;
+						writer(wuc, off, table_writer);
 						if (!verbatim) {
 							EmitSetUconfig(body, off, value);
 						}
@@ -3601,6 +3962,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_CLEAR_STATE:
 				// CMD 1-3 (libSceAgc's AgcDcbContextStateOp): PUSH_STATE, POP_STATE, push then clear, which the
 				// PS5's CP does with register shadowing the kernel sets up. The shadow does them here.
+				reg_write = true;
 				if (body_count >= 1 && (bptr[0] & 0xfu) != 0) {
 					context_state_op(bptr[0] & 0xfu);
 					break;
@@ -3610,9 +3972,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// one of them, since the hardware no longer matches the shadow.
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				stats.clear_state++;
+				// CP shadowing: a plain CLEAR_STATE leaves S alone and the bases survive it (probe shadow-pushpop);
+				// whether the enables do is not probed. KYTY_NATIVE_GPU_CP_SHADOW_REARM=1 turns them on again here.
+				if (cp_shadow && m_cp_shadow_rearm) {
+					body.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
+					body.push_back(kCpShadowEnables);
+					body.push_back(kCpShadowEnables);
+				}
 				for (const auto& [off, value]: m_cx_defaults) {
 					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
 					mark_cx(off);
+					writer(wcx, off, RegWriter::Insert);
 				}
 				cx = m_cx_defaults;
 				break;
@@ -3643,6 +4013,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			body[body_before] = header;
 		}
 		if (IsWork(op)) {
+			seg_effects = true;
+		}
+		// A first segment that only writes registers is dropped without CP shadowing: the next segment's preamble
+		// replays its writes from the copy. A LOAD from S would not see them, so with shadowing it stays.
+		if (cp_shadow && reg_write) {
 			seg_effects = true;
 		}
 		const bool same_seg = segs.size() == segs_before;
@@ -3702,8 +4077,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 
 	// Pass succeeded: commit the shadow, build the IB (preamble from the committed shadow, then the
 	// translated body), and return. SetPreambleFromStart keeps the state where the buffer starts for it.
+	// CP shadowing: the first segment's shadow preamble. In load mode it restores the state where the buffer
+	// starts (the keys there, the values S holds when it runs), as on the PS5; in record mode, like the replay,
+	// from the state SetPreambleFromStart picks. With SetNoPreamble it is the resume the backend may put in front.
+	std::vector<uint32_t> cp_head;
+	Pm4TranslateStats     resume_stats;
+	Pm4TranslateStats&    head_stats      = m_no_preamble && labels ? resume_stats : stats;
+	const bool            head_from_start = CpShadow() == CpShadowMode::Load || m_preamble_from_start;
+	if (cp_shadow && head_from_start) {
+		EmitShadowPreamble(cp_head, head_stats, m_cx, m_sh, m_uc, m_cp);
+	}
 	RegFile start_cx, start_sh, start_uc;
-	if (m_preamble_from_start) {
+	if (m_preamble_from_start && !cp_shadow) {
 		start_cx = m_cx;
 		start_sh = m_sh;
 		start_uc = m_uc;
@@ -3713,9 +4098,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_cx_pushed = cx_pushed;
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
+	m_writer_cx = wcx;
+	m_writer_sh = wsh;
+	m_writer_uc = wuc;
 	// The IB starts where the previous DCB left the CP, not where this one leaves it.
 	const Pm4CpDrawState cp_start = m_cp;
 	m_cp                          = cp;
+	if (cp_shadow && !head_from_start) {
+		EmitShadowPreamble(cp_head, head_stats, m_cx, m_sh, m_uc, cp_start);
+	}
+	r.cp_shadow = cp_shadow;
 
 	// Copies body[from, to) to the IB, each direct run in it as IB2s into the guest's buffer. Returns,
 	// per run, (body offset where it ends, dwords removed up to there) to move later body offsets.
@@ -3778,6 +4170,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			if (k == 0) {
 				if (m_no_preamble) {
+					if (cp_shadow) {
+						// Whole 8-dword units, as every piece it is put in front of.
+						r.cp_shadow_resume = cp_head;
+						while ((r.cp_shadow_resume.size() & 7u) != 0) {
+							r.cp_shadow_resume.push_back(kFiller);
+						}
+					}
+				} else if (cp_shadow) {
+					r.ib.insert(r.ib.end(), cp_head.begin(), cp_head.end());
+					s.cp_shadow_head = true;
 				} else if (m_preamble_from_start) {
 					EmitPreamble(r.ib, stats, start_cx, start_sh, start_uc, cp_start);
 				} else {
@@ -3836,7 +4238,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	} else {
 		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
-		EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
+		if (cp_shadow) {
+			r.ib.insert(r.ib.end(), cp_head.begin(), cp_head.end());
+		} else {
+			EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
+		}
 		append_body(0, static_cast<uint32_t>(body.size()), true);
 
 		// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
