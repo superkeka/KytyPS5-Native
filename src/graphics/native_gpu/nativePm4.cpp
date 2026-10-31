@@ -94,6 +94,7 @@ constexpr uint32_t kCbColor0Base     = 0x318;
 constexpr uint32_t kCbColorStride    = 0xF;
 constexpr uint32_t kCbColor0View     = 0x31B;
 constexpr uint32_t kCbColor0Info     = 0x31C;
+constexpr uint32_t kCbDccEnable      = 1u << 28u; // CB_COLORn_INFO.DCC_ENABLE
 constexpr uint32_t kCbColor0Attrib   = 0x31D;
 constexpr uint32_t kCbColor0Attrib3  = 0x3B8;
 constexpr uint32_t kCbColor0Cmask    = 0x31F;
@@ -538,6 +539,18 @@ bool CpShadowLoadsUconfig(uint32_t off) {
 	return off < RegFile::kDense && off != 0x242u && off != 0x243u;
 }
 
+// The MRT slots whose display-DCC decision reads context register `off`: CB_COLORn_BASE, BASE_EXT, INFO.
+uint32_t DccFixSlots(uint32_t off) {
+	if (off >= kCbColor0Base && off < kCbColor0Base + 8 * kCbColorStride) {
+		const uint32_t rel = off - kCbColor0Base;
+		return rel % kCbColorStride == 0 || rel % kCbColorStride == kCbColor0Info - kCbColor0Base ? 1u << (rel / kCbColorStride) : 0u;
+	}
+	if (off >= kCbColor0BaseExt && off < kCbColor0BaseExt + 8) {
+		return 1u << (off - kCbColor0BaseExt);
+	}
+	return 0u;
+}
+
 // The MRT slots whose FMASK fix reads context register `off` (CB_TARGET_MASK: all of them).
 uint32_t FmaskFixSlots(uint32_t off) {
 	if (off == kCbTargetMask) {
@@ -811,10 +824,11 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				if (const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed); !compute && s != 0 && b[3] == 5u) {
 					const uint64_t a   = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
 					const uint64_t fix = s + kCpShadowFixOffset;
-					if (a >= fix && a < fix + kCpShadowFixBytes && (a - fix) % 8u == 4u && dw + 10u <= ib.size() &&
+					const uint64_t end = s + kCpShadowDccFixOffset; // the FMASK fix's tables
+					if (a >= fix && a < end && (a - fix) % 8u == 4u && dw + 10u <= ib.size() &&
 					    ib[dw + 5] == Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false)) {
 						const uint64_t t = ib[dw + 6] | (static_cast<uint64_t>(ib[dw + 7]) << 32u);
-						if (t >= fix && t + 16u <= fix + kCpShadowFixBytes && (t - fix) % 16u == 0 && ib[dw + 8] == 0x80000000u &&
+						if (t >= fix && t + 16u <= end && (t - fix) % 16u == 0 && ib[dw + 8] == 0x80000000u &&
 						    ib[dw + 9] == 2u) {
 							break;
 						}
@@ -889,7 +903,20 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 				break;
 			// libSceAgc's flag swap around a context push or pop (AgcDcbContextStateOp), on the gfx ring.
 			case IT_ATOMIC_MEM:
-				if (compute || size != 9 || (b[0] & 0x7fu) != 0x67u) {
+				if (compute || size != 9) {
+					return bad();
+				}
+				// CP shadowing's display-DCC fix: an AND that clears DCC_ENABLE in the first table of a slot, as written.
+				if (const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed); s != 0 && b[0] == kCpShadowDccAnd) {
+					const uint64_t a   = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
+					const uint64_t dcc = s + kCpShadowDccFixOffset;
+					if (a >= dcc && a < dcc + 8u * 16u && (a - dcc) % 16u == 4u && b[3] == ~kCbDccEnable && b[4] == 0u && b[5] == 0u &&
+					    b[6] == 0u) {
+						break;
+					}
+					return bad();
+				}
+				if ((b[0] & 0x7fu) != 0x67u) { // libSceAgc's flag swap around a context push or pop
 					return bad();
 				}
 				break;
@@ -1437,8 +1464,39 @@ std::array<uint32_t, kCpShadowFixBytes / 4u> CpShadowFixTables() {
 		uint32_t* e = t.data() + 8u * n;
 		e[0] = e[4] = kCbColor0Fmask + n * kCbColorStride;
 		e[2] = e[6] = kCbColor0FmaskExt + n;
+		uint32_t* d = t.data() + (kCpShadowDccFixOffset - kCpShadowFixOffset) / 4u + 4u * n;
+		d[0] = d[2] = kCbColor0Info + n * kCbColorStride;
 	}
 	return t;
+}
+
+// The display-DCC fix on the GPU (load mode): where the copy has CB_COLORn_INFO from a verbatim table the CP may hold
+// another INFO, so the CPU cannot write one without DCC; the GPU clears DCC_ENABLE in its own. The CP's INFO from S
+// into the value dwords of the slot's two tables once every shadow write before it has landed (PFP_SYNC_ME; DMA_DATA by
+// the ME with CP_SYNC, as the FMASK fix), ATOMIC_MEM AND on the first, a PFP wait until that word has lost DCC_ENABLE,
+// then the first table sets INFO. The CP shadows that write into S. The second keeps the INFO it had.
+void Pm4Translator::EmitCpShadowDccOff(std::vector<uint32_t>& ib, uint32_t slot) const {
+	const uint64_t from = m_cp_shadow_va + 4ull * (kCpShadowContextDw + kCbColor0Info + slot * kCbColorStride);
+	const uint64_t t    = m_cp_shadow_va + kCpShadowDccFixOffset + 16ull * slot;
+	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
+	ib.push_back(0u);
+	for (const uint64_t to: {t + 4u, t + 12u}) {
+		ib.insert(ib.end(), {Pkt3(IT_DMA_DATA, 6, false), kCpShadowDmaControl, static_cast<uint32_t>(from), static_cast<uint32_t>(from >> 32u),
+		                     static_cast<uint32_t>(to), static_cast<uint32_t>(to >> 32u), kCpShadowDmaWordCommand});
+	}
+	ib.insert(ib.end(), {Pkt3(IT_ATOMIC_MEM, 8, false), kCpShadowDccAnd, static_cast<uint32_t>(t + 4u), static_cast<uint32_t>((t + 4u) >> 32u),
+	                     ~kCbDccEnable, 0u, 0u, 0u, 6u});
+	// The ME sends the atomic and goes on: the PFP, which reads the table, waits until the word has lost DCC_ENABLE
+	// (with PFP_SYNC_ME alone it read the INFO from before the AND, and GT7's video-out buffers kept their DCC).
+	ib.insert(ib.end(), {Pkt3(IT_WAIT_REG_MEM, 6, false), 3u | (1u << 4u) | (1u << 8u), static_cast<uint32_t>(t + 4u),
+	                     static_cast<uint32_t>((t + 4u) >> 32u), 0u, kCbDccEnable, 4u});
+	ib.insert(ib.end(), {Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false), static_cast<uint32_t>(t), static_cast<uint32_t>(t >> 32u), 0x80000000u, 1u});
+}
+
+// The slot left the video-out buffer with the INFO the GPU cleared DCC in and not written since: the INFO the CP had.
+void Pm4Translator::EmitCpShadowDccRestore(std::vector<uint32_t>& ib, uint32_t slot) const {
+	const uint64_t t = m_cp_shadow_va + kCpShadowDccFixOffset + 16ull * slot + 8u;
+	ib.insert(ib.end(), {Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false), static_cast<uint32_t>(t), static_cast<uint32_t>(t >> 32u), 0x80000000u, 1u});
 }
 
 // fix_fmask on the GPU (load mode), as the CPU does it on the copy (FMASK = BASE when the target has none) but on the
@@ -1952,12 +2010,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	}
 	uint8_t    fmask_done = 0; // MRT slots the GPU fixed since their registers changed or a preamble ran
-	auto       writer    = [cp_shadow, &wcx, &vcx, &fmask_done](std::array<uint8_t, RegFile::kDense>& w, uint32_t off, RegWriter kind) {
+	uint8_t    dcc_done   = 0; // the same for the display-DCC fix
+	auto       writer    = [this, cp_shadow, &wcx, &vcx, &fmask_done, &dcc_done](std::array<uint8_t, RegFile::kDense>& w, uint32_t off,
+	                                                                          RegWriter kind) {
         if (cp_shadow && off < RegFile::kDense) {
             w[off] = static_cast<uint8_t>(kind);
             if (&w == &wcx) {
                 vcx.set(off);
                 fmask_done &= static_cast<uint8_t>(~FmaskFixSlots(off));
+                dcc_done &= static_cast<uint8_t>(~DccFixSlots(off));
+                const bool info = off >= kCbColor0Base && off < kCbColor0Base + 8 * kCbColorStride &&
+                                  (off - kCbColor0Base) % kCbColorStride == kCbColor0Info - kCbColor0Base;
+                if (info && kind != RegWriter::Gpu) {
+                    m_display_dcc_gpu &= ~(1u << ((off - kCbColor0Base) / kCbColorStride)); // the title's INFO again: nothing to give back
+                }
             }
         }
 	};
@@ -2573,6 +2639,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		saved_cx  = cx;
 		saved_wcx = wcx;
 		saved_vcx = vcx;
+		m_saved_display_dcc_gpu = m_display_dcc_gpu; // P's INFO is S's, DCC cleared or not
 		cx_pushed = true;
 		stats.cp_shadow_pushes++;
 	};
@@ -2602,6 +2669,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		cx  = saved_cx;
 		wcx = saved_wcx;
 		fmask_done = 0; // the CB registers are the pushed ones again
+		dcc_done   = 0;
+		// An INFO cleared inside the window is the pushed one again: giving that one's DCC back would put it on
+		// whatever target the pushed INFO belongs to.
+		m_display_dcc_gpu = m_saved_display_dcc_gpu;
 		stats.cp_shadow_pops++;
 	};
 	auto context_state_op = [&](uint32_t operation) {
@@ -2680,33 +2751,44 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (m_display_ranges.empty()) {
 			return;
 		}
-		constexpr uint32_t kDccEnable = 1u << 28u;
 		for (uint32_t i = 0; i < 8; i++) {
 			const uint32_t step = i * kCbColorStride;
 			const uint32_t off  = kCbColor0Info + step;
-			// Load mode: an INFO the copy has from a verbatim table may not be the GPU's (the CP reads the table when it
-			// runs it), and the insert replaces the GPU's with the copy's, DCC off. Left out, the target kept its DCC and
-			// the video-out buffer went to the display compressed (GT7's menus: noise over the UI and the water); a table
-			// that changes a display target's format after it was translated is the smaller risk. Deciding on the GPU
-			// needs an AND on the CP's INFO and a range compare of its BASE, which no packet of the CP here does.
-			if (stale(off)) {
-				stats.cp_shadow_dcc_table++;
-			}
 			const uint32_t info = reg(cx, off);
 			const uint64_t addr = (static_cast<uint64_t>(reg(cx, kCbColor0Base + step)) << 8u) |
 			                      (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt + i) & 0xffu) << 40u);
 			const bool display = addr != 0 && std::any_of(m_display_ranges.begin(), m_display_ranges.end(), [&](const auto& d) {
 				return addr >= d.first && addr < d.first + d.second;
 			});
-			if (display && (info & kDccEnable) != 0) {
+			// Load mode, an INFO the copy took from a verbatim table: the CP may hold another (it reads the table when it
+			// runs it), so the GPU clears DCC in its own (EmitCpShadowDccOff), once until the slot's INFO or BASE change, and
+			// gives it back when the slot leaves the video-out buffer with that INFO. The copy's INFO would replace the CP's,
+			// format and all (GT7 then faulted); left out, the video-out buffer went to the display compressed (GT7's menus:
+			// noise over the UI and the water). The copy's BASE decides. An INFO S has no value for is 0 on the GPU.
+			if (stale(off)) {
+				if (display && (dcc_done & (1u << i)) == 0 && vcx.test(off)) {
+					EmitCpShadowDccOff(body, i);
+					wcx[off] = static_cast<uint8_t>(RegWriter::Gpu);
+					dcc_done |= static_cast<uint8_t>(1u << i);
+					m_display_dcc_gpu |= 1u << i;
+					stats.cp_shadow_dcc_gpu++;
+					NoteOnce(17, "render target in a video-out buffer drawn without DCC");
+				} else if (!display && ((m_display_dcc_gpu >> i) & 1u) != 0) {
+					EmitCpShadowDccRestore(body, i);
+					m_display_dcc_gpu &= ~(1u << i);
+					stats.cp_shadow_dcc_back++;
+				}
+				continue;
+			}
+			if (display && (info & kCbDccEnable) != 0) {
 				m_display_dcc_info[i] = info;
 				m_display_dcc_off |= 1u << i;
-				cx[off] = info & ~kDccEnable;
+				cx[off] = info & ~kCbDccEnable;
 				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, cx[off]), false);
 				writer(wcx, off, RegWriter::Insert);
 				NoteOnce(17, "render target in a video-out buffer drawn without DCC");
 			} else if (!display && ((m_display_dcc_off >> i) & 1u) != 0) {
-				if (info == (m_display_dcc_info[i] & ~kDccEnable)) {
+				if (info == (m_display_dcc_info[i] & ~kCbDccEnable)) {
 					cx[off] = m_display_dcc_info[i];
 					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, cx[off]), false);
 					writer(wcx, off, RegWriter::Insert);
@@ -2948,6 +3030,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 			}
 			fmask_done = 0;
+			dcc_done   = 0;
 		}
 		s.wait  = w;
 		s.barrier_dw = static_cast<uint32_t>(body.size());
@@ -4309,6 +4392,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (cp_shadow) {
 					vcx.reset();
 					fmask_done = 0;
+					dcc_done   = 0;
 				}
 				for (const auto& [off, value]: m_cx_defaults) {
 					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
