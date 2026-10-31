@@ -1281,6 +1281,32 @@ static bool RunLanes(Device* d, Common* c, const uint8_t* code, size_t size, Bo*
 	return r == 0 && state == 0;
 }
 
+// One wave64 loads the dword at VA 0, which has no mapping (a read through a null descriptor's
+// base), and stores what it read, then a normal store checks that the GPU still works.
+static bool DangerVmFaultRead(Device* d, Common* c) {
+	printf("== danger vmfault-read: wave64 load of a dword at unmapped VA 0\n");
+	PrintGpuvmFault(d, "before");
+	uint32_t out[64];
+	// RunLanes waits longer than amdgpu's 5 s lockup timeout, so a hang shows up as a reset.
+	bool done = RunLanes(d, c, k_readfault_w64, sizeof(k_readfault_w64), NULL, out, 15.0, 16);
+	PrintGpuvmFault(d, "after");
+	if (!done) {
+		return false;
+	}
+	printf("  lane 0 read 0x%08x (markers 0x%08x 0x%08x 0x%08x)\n", out[0], out[1], out[2], out[3]);
+
+	LoadCode(c, k_store_w64, sizeof(k_store_w64));
+	Bo  dst;
+	int r = MemCreate(d, &dst, MEM_GTT, 2 * MiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &dst, 0x0200000000ull, 0);
+	}
+	bool ok = r == 0 && StoreAndCheck(d, c, &dst, &c->code, 64, 64);
+	printf("  follow-up store on the same context: %s\n", ok ? "ok" : "FAILED");
+	BoDestroy(d, &dst);
+	return ok;
+}
+
 static bool DangerDot2c(Device* d, Common* c) {
 	printf("== danger dot2c: v_dot2c_f32_f16 (gfx10.3 encoding, VOP2 0x02), expect 22.5 in all lanes\n");
 	uint32_t out[64];
@@ -2565,7 +2591,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
+	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
 }
 
 int main(int argc, char** argv) {
@@ -2624,6 +2650,8 @@ int main(int argc, char** argv) {
 		}
 		if (strcmp(danger, "vmfault") == 0) {
 			ok = DangerVmFault(&d, &c);
+		} else if (strcmp(danger, "vmfault-read") == 0) {
+			ok = DangerVmFaultRead(&d, &c);
 		} else if (strcmp(danger, "long") == 0) {
 			ok = DangerLong(&d, &c);
 		} else if (strcmp(danger, "dot2c") == 0) {

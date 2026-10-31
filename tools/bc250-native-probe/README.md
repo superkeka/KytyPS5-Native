@@ -95,6 +95,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | Case | What it does |
 |---|---|
 | `vmfault` | one wave64 stores 256 bytes to the unmapped VA `0x900000000`, then a normal store checks the GPU |
+| `vmfault-read` | one wave64 loads a dword at the unmapped VA `0` (a null descriptor's base) and stores it, then a normal store checks the GPU |
 | `long` | one valid wave64 spins 12 s, publishing elapsed GPU time |
 | `dot2c` | `v_dot2c_f32_f16` (gfx10.3 encoding) with known inputs |
 | `dot2x` | same opcode as raw words with several accumulators/inputs, plus a control store |
@@ -154,6 +155,15 @@ never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of
 For the backend this means a single bad guest address costs a ~10 s freeze of that queue, not
 the machine: every guest range must be mapped before submission, and the fault query plus the
 devcoredump are the debugging path.
+
+### `vmfault` and `vmfault-read` with and without retry (2026-10-31)
+
+- The same for the store and the load, with `amdgpu.noretry=1` (retry off) and with the default `-1`
+  (retry on for GC 10.1): one fault (client TCP; the load: `RW=0`, status `0x00701030`), the wave does
+  not retire, the job times out after ~10 s and only its compute queue is reset.
+- So `noretry` does not change what a fault costs: the faulting wave halts either way. On the gfx ring
+  it is the whole board: Demon's Souls froze it right after this same fault (a TCP read of VA 0 from a
+  gfx VMID). Every address a guest shader can reach has to be mapped.
 
 ### `long` result
 
