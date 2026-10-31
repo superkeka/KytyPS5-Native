@@ -2730,7 +2730,8 @@ static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
 			       t[0x20 + k] == ShadowMagic(k) ? "" : " (not the written value)");
 		}
 	}
-	bool all = t[0x40] == 0x5ad0e001u;
+	bool     all       = t[0x40] == 0x5ad0e001u;
+	uint32_t off_found = 0; // test values of a class with shadowing off found in S
 	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
 		const ShadowReg* r     = &k_shadow_regs[k];
 		const uint32_t   at    = ShadowAt(r, 0);
@@ -2753,11 +2754,17 @@ static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
 		} else {
 			snprintf(where, sizeof(where), "%u times, first at +0x%06x (its place +0x%05x)", found, first, at);
 		}
-		const bool on = (classes & ShadowBit(r->cls)) != 0;
+		// A compute register written by a graphics-type 0x63: which SH enable governs it is open, so it counts only
+		// when both agree.
+		const uint32_t bits = r->cls == 'c' && r->how == 't' ? (CC_GFX_SH | CC_CS_SH) : ShadowBit(r->cls);
+		const bool     on   = (classes & bits) == bits;
+		const bool     off  = (classes & bits) == 0;
 		printf("  %-26s %-3s %-7s shadow %-3s: %s\n", r->name, ShadowClassName(r->cls), ShadowHowName(r),
-		       on ? "on" : "off", where);
+		       on ? "on" : off ? "off" : "mix", where);
 		if (on) {
 			all = all && found == 1 && (first == at || (load_off && first == at_b));
+		} else if (off) {
+			off_found += found;
 		}
 	}
 	// SETs made with shadowing off: the SH values before the LOADs, the UCONFIG values put back at the end.
@@ -2769,9 +2776,9 @@ static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
 		}
 		leaked += r->cls == 'u' && r->rest != 0 && s[ShadowAt(r, 0) / 4] == r->rest;
 	}
-	printf("  SET values written with shadowing off found in S: %u\n", leaked);
+	printf("  SET values written with shadowing off found in S: %u, of classes with shadowing off: %u\n", leaked, off_found);
 	ShadowOthers(b);
-	return all;
+	return all && leaked == 0 && off_found == 0;
 }
 
 static int CtxAlloc(Device* d, uint32_t* id) {
@@ -2915,12 +2922,21 @@ static bool DangerShadow(Device* d, Common* c, bool restore) {
 	return ok;
 }
 
+static void IbClearState(Ib* ib, uint32_t cmd) {
+	IbPush(ib, Pkt3Gfx(0x12u, 1));
+	IbPush(ib, cmd);
+}
+
 // shadow-pushpop: libSceAgc's context push and pop as it writes them (AgcDcbContextStateOp in src/libs/agc.cpp:
 // CONTEXT_CONTROL 0 / 0x80018001 then CLEAR_STATE CMD 1 for a push, 0 / 0x80018003 then CMD 2 for a pop; AMD's F32
-// PFP/ME packet lists name CMD 1-3 PUSH_STATE, POP_STATE, PUSH_CLEAR_STATE) inside a set-up shadow, the context
-// places of S copied out after each step (COPY_DATA from memory): what do push and pop do to the shadow, is a SET
-// between them shadowed, is shadowing on after the pop, does a plain CLEAR_STATE write the shadow? Whether the pop
-// restored the registers takes a draw and is not checked here.
+// PFP/ME packet lists name CMD 1-3 PUSH_STATE, POP_STATE, PUSH_CLEAR_STATE) inside a set-up shadow. Three blocks in one
+// job, S copied out after each step (COPY_DATA from memory):
+// 1. markers written into the context places of S right before the push, the pop and a plain CLEAR_STATE: does any
+//    of them write S (a marker replaced), is a SET between push and pop shadowed, one after the pop?
+// 2. the push's and the pop's CONTEXT_CONTROL without CLEAR_STATE: what the CONTEXT_CONTROLs do on their own.
+// 3. a register that can be read: SPI_SHADER_USER_DATA_PS_0 set with gfx SH shadowing on, a push with gfx SH shadowing
+//    off too (0x80008001), a new value, libSceAgc's pop, the register read: does the pop load registers back from S?
+//    Then the same without CLEAR_STATE. Context registers cannot be read (a COPY_DATA of one stops the ring).
 static bool DangerShadowPushPop(Device* d, Common* c) {
 	printf("== danger shadow-pushpop: libSceAgc's CONTEXT_CONTROL + CLEAR_STATE push and pop inside a set-up shadow\n");
 	ShadowBufs b;
@@ -2929,61 +2945,99 @@ static bool DangerShadowPushPop(Device* d, Common* c) {
 	}
 	const ShadowReg* tl   = &k_shadow_regs[0];
 	const ShadowReg* br   = &k_shadow_regs[1];
+	const ShadowReg* ps0  = &k_shadow_regs[4];
 	const uint64_t   stl  = b.s.va + ShadowAt(tl, 0);
 	const uint64_t   sbr  = b.s.va + ShadowAt(br, 0);
+	const uint64_t   sps0 = b.s.va + ShadowAt(ps0, 0);
 	const uint64_t   copy = b.t.va + 0xa00;
 	Ib               ib   = {.n = 0};
 	IbContextControl(&ib, CC_UPDATE, CC_UPDATE);
 	IbContextControl(&ib, CC_UPDATE | CC_ALL, CC_UPDATE | CC_ALL);
 	IbShadowLoads(&ib, b.s.va, 0);
+	// 1
 	IbShadowSet(&ib, tl, 0x7e100001u);
 	IbShadowSet(&ib, br, 0x7e100002u);
 	IbCopyMemToMem(&ib, stl, copy + 0);
 	IbCopyMemToMem(&ib, sbr, copy + 4);
+	IbWriteData(&ib, stl, 0x7e1000a1u);
+	IbWriteData(&ib, sbr, 0x7e1000a2u);
 	IbContextControl(&ib, 0, 0x80018001u); // the push
-	IbPush(&ib, Pkt3Gfx(0x12u, 1));
-	IbPush(&ib, 1u);
+	IbClearState(&ib, 1);
 	IbCopyMemToMem(&ib, stl, copy + 8);
 	IbCopyMemToMem(&ib, sbr, copy + 12);
 	IbShadowSet(&ib, tl, 0x7e100003u);
 	IbCopyMemToMem(&ib, stl, copy + 16);
+	IbWriteData(&ib, stl, 0x7e1000b1u);
+	IbWriteData(&ib, sbr, 0x7e1000b2u);
 	IbContextControl(&ib, 0, 0x80018003u); // the pop
-	IbPush(&ib, Pkt3Gfx(0x12u, 1));
-	IbPush(&ib, 2u);
+	IbClearState(&ib, 2);
 	IbCopyMemToMem(&ib, stl, copy + 20);
 	IbCopyMemToMem(&ib, sbr, copy + 24);
 	IbShadowSet(&ib, br, 0x7e100004u);
 	IbCopyMemToMem(&ib, sbr, copy + 28);
-	IbPush(&ib, Pkt3Gfx(0x12u, 1)); // a plain CLEAR_STATE
-	IbPush(&ib, 0u);
+	IbWriteData(&ib, stl, 0x7e1000c1u);
+	IbWriteData(&ib, sbr, 0x7e1000c2u);
+	IbClearState(&ib, 0); // a plain CLEAR_STATE
 	IbCopyMemToMem(&ib, stl, copy + 32);
 	IbCopyMemToMem(&ib, sbr, copy + 36);
+	// 2
+	IbContextControl(&ib, CC_UPDATE | CC_ALL, CC_UPDATE | CC_ALL);
+	IbShadowSet(&ib, tl, 0x7e100011u);
+	IbContextControl(&ib, 0, 0x80018001u);
+	IbShadowSet(&ib, tl, 0x7e100013u);
+	IbCopyMemToMem(&ib, stl, copy + 40);
+	IbContextControl(&ib, 0, 0x80018003u);
+	IbShadowSet(&ib, br, 0x7e100014u);
+	IbCopyMemToMem(&ib, sbr, copy + 44);
+	// 3
+	IbContextControl(&ib, CC_UPDATE | CC_ALL, CC_UPDATE | CC_ALL);
+	IbShadowSet(&ib, ps0, 0x7e200001u);
+	IbContextControl(&ib, 0, 0x80008001u); // the push with gfx SH shadowing off too
+	IbClearState(&ib, 1);
+	IbShadowSet(&ib, ps0, 0x7e200002u);
+	IbContextControl(&ib, 0, 0x80018003u); // libSceAgc's pop
+	IbClearState(&ib, 2);
+	IbCopyRegToMem(&ib, ps0->reg, copy + 48);
+	IbCopyMemToMem(&ib, sps0, copy + 52);
+	IbContextControl(&ib, CC_UPDATE | CC_ALL, CC_UPDATE | CC_ALL);
+	IbShadowSet(&ib, ps0, 0x7e200011u);
+	IbContextControl(&ib, 0, 0x80008001u);
+	IbShadowSet(&ib, ps0, 0x7e200012u);
+	IbContextControl(&ib, 0, 0x80018003u);
+	IbCopyRegToMem(&ib, ps0->reg, copy + 56);
+	IbCopyMemToMem(&ib, sps0, copy + 60);
 	IbWriteData(&ib, b.t.va + 0x100, 0x5ad0e001u);
 	IbShadowOff(&ib);
 	IbWriteData(&ib, b.t.va + 0x104, 0x5ad0e002u);
 	IbPad(&ib);
 	ShadowRun(d, c, &b, &ib, "push/pop job");
-	const uint32_t* s = (const uint32_t*)b.s.cpu;
 	const uint32_t* t = (const uint32_t*)b.t.cpu;
 	const uint32_t* v = t + 0xa00 / 4;
 	printf("  marker after the steps %s, after shadowing off %s\n", t[0x40] == 0x5ad0e001u ? "landed" : "MISSING",
 	       t[0x41] == 0x5ad0e002u ? "landed" : "MISSING");
-	printf("  S at %s / %s (0x%08x / 0x%08x before the job):\n", tl->name, br->name, ShadowSentinel(0, 0),
-	       ShadowSentinel(1, 0));
-	printf("    after SETs of 0x7e100001 / 0x7e100002  0x%08x / 0x%08x\n", v[0], v[1]);
-	printf("    after the push                         0x%08x / 0x%08x\n", v[2], v[3]);
-	printf("    after a SET of _TL to 0x7e100003       0x%08x\n", v[4]);
-	printf("    after the pop                          0x%08x / 0x%08x\n", v[5], v[6]);
-	printf("    after a SET of _BR to 0x7e100004       0x%08x\n", v[7]);
-	printf("    after a plain CLEAR_STATE              0x%08x / 0x%08x\n", v[8], v[9]);
-	printf("    at the end                             0x%08x / 0x%08x\n", s[ShadowAt(tl, 0) / 4],
-	       s[ShadowAt(br, 0) / 4]);
-	printf("  context shadowing before the push: %s; the push %s S; a SET between push and pop %s; the pop %s S;\n",
+	printf("  1. S at %s / %s:\n", tl->name, br->name);
+	printf("    after SETs of 0x7e100001 / 0x7e100002              0x%08x / 0x%08x\n", v[0], v[1]);
+	printf("    marks 0x7e1000a1 / a2, then the push              0x%08x / 0x%08x\n", v[2], v[3]);
+	printf("    after a SET of _TL to 0x7e100003                   0x%08x\n", v[4]);
+	printf("    marks 0x7e1000b1 / b2, then the pop               0x%08x / 0x%08x\n", v[5], v[6]);
+	printf("    after a SET of _BR to 0x7e100004                   0x%08x\n", v[7]);
+	printf("    marks 0x7e1000c1 / c2, then a plain CLEAR_STATE   0x%08x / 0x%08x\n", v[8], v[9]);
+	printf("    context shadowing before the push: %s; the push %s; a SET between push and pop %s; the pop %s;\n",
 	       v[0] == 0x7e100001u && v[1] == 0x7e100002u ? "on" : "NOT seen",
-	       v[2] != v[0] || v[3] != v[1] ? "changed" : "left", v[4] == 0x7e100003u ? "was shadowed" : "was not shadowed",
-	       v[5] != v[4] || v[6] != v[3] ? "changed" : "left");
-	printf("  a SET after the pop %s; the plain CLEAR_STATE %s S\n",
-	       v[7] == 0x7e100004u ? "was shadowed" : "was not shadowed", v[8] != v[5] || v[9] != v[7] ? "changed" : "left");
+	       v[2] == 0x7e1000a1u && v[3] == 0x7e1000a2u ? "left S" : "wrote S",
+	       v[4] == 0x7e100003u ? "was shadowed" : "was not shadowed",
+	       v[5] == 0x7e1000b1u && v[6] == 0x7e1000b2u ? "left S" : "wrote S");
+	printf("    a SET after the pop %s; the plain CLEAR_STATE %s\n", v[7] == 0x7e100004u ? "was shadowed" : "was not shadowed",
+	       v[8] == 0x7e1000c1u && v[9] == 0x7e1000c2u ? "left S" : "wrote S");
+	printf("  2. the CONTEXT_CONTROLs alone: a SET after the push's %s, a SET after the pop's %s\n",
+	       v[10] == 0x7e100013u ? "was shadowed" : v[10] == 0x7e100011u ? "was not shadowed" : "(other)",
+	       v[11] == 0x7e100014u ? "was shadowed" : "was not shadowed");
+	printf("  3. %s 0x7e200001 shadowed, push with gfx SH shadowing off, 0x7e200002, pop: register 0x%08x, S 0x%08x\n",
+	       ps0->name, v[12], v[13]);
+	printf("     the same without CLEAR_STATE (0x7e200011, then 0x7e200012): register 0x%08x, S 0x%08x\n", v[14], v[15]);
+	printf("     the pop %s\n", v[12] == 0x7e200001u   ? "loaded the register back from S"
+	                            : v[12] == 0x7e200002u ? "left the register"
+	                                                   : "left something else in the register");
 	ShadowOthers(&b);
 	const bool ok = t[0x40] == 0x5ad0e001u && t[0x41] == 0x5ad0e002u;
 	BoDestroy(d, &b.t);

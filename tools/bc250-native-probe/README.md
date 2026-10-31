@@ -113,7 +113,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `labelvis` | a `RELEASE_MEM` label without cache write-back seen by the CPU, then a `WAIT_REG_MEM` on a dword the CPU writes, per MTYPE (`LABELVIS_KIND=nc\|uc\|cc\|wc\|default`, one per run; `LABELVIS_DST=1` sends the label to L2, `LABELVIS_EVENT` sets the event dword) |
 | `shadow` | CP register shadowing: `CONTEXT_CONTROL` shadow enables and `LOAD_*_REG` addresses, then 13 registers written by SET, by register table and by SET in an IB2; where each value lands in the shadow buffer (`SHADOW_CLASSES`, `SHADOW_LOAD=0`) |
 | `shadow-restore` | `shadow`, then the SH registers loaded back from the shadow in later jobs and read: with every load on, and twice with amdgpu's load enables (a second DRM context's job in between) |
-| `shadow-pushpop` | libSceAgc's context push and pop (`CONTEXT_CONTROL` + `CLEAR_STATE` CMD 1 / 2) inside a set-up shadow, the shadow copied out after each step |
+| `shadow-pushpop` | libSceAgc's context push and pop (`CONTEXT_CONTROL` + `CLEAR_STATE` CMD 1 / 2) inside a set-up shadow: markers in the shadow before each step, the same `CONTEXT_CONTROL`s without `CLEAR_STATE`, and an SH register changed between a push and a pop and read back |
 
 `--awake SEC` keeps one wave spinning on the compute ring while the case runs, so the graphics block
 never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of freeing buffers
@@ -131,11 +131,32 @@ back with `COPY_DATA`; context and UCONFIG registers never are (those reads stop
 picks the shadow enables; `SHADOW_LOAD=0` adds LOADs from a second region set 1 MiB in with loading off (does such a
 LOAD still move the address?). `shadow-restore` then clobbers the SH registers and loads them back from S in a second
 job, then twice more with the load enables left as amdgpu set them (on only after another context ran on the ring): right
-after our own job and after a second DRM context's job. `shadow-pushpop` copies S out after each step of libSceAgc's push
-(`CONTEXT_CONTROL` 0 / 0x80018001, `CLEAR_STATE` 1), a SET, its pop (0 / 0x80018003, `CLEAR_STATE` 2), a SET and a plain
-`CLEAR_STATE`; whether the pop restored the registers takes a draw and is not checked. Run each alone, e.g.
-`./bc250-native-probe --danger shadow --awake 5`; a microcode that writes the shadow somewhere else may fault the ring,
-`shadow-pushpop` most of all (where AMD's F32 microcode keeps a pushed state is not public).
+after our own job and after a second DRM context's job. `shadow-pushpop` writes markers into S before libSceAgc's push
+(`CONTEXT_CONTROL` 0 / 0x80018001, `CLEAR_STATE` 1), before its pop (0 / 0x80018003, `CLEAR_STATE` 2) and before a plain
+`CLEAR_STATE`, and copies S out after each step and after a SET between them; then the two `CONTEXT_CONTROL`s alone; then
+an SH register set with shadowing on, a push that also turns gfx SH shadowing off (0x80008001), a new value, the pop,
+the register read back, and the same without `CLEAR_STATE`. Whether a pop restores context registers takes a draw and
+is not checked. Run each alone, e.g. `./bc250-native-probe --danger shadow --awake 5`; a microcode that writes the
+shadow somewhere else may fault the ring.
+
+### Register shadowing results (2026-10-31, stock amdgpu, kernel 7.2)
+
+- `shadow`: the CP shadows every one of the 13 writes at `S + region + (register - space start)`, Mesa's layout, for
+  SET, for the 0x9F / 0x63 / 0x64 tables and for a SET in an IB2. `SQ_THREAD_TRACE_USERDATA_2`, on PAL's never-shadowed
+  list, is shadowed too. The LOADs loaded the CPU's sentinels into the SH registers; nothing written with shadowing
+  off reached S, and the CP wrote nothing else into S.
+- `SHADOW_LOAD=0`: LOADs with loading off neither load nor move the shadow address (the writes still land in the first
+  region set). The CP takes a class's address only from a LOAD that loads.
+- `shadow-restore`: a later job with every load on loads all 6 SH registers back with the values the CP shadowed; so
+  does one with amdgpu's load enables after another DRM context's job. One with amdgpu's load enables right after our
+  own job leaves no trace at all, neither its register reads nor its marker, though its fence signals (twice in two
+  runs; not understood). A preamble sets its load enables itself.
+- `shadow-pushpop`: the push, the pop and a plain `CLEAR_STATE` leave S untouched (every marker survives). Context
+  shadowing goes off at the push and on again at the pop, and the two `CONTEXT_CONTROL`s alone do the same, so it is
+  their shadow enables, not `CLEAR_STATE`. The pop does not load an SH register back from S: it keeps the value set
+  between push and pop, as without `CLEAR_STATE`. Through the shadow, libSceAgc's push and pop save and restore nothing
+  on this microcode; whether the CP keeps context registers of its own between them takes a draw to see. A translator
+  can do it with the shadow itself: copy the context region at a push, load it back at a pop.
 
 ### Direct-execution probes (2026-10-27, two gfx rings, `sched_policy=2`)
 
