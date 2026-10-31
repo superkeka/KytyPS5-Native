@@ -2780,6 +2780,14 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return g_guest_address_space->MapBacking(target_addr, len, direct_memory_start, mode,
 		                                         &shared_failure);
 	};
+#if KYTY_GEM_BACKING_SUPPORTED
+	// PS5 residency: the blocks of a mapping with GPU access become resident before its view is bound, so the GPU
+	// mapping goes straight onto their buffers (GemBacking::PromoteBackingAtMap).
+	if (auto* gem = GetGemBacking(); gem != nullptr && Libs::Graphics::NativeGpu::GemBacking::ResidencyAtMap() &&
+	                                 (prot & (PROT_GPU_READ | PROT_GPU_WRITE)) != 0) {
+		gem->PromoteBackingAtMap(static_cast<uint64_t>(direct_memory_start), len);
+	}
+#endif
 	std::vector<VirtualRanges::Range> replaced_mappings;
 	auto restore_mappings = [&](size_t count, bool restore_views) {
 		for (size_t index = 0; index < count; ++index) {

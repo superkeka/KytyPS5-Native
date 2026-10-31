@@ -23,6 +23,7 @@
 #include <string>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <thread>
 #include <memory>
 #include <condition_variable>
@@ -152,10 +153,41 @@ public:
 	// True while every block with GPU access was made resident at map time.
 	[[nodiscard]] bool MapComplete() const { return ResidencyAtMap() && !m_map_overflow.load(std::memory_order_acquire); }
 
+	// Map-time residency for backing bytes [offset, offset + size) before their new view is bound: BindView then maps
+	// the view straight onto the blocks' buffers. Bound first, the view would map the dummy and PromoteAtMap would
+	// replace it; amdgpu writes the invalid entries of a replaced or cleared mapping only after the VM's running CS
+	// jobs end, and every page-table update after it waits in line (GT7 loading a race: updates 50 ms and more
+	// late, its compute queues read pages whose entries were not written yet). Returns how many blocks were promoted.
+	uint32_t PromoteBackingAtMap(uint64_t offset, uint64_t size) {
+		if (size == 0 || !EnsureRange(offset, size)) {
+			return 0;
+		}
+		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
+		uint32_t                    promoted = 0;
+		for (uint64_t index = offset / BlockSize(); index <= (offset + size - 1) / BlockSize(); index++) {
+			Block& block = m_blocks[index];
+			if (block.resident || block.code) {
+				continue;
+			}
+			if (MapBudgetAllows(block.size) && PromoteBlockUnlocked(index)) {
+				promoted++;
+			} else if (!m_map_overflow.exchange(true, std::memory_order_acq_rel)) {
+				std::fprintf(stderr,
+				             "GemBacking: map-time residency stops at %llu MiB (less than %llu MiB of RAM would be left); "
+				             "submissions make the rest resident as they reference it\n",
+				             static_cast<unsigned long long>(m_resident_bytes >> 20u),
+				             static_cast<unsigned long long>(MapReserve() >> 20u));
+			}
+		}
+		return promoted;
+	}
+
 	// Map-time residency (see ResidencyAtMap) for guest addresses [vaddr, vaddr + size): their blocks
 	// become resident while the budget allows. Returns how many blocks were promoted.
 	uint32_t PromoteAtMap(uint64_t vaddr, uint64_t size) {
 		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
 		uint32_t                    promoted = 0;
 		ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t, uint64_t backing, uint64_t len) {
 			for (uint64_t index = backing / BlockSize(); index <= (backing + len - 1) / BlockSize(); index++) {
@@ -206,6 +238,7 @@ public:
 			delete self;
 			return nullptr;
 		}
+		self->InitVaTimeline();
 		self->m_mem_fd = ::memfd_create("KytyDirectMemoryGem", MFD_CLOEXEC);
 		if (self->m_mem_fd < 0 || ::ftruncate(self->m_mem_fd, static_cast<off_t>(size)) != 0) {
 			std::fprintf(stderr, "GemBacking: memfd setup failed: %s\n", std::strerror(errno));
@@ -346,6 +379,7 @@ public:
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this, !InPrtApertureUnlocked(vaddr, size));
 		const bool ok = ForEachBlockPiece(offset, size, [&](uint64_t index, uint64_t inner, uint64_t done, uint64_t part) {
 			const uint32_t handle = m_blocks[index].resident ? m_blocks[index].bo.handle : m_dummy.handle;
 			return VaReplace(handle, vaddr + done, inner, offset + done, part) == 0;
@@ -416,6 +450,11 @@ public:
 		return ok;
 	}
 
+	// True when [vaddr, vaddr + size) lies in one PRT aperture, whose unmapped pages read zeros on the GPU.
+	bool InPrtApertureUnlocked(uint64_t vaddr, uint64_t size) const {
+		return std::any_of(m_prt.begin(), m_prt.end(),
+		                   [&](const auto& a) { return a.second != 0 && vaddr >= a.first && vaddr + size <= a.first + a.second; });
+	}
 	// sceKernelSetPrtAperture (index 0-2): on PS5 the GPU reads zeros from, and drops writes to, the
 	// pages of a PRT aperture that nothing is mapped at. Titles map sparse resources into one piece by
 	// piece and clear them whole (My First Gran Turismo's track load), which here faulted and hung the
@@ -426,6 +465,7 @@ public:
 			return;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
 		const auto old = m_prt[static_cast<size_t>(index)];
 		m_prt[static_cast<size_t>(index)] = {vaddr, size};
 		if (old.second != 0) {
@@ -444,6 +484,7 @@ public:
 	// were promoted.
 	uint32_t PromoteTouched() {
 		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
 		uint32_t promoted = 0;
 		uint64_t pos      = 0;
 		while (pos < m_size) {
@@ -502,6 +543,7 @@ public:
 	// cover them; addresses outside every view are ignored. Returns how many blocks were promoted.
 	uint32_t PromoteGuestRange(uint64_t vaddr, uint64_t size) {
 		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
 		uint32_t promoted = 0;
 		ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t, uint64_t backing, uint64_t len) {
 			for (uint64_t index = backing / BlockSize(); index <= (backing + len - 1) / BlockSize(); index++) {
@@ -691,6 +733,7 @@ public:
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
 		ClearExternalRangeUnlocked(vaddr, size);
 		// A single guest range can hold sub-ranges the guest reprotected to execute-only or no-access
 		// (seen in program memory: the shader is a readable slice, with an execute-only tail). A
@@ -966,9 +1009,107 @@ private:
 		return r;
 	}
 
+	// GEM_VA's page-table update runs on the SDMA after the ioctl returns. A CS job waits for it, a KFD queue does not:
+	// GT7 mapped new blocks while loading a race and its compute waves read them before their entries were written
+	// (SQC and TCP faults in VMID 8, the gfx ring hung behind them). Each VaOp puts its update's fence on a timeline
+	// syncobj, and a mapping call returns once the last one signaled (VaSync), as the PS5 writes the GPU page tables
+	// at map time. Bounded at 50 ms: an update may wait for GPU work, which may wait for the caller.
+	void InitVaTimeline() {
+		struct drm_syncobj_create c {};
+		if (Ioctl(DRM_IOCTL_SYNCOBJ_CREATE, &c) != 0) {
+			return;
+		}
+		m_va_syncobj = c.handle;
+		// A CLEAR of a range nothing maps is a no-op that still installs a fence where the kernel takes the timeline.
+		VaOp(AMDGPU_VA_OP_CLEAR, 0, kVaProbeAddress, 0, 0x1000);
+		if (!WaitVaUpdates(200)) {
+			std::fprintf(stderr, "GemBacking: no GEM_VA update fences from this kernel; mappings return before their page "
+			                     "table updates\n");
+			struct drm_syncobj_destroy d {};
+			d.handle = m_va_syncobj;
+			Ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &d);
+			m_va_syncobj = 0;
+		}
+	}
+	// Waits for the page-table update of the last VaOp, up to `timeout_ms`. False on a timeout or an error.
+	bool WaitVaUpdates(int timeout_ms = 50) const {
+		if (m_va_syncobj == 0) {
+			return true;
+		}
+		const uint32_t handle = m_va_syncobj;
+		const uint64_t point  = m_va_point;
+		struct timespec now {};
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		const int64_t start = static_cast<int64_t>(now.tv_sec) * 1000000000 + now.tv_nsec;
+		struct drm_syncobj_timeline_wait w {};
+		w.handles       = reinterpret_cast<uintptr_t>(&handle);
+		w.points        = reinterpret_cast<uintptr_t>(&point);
+		w.timeout_nsec  = start + static_cast<int64_t>(timeout_ms) * 1000000;
+		w.count_handles = 1;
+		w.flags         = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+		const int r     = Ioctl(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &w);
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		const double ms = static_cast<double>(static_cast<int64_t>(now.tv_sec) * 1000000000 + now.tv_nsec - start) / 1e6;
+		m_va_waits++;
+		if (r != 0 || ms > 2.0) {
+			if (m_va_slow++ < 24) {
+				std::string ops;
+				for (uint64_t k = point >= 6 ? point - 5 : 1; k <= point; k++) {
+					const auto& e = m_va_recent[k % m_va_recent.size()];
+					if (e.point == k) {
+						char one[64];
+						std::snprintf(one, sizeof(one), " %llu:%s%s/%lluK", static_cast<unsigned long long>(k),
+						              e.op == AMDGPU_VA_OP_REPLACE ? "R" : e.op == AMDGPU_VA_OP_CLEAR ? "C" : e.op == AMDGPU_VA_OP_MAP ? "M" : "U",
+						              e.target == 2 ? "dummy" : e.target == 1 ? "bo" : "", static_cast<unsigned long long>(e.size >> 10u));
+						ops += one;
+					}
+				}
+				std::fprintf(stderr, "GemBacking: page table update of GEM_VA %llu %s after %.1f ms (%llu waits so far); ops%s\n",
+				             static_cast<unsigned long long>(point), r != 0 ? "NOT signaled" : "signaled", ms,
+				             static_cast<unsigned long long>(m_va_waits), ops.c_str());
+			}
+		}
+		return r == 0;
+	}
+	// In a mapping call, after its lock: on leaving, waits for the page-table updates its VaOps started (and every
+	// one before them, which run in order): views, promotions (the dummy's garbage read as descriptors sent GT7's
+	// waves to random addresses), external ranges, an aperture change. Not a view inside a PRT aperture, whose holes
+	// read zeros until the update lands (Demon's Souls maps sparse textures there constantly: 2 ms a frame waiting),
+	// and not unmapping.
+	struct VaSync {
+		const GemBacking& g;
+		const uint64_t    start;
+		const bool        on;
+		explicit VaSync(const GemBacking& b, bool wait = true): g(b), start(b.m_va_point), on(wait) {}
+		~VaSync() {
+			if (on && g.m_va_point != start) {
+				g.WaitVaUpdates();
+			}
+		}
+		VaSync(const VaSync&)            = delete;
+		VaSync& operator=(const VaSync&) = delete;
+	};
+
+	// drm_amdgpu_gem_va with the fields kernels from 6.16 on take (the board's 7.2.7 has them): the update's fence goes
+	// to `vm_timeline_syncobj_out` at `vm_timeline_point`. An older kernel reads the first 40 bytes only.
+	struct GemVaTimeline {
+		uint32_t handle;
+		uint32_t pad;
+		uint32_t operation;
+		uint32_t flags;
+		uint64_t va_address;
+		uint64_t offset_in_bo;
+		uint64_t map_size;
+		uint64_t vm_timeline_point;
+		uint32_t vm_timeline_syncobj_out;
+		uint32_t num_syncobj_handles;
+		uint64_t input_fence_syncobj_handles;
+	};
+	static_assert(sizeof(GemVaTimeline) == 64 && sizeof(drm_amdgpu_gem_va) <= sizeof(GemVaTimeline));
+
 	int VaOp(uint32_t op, uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t size,
 	         uint32_t page_flags = kRwxPageFlags) const {
-		struct drm_amdgpu_gem_va v;
+		GemVaTimeline v;
 		std::memset(&v, 0, sizeof(v));
 		v.handle       = handle;
 		v.operation    = op;
@@ -976,7 +1117,14 @@ private:
 		v.va_address   = vaddr;
 		v.offset_in_bo = offset_in_bo;
 		v.map_size     = size;
-		const int r    = Ioctl(DRM_IOCTL_AMDGPU_GEM_VA, &v);
+		if (m_va_syncobj != 0) {
+			v.vm_timeline_syncobj_out = m_va_syncobj;
+			v.vm_timeline_point       = ++m_va_point;
+			m_va_recent[m_va_point % m_va_recent.size()] = {m_va_point, op, handle == m_dummy.handle ? 2u : handle != 0 ? 1u : 0u, size};
+		}
+		const int r = Ioctl(m_va_syncobj != 0 ? static_cast<unsigned long>(DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA, GemVaTimeline))
+		                                      : static_cast<unsigned long>(DRM_IOCTL_AMDGPU_GEM_VA),
+		                    &v);
 		if (r != 0) {
 			std::fprintf(stderr, "GemBacking: GEM_VA op %u at 0x%llx (+0x%llx) failed: %s\n", op,
 			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
@@ -1836,6 +1984,18 @@ private:
 	}
 
 	int                           m_drm_fd = -1;
+	uint32_t                      m_va_syncobj = 0;       // GEM_VA update fences (InitVaTimeline), 0 without
+	mutable uint64_t              m_va_point   = 0;       // the last VaOp's timeline point
+	mutable uint64_t              m_va_waits   = 0;       // WaitVaUpdates calls
+	mutable uint32_t              m_va_slow    = 0;       // slow or failed ones logged
+	struct VaRecent {
+		uint64_t point;
+		uint32_t op;
+		uint32_t target; // 2 the dummy, 1 a buffer, 0 none
+		uint64_t size;
+	};
+	mutable std::array<VaRecent, 64> m_va_recent {}; // the last VaOps, for the slow-wait log
+	static constexpr uint64_t     kVaProbeAddress = 0x6f0000000000ull; // InitVaTimeline's CLEAR, nothing maps it
 	int                           m_mem_fd = -1;
 	int                           m_kfd_fd  = -1; // KYTY_NATIVE_GPU_KFD_MEMORY: see InitKfd
 	uint32_t                      m_kfd_gpu = 0;
