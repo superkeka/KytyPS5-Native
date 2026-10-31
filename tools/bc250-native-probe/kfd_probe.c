@@ -94,6 +94,12 @@ int main(int argc, char** argv) {
 	// another (each MAP_MEMORY_TO_GPU of a process with a queue flushes its VMID's TLB through the KIQ),
 	// as Kyty's residency does while a title loads.
 	const int mapstorm = argc > 1 && strcmp(argv[1], "mapstorm") == 0 ? (argc > 2 ? atoi(argv[2]) : 300) : 0;
+	// "condexec": COND_EXEC on the queue's MEC, a guarded WRITE_DATA skipped while the word is 0, also with
+	// the word cleared while a WAIT_REG_MEM ahead of it waits (Kyty's exit guard).
+	const int condexec = argc > 1 && strcmp(argv[1], "condexec") == 0;
+	// "stopwait destroy|exit": the queue waits on a label nobody writes, then DESTROY_QUEUE, or the process
+	// exits with the queue still waiting: what a title's compute queues are left in when it stops.
+	const int stopwait = argc > 2 && strcmp(argv[1], "stopwait") == 0 ? (strcmp(argv[2], "exit") == 0 ? 2 : 1) : 0;
 	// The GPU node: the one with SIMDs.
 	char path[128];
 	for (int n = 0; n < 8 && gpu_id == 0; n++) {
@@ -243,6 +249,82 @@ int main(int argc, char** argv) {
 		printf("holding the queue %d s\n", hold);
 		fflush(stdout);
 		sleep(hold);
+	}
+
+	if (condexec) {
+		volatile uint32_t* cw = d + 32; // abort word +128, label +132, A +136, B +140
+		const uint64_t     word_va = data.va + 128, label_va = data.va + 132;
+		int                bad     = 0;
+		for (int step = 0; step < 2; step++) {
+			cw[0] = step == 0 ? 0 : 1;
+			cw[1] = cw[2] = cw[3] = 0;
+			__sync_synchronize();
+			if (step == 1) {
+				PUSH(Pkt3(0x3c, 6)); // WAIT_REG_MEM == 1
+				PUSH(3u | (1u << 4));
+				PUSH((uint32_t)label_va);
+				PUSH((uint32_t)(label_va >> 32));
+				PUSH(1u);
+				PUSH(0xffffffffu);
+				PUSH(4u);
+			}
+			PUSH(Pkt3(0x22, 4)); // COND_EXEC over the WRITE_DATA of A
+			PUSH((uint32_t)word_va);
+			PUSH((uint32_t)(word_va >> 32));
+			PUSH(0);
+			PUSH(5);
+			WRITE(data.va + 136, 0xa0u + (uint32_t)step);
+			WRITE(data.va + 140, 0xb0u + (uint32_t)step);
+			KICK();
+			if (step == 1) {
+				usleep(50000);
+				cw[0] = 0;
+				__sync_synchronize();
+				usleep(50000);
+				cw[1] = 1;
+				__sync_synchronize();
+			}
+			t0 = Now();
+			while (cw[3] != 0xb0u + (uint32_t)step && Now() - t0 < 2.0) {
+			}
+			printf("condexec on the KFD queue, %s: A %s, B %s\n", step == 0 ? "word 0" : "word cleared while a wait ahead waits",
+			       cw[2] != 0 ? "LANDED (not skipped)" : "skipped", cw[3] == 0xb0u + (uint32_t)step ? "landed" : "MISSING");
+			bad |= cw[2] != 0 || cw[3] != 0xb0u + (uint32_t)step;
+		}
+		return bad ? 13 : 0;
+	}
+
+	if (stopwait) {
+		volatile uint32_t* lab = d + 48; // label +192, marker +196
+		lab[0] = lab[1] = 0;
+		__sync_synchronize();
+		PUSH(Pkt3(0x3c, 6)); // WAIT_REG_MEM == 1, never written
+		PUSH(3u | (1u << 4));
+		PUSH((uint32_t)(data.va + 192));
+		PUSH((uint32_t)((data.va + 192) >> 32));
+		PUSH(1u);
+		PUSH(0xffffffffu);
+		PUSH(4u);
+		WRITE(data.va + 196, 0xcafe0010u);
+		KICK();
+		usleep(100000);
+		printf("stopwait: the queue waits (rptr %llu, wptr %llu), marker %s\n", (unsigned long long)*rptr, (unsigned long long)w,
+		       lab[1] != 0 ? "LANDED (no wait?)" : "not landed");
+		fflush(stdout);
+		if (stopwait == 2) {
+			printf("stopwait: exiting with the queue waiting\n");
+			fflush(stdout);
+			_exit(0);
+		}
+		t0 = Now();
+		struct kfd_ioctl_destroy_queue_args dq = {.queue_id = q.queue_id};
+		r = Ioctl(kfd, AMDKFD_IOC_DESTROY_QUEUE, &dq);
+		printf("stopwait: DESTROY_QUEUE of the waiting queue: %s after %.1f ms\n", r ? strerror(-r) : "ok", (Now() - t0) * 1e3);
+		lab[0] = 1;
+		__sync_synchronize();
+		usleep(100000);
+		printf("stopwait: the label written after it: marker %s\n", lab[1] != 0 ? "LANDED (the queue still ran)" : "not landed");
+		return r != 0 || lab[1] != 0 ? 14 : 0;
 	}
 
 	if (gds) {

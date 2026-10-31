@@ -107,6 +107,8 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `condib` | libSceAgc's conditional branch (`COND_INDIRECT_BUFFER`, 14 dwords) on the gfx ring: then, else and none taken, with and without VALID (`PROBE_CONDIB_VALID=0`) in the sizes |
 | `atomicmem` | libSceAgc's `ATOMIC_MEM` around a context push or pop (atomic 0x67, command 2) on the gfx ring: the flags swap, a `WRITE_DATA` after it lands |
 | `mecforms` | libSceAgc's ACB packets without the shader-type bit on the compute ring: store dispatch, `EVENT_WRITE` + `ACQUIRE_MEM`, `DMA_DATA`, `WAIT_REG_MEM_64`, `RELEASE_MEM` |
+| `condexec` | `COND_EXEC` on an abort word (gfx ring, compute ring 1): word 1 and 0, an IB2 call guarded, EXEC_COUNT 20000 and 70000, the word cleared while an ME wait (with and without `PFP_SYNC_ME`) or a PFP wait ahead of it waits; one step per run with `CONDEXEC_STEP` |
+| `exitguard` | Kyty's exit guard: `COND_EXEC` over an `INDIRECT_BUFFER` chain to an empty IB; `GUARD_STEP` 0-3 on the gfx ring. **Steps 4-5 (compute ring) took the board down; do not run them** |
 | `waitforms` | the guest's `WAIT_REG_MEM` / `WAIT_REG_MEM_64` forms (ME and PFP, EQUAL and GREATER_EQUAL, met and released by the CPU) on the gfx ring |
 | `regindex-sh`, `-shc`, `-ctx`, `-uc` | 0x63 / 0x9F / 0x64 (AMD's `LOAD_*_REG_INDEX`) with one pair, read back with `COPY_DATA`; `shc` loads a compute register from a graphics-type header |
 | `regindex-uc342`, `-sh-nr`, `-ctx-nr` | the same packets without register reads, a `WRITE_DATA` after them as the proof |
@@ -319,3 +321,20 @@ the attributes (`AMDKFD_IOC_SVM + (n * 8 << _IOC_SIZESHIFT)`, as libhsakmt does)
 distrobox enter bc250-mesa-dev -- make svm_probe && ./svm_probe
 ```
 
+
+### `condexec`, `exitguard`, `kfd_probe condexec|stopwait` (2026-10-31, stock amdgpu 7.2.7)
+
+For Kyty's exit (Pm4Translator::SetExitGuard): how to stop a title's GPU work where it stands.
+
+- `COND_EXEC` runs in a user IB on the gfx ring, on amdgpu's compute ring and on a KFD queue; it skips
+  an IB2 call. EXEC_COUNT 20005 skips right, 70005 does not (the field is narrower).
+- The PFP decides a `COND_EXEC` before an ME `WAIT_REG_MEM` ahead of it is released: the word cleared
+  while the ME waits comes too late, the guarded write still lands. With `PFP_SYNC_ME` after the wait,
+  or with a PFP wait, it is skipped.
+- The gfx guard (`COND_EXEC` over a chain to 8 filler NOPs) leaves the IB and the job ends, also when
+  the word is set while an ME (+`PFP_SYNC_ME`) or PFP wait waits.
+- The same chain on amdgpu's compute ring (MEC) froze the whole board at once, with nothing in the
+  kernel log. On MEC only `COND_EXEC` with a count.
+- `kfd_probe stopwait destroy`: `DESTROY_QUEUE` of a KFD queue waiting on a label nobody writes takes
+  0.8 ms and the queue never runs again; `stopwait exit`: the process exits with the queue waiting, KFD
+  tears it down, the next process's queue works.
