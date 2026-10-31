@@ -1,6 +1,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "emulator.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 
@@ -179,6 +180,8 @@ int LoadExec(const char* path, const char* const argv[]) {
 	}
 	environment.push_back(relaunched_entry.data());
 	environment.push_back(nullptr);
+	// The title's native GPU work ends here, as at exit; the new program starts with idle rings.
+	Libs::Graphics::NativeGpu::ShadowStopGpu("exec");
 	if (close_range(3, ~0u, CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) == 0) {
 		execvpe(host_argv[0], host_argv.data(), environment.data());
 	}

@@ -113,6 +113,10 @@ void Shutdown() {
 	g_renderer = nullptr;
 }
 
+void EmergencyShutdown() {
+	NativeGpu::ShadowStopGpu("exit");
+}
+
 void GraphicsDbgDumpDcb(const char* type, uint32_t num_dw, const uint32_t* cmd_buffer) {
 	EXIT_IF(type == nullptr);
 
