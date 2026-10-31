@@ -105,6 +105,14 @@ for that one boot with an `install amdgpu ... insmod /run/...` line) shows why: 
 (write pointer 0x200, read pointer 0). On the BC-250 only the PSP can point the CP at microcode; the PS5's PSP leaves
 these registers open.
 
+VCN (2026-10-31): the BC-250's IP discovery lists UVD 2.0.3 (bases 0x7800, 0x7e00, 0x2403000, harvest 0), which
+stock amdgpu gives no block, and its SMU (11.8) has no VCN power messages, as on the PS5. `vcnpatch.py` patches a
+stock amdgpu copy the way ps5-linux brings VCN up on the PS5 (`amdgpu.bc250_vcn=1`: the vcn_v2_0 block, ps5_vcn.bin
+loaded directly while GC stays with the PSP, no doorbells, power and reset by UVD register writes). Loaded for one
+boot, it froze the board about 2 s into the boot, before the kernel log reached the disk: its first access to the
+block is a read of `UVD_STATUS`. The VCN tile is powered off on the BC-250 and only the SMU could turn it on; the
+PS5's own system turns it on before Linux starts.
+
 ## Companion pieces
 
 - `tools/bc250-lodhw/kyty-lodhw`: the root helper. Op 14 invalidates the KFD VMIDs' TLBs (invalidation
