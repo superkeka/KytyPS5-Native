@@ -2684,14 +2684,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		for (uint32_t i = 0; i < 8; i++) {
 			const uint32_t step = i * kCbColorStride;
 			const uint32_t off  = kCbColor0Info + step;
-			// Load mode: an INFO the copy has from a verbatim table may not be the GPU's, and the insert would replace
-			// the GPU's with it (format, compression and all): left out, the target keeps its DCC. The decision needs
-			// an AND on the CP's INFO and a range compare of its BASE, which no packet of the CP here does. With INFO
-			// known and only BASE from a table the copy's BASE decides as before: what goes to the GPU is its own INFO
-			// with DCC toggled, and a wrong choice there costs a picture, not a stray write.
+			// Load mode: an INFO the copy has from a verbatim table may not be the GPU's (the CP reads the table when it
+			// runs it), and the insert replaces the GPU's with the copy's, DCC off. Left out, the target kept its DCC and
+			// the video-out buffer went to the display compressed (GT7's menus: noise over the UI and the water); a table
+			// that changes a display target's format after it was translated is the smaller risk. Deciding on the GPU
+			// needs an AND on the CP's INFO and a range compare of its BASE, which no packet of the CP here does.
 			if (stale(off)) {
-				stats.cp_shadow_dcc_skipped++;
-				continue;
+				stats.cp_shadow_dcc_table++;
 			}
 			const uint32_t info = reg(cx, off);
 			const uint64_t addr = (static_cast<uint64_t>(reg(cx, kCbColor0Base + step)) << 8u) |

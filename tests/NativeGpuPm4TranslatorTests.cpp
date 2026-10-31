@@ -3733,8 +3733,9 @@ void TestCpShadowCbInserts() {
 		      "into an offset dword, past the tables, from outside S's context region, into the zero word or into S: refused");
 	}
 
-	// Display DCC: a target in a video-out buffer. In load mode with INFO from a table the insert is left out; with
-	// only BASE from a table (INFO the title's SET) it goes as before; off, it goes too.
+	// Display DCC: a target in a video-out buffer gets its insert in every mode, also in load mode with INFO from a
+	// table (the copy's INFO, DCC off: left out, the video-out buffer went to the display compressed); the flip stats
+	// count those.
 	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Off}) {
 		for (const bool info_table: {true, false}) {
 			Pm4Translator t;
@@ -3752,8 +3753,8 @@ void TestCpShadowCbInserts() {
 			}
 			AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
 			draw(dcb);
-			auto       r    = t.Translate(dcb);
-			const bool left = mode == CpShadowMode::Load && info_table;
+			auto       r     = t.Translate(dcb);
+			const bool table = mode == CpShadowMode::Load && info_table;
 			// SETs of INFO without DCC: the insert's (and, off, the preamble's replay of the copy, which has it).
 			uint32_t sets = 0;
 			for (const auto& p: Decode(r.ib)) {
@@ -3762,8 +3763,8 @@ void TestCpShadowCbInserts() {
 				            ? 1u
 				            : 0u;
 			}
-			Check(r.ok && (sets != 0) == !left && r.stats.cp_shadow_dcc_skipped == (left ? 1u : 0u),
-			      left ? "load mode, INFO from a table: the display-DCC insert is left out" : "the CPU clears DCC as before");
+			Check(r.ok && sets != 0 && r.stats.cp_shadow_dcc_table == (table ? 1u : 0u),
+			      table ? "load mode, INFO from a table: the display-DCC insert goes, from the copy's INFO" : "the CPU clears DCC as before");
 		}
 	}
 }
