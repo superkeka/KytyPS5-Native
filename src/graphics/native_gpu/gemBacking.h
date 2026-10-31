@@ -1339,10 +1339,18 @@ private:
 			if (fd < 0) {
 				return;
 			}
+			// Read straight into the string: this runs on guest threads too, whose stacks are guest memory
+			// and small. A 64 KiB buffer here ran past a job thread's stack and wrote the maps text over the
+			// title's memory (Demon's Souls: __stack_chk_fail, pointers holding "7fd5c..." text).
 			std::string text;
-			char        chunk[65536];
-			for (ssize_t n = 0; (n = ::read(fd, chunk, sizeof(chunk))) > 0;) {
-				text.append(chunk, static_cast<size_t>(n));
+			for (;;) {
+				const size_t used = text.size();
+				text.resize(used + 65536);
+				const ssize_t n = ::read(fd, text.data() + used, 65536);
+				text.resize(used + static_cast<size_t>(std::max<ssize_t>(n, 0)));
+				if (n <= 0) {
+					break;
+				}
 			}
 			::close(fd);
 			m_read = true;
