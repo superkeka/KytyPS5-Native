@@ -97,8 +97,13 @@ Direct loading (2026-10-31): `fw_load_type=0` makes amdgpu load cyan_skillfish2'
 through the PSP (`amdgpu_ucode_get_load_type`). With the eight files stripped (pfp, me, ce, rlc, mec, mec2, sdma,
 sdma1) the BC-250 does not come up: `ring kiq_0.2.1.0 test failed (-110)`, `KCQ enable failed`, `hw_init of IP
 block <gfx_v10_0> failed`, a MODE1 reset and no `/dev/dri`. The board itself boots (SSH), and the next boot is
-normal. The same files and code start a PS5 under ps5-linux, so the BC-250's firmware set-up keeps the MEC from
-running directly loaded microcode, or needs a step this path lacks; not known which.
+normal. The same files and code start a PS5 under ps5-linux. A stock amdgpu with a register dump in gfx_v10_0 (loaded
+for that one boot with an `install amdgpu ... insmod /run/...` line) shows why: the microcode load registers read
+0xffffffff from the host, whatever amdgpu wrote (`CP_CPC_IC_BASE_LO/HI`, `CP_CPC_IC_BASE_CNTL`, `CP_CPC_IC_OP_CNTL`,
+`CP_MEC_ME1_UCODE_ADDR`, `CP_PFP_IC_BASE_LO`, `RLC_GPM_UCODE_ADDR`, all in 0x5800-0x5bff), while `GRBM_STATUS`,
+`CP_MEC_CNTL` and `RLC_CNTL` read normally. Unhalted, the MEC stays at instruction 0x402 and never reads the KIQ ring
+(write pointer 0x200, read pointer 0). On the BC-250 only the PSP can point the CP at microcode; the PS5's PSP leaves
+these registers open.
 
 ## Companion pieces
 
