@@ -809,12 +809,40 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 					return bad();
 				}
 				break;
+			// A DMA_DATA that reads or writes CP shadowing's S or its save area P only as the GPU push or pop
+			// (Pm4Translator::SetCpShadowPushPop): the gfx ring, S's context region to P or back, exactly as the
+			// translator writes it. Any other one passes as before.
+			case IT_DMA_DATA: {
+				const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed);
+				if (s != 0 && size >= 7) {
+					const uint32_t src_sel = (b[0] >> 29u) & 0x3u;
+					const uint32_t dst_sel = (b[0] >> 20u) & 0x3u;
+					const uint64_t bytes   = std::max<uint64_t>(b[5] & 0x3ffffffu, 1u);
+					const uint64_t src     = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
+					const uint64_t dst     = b[3] | (static_cast<uint64_t>(b[4]) << 32u);
+					auto           in_s    = [&](uint64_t a) { return a < s + kCpShadowReserveBytes && a + bytes > s; };
+					const bool     touches = ((src_sel == 0u || src_sel == 3u) && in_s(src)) || ((dst_sel == 0u || dst_sel == 3u) && in_s(dst));
+					if (touches) {
+						const uint64_t cx   = s + 4ull * kCpShadowContextDw;
+						const uint64_t p    = s + kCpShadowSaveOffset;
+						const bool     form = header == Pkt3(IT_DMA_DATA, 6, false) && b[0] == kCpShadowDmaControl && b[5] == kCpShadowDmaCommand &&
+						                  ((src == cx && dst == p) || (src == p && dst == cx));
+						if (compute || !form) {
+							return bad();
+						}
+						break;
+					}
+				}
+				if (compute && (header & 2u) == 0 && !MecPlainOp(IT_DMA_DATA)) {
+					return bad();
+				}
+				break;
+			}
 			// Packets both rings run. On MEC the shader-type bit is set.
 			case IT_SET_BASE:
 			case IT_DISPATCH_DIRECT:
 			case IT_DISPATCH_INDIRECT:
 			case IT_EVENT_WRITE:
-			case IT_DMA_DATA:
 			case IT_ACQUIRE_MEM:
 			case IT_SET_SH_REG:
 				if (compute && (header & 2u) == 0 && !MecPlainOp((header >> 8u) & 0xffu)) {
@@ -1365,6 +1393,81 @@ void Pm4Translator::EmitShadowPreamble(std::vector<uint32_t>& ib, Pm4TranslateSt
 	                 m_cp_shadow_mode == CpShadowMode::Record ? kCpShadowClasses : (~m_cp_shadow_classes & kCpShadowClasses));
 }
 
+// libSceAgc's context push on the GPU (SetCpShadowPushPop): S's context region to P once every shadow write before
+// it has landed (PFP_SYNC_ME, and RAW_WAIT for the DMA's own reads), CP_SYNC so nothing after it runs before the copy
+// is done. Shadowing stays on: S goes on following the inner state.
+void Pm4Translator::EmitCpShadowPush(std::vector<uint32_t>& ib) const {
+	const uint64_t cx = m_cp_shadow_va + 4ull * kCpShadowContextDw;
+	const uint64_t p  = m_cp_shadow_va + kCpShadowSaveOffset;
+	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
+	ib.push_back(0u);
+	ib.insert(ib.end(), {Pkt3(IT_DMA_DATA, 6, false), kCpShadowDmaControl, static_cast<uint32_t>(cx), static_cast<uint32_t>(cx >> 32u),
+	                     static_cast<uint32_t>(p), static_cast<uint32_t>(p >> 32u), kCpShadowDmaCommand});
+}
+
+// The pop: P back into S's context region, PFP_SYNC_ME so the PFP's LOAD reads it only after the ME has finished
+// the copy (CP_SYNC), the enables (loading context on), LOAD_CONTEXT_REG of every context register `valid` in S
+// (all of 0x000-0x3FF with the whole range), then what a LOAD does not restore, from `target` as a shadow
+// preamble SETs it (PA_SC_SHADER_CONTROL, DB_RENDER_OVERRIDE for HizOff, offsets from 0x400), and 0 for such
+// registers `current` holds and `target` does not (the CPU pop's rule).
+void Pm4Translator::EmitCpShadowPop(std::vector<uint32_t>& ib, const RegFile& target, const RegFile& current,
+                                    const std::bitset<RegFile::kDense>& valid) const {
+	const uint64_t cx = m_cp_shadow_va + 4ull * kCpShadowContextDw;
+	const uint64_t p  = m_cp_shadow_va + kCpShadowSaveOffset;
+	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
+	ib.push_back(0u);
+	ib.insert(ib.end(), {Pkt3(IT_DMA_DATA, 6, false), kCpShadowDmaControl, static_cast<uint32_t>(p), static_cast<uint32_t>(p >> 32u),
+	                     static_cast<uint32_t>(cx), static_cast<uint32_t>(cx >> 32u), kCpShadowDmaCommand});
+	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
+	ib.push_back(0u);
+	ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
+	ib.push_back(kCpShadowEnables);
+	ib.push_back(kCpShadowEnables);
+	const size_t at = ib.size();
+	ib.push_back(0u); // the header, once the length is known
+	ib.push_back(static_cast<uint32_t>(cx));
+	ib.push_back(static_cast<uint32_t>(cx >> 32u));
+	if (m_cp_shadow_pop_all) {
+		ib.push_back(0u);
+		ib.push_back(RegFile::kDense);
+	} else {
+		for (uint32_t off = 0; off < RegFile::kDense;) {
+			if (!valid.test(off) || !CpShadowLoadsContext(off)) {
+				off++;
+				continue;
+			}
+			uint32_t end = off + 1;
+			while (end < RegFile::kDense && valid.test(end) && CpShadowLoadsContext(end)) {
+				end++;
+			}
+			ib.push_back(off);
+			ib.push_back(end - off);
+			off = end;
+		}
+		if (ib.size() == at + 3) {
+			ib.push_back(0x080u); // as the preamble's anchor: a LOAD needs a range
+			ib.push_back(1u);
+		}
+	}
+	ib[at] = Pkt3(IT_LOAD_CONTEXT_REG, static_cast<uint32_t>(ib.size() - at - 1), false);
+	for (const auto& [off, value]: target) {
+		if (!CpShadowLoadsContext(off)) {
+			EmitSet(ib, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
+		}
+	}
+	for (const auto& [off, value]: current) {
+		if (!CpShadowLoadsContext(off) && target.count(off) == 0 && value != 0) {
+			EmitSet(ib, IT_SET_CONTEXT_REG, off, PatchContext(off, 0), false);
+		}
+	}
+	if (m_ps5_reg_overrides && target.count(kPaScShaderControl) == 0) {
+		EmitSet(ib, IT_SET_CONTEXT_REG, kPaScShaderControl, PatchContext(kPaScShaderControl, 0), false);
+	}
+	if (m_depth_mode == DepthDebugMode::HizOff && target.count(kDbRenderOverride) == 0) {
+		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
+	}
+}
+
 void Pm4Translator::EmitPreambleState(std::vector<uint32_t>& ib, const RegFile& uc, const Pm4CpDrawState& cp) const {
 	// The title's tessellation rings (SetTessellationRings), in the *_UMD registers user mode drivers own.
 	if (const uint32_t tf_bytes = g_tf_ring_bytes.load(std::memory_order_acquire); tf_bytes != 0) {
@@ -1450,13 +1553,23 @@ void Pm4Translator::EmitRegisterSets(std::vector<uint32_t>& ib, Pm4TranslateStat
 	}
 }
 
-void Pm4Translator::WriteCpShadowImage(std::span<uint32_t> s) const {
+void Pm4Translator::WriteCpShadowImage(std::span<uint32_t> s, std::span<uint32_t> save) {
 	if (s.size() < kCpShadowDwords) {
 		return;
 	}
 	for (const auto& [offset, value]: m_cx) {
 		if (offset < RegFile::kDense) {
 			s[kCpShadowContextDw + offset] = PatchContext(offset, value);
+			m_cp_valid_cx.set(offset);
+		}
+	}
+	// P: what a pop restores, the pushed context while one is pushed (a push translated before shadowing came on).
+	if (save.size() >= kCpShadowSaveBytes / 4u) {
+		for (const auto& [offset, value]: m_cx_pushed ? m_saved_cx : m_cx) {
+			if (offset < RegFile::kDense) {
+				save[offset] = PatchContext(offset, value);
+				m_saved_valid_cx.set(offset); // what a GPU pop LOADs from it
+			}
 		}
 	}
 	for (const auto& [offset, value]: m_sh) {
@@ -1739,11 +1852,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	auto       wcx       = m_writer_cx;
 	auto       wsh       = m_writer_sh;
 	auto       wuc       = m_writer_uc;
-	auto       writer    = [cp_shadow](std::array<uint8_t, RegFile::kDense>& w, uint32_t off, RegWriter kind) {
+	auto       saved_wcx = m_saved_writer_cx;
+	auto       vcx       = m_cp_valid_cx; // context registers S has a value for
+	auto       saved_vcx = m_saved_valid_cx; // and had at the GPU push
+	auto       writer    = [cp_shadow, &wcx, &vcx](std::array<uint8_t, RegFile::kDense>& w, uint32_t off, RegWriter kind) {
         if (cp_shadow && off < RegFile::kDense) {
             w[off] = static_cast<uint8_t>(kind);
+            if (&w == &wcx) {
+                vcx.set(off);
+            }
         }
 	};
+	const bool gpu_pushpop = CpShadowGpuPushPop();
 	// Memory this DCB writes with WRITE_DATA / DMA_DATA before the GPU gets further. The CP reads an
 	// indirect register table when it runs the packet; the translator reads it now, so a table written
 	// earlier in the same DCB would be read before it is written.
@@ -2308,24 +2428,77 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// Agc context-state operations (AgcDcbContextStateOp, emulated by Kyty's command processor):
 	// 0 clear to the defaults, 1 push, 2 pop, 3 push then clear. The PS5 packets behind them save and
 	// restore the context registers; here the shadow does it and the differences are emitted.
+	// With CP shadowing in load mode (SetCpShadowPushPop) the push and the pop run on the GPU through S: a push
+	// copies S's context region to P (the first of a window only), the pop copies it back and LOADs it, so the GPU
+	// gets back what it had at the push, late tables included. The copy follows: saved_cx is the pushed state,
+	// the pop makes it cx again (the registers that change are marked, as a CPU pop's SETs would mark them).
+	auto gpu_push = [&]() {
+		if (cx_pushed) {
+			return; // the PS5 restores the first pushed state
+		}
+		EmitCpShadowPush(body);
+		saved_cx  = cx;
+		saved_wcx = wcx;
+		saved_vcx = vcx;
+		cx_pushed = true;
+		stats.cp_shadow_pushes++;
+	};
+	auto gpu_pop = [&]() {
+		// P holds S as it was at the push: the registers it had a value for then are LOADed. One first written
+		// inside the window has no pushed value in P; it gets the CPU pop's 0 when the copy holds it.
+		EmitCpShadowPop(body, saved_cx, cx, saved_vcx);
+		for (const auto& [off, value]: cx) {
+			if (off < RegFile::kDense && !saved_vcx.test(off) && CpShadowLoadsContext(off) && saved_cx.count(off) == 0 && value != 0) {
+				EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, 0), false);
+				saved_vcx.set(off);
+			}
+		}
+		vcx = saved_vcx; // S's context region is P's again
+		for (const auto& [off, value]: saved_cx) {
+			const uint32_t* cur = cx.Find(off);
+			if (cur == nullptr || *cur != value) {
+				mark_cx(off);
+			}
+		}
+		for (const auto& [off, value]: cx) {
+			if (saved_cx.count(off) == 0) {
+				mark_cx(off);
+			}
+		}
+		cx  = saved_cx;
+		wcx = saved_wcx;
+		stats.cp_shadow_pops++;
+	};
 	auto context_state_op = [&](uint32_t operation) {
 		stats.context_ops++;
 		switch (operation) {
 			case 0: switch_context(m_cx_defaults); break;
 			case 1:
+				if (gpu_pushpop) {
+					gpu_push();
+					break;
+				}
 				saved_cx  = cx;
 				cx_pushed = true;
 				break;
 			case 2:
 				if (cx_pushed) {
-					switch_context(saved_cx);
+					if (gpu_pushpop) {
+						gpu_pop();
+					} else {
+						switch_context(saved_cx);
+					}
 					saved_cx.clear();
 					cx_pushed = false;
 				}
 				break;
 			case 3:
-				saved_cx  = cx;
-				cx_pushed = true;
+				if (gpu_pushpop) {
+					gpu_push();
+				} else {
+					saved_cx  = cx;
+					cx_pushed = true;
+				}
 				switch_context(m_cx_defaults);
 				break;
 			default: break;
@@ -3979,6 +4152,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					body.push_back(kCpShadowEnables);
 					body.push_back(kCpShadowEnables);
 				}
+				// The clear sets the context to amdgpu's clear state, which S does not hold: only the defaults'
+				// SETs below give S its values again.
+				if (cp_shadow) {
+					vcx.reset();
+				}
 				for (const auto& [off, value]: m_cx_defaults) {
 					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
 					mark_cx(off);
@@ -4098,9 +4276,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_cx_pushed = cx_pushed;
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
-	m_writer_cx = wcx;
-	m_writer_sh = wsh;
-	m_writer_uc = wuc;
+	m_writer_cx       = wcx;
+	m_writer_sh       = wsh;
+	m_writer_uc       = wuc;
+	m_saved_writer_cx = saved_wcx;
+	m_cp_valid_cx     = vcx;
+	m_saved_valid_cx  = saved_vcx;
 	// The IB starts where the previous DCB left the CP, not where this one leaves it.
 	const Pm4CpDrawState cp_start = m_cp;
 	m_cp                          = cp;

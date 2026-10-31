@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <span>
 #include <thread>
 #include <vector>
@@ -2614,11 +2615,12 @@ struct ToyCp {
 	std::array<uint32_t, 0x400> cx {};
 	std::array<uint32_t, 0x400> sh {};
 	std::array<uint32_t, 0x400> uc {};
-	std::vector<uint32_t>       s = std::vector<uint32_t>(kCpShadowBytes / 4u, 0u);
+	std::vector<uint32_t>       s = std::vector<uint32_t>(Libs::Graphics::NativeGpu::kCpShadowReserveBytes / 4u, 0u); // S, then P
 	uint32_t                    load   = 0;
 	uint32_t                    shadow = 0;
 	std::array<bool, 4>         base {};
 	uint32_t                    loads = 0; // LOADs that loaded
+	uint32_t                    dmas  = 0; // DMA_DATA copies
 
 	static uint32_t Bit(int c) { return c == kCtx ? 1u << 1u : c == kUc ? 1u << 15u : c == kGsh ? 1u << 16u : 1u << 24u; }
 	static uint32_t Region(int c) { return c == kCtx ? kCpShadowContextDw : c == kUc ? kCpShadowUconfigDw : kCpShadowShDw; }
@@ -2705,6 +2707,18 @@ struct ToyCp {
 					Run(std::span<const uint32_t>(reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(b[1]) << 32u) | b[0]),
 					                              b[2] & 0xfffffu));
 					break;
+				case 0x50u: { // DMA_DATA: memory to memory, only inside S and P here
+					const uint64_t src = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
+					const uint64_t dst = b[3] | (static_cast<uint64_t>(b[4]) << 32u);
+					const uint32_t len = b[5] & 0x3ffffffu;
+					Check(src >= kTestShadowVa && dst >= kTestShadowVa && src + len <= kTestShadowVa + 4ull * s.size() &&
+					          dst + len <= kTestShadowVa + 4ull * s.size(),
+					      "toy CP: a DMA_DATA inside S and P");
+					std::copy_n(s.begin() + static_cast<std::ptrdiff_t>((src - kTestShadowVa) / 4u), len / 4u,
+					            s.begin() + static_cast<std::ptrdiff_t>((dst - kTestShadowVa) / 4u));
+					dmas++;
+					break;
+				}
 				case 0x22u: // COND_EXEC: no stop armed, the dwords it guards are skipped
 					dw += b[3];
 					break;
@@ -2729,9 +2743,11 @@ struct ToyCp {
 		Job(ib);
 	}
 	// S as the backend seeds it when CP shadowing comes on.
-	void Seed(const Pm4Translator& t) {
+	void Seed(Pm4Translator& t) {
 		std::fill(s.begin(), s.end(), 0u);
-		t.WriteCpShadowImage(std::span<uint32_t>(s.data(), kCpShadowDwords));
+		t.WriteCpShadowImage(std::span<uint32_t>(s.data(), kCpShadowDwords),
+		                     std::span<uint32_t>(s.data() + Libs::Graphics::NativeGpu::kCpShadowSaveOffset / 4u,
+		                                         Libs::Graphics::NativeGpu::kCpShadowSaveBytes / 4u));
 	}
 };
 
@@ -3244,6 +3260,206 @@ void TestCpShadowPushPopCpu() {
 	Check(cp.cx[0x10] == 0x1111u && cp.s[kCpShadowContextDw + 0x10u] == 0x1111u, "the pop's SET reaches the register and S");
 }
 
+// libSceAgc's push and pop on the GPU through S (SetCpShadowPushPop): the packets, the Demon's Souls case (a late
+// table inside the window that the CPU pop cannot see), a window across buffers and another process, a register
+// first written inside the window, a pop whose push came before shadowing, and the packet check of the DMA_DATAs.
+void TestCpShadowPushPopGpu() {
+	using Libs::Graphics::NativeGpu::kCpShadowDmaCommand;
+	using Libs::Graphics::NativeGpu::kCpShadowDmaControl;
+	using Libs::Graphics::NativeGpu::kCpShadowSaveOffset;
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	constexpr uint32_t IT_DMA_DATA = 0x50;
+	const uint64_t     cx_va       = kTestShadowVa + 0x1000u;
+	const uint64_t     p_va        = kTestShadowVa + kCpShadowSaveOffset;
+	auto push = [](std::vector<uint32_t>& d) { d.insert(d.end(), {0xc0001200u, 1u}); };
+	auto pop  = [](std::vector<uint32_t>& d) { d.insert(d.end(), {0xc0001200u, 2u}); };
+	auto draw = [](std::vector<uint32_t>& d) { Append(d, IT_DRAW_INDEX_AUTO, {3u, 0u}, false); };
+	auto dma  = [](const Packet& p, uint64_t from, uint64_t to) {
+		return p.op == IT_DMA_DATA && !p.compute &&
+		       p.body == std::vector<uint32_t>({kCpShadowDmaControl, static_cast<uint32_t>(from), static_cast<uint32_t>(from >> 32u),
+		                                        static_cast<uint32_t>(to), static_cast<uint32_t>(to >> 32u), kCpShadowDmaCommand});
+	};
+	auto make = [&](bool gpu) {
+		auto t = std::make_unique<Pm4Translator>();
+		t->SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		t->SetCpShadowPushPop(gpu);
+		Start(*t, {{0x10Fu, 0xAu}, {0x20u, 2u}}, {}, {});
+		return t;
+	};
+
+	// One buffer: push, a table that sets the viewport to what the copy already holds (A when translated, B when
+	// it runs), a draw, pop, a draw. The CPU pop sees no difference and leaves B; the GPU pop restores A.
+	for (const bool gpu: {true, false}) {
+		auto                  t = make(gpu);
+		ToyCp                 cp;
+		cp.Seed(*t);
+		std::vector<uint32_t> pairs = {0x10Fu, 0xAu};
+		std::vector<uint32_t> dcb;
+		push(dcb);
+		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+		draw(dcb);
+		pop(dcb);
+		draw(dcb);
+		auto r = t->Translate(dcb);
+		Check(r.ok && r.stats.loads_verbatim == 1, "the table runs as written");
+		pairs[1] = 0xBu;
+		const auto pkts = Decode(r.ib);
+		if (gpu) {
+			Check(r.stats.cp_shadow_pushes == 1 && r.stats.cp_shadow_pops == 1, "one GPU push and one GPU pop");
+			size_t i = 0;
+			while (i < pkts.size() && pkts[i].op != IT_DMA_DATA) {
+				i++;
+			}
+			Check(i >= 1 && i + 1 < pkts.size() && pkts[i - 1].op == IT_PFP_SYNC_ME && dma(pkts[i], cx_va, p_va),
+			      "push: PFP_SYNC_ME, DMA_DATA of S's context region to P");
+			size_t j = i + 1;
+			while (j < pkts.size() && pkts[j].op != IT_DMA_DATA) {
+				j++;
+			}
+			Check(j + 4 < pkts.size() && pkts[j - 1].op == IT_PFP_SYNC_ME && dma(pkts[j], p_va, cx_va) && pkts[j + 1].op == IT_PFP_SYNC_ME &&
+			          pkts[j + 2].op == IT_CONTEXT_CONTROL && pkts[j + 2].body == std::vector<uint32_t>({0x81018002u, 0x81018002u}) &&
+			          pkts[j + 3].op == IT_LOAD_CX && pkts[j + 3].body[0] == static_cast<uint32_t>(cx_va),
+			      "pop: PFP_SYNC_ME, DMA_DATA of P back, PFP_SYNC_ME, the enables, LOAD_CONTEXT_REG from S");
+			const std::vector<std::pair<uint32_t, uint32_t>> ranges(LoadRanges({pkts[j + 3]}, IT_LOAD_CX, false));
+			Check(ranges == std::vector<std::pair<uint32_t, uint32_t>>({{0x20u, 1u}, {0x10Fu, 1u}}), "over the registers S has a value for");
+			bool set_after = false;
+			for (size_t k = j + 4; k < pkts.size(); k++) {
+				set_after = set_after || pkts[k].op == IT_SET_CONTEXT_REG;
+			}
+			Check(!set_after, "and no CPU diff SET");
+			SetCpShadowValidation(kTestShadowVa);
+			Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "the packet check takes it");
+			SetCpShadowValidation(0);
+		}
+		cp.Job(AsJob(r.ib));
+		Check(cp.cx[0x10F] == (gpu ? 0xAu : 0xBu), gpu ? "GPU pop: the pushed viewport comes back" : "CPU pop: the inner one stays (the bug)");
+		Check(!gpu || (cp.dmas == 2 && cp.s[kCpShadowContextDw + 0x10Fu] == 0xAu && cp.s[kCpShadowSaveOffset / 4u + 0x10Fu] == 0xAu),
+		      "two copies: P holds the pushed value, and S holds it again after the pop");
+	}
+
+	// A second push inside a window does nothing; a pop without a push does nothing.
+	{
+		auto                  t = make(true);
+		std::vector<uint32_t> dcb;
+		pop(dcb);
+		push(dcb);
+		Append(dcb, IT_SET_CONTEXT_REG, {0x10Fu, 0xCu}, false);
+		push(dcb);
+		pop(dcb);
+		draw(dcb);
+		auto     r    = t->Translate(dcb);
+		uint32_t dmas = 0;
+		for (const auto& p: Decode(r.ib)) {
+			dmas += p.op == IT_DMA_DATA ? 1u : 0u;
+		}
+		Check(r.ok && dmas == 2 && r.stats.cp_shadow_pushes == 1 && r.stats.cp_shadow_pops == 1,
+		      "a pop with nothing pushed and a second push emit nothing");
+		ToyCp cp;
+		auto  t2 = make(true);
+		cp.Seed(*t2);
+		auto r2 = t2->Translate(dcb);
+		cp.Job(AsJob(r2.ib));
+		Check(cp.cx[0x10F] == 0xAu, "the first pushed state comes back");
+	}
+
+	// A window across two buffers with another process between them: the second buffer's preamble LOADs the inner
+	// state from S, its pop the pushed one from P.
+	{
+		auto                  t = make(true);
+		ToyCp                 cp;
+		cp.Seed(*t);
+		std::vector<uint32_t> pairs = {0x10Fu, 0xAu};
+		std::vector<uint32_t> dcb1, dcb2;
+		push(dcb1);
+		AppendIndirect(dcb1, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+		draw(dcb1);
+		draw(dcb2);
+		pop(dcb2);
+		draw(dcb2);
+		auto r1 = t->Translate(dcb1);
+		pairs[1] = 0xBu;
+		cp.Job(AsJob(r1.ib));
+		cp.Foreign();
+		auto r2 = t->Translate(dcb2);
+		Check(cp.s[kCpShadowContextDw + 0x10Fu] == 0xBu && cp.s[kCpShadowSaveOffset / 4u + 0x10Fu] == 0xAu,
+		      "between the buffers S holds the inner value, P the pushed one");
+		// Up to the pop's first packet (its PFP_SYNC_ME): the preamble and the draw see the inner value.
+		size_t until = 0;
+		for (size_t dw = 0; dw < r2.ib.size(); dw += PacketSizeDw(r2.ib[dw])) {
+			if (r2.ib[dw] == Pkt3(IT_DMA_DATA, 6, false)) {
+				break;
+			}
+			until = dw;
+		}
+		ToyCp mid = cp;
+		mid.Job(AsJob(std::span<const uint32_t>(r2.ib.data(), until)));
+		Check(mid.cx[0x10F] == 0xBu, "the next buffer's preamble LOADs the inner value inside the window");
+		cp.Job(AsJob(r2.ib));
+		Check(cp.cx[0x10F] == 0xAu && r2.stats.cp_shadow_pops == 1, "the pop in the next buffer restores the pushed value");
+	}
+
+	// A register first written inside the window: no pushed value in P, the CPU pop's 0.
+	{
+		auto                  t = make(true);
+		ToyCp                 cp;
+		cp.Seed(*t);
+		std::vector<uint32_t> dcb;
+		push(dcb);
+		Append(dcb, IT_SET_CONTEXT_REG, {0x30u, 5u}, false);
+		draw(dcb);
+		pop(dcb);
+		draw(dcb);
+		auto r = t->Translate(dcb);
+		cp.Job(AsJob(r.ib));
+		Check(cp.cx[0x30] == 0u && cp.s[kCpShadowContextDw + 0x30u] == 0u && cp.cx[0x10F] == 0xAu, "it is set to 0 after the LOAD");
+	}
+
+	// A push translated before shadowing came on: P is seeded with the pushed state, and the pop restores it.
+	{
+		Pm4Translator t;
+		Start(t, {{0x10Fu, 0xAu}}, {}, {});
+		std::vector<uint32_t> dcb1;
+		push(dcb1);
+		Append(dcb1, IT_SET_CONTEXT_REG, {0x10Fu, 0xDu}, false);
+		draw(dcb1);
+		Check(t.Translate(dcb1).ok, "a CPU push");
+		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		t.SetCpShadowPushPop(true);
+		ToyCp cp;
+		cp.Seed(t);
+		Check(cp.s[kCpShadowContextDw + 0x10Fu] == 0xDu && cp.s[kCpShadowSaveOffset / 4u + 0x10Fu] == 0xAu, "S holds the inner state, P the pushed");
+		std::vector<uint32_t> dcb2;
+		pop(dcb2);
+		draw(dcb2);
+		auto r = t.Translate(dcb2);
+		cp.Job(AsJob(r.ib));
+		Check(r.stats.cp_shadow_pops == 1 && cp.cx[0x10F] == 0xAu, "the GPU pop restores it");
+	}
+
+	// The packet check: a DMA_DATA at S or P only in the push's and the pop's form, and only on the gfx ring.
+	{
+		SetCpShadowValidation(kTestShadowVa);
+		auto ib_of = [](uint32_t control, uint64_t from, uint64_t to, uint32_t command) {
+			return std::vector<uint32_t> {Pkt3(IT_DMA_DATA, 6, false), control, static_cast<uint32_t>(from), static_cast<uint32_t>(from >> 32u),
+			                              static_cast<uint32_t>(to), static_cast<uint32_t>(to >> 32u), command};
+		};
+		Check(ValidateNativeIb(ib_of(kCpShadowDmaControl, cx_va, p_va, kCpShadowDmaCommand), false, nullptr, NativeIbKind::Gfx) &&
+		          ValidateNativeIb(ib_of(kCpShadowDmaControl, p_va, cx_va, kCpShadowDmaCommand), false, nullptr, NativeIbKind::Gfx),
+		      "the push's and the pop's copies pass");
+		Check(!ValidateNativeIb(ib_of(kCpShadowDmaControl, cx_va, p_va, kCpShadowDmaCommand | 0x10u), false, nullptr, NativeIbKind::Gfx) &&
+		          !ValidateNativeIb(ib_of(kCpShadowDmaControl, 0x1000000u, kTestShadowVa + 0x9000u, kCpShadowDmaCommand), false, nullptr,
+		                            NativeIbKind::Gfx) &&
+		          !ValidateNativeIb(ib_of(0u, 0x1000000u, p_va + 0xff0u, 0x40u), false, nullptr, NativeIbKind::Gfx),
+		      "another size, or another copy into S or P, is refused");
+		std::vector<uint32_t> cs = ib_of(kCpShadowDmaControl, cx_va, p_va, kCpShadowDmaCommand);
+		cs[0] |= 2u;
+		Check(!ValidateNativeIb(cs, false, nullptr, NativeIbKind::Compute), "and on a compute ring");
+		Check(ValidateNativeIb(ib_of(0u, 0x1000000u, 0x2000000u, 0x40u), false, nullptr, NativeIbKind::Gfx),
+		      "a title's DMA_DATA elsewhere still passes");
+		SetCpShadowValidation(0);
+	}
+}
+
 int main() {
 	// The cases count the packets a DCB turns into; the preamble's start values (PIXEL_PIPE_STAT_CONTROL,
 	// the CP draw state) are board settings with their own switches, left out here.
@@ -3324,6 +3540,7 @@ int main() {
 	TestCpShadowCompare();
 	TestCpShadowStartKeys();
 	TestCpShadowPushPopCpu();
+	TestCpShadowPushPopGpu();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
