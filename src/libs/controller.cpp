@@ -21,8 +21,15 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace Libs::Controller {
@@ -187,6 +194,33 @@ private:
 };
 
 static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_players;
+
+// KYTY_PAD_RECORD=<file>: every input event a player takes (buttons, axes, the right stick, the touch pad; not motion)
+// goes to the file as a line "<process time, us> <player> B <button> <down> | A <axis> <value> | R <x> <y> |
+// T <finger> <down> <x> <y>". KYTY_PAD_REPLAY=<file> feeds such a file back from PadInit on, each event at its
+// process time plus KYTY_PAD_REPLAY_SHIFT_MS, as host input next to the real pads: a run driven as it was recorded.
+static void PadRecord(int player, const char* format, ...) {
+	static std::mutex  mutex;
+	static std::FILE*  file = [] {
+		const char* path = std::getenv("KYTY_PAD_RECORD");
+		std::FILE*  f    = path != nullptr && path[0] != '\0' ? std::fopen(path, "w") : nullptr;
+		if (f != nullptr) {
+			std::fprintf(stderr, "pad: recording input to %s\n", path);
+		}
+		return f;
+	}();
+	if (file == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(mutex);
+	std::fprintf(file, "%llu %d ", static_cast<unsigned long long>(LibKernel::KernelGetProcessTime()), player);
+	va_list args;
+	va_start(args, format);
+	std::vfprintf(file, format, args);
+	va_end(args);
+	std::fputc('\n', file);
+	std::fflush(file);
+}
 
 // Maps host gamepads to players; the keyboard follows the configured keyboard player.
 static Common::Mutex g_router_mutex;
@@ -600,6 +634,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 	// Keyboard events are routed to the configured player's port.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
+		PadRecord(m_player, "B 0x%x %d", button, down ? 1 : 0);
 
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
 
@@ -616,6 +651,7 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 		int axis_id = static_cast<int>(axis);
 
 		EXIT_IF(axis_id < 0 || axis_id >= static_cast<int>(Controller::Axis::AxisMax));
+		PadRecord(m_player, "A %d %d", axis_id, value);
 
 		if (m_gyro_emulation && (axis == Controller::Axis::RightX || axis == Controller::Axis::RightY)) {
 			m_emulated_stick[axis == Controller::Axis::RightY ? 1 : 0] = value;
@@ -645,6 +681,7 @@ void GameController::RightStick(int id, int x, int y) {
 
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
+		PadRecord(m_player, "R %d %d", x, y);
 		if (m_gyro_emulation) {
 			m_emulated_stick = {x, y};
 			UpdateEmulatedTilt();
@@ -665,6 +702,7 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		auto& touch  = m_state.touch[finger];
 		m_state.time = LibKernel::KernelGetProcessTime();
+		PadRecord(m_player, "T %d %d %.4f %.4f", finger, down ? 1 : 0, x, y);
 		if (down && !touch.down) {
 			touch.id        = m_next_touch_id;
 			m_next_touch_id = m_next_touch_id == 127 ? 1 : m_next_touch_id + 1;
@@ -1300,11 +1338,79 @@ bool PadInitialized() {
 	return g_players[0] != nullptr && g_players[0]->CheckPortHandle(0) != PAD_ERROR_NOT_INITIALIZED;
 }
 
+// KYTY_PAD_RECORD's file played back (see PadRecord), once, on a thread of its own.
+static void PadReplayStart() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		const char* path = std::getenv("KYTY_PAD_REPLAY");
+		if (path == nullptr || path[0] == '\0') {
+			return;
+		}
+		const char*   shift_env = std::getenv("KYTY_PAD_REPLAY_SHIFT_MS");
+		const int64_t shift_us  = shift_env != nullptr ? std::strtoll(shift_env, nullptr, 0) * 1000 : 0;
+		std::thread([path = std::string(path), shift_us] {
+			std::ifstream in(path);
+			if (!in) {
+				std::fprintf(stderr, "pad: replay file %s not readable\n", path.c_str());
+				return;
+			}
+			std::fprintf(stderr, "pad: replaying input from %s (shift %lld ms)\n", path.c_str(), static_cast<long long>(shift_us / 1000));
+			std::string line;
+			uint32_t    events = 0;
+			while (std::getline(in, line)) {
+				std::istringstream ls(line);
+				long long          t      = 0;
+				int                player = 0;
+				std::string        op;
+				if (!(ls >> t >> player >> op) || player < 0 || player >= static_cast<int>(g_players.size()) || g_players[player] == nullptr) {
+					continue;
+				}
+				const int64_t at = t + shift_us;
+				for (int64_t now = static_cast<int64_t>(LibKernel::KernelGetProcessTime()); now < at;
+				     now         = static_cast<int64_t>(LibKernel::KernelGetProcessTime())) {
+					std::this_thread::sleep_for(std::chrono::microseconds(std::min<int64_t>(at - now, 5000)));
+				}
+				auto& pad = *g_players[player];
+				if (op == "B") {
+					std::string button;
+					int         down = 0;
+					if (ls >> button >> down) {
+						pad.Button(HOST_INPUT_CONTROLLER_ID, static_cast<uint32_t>(std::strtoul(button.c_str(), nullptr, 0)), down != 0);
+					}
+				} else if (op == "A") {
+					int axis = 0;
+					int value = 0;
+					if ((ls >> axis >> value) && axis >= 0 && axis < static_cast<int>(Axis::AxisMax)) {
+						pad.Axis(HOST_INPUT_CONTROLLER_ID, static_cast<Axis>(axis), value);
+					}
+				} else if (op == "R") {
+					int x = 0;
+					int y = 0;
+					if (ls >> x >> y) {
+						pad.RightStick(HOST_INPUT_CONTROLLER_ID, x, y);
+					}
+				} else if (op == "T") {
+					int   finger = 0;
+					int   down   = 0;
+					float x      = 0.0f;
+					float y      = 0.0f;
+					if (ls >> finger >> down >> x >> y) {
+						pad.TouchPad(HOST_INPUT_CONTROLLER_ID, finger, down != 0, x, y);
+					}
+				}
+				events++;
+			}
+			std::fprintf(stderr, "pad: replay done, %u events\n", events);
+		}).detach();
+	});
+}
+
 int KYTY_SYSV_ABI PadInit() {
 	PRINT_NAME();
 	for (const auto& player: g_players) {
 		(void)player->InitPort();
 	}
+	PadReplayStart();
 	return OK;
 }
 
