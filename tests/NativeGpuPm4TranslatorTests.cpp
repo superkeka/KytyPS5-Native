@@ -3475,7 +3475,7 @@ void TestCpShadowPushPopGpu() {
 // from the values the CP holds (a late BASE; a late FMASK that is not 0 stays), once until they change, with the
 // zero word for a register S has no value for; the GPU's FMASK is SET again by a context switch, and the fix follows
 // a GPU pop to what the GPU holds again. With CP shadowing off (or in record mode) it stays on the CPU as before.
-// And the packet check of the fix's DMA_DATA and COND_EXEC.
+// And the packet check of the fix's DMA_DATA and COND_EXEC. The display-DCC insert is left out on a late INFO only.
 void TestCpShadowCbInserts() {
 	using Libs::Graphics::NativeGpu::kCpShadowDmaControl;
 	using Libs::Graphics::NativeGpu::kCpShadowDmaWordCommand;
@@ -3483,7 +3483,7 @@ void TestCpShadowCbInserts() {
 	using Libs::Graphics::NativeGpu::kCpShadowZeroOffset;
 	using Libs::Graphics::NativeGpu::ValidateNativeIb;
 	constexpr uint32_t IT_DMA_DATA = 0x50, IT_COND_EXEC = 0x22;
-	constexpr uint32_t kBase0 = 0x318, kFmask0 = 0x321, kMask = 0x08E, kBaseExt0 = 0x390, kFmaskExt0 = 0x3A0;
+	constexpr uint32_t kBase0 = 0x318, kFmask0 = 0x321, kInfo0 = 0x31C, kMask = 0x08E, kBaseExt0 = 0x390, kFmaskExt0 = 0x3A0;
 	const uint64_t     cx_va   = kTestShadowVa + 0x1000u;
 	const uint64_t     zero_va = kTestShadowVa + kCpShadowZeroOffset;
 	const uint64_t     fix_va  = kTestShadowVa + kCpShadowFixOffset;
@@ -3667,6 +3667,40 @@ void TestCpShadowCbInserts() {
 		          !word(cx_va + 0x1000u, fix_va + 4u) && !word(zero_va + 4u, fix_va + 4u) && !word(cx_va + 4u * kBase0, zero_va) &&
 		          !word(cx_va + 4u * kBase0, cx_va + 4u * kFmask0),
 		      "into an offset dword, past the tables, from outside S's context region, into the zero word or into S: refused");
+	}
+
+	// Display DCC: a target in a video-out buffer. In load mode with INFO from a table the insert is left out; with
+	// only BASE from a table (INFO the title's SET) it goes as before; off, it goes too.
+	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Off}) {
+		for (const bool info_table: {true, false}) {
+			Pm4Translator t;
+			if (mode != CpShadowMode::Off) {
+				t.SetCpShadow(kTestShadowVa, mode);
+			}
+			t.AddDisplayRange(0x200000000ull, 0x2000000ull);
+			Start(t, {{kMask, 0xFu}, {kFmask0, 0x1u}}, {}, {});
+			std::vector<uint32_t> pairs = {kBase0, 0x2000000u};
+			std::vector<uint32_t> dcb;
+			if (info_table) {
+				pairs.insert(pairs.end(), {kInfo0, (1u << 28u) | 0x40u});
+			} else {
+				Append(dcb, IT_SET_CONTEXT_REG, {kInfo0, (1u << 28u) | 0x40u}, false);
+			}
+			AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+			draw(dcb);
+			auto       r    = t.Translate(dcb);
+			const bool left = mode == CpShadowMode::Load && info_table;
+			// SETs of INFO without DCC: the insert's (and, off, the preamble's replay of the copy, which has it).
+			uint32_t sets = 0;
+			for (const auto& p: Decode(r.ib)) {
+				sets += p.op == IT_SET_CONTEXT_REG && !p.body.empty() && (p.body[0] & 0xffffu) == kInfo0 && p.body.size() == 2 &&
+				                p.body[1] == 0x40u
+				            ? 1u
+				            : 0u;
+			}
+			Check(r.ok && (sets != 0) == !left && r.stats.cp_shadow_dcc_skipped == (left ? 1u : 0u),
+			      left ? "load mode, INFO from a table: the display-DCC insert is left out" : "the CPU clears DCC as before");
+		}
 	}
 }
 

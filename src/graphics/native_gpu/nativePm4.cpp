@@ -1966,7 +1966,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// (the CP reads the table when it runs it, which may be after a GPU write the translator never sees) the GPU may
 	// hold another value; a GPU pop gives it back as S had it at the push, and a preamble LOADs it from S. The same
 	// for the FMASK the GPU's own fix set. Decisions the CPU makes on such registers are made on the GPU (the FMASK
-	// fix) or not skipped as unchanged (a clear, a CPU pop).
+	// fix), left out (display DCC on such an INFO), or not skipped as unchanged (a clear, a CPU pop).
 	const bool shadow_load = CpShadow() == CpShadowMode::Load;
 	auto       stale       = [&](uint32_t off) {
 		return shadow_load && off < RegFile::kDense &&
@@ -2684,6 +2684,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		for (uint32_t i = 0; i < 8; i++) {
 			const uint32_t step = i * kCbColorStride;
 			const uint32_t off  = kCbColor0Info + step;
+			// Load mode: an INFO the copy has from a verbatim table may not be the GPU's, and the insert would replace
+			// the GPU's with it (format, compression and all): left out, the target keeps its DCC. The decision needs
+			// an AND on the CP's INFO and a range compare of its BASE, which no packet of the CP here does. With INFO
+			// known and only BASE from a table the copy's BASE decides as before: what goes to the GPU is its own INFO
+			// with DCC toggled, and a wrong choice there costs a picture, not a stray write.
+			if (stale(off)) {
+				stats.cp_shadow_dcc_skipped++;
+				continue;
+			}
 			const uint32_t info = reg(cx, off);
 			const uint64_t addr = (static_cast<uint64_t>(reg(cx, kCbColor0Base + step)) << 8u) |
 			                      (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt + i) & 0xffu) << 40u);
