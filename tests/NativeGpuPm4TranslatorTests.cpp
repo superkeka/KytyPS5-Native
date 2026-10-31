@@ -695,6 +695,31 @@ void TestIndirectDraws() {
 	Check(Count(pkts, 0x25u) == 1 && Count(pkts, 0x8Eu) == 0, "indirect draw kept, LOD statistics dropped");
 }
 
+void TestIndirectMultiDraws() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x10000000u, 0x2u}, false);
+	// AgcDcbDrawIndexIndirectMulti: offset 0x40, at most 16 records 20 bytes apart, the count at 0x2_3000_0000.
+	Append(dcb, 0x38u /* IT_DRAW_INDEX_INDIRECT_MULTI */,
+	       {0x40u, 0x280u, 0x280u, 0x280u | (1u << 30u), 16u, 0x30000000u, 0x2u, 20u, 0u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.draws == 1, "DRAW_INDEX_INDIRECT_MULTI translated");
+	const auto    pkts = Decode(r.ib);
+	const Packet* p    = FindFirst(pkts, 0x38u);
+	Check(p != nullptr && p->body.size() == 9 && p->body[3] == (0x280u | (1u << 30u)) && p->body[4] == 16u && p->body[7] == 20u,
+	      "multi indirect draw kept as written");
+	bool args_ref  = false;
+	bool count_ref = false;
+	for (const auto& ref: r.refs) {
+		args_ref  = args_ref || (ref.addr == 0x210000040ull && ref.size == 320u);
+		count_ref = count_ref || (ref.addr == 0x230000000ull && ref.size == 4u);
+	}
+	Check(args_ref && count_ref, "argument records and the count reported as references");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a multi indirect draw passes the gfx-ring check");
+	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "and is refused on a compute ring");
+}
+
 void TestContextStatePushPop() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
@@ -2477,6 +2502,7 @@ int main() {
 	TestFmaskFix();
 	TestComputeQueueDispatchIndirect();
 	TestIndirectDraws();
+	TestIndirectMultiDraws();
 	TestContextStatePushPop();
 	TestWaitBarrier();
 	TestCompactRefs();

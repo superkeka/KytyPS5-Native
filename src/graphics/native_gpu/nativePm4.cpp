@@ -33,6 +33,8 @@ constexpr uint32_t IT_DISPATCH_INDIRECT        = 0x16;
 constexpr uint32_t IT_DRAW_INDIRECT            = 0x24;
 constexpr uint32_t IT_RELEASE_MEM              = 0x49;
 constexpr uint32_t IT_DRAW_INDEX_INDIRECT      = 0x25;
+constexpr uint32_t IT_DRAW_INDIRECT_MULTI      = 0x2C;
+constexpr uint32_t IT_DRAW_INDEX_INDIRECT_MULTI = 0x38;
 constexpr uint32_t IT_GET_LOD_STATS            = 0x8E;
 constexpr uint32_t IT_INDEX_BASE               = 0x26;
 constexpr uint32_t IT_DRAW_INDEX_2             = 0x27;
@@ -486,6 +488,8 @@ bool IsWork(uint32_t op) {
 		case IT_DRAW_INDEX_OFFSET_2:
 		case IT_DRAW_INDIRECT:
 		case IT_DRAW_INDEX_INDIRECT:
+		case IT_DRAW_INDIRECT_MULTI:
+		case IT_DRAW_INDEX_INDIRECT_MULTI:
 		case IT_DRAW_INDEX_AUTO:
 		case IT_DISPATCH_DIRECT:
 		case IT_DISPATCH_INDIRECT:
@@ -724,6 +728,13 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			// libSceAgc's flag swap around a context push or pop (AgcDcbContextStateOp), on the gfx ring.
 			case IT_ATOMIC_MEM:
 				if (compute || size != 9 || (b[0] & 0x7fu) != 0x67u) {
+					return bad();
+				}
+				break;
+			// AgcDcbDraw[Index]IndirectMulti as written: the gfx ring only, ten dwords.
+			case IT_DRAW_INDIRECT_MULTI:
+			case IT_DRAW_INDEX_INDIRECT_MULTI:
+				if (compute || size != 10) {
 					return bad();
 				}
 				break;
@@ -2376,6 +2387,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			switch (op) {
 				case IT_DRAW_INDIRECT:
 				case IT_DRAW_INDEX_INDIRECT:
+				case IT_DRAW_INDIRECT_MULTI:
+				case IT_DRAW_INDEX_INDIRECT_MULTI:
 				case IT_DRAW_INDEX_2:
 				case IT_DRAW_INDEX_OFFSET_2:
 				case IT_DRAW_INDEX_AUTO:
@@ -3278,6 +3291,34 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
 				}
 				break;
+			// AgcDcbDraw[Index]IndirectMulti: up to MAX_COUNT argument records STRIDE bytes apart from the SET_BASE
+			// base + DATA_OFFSET, and with COUNT_INDIRECT_ENABLE (bit 30 of the fourth dword) the count read
+			// from COUNT_ADDR. The BC-250's CP runs the packet as written, as it does the single forms.
+			case IT_DRAW_INDIRECT_MULTI:
+			case IT_DRAW_INDEX_INDIRECT_MULTI: {
+				if (body_count < 9) {
+					return fail(op, dw);
+				}
+				const uint64_t args = log_set_base + bptr[0];
+				log_draw(op, 0, args, false);
+				if (skip_draw()) {
+					stats.draws_skipped++;
+				} else {
+					pfp_sync_me();
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				}
+				stats.draws++;
+				collect_refs();
+				add_ref(args, std::min<uint64_t>(std::max<uint64_t>(static_cast<uint64_t>(bptr[4]) * bptr[7], bptr[7]), kMetadataSpan),
+				        false);
+				if ((bptr[3] & (1u << 30u)) != 0) {
+					add_ref((static_cast<uint64_t>(bptr[5]) & ~3ull) | (static_cast<uint64_t>(bptr[6] & 0xffffu) << 32u), 4, false);
+				}
+				if (op == IT_DRAW_INDEX_INDIRECT_MULTI) {
+					add_ref(index_base, index_bytes != 0 ? index_bytes : kTextureSpan, false, true);
+				}
+				break;
+			}
 			case IT_GET_LOD_STATS: // texture LOD statistics, which the game's texture streaming reads
 				// BU_SIZE == 0 is the per-frame disable: no buffer the streamer reads, so it must not
 				// close the window (those samples belong to the next real report).
