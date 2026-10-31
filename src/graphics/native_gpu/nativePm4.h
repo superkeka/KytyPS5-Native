@@ -215,10 +215,11 @@ struct Pm4TranslateStats {
 	uint32_t cp_shadow_pushes = 0;
 	uint32_t cp_shadow_pops   = 0;
 	// Load mode: FMASK = BASE fixes done on the GPU from S (some of the slot's CB registers came from a verbatim
-	// table, so the GPU may hold other values than the copy), and display-DCC inserts made from a CB_COLORn_INFO
-	// the copy took from one.
-	uint32_t cp_shadow_fmask_gpu   = 0;
-	uint32_t cp_shadow_dcc_table   = 0;
+	// table, so the GPU may hold other values than the copy), and display-DCC fixes done on the GPU from S (the
+	// copy's CB_COLORn_INFO came from one).
+	uint32_t cp_shadow_fmask_gpu = 0;
+	uint32_t cp_shadow_dcc_gpu   = 0;
+	uint32_t cp_shadow_dcc_back  = 0; // and the DCC given back on the GPU (EmitCpShadowDccRestore)
 };
 
 // CP register shadowing (Pm4Translator::SetCpShadow, KYTY_NATIVE_GPU_CP_SHADOW). With the CONTEXT_CONTROL
@@ -238,10 +239,17 @@ constexpr uint64_t kCpShadowSaveOffset = kCpShadowBytes;
 constexpr uint32_t kCpShadowSaveBytes  = 0x1000;
 // After P, the register tables of the GPU-side FMASK fix (Pm4Translator::SetCpShadow, load mode): per MRT slot n
 // at kCpShadowFixOffset + 32 * n, {CB_COLORn_FMASK, BASE, CB_COLORn_FMASK_EXT, BASE_EXT} and then {.., FMASK, ..,
-// FMASK_EXT}, the offsets seeded once (CpShadowFixTables), the values copied from S by the GPU. Then a zero word,
-// seeded 0 and never written, copied for a register S has no value for (amdgpu's clear state, 0, on the GPU).
-constexpr uint64_t kCpShadowFixOffset  = kCpShadowSaveOffset + kCpShadowSaveBytes;
-constexpr uint32_t kCpShadowFixBytes   = 0x100;
+// FMASK_EXT}; then those of the GPU-side display-DCC fix, per slot at kCpShadowDccFixOffset + 16 * n,
+// {CB_COLORn_INFO, the CP's INFO without DCC} and {CB_COLORn_INFO, the CP's INFO as it was}. The offsets are
+// seeded once (CpShadowFixTables), the values copied from S by the GPU. Then a zero word, seeded 0 and never
+// written, copied for a register S has no value for (amdgpu's clear state, 0, on the GPU).
+constexpr uint64_t kCpShadowFixOffset    = kCpShadowSaveOffset + kCpShadowSaveBytes;
+constexpr uint64_t kCpShadowDccFixOffset = kCpShadowFixOffset + 0x100;
+constexpr uint32_t kCpShadowFixBytes     = 0x180;
+// The display-DCC fix's ATOMIC_MEM: TC_OP_ATOMIC_AND_32, COMMAND 2 as libSceAgc's, which clears DCC_ENABLE in the copied
+// INFO, with ENGINE_SEL the ME, after the ME's copy (libSceAgc's form sets bit 30, the PFP, which runs ahead of the ME:
+// the AND came before the copy). Probes atomicand, atomicand-order.
+constexpr uint32_t kCpShadowDccAnd = (2u << 8u) | 0x55u;
 constexpr uint64_t kCpShadowZeroOffset = kCpShadowFixOffset + kCpShadowFixBytes;
 std::array<uint32_t, kCpShadowFixBytes / 4u> CpShadowFixTables();
 // What the backend reserves for S, P, the fix tables and the zero word, and the packet check guards.
@@ -1037,6 +1045,11 @@ private:
 	// not the copy's; with `check` only when the CP's FMASK is not 0. A register S has no value for (`valid`) is
 	// amdgpu's clear state on the GPU, 0: the zero word is copied for it.
 	void     EmitCpShadowFmaskFix(std::vector<uint32_t>& ib, uint32_t slot, bool check, const std::bitset<RegFile::kDense>& valid) const;
+	// The display-DCC fix on the GPU for MRT slot `slot` (its INFO the copy took from a verbatim table): the CP's
+	// CB_COLORn_INFO from S into both of the slot's tables, DCC_ENABLE cleared in the first by an ATOMIC_MEM AND, which
+	// then sets the register; EmitCpShadowDccRestore sets it from the second, the INFO the CP had.
+	void     EmitCpShadowDccOff(std::vector<uint32_t>& ib, uint32_t slot) const;
+	void     EmitCpShadowDccRestore(std::vector<uint32_t>& ib, uint32_t slot) const;
 	void     EmitCpShadowPop(std::vector<uint32_t>& ib, const RegFile& target, const RegFile& current,
 	                         const std::bitset<RegFile::kDense>& valid) const;
 	uint32_t PatchContext(uint32_t offset, uint32_t value) const; // applies the depth experiment
@@ -1054,6 +1067,8 @@ private:
 	std::array<uint32_t, 4>      m_cu_clamp {};
 	std::vector<std::pair<uint64_t, uint64_t>> m_display_ranges; // AddDisplayRange
 	uint32_t                     m_display_dcc_off = 0;           // MRT slots drawn with DCC cleared
+	uint32_t                     m_display_dcc_gpu = 0;           // MRT slots whose CP INFO lost DCC on the GPU (EmitCpShadowDccOff)
+	uint32_t                     m_saved_display_dcc_gpu = 0;     // m_display_dcc_gpu at the GPU push
 	std::array<uint32_t, 8>      m_display_dcc_info {};           // their guest CB_COLORn_INFO
 	bool                         m_ps5_reg_overrides = false;
 	uint32_t                     m_target_mask = 0xffffffffu;

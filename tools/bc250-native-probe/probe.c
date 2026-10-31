@@ -1854,6 +1854,119 @@ static bool DangerAtomicMem(Device* d, Common* c) {
 	return ok;
 }
 
+// The display-DCC fix of CP shadowing's load mode: libSceAgc's ATOMIC_MEM form with TC_OP_ATOMIC_AND_32 (0x55)
+// clears DCC_ENABLE (bit 28) in a copied CB_COLORn_INFO, on the gfx ring, in uncached memory as the IB buffer is.
+// The word should lose bit 28 only, its neighbour stay, and a WRITE_DATA after it land.
+static bool DangerAtomicAnd(Device* d, Common* c) {
+	printf("== danger atomicand: ATOMIC_MEM AND (atomic 0x55, command 2) on the gfx ring\n");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m = (volatile uint32_t*)mem.cpu;
+	m[0]                 = 0x1f00a5c3u;
+	m[1]                 = 0x12345678u;
+	m[4]                 = 0;
+	__sync_synchronize();
+	Ib ib = {.n = 0};
+	IbPush(&ib, 0xc0071e00u);
+	IbPush(&ib, (1u << 30) | (2u << 8) | 0x55u);
+	IbPush(&ib, (uint32_t)mem.va);
+	IbPush(&ib, (uint32_t)(mem.va >> 32));
+	IbPush(&ib, ~(1u << 28));
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 6u);
+	IbPush(&ib, Pkt3Gfx(0x37u, 4));
+	IbPush(&ib, (5u << 8) | (1u << 20));
+	IbPush(&ib, (uint32_t)(mem.va + 16));
+	IbPush(&ib, (uint32_t)((mem.va + 16) >> 32));
+	IbPush(&ib, 0x616e6421u);
+	IbPad(&ib);
+	Bo*      bos[] = {&mem};
+	uint64_t seq   = 0;
+	r              = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+	int     w      = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 2.0) : r;
+	int64_t st     = ContextState(d);
+	printf("  gfx ring: %s, ctx 0x%" PRIx64 ", word 0x%08x (want 0x0f00a5c3), neighbour 0x%08x (want 0x12345678), WRITE_DATA after it %s\n",
+	       w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st, m[0], m[1], m[4] == 0x616e6421u ? "landed" : "missing");
+	if (w != 0 || st != 0) {
+		_exit(3);
+	}
+	const bool ok = m[0] == 0x0f00a5c3u && m[1] == 0x12345678u && m[4] == 0x616e6421u;
+	BoDestroy(d, &mem);
+	return ok;
+}
+
+// The display-DCC fix's order: the ME writes the word (as its DMA_DATA of S's INFO does), the same ATOMIC_MEM AND with
+// ENGINE_SEL the ME (bit 30 clear: libSceAgc's form sets it, and the PFP, ahead of the ME, ran the AND before the
+// copy), then a PFP WAIT_REG_MEM until bit 28 is clear, then a WRITE_DATA. All of it should finish.
+static bool DangerAtomicAndOrder(Device* d, Common* c) {
+	printf("== danger atomicand-order: ME write, ATOMIC_MEM AND on the ME, PFP wait for the bit\n");
+	Bo  mem;
+	int r = MemCreate(d, &mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &mem, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m = (volatile uint32_t*)mem.cpu;
+	m[0]                 = 0;
+	m[4]                 = 0;
+	__sync_synchronize();
+	Ib ib = {.n = 0};
+	IbPush(&ib, Pkt3Gfx(0x37u, 4)); // WRITE_DATA by the ME, write confirmed
+	IbPush(&ib, (5u << 8) | (1u << 20));
+	IbPush(&ib, (uint32_t)mem.va);
+	IbPush(&ib, (uint32_t)(mem.va >> 32));
+	IbPush(&ib, 0x1f00a5c3u);
+	IbPush(&ib, 0xc0071e00u); // ATOMIC_MEM, ENGINE_SEL ME
+	IbPush(&ib, (2u << 8) | 0x55u);
+	IbPush(&ib, (uint32_t)mem.va);
+	IbPush(&ib, (uint32_t)(mem.va >> 32));
+	IbPush(&ib, ~(1u << 28));
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 6u);
+	IbPush(&ib, Pkt3Gfx(0x3Cu, 6)); // WAIT_REG_MEM on the PFP: (word & bit 28) == 0
+	IbPush(&ib, 3u | (1u << 4) | (1u << 8));
+	IbPush(&ib, (uint32_t)mem.va);
+	IbPush(&ib, (uint32_t)(mem.va >> 32));
+	IbPush(&ib, 0u);
+	IbPush(&ib, 1u << 28);
+	IbPush(&ib, 4u);
+	IbPush(&ib, Pkt3Gfx(0x37u, 4));
+	IbPush(&ib, (5u << 8) | (1u << 20));
+	IbPush(&ib, (uint32_t)(mem.va + 16));
+	IbPush(&ib, (uint32_t)((mem.va + 16) >> 32));
+	IbPush(&ib, 0x6f726472u);
+	IbPad(&ib);
+	Bo*      bos[] = {&mem};
+	uint64_t seq   = 0;
+	r              = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+	int     w      = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 2.0) : r;
+	int64_t st     = ContextState(d);
+	printf("  gfx ring: %s, ctx 0x%" PRIx64 ", word 0x%08x (want 0x0f00a5c3), WRITE_DATA after the wait %s\n", w == 1 ? "TIMEOUT" : ErrStr(w),
+	       (uint64_t)st, m[0], m[4] == 0x6f726472u ? "landed" : "missing");
+	if (w != 0 || st != 0) {
+		_exit(3);
+	}
+	const bool ok = m[0] == 0x0f00a5c3u && m[4] == 0x6f726472u;
+	BoDestroy(d, &mem);
+	return ok;
+}
+
 // libSceAgc's ACB packets as it writes them, without the shader-type bit (header bit 1) the translator
 // sets for MEC: does the BC-250's MEC run them as the PS5's does? One job per step on the compute ring,
 // each checked by what it writes; the first that does not finish stops the run (a stopped MEC needs a
@@ -3565,7 +3678,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib condexec exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
+	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order condib condexec exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
 }
 
 int main(int argc, char** argv) {
@@ -3660,6 +3773,10 @@ int main(int argc, char** argv) {
 			ok = DangerExitGuard(&d, &c);
 		} else if (strcmp(danger, "atomicmem") == 0) {
 			ok = DangerAtomicMem(&d, &c);
+		} else if (strcmp(danger, "atomicand") == 0) {
+			ok = DangerAtomicAnd(&d, &c);
+		} else if (strcmp(danger, "atomicand-order") == 0) {
+			ok = DangerAtomicAndOrder(&d, &c);
 		} else if (strcmp(danger, "mecforms") == 0) {
 			ok = DangerMecForms(&d, &c);
 		} else if (strcmp(danger, "regindex-shc-nr") == 0) {

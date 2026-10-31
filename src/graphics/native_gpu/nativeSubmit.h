@@ -403,7 +403,7 @@ public:
 			parts = SplitIbAtPackets(ib, room / 4 - 8 - m_part_guard.size());
 		}
 		const bool part_guards = parts.size() > 1 && target.ip_type == AMDGPU_HW_IP_GFX && !m_part_guard.empty();
-		if (parts.empty() || parts.size() > kSlots || (parts.size() > 1 && Queue(target) != nullptr)) {
+		if (parts.empty() || parts.size() > kSlots) {
 			res.err = -E2BIG;
 			return res;
 		}
@@ -471,13 +471,24 @@ public:
 			}
 			const double t0 = NowSec();
 			uint64_t     seq = 0;
-			if (!q->Submit(m_ib_kfd_va + slot * kSlotSize, static_cast<uint32_t>(ib.size()), timeout_sec, &seq)) {
+			// A part per slot, one IB each, under one sequence (GT7's ACBs while it loads reach past a slot).
+			std::vector<std::pair<uint64_t, uint32_t>> ibs;
+			for (size_t k = 0; k < parts.size(); k++) {
+				ibs.emplace_back(m_ib_kfd_va + slots[k] * kSlotSize, static_cast<uint32_t>(parts[k].second));
+			}
+			if (!q->Submit(ibs, timeout_sec, &seq)) {
 				res.timed_out = true;
 				return res;
 			}
-			m_slot[slot].seq    = seq;
-			m_slot[slot].target = target;
-			m_slot[slot].order  = ++m_slot_order;
+			if (ibs.size() > 1 && m_kfd_multi_ib++ < 8) {
+				std::fprintf(stderr, "NativeSubmitter: %zu dwords to KFD queue %u as %zu IBs (sequence %llu)\n", ib.size(), target.ring,
+				             ibs.size(), static_cast<unsigned long long>(seq));
+			}
+			for (const uint32_t s: slots) {
+				m_slot[s].seq    = seq;
+				m_slot[s].target = target;
+				m_slot[s].order  = ++m_slot_order;
+			}
 			res.submitted       = true;
 			res.completed       = true;
 			res.seq             = seq;
@@ -902,6 +913,7 @@ private:
 	std::function<bool()>         m_kfd_tlb_flush;  // SetKfdTlbFlush
 	uint32_t    m_trace_submits = 0; // KYTY_NATIVE_GPU_KFD_TRACE
 	uint32_t    m_tail_refused  = 0; // gfx IBs refused by the CpShadowTailOk check
+	uint32_t    m_kfd_multi_ib  = 0; // KFD submissions of more than one IB, logged
 	struct SlotUse {
 		uint64_t   seq   = 0;
 		uint64_t   order = 0; // when it was last submitted

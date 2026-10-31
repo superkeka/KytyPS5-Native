@@ -2729,6 +2729,12 @@ struct ToyCp {
 					dmas++;
 					break;
 				}
+				case 0x1Eu: { // ATOMIC_MEM: the display-DCC fix's AND on a word in S's area
+					const uint64_t at = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
+					Check((b[0] & 0x7fu) == 0x55u && InS(at), "toy CP: an ATOMIC_MEM AND in S's area");
+					s[(at - kTestShadowVa) / 4u] &= b[3];
+					break;
+				}
 				case 0x22u: { // COND_EXEC: on a word in S's area (the FMASK fix) as the CP does; an exit guard's abort
 				             // word is 0 (no stop armed), so the dwords it guards are skipped
 					const uint64_t at = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
@@ -3543,10 +3549,12 @@ void TestCpShadowPushPopGpu() {
 void TestCpShadowCbInserts() {
 	using Libs::Graphics::NativeGpu::kCpShadowDmaControl;
 	using Libs::Graphics::NativeGpu::kCpShadowDmaWordCommand;
+	using Libs::Graphics::NativeGpu::kCpShadowDccAnd;
+	using Libs::Graphics::NativeGpu::kCpShadowDccFixOffset;
 	using Libs::Graphics::NativeGpu::kCpShadowFixOffset;
 	using Libs::Graphics::NativeGpu::kCpShadowZeroOffset;
 	using Libs::Graphics::NativeGpu::ValidateNativeIb;
-	constexpr uint32_t IT_DMA_DATA = 0x50, IT_COND_EXEC = 0x22;
+	constexpr uint32_t IT_DMA_DATA = 0x50, IT_COND_EXEC = 0x22, IT_ATOMIC_MEM = 0x1E;
 	constexpr uint32_t kBase0 = 0x318, kFmask0 = 0x321, kInfo0 = 0x31C, kMask = 0x08E, kBaseExt0 = 0x390, kFmaskExt0 = 0x3A0;
 	const uint64_t     cx_va   = kTestShadowVa + 0x1000u;
 	const uint64_t     zero_va = kTestShadowVa + kCpShadowZeroOffset;
@@ -3727,15 +3735,16 @@ void TestCpShadowCbInserts() {
 		Check(!valid(other), "a COND_EXEC on the fix tables over anything else is refused");
 		Check(word(cx_va + 4u * kBase0, fix_va + 4u) && word(zero_va, fix_va + 12u) && word(cx_va + 4u * 0x3FFu, fix_va + 0xFCu),
 		      "the fix's DMA_DATA passes");
-		Check(!word(cx_va + 4u * kBase0, fix_va) && !word(cx_va + 4u * kBase0, fix_va + 8u) && !word(cx_va + 4u * kBase0, fix_va + 0x104u) &&
+		Check(!word(cx_va + 4u * kBase0, fix_va) && !word(cx_va + 4u * kBase0, fix_va + 8u) && !word(cx_va + 4u * kBase0, fix_va + 0x184u) &&
 		          !word(cx_va + 0x1000u, fix_va + 4u) && !word(zero_va + 4u, fix_va + 4u) && !word(cx_va + 4u * kBase0, zero_va) &&
 		          !word(cx_va + 4u * kBase0, cx_va + 4u * kFmask0),
 		      "into an offset dword, past the tables, from outside S's context region, into the zero word or into S: refused");
 	}
 
-	// Display DCC: a target in a video-out buffer gets its insert in every mode, also in load mode with INFO from a
-	// table (the copy's INFO, DCC off: left out, the video-out buffer went to the display compressed); the flip stats
-	// count those.
+	// Display DCC: a target in a video-out buffer is drawn without DCC. Off, and in load mode with INFO the title's SET,
+	// the CPU clears DCC in the copy's INFO. In load mode with INFO from a table the CP may hold another INFO: the GPU
+	// clears DCC in its own (DMA_DATA of S's INFO into the slot's tables, ATOMIC_MEM AND, the table SETs it), which the
+	// packet check takes; a slot that leaves the video-out buffer gets the CP's INFO back from the second table.
 	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Off}) {
 		for (const bool info_table: {true, false}) {
 			Pm4Translator t;
@@ -3753,19 +3762,72 @@ void TestCpShadowCbInserts() {
 			}
 			AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
 			draw(dcb);
-			auto       r     = t.Translate(dcb);
-			const bool table = mode == CpShadowMode::Load && info_table;
-			// SETs of INFO without DCC: the insert's (and, off, the preamble's replay of the copy, which has it).
+			const auto r    = t.Translate(dcb);
+			const bool gpu  = mode == CpShadowMode::Load && info_table;
+			const auto pkts = Decode(r.ib);
+			// SETs of INFO without DCC: the CPU's insert (and, off, the preamble's replay of the copy, which has it).
 			uint32_t sets = 0;
-			for (const auto& p: Decode(r.ib)) {
+			for (const auto& p: pkts) {
 				sets += p.op == IT_SET_CONTEXT_REG && !p.body.empty() && (p.body[0] & 0xffffu) == kInfo0 && p.body.size() == 2 &&
 				                p.body[1] == 0x40u
 				            ? 1u
 				            : 0u;
 			}
-			Check(r.ok && sets != 0 && r.stats.cp_shadow_dcc_table == (table ? 1u : 0u),
-			      table ? "load mode, INFO from a table: the display-DCC insert goes, from the copy's INFO" : "the CPU clears DCC as before");
+			const uint64_t dcc_va = kTestShadowVa + kCpShadowDccFixOffset; // slot 0's tables
+			const auto     to     = dmas_from(pkts, cx_va + 4u * kInfo0);
+			Check(r.ok && r.stats.cp_shadow_dcc_gpu == (gpu ? 1u : 0u) && (sets != 0) == !gpu && count(pkts, IT_ATOMIC_MEM) == (gpu ? 1u : 0u) &&
+			          (!gpu || (to.size() == 2 && to[0] == dcc_va + 4u && to[1] == dcc_va + 12u)),
+			      gpu ? "load mode, INFO from a table: the GPU clears DCC in the CP's INFO" : "the CPU clears DCC in the copy's INFO");
+			if (!gpu) {
+				continue;
+			}
+			Check(valid(r.ib), "the packet check takes the display-DCC fix");
+			ToyCp cp;
+			cp.Seed(t);
+			cp.Job(AsJob(r.ib));
+			Check(cp.cx[kInfo0] == 0x40u && cp.s[kCpShadowContextDw + kInfo0] == 0x40u, "the CP draws without DCC, and S holds that INFO");
+			// The slot leaves the video-out buffer (BASE the title's SET, INFO untouched): the CP's INFO comes back.
+			std::vector<uint32_t> away;
+			Append(away, IT_SET_CONTEXT_REG, {kBase0, 0x1000u}, false);
+			draw(away);
+			const auto r2 = t.Translate(away);
+			cp.Job(AsJob(r2.ib));
+			Check(r2.ok && valid(r2.ib) && cp.cx[kInfo0] == ((1u << 28u) | 0x40u), "off the video-out buffer the CP's INFO comes back, DCC and all");
+			// An AND anywhere else, or of another mask, fails the packet check.
+			std::vector<uint32_t> bad = {Pkt3(IT_ATOMIC_MEM, 8, false), kCpShadowDccAnd, static_cast<uint32_t>(dcc_va + 12u),
+			                             static_cast<uint32_t>((dcc_va + 12u) >> 32u), ~(1u << 28u), 0u, 0u, 0u, 6u};
+			std::vector<uint32_t> mask = {Pkt3(IT_ATOMIC_MEM, 8, false), kCpShadowDccAnd, static_cast<uint32_t>(dcc_va + 4u),
+			                              static_cast<uint32_t>((dcc_va + 4u) >> 32u), 0u, 0u, 0u, 0u, 6u};
+			Check(!valid(bad) && !valid(mask), "the packet check refuses another AND");
 		}
+	}
+
+	// A GPU push, the display target bound by a table inside the window (the GPU clears its DCC), the pop: the CP holds
+	// the pushed target's INFO again, with its own format, and nothing is given back on it.
+	{
+		Pm4Translator t;
+		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		t.SetCpShadowPushPop(true);
+		t.AddDisplayRange(0x200000000ull, 0x2000000ull);
+		Start(t, {{kMask, 0xFu}, {kFmask0, 0x1u}}, {}, {});
+		ToyCp cp;
+		cp.Seed(t);
+		const std::vector<uint32_t> pushed  = {kBase0, 0x1000u, kInfo0, (1u << 28u) | 0x44u};
+		const std::vector<uint32_t> display = {kBase0, 0x2000000u, kInfo0, (1u << 28u) | 0x40u};
+		std::vector<uint32_t>       dcb;
+		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pushed, 0x80000000u);
+		draw(dcb);
+		op(dcb, 1u);
+		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, display, 0x80000000u);
+		draw(dcb);
+		op(dcb, 2u);
+		draw(dcb);
+		const auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.cp_shadow_pops == 1 && r.stats.cp_shadow_dcc_gpu == 1 && r.stats.cp_shadow_dcc_back == 0,
+		      "the GPU clears DCC inside the window and gives nothing back after the pop");
+		Check(valid(r.ib), "the packet check takes it");
+		cp.Job(AsJob(r.ib));
+		Check(cp.cx[kBase0] == 0x1000u && cp.cx[kInfo0] == ((1u << 28u) | 0x44u), "after the pop: the pushed target and its own INFO");
 	}
 }
 
