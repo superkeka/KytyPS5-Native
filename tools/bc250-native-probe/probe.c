@@ -2418,7 +2418,7 @@ typedef struct {
 	char        cls;  // 'x' context, 's' graphics SH, 'c' compute SH (SET and LOAD with the compute-type header),
 	                  // 'u' UCONFIG
 	char        how;  // 's' SET, 't' a one-pair register table (0x9F/0x63/0x64 with libSceAgc's graphics-type
-	                  // header), 'i' SET in an IB2
+	                  // header), 'i' SET in an IB2, 'j' a one-pair table in an IB2 (as direct runs execute titles' tables)
 	bool        load; // in the LOAD ranges (as on PAL's Navi10 restore lists); the SH ones are also read back
 	uint32_t    rest; // UCONFIG: left in the register afterwards (Mesa's gfx10 preamble values)
 } ShadowReg;
@@ -2428,14 +2428,17 @@ static const ShadowReg k_shadow_regs[] = {
     {"PA_SC_SCREEN_SCISSOR_BR", 0x28034u, 'x', 's', true, 0},
     {"PA_SC_WINDOW_OFFSET", 0x28200u, 'x', 't', true, 0},
     {"PA_SC_GENERIC_SCISSOR_TL", 0x28240u, 'x', 'i', true, 0},
+    {"PA_SC_GENERIC_SCISSOR_BR", 0x28244u, 'x', 'j', true, 0},
     {"SPI_SHADER_USER_DATA_PS_0", 0xb030u, 's', 's', true, 0},
     {"SPI_SHADER_USER_DATA_PS_1", 0xb034u, 's', 's', true, 0},
     {"SPI_SHADER_USER_DATA_PS_2", 0xb038u, 's', 't', true, 0},
+    {"SPI_SHADER_USER_DATA_PS_3", 0xb03cu, 's', 'j', true, 0},
     {"COMPUTE_USER_DATA_0", 0xb900u, 'c', 's', true, 0},
     {"COMPUTE_USER_DATA_1", 0xb904u, 'c', 's', true, 0},
     {"COMPUTE_USER_DATA_2", 0xb908u, 'c', 't', true, 0}, // a graphics-type 0x63, as My First GT's DCB dispatches
     {"GE_MAX_VTX_INDX", 0x30964u, 'u', 's', true, 0xffffffffu},
     {"GE_INDX_OFFSET", 0x30928u, 'u', 't', true, 0},
+    {"GE_MIN_VTX_INDX", 0x30924u, 'u', 'j', true, 0},
     {"SQ_THREAD_TRACE_USERDATA_2", 0x30d08u, 'u', 's', false, 0}, // on PAL's never-shadowed list
 };
 
@@ -2446,6 +2449,15 @@ typedef struct {
 	Bo s;
 	Bo t;
 } ShadowBufs;
+
+static const ShadowReg* ShadowRegNamed(const char* name) {
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		if (strcmp(k_shadow_regs[k].name, name) == 0) {
+			return &k_shadow_regs[k];
+		}
+	}
+	abort();
+}
 
 static uint32_t ShadowMagic(size_t k) { // what the test writes
 	return 0x5ad00000u | ((uint32_t)k << 8) | (uint32_t)k;
@@ -2488,7 +2500,25 @@ static const char* ShadowHowName(const ShadowReg* r) {
 	if (r->how == 't') {
 		return r->cls == 'x' ? "0x9F" : r->cls == 'u' ? "0x64" : "0x63";
 	}
+	if (r->how == 'j') {
+		return r->cls == 'x' ? "IB2 0x9F" : r->cls == 'u' ? "IB2 0x64" : "IB2 0x63";
+	}
 	return r->how == 'i' ? "IB2 SET" : "SET";
+}
+
+// The one-pair register table of a test register: {offset in its space, value} at T + 0x200 + 8 * k, and the packet
+// that loads it (libSceAgc's graphics-type header, INDEX 0, offset_and_data).
+static void IbShadowTable(Ib* ib, const ShadowBufs* b, size_t k) {
+	const ShadowReg* r  = &k_shadow_regs[k];
+	const uint32_t   at = 0x200u + 8u * (uint32_t)k;
+	uint32_t*        tm = (uint32_t*)b->t.cpu;
+	tm[at / 4]          = (r->reg - ShadowSpace(r->cls)) / 4;
+	tm[at / 4 + 1]      = ShadowMagic(k);
+	IbPush(ib, Pkt3Gfx(r->cls == 'x' ? 0x9fu : r->cls == 'u' ? 0x64u : 0x63u, 4));
+	IbPush(ib, (uint32_t)(b->t.va + at) & ~3u); // INDEX 0: direct address
+	IbPush(ib, (uint32_t)((b->t.va + at) >> 32));
+	IbPush(ib, 0x80000000u); // DATA_FORMAT offset_and_data, REG_OFFSET 0
+	IbPush(ib, 1u);          // one pair
 }
 
 static void IbContextControl(Ib* ib, uint32_t load, uint32_t shadow) {
@@ -2660,8 +2690,7 @@ static uint32_t ShadowOthers(const ShadowBufs* b) {
 // the next job on the ring may be another process's, and amdgpu's CONTEXT_CONTROL before an IB leaves the shadow
 // enables alone (RADV's, radeonsi's and Kyty's preambles turn them off themselves).
 static void ShadowIb1(Ib* ib, const ShadowBufs* b, uint32_t classes, bool load_off) {
-	const uint64_t t  = b->t.va;
-	uint32_t*      tm = (uint32_t*)b->t.cpu;
+	const uint64_t t = b->t.va;
 	IbContextControl(ib, CC_UPDATE, CC_UPDATE);
 	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
 		if (ShadowIsSh(&k_shadow_regs[k])) {
@@ -2680,18 +2709,15 @@ static void ShadowIb1(Ib* ib, const ShadowBufs* b, uint32_t classes, bool load_o
 		if (r->how == 's') {
 			IbShadowSet(ib, r, ShadowMagic(k));
 		} else if (r->how == 't') {
-			const uint32_t at = 0x200u + 8u * (uint32_t)k;
-			tm[at / 4]        = (r->reg - ShadowSpace(r->cls)) / 4; // {offset in its space, value}
-			tm[at / 4 + 1]    = ShadowMagic(k);
-			IbPush(ib, Pkt3Gfx(r->cls == 'x' ? 0x9fu : r->cls == 'u' ? 0x64u : 0x63u, 4));
-			IbPush(ib, (uint32_t)(t + at) & ~3u); // INDEX 0: direct address
-			IbPush(ib, (uint32_t)((t + at) >> 32));
-			IbPush(ib, 0x80000000u); // DATA_FORMAT offset_and_data, REG_OFFSET 0
-			IbPush(ib, 1u);          // one pair
+			IbShadowTable(ib, b, k);
 		} else {
 			const uint32_t at   = 0x400u + 0x20u * (uint32_t)k;
 			Ib             body = {.n = 0};
-			IbShadowSet(&body, r, ShadowMagic(k));
+			if (r->how == 'j') {
+				IbShadowTable(&body, b, k);
+			} else {
+				IbShadowSet(&body, r, ShadowMagic(k));
+			}
 			IbPad(&body);
 			memcpy((uint8_t*)b->t.cpu + at, body.dw, body.n * 4u);
 			IbPush(ib, Pkt3Gfx(0x3fu, 3)); // INDIRECT_BUFFER
@@ -2759,7 +2785,7 @@ static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
 		const uint32_t bits = r->cls == 'c' && r->how == 't' ? (CC_GFX_SH | CC_CS_SH) : ShadowBit(r->cls);
 		const bool     on   = (classes & bits) == bits;
 		const bool     off  = (classes & bits) == 0;
-		printf("  %-26s %-3s %-7s shadow %-3s: %s\n", r->name, ShadowClassName(r->cls), ShadowHowName(r),
+		printf("  %-26s %-3s %-8s shadow %-3s: %s\n", r->name, ShadowClassName(r->cls), ShadowHowName(r),
 		       on ? "on" : off ? "off" : "mix", where);
 		if (on) {
 			all = all && found == 1 && (first == at || (load_off && first == at_b));
@@ -2943,9 +2969,9 @@ static bool DangerShadowPushPop(Device* d, Common* c) {
 	if (!ShadowSetup(d, &b)) {
 		return false;
 	}
-	const ShadowReg* tl   = &k_shadow_regs[0];
-	const ShadowReg* br   = &k_shadow_regs[1];
-	const ShadowReg* ps0  = &k_shadow_regs[4];
+	const ShadowReg* tl   = ShadowRegNamed("PA_SC_SCREEN_SCISSOR_TL");
+	const ShadowReg* br   = ShadowRegNamed("PA_SC_SCREEN_SCISSOR_BR");
+	const ShadowReg* ps0  = ShadowRegNamed("SPI_SHADER_USER_DATA_PS_0"); // an SH register: COPY_DATA may read it
 	const uint64_t   stl  = b.s.va + ShadowAt(tl, 0);
 	const uint64_t   sbr  = b.s.va + ShadowAt(br, 0);
 	const uint64_t   sps0 = b.s.va + ShadowAt(ps0, 0);

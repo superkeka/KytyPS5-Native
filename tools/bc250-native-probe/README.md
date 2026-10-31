@@ -111,7 +111,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `regindex-sh`, `-shc`, `-ctx`, `-uc` | 0x63 / 0x9F / 0x64 (AMD's `LOAD_*_REG_INDEX`) with one pair, read back with `COPY_DATA`; `shc` loads a compute register from a graphics-type header |
 | `regindex-uc342`, `-sh-nr`, `-ctx-nr` | the same packets without register reads, a `WRITE_DATA` after them as the proof |
 | `labelvis` | a `RELEASE_MEM` label without cache write-back seen by the CPU, then a `WAIT_REG_MEM` on a dword the CPU writes, per MTYPE (`LABELVIS_KIND=nc\|uc\|cc\|wc\|default`, one per run; `LABELVIS_DST=1` sends the label to L2, `LABELVIS_EVENT` sets the event dword) |
-| `shadow` | CP register shadowing: `CONTEXT_CONTROL` shadow enables and `LOAD_*_REG` addresses, then 13 registers written by SET, by register table and by SET in an IB2; where each value lands in the shadow buffer (`SHADOW_CLASSES`, `SHADOW_LOAD=0`) |
+| `shadow` | CP register shadowing: `CONTEXT_CONTROL` shadow enables and `LOAD_*_REG` addresses, then 16 registers written by SET, by register table, by SET in an IB2 and by register table in an IB2; where each value lands in the shadow buffer (`SHADOW_CLASSES`, `SHADOW_LOAD=0`) |
 | `shadow-restore` | `shadow`, then the SH registers loaded back from the shadow in later jobs and read: with every load on, and twice with amdgpu's load enables (a second DRM context's job in between) |
 | `shadow-pushpop` | libSceAgc's context push and pop (`CONTEXT_CONTROL` + `CLEAR_STATE` CMD 1 / 2) inside a set-up shadow: markers in the shadow before each step, the same `CONTEXT_CONTROL`s without `CLEAR_STATE`, and an SH register changed between a push and a pop and read back |
 
@@ -123,8 +123,8 @@ never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of
 and Mesa use it for mid command buffer preemption and the PS5's CP for libSceAgc's context push and pop. The first job
 turns shadowing on (`CONTEXT_CONTROL` 0x81018002 / 0x81018002), points the CP at a zeroed buffer S with `LOAD_UCONFIG_REG`,
 `LOAD_CONTEXT_REG` and `LOAD_SH_REG` (Mesa's layout: SH space at +0, context at +0x1000, UCONFIG at +0x9000; one range per
-test register), writes 13 harmless context, SH and UCONFIG registers by SET, by a one-pair 0x9F / 0x63 / 0x64 table as
-libSceAgc writes them and by a SET in an IB2, and turns shadowing off again (as every job of the three does before it
+test register), writes 16 harmless context, SH and UCONFIG registers by SET, by a one-pair 0x9F / 0x63 / 0x64 table as
+libSceAgc writes them, by a SET in an IB2 and by such a table in an IB2 (as direct runs execute titles' tables), and turns shadowing off again (as every job of the three does before it
 ends). The case then prints where each value landed in S against `S + region + (register - space start)`, what the
 LOADs left in the SH registers (the CPU's sentinels in S: loaded) and anything else the CP wrote. SH registers are read
 back with `COPY_DATA`; context and UCONFIG registers never are (those reads stop the ring). `SHADOW_CLASSES=ctx,sh,cs,uc`
@@ -141,10 +141,13 @@ shadow somewhere else may fault the ring.
 
 ### Register shadowing results (2026-10-31, stock amdgpu, kernel 7.2)
 
-- `shadow`: the CP shadows every one of the 13 writes at `S + region + (register - space start)`, Mesa's layout, for
-  SET, for the 0x9F / 0x63 / 0x64 tables and for a SET in an IB2. `SQ_THREAD_TRACE_USERDATA_2`, on PAL's never-shadowed
-  list, is shadowed too. The LOADs loaded the CPU's sentinels into the SH registers; nothing written with shadowing
-  off reached S, and the CP wrote nothing else into S.
+- `shadow`: the CP shadows every one of the 16 writes at `S + region + (register - space start)`, Mesa's layout, for
+  SET, for the 0x9F / 0x63 / 0x64 tables, for a SET in an IB2 and for the tables in an IB2. `SQ_THREAD_TRACE_USERDATA_2`,
+  on PAL's never-shadowed list, is shadowed too. The LOADs loaded the CPU's sentinels into the SH registers; nothing
+  written with shadowing off reached S, and the CP wrote nothing else into S.
+- `SHADOW_CLASSES=sh` / `=cs`: the class follows the packet's shader type, not the register. A compute register written
+  by a graphics-type 0x63 (as libSceAgc's DCB dispatches) is shadowed under gfx SH (bit 16) and not under CS SH (bit
+  24); SETs with the compute-type header are shadowed under CS SH only. The place in S is the register's either way.
 - `SHADOW_LOAD=0`: LOADs with loading off neither load nor move the shadow address (the writes still land in the first
   region set). The CP takes a class's address only from a LOAD that loads.
 - `shadow-restore`: a later job with every load on loads all 6 SH registers back with the values the CP shadowed; so
