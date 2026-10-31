@@ -86,6 +86,20 @@ sudo systemctl reboot   # a hang costs a power cycle, which boots without them
 
 `oneshot-modprobe.sh uninstall` removes its unit.
 
+Firmware for one boot: `oneshot-firmware.sh arm DIR "options ..."` stages `DIR/firmware/amdgpu/*.bin`. Before udev
+loads amdgpu, its unit renames the staged copy on the disk, copies it to `/run`, points the firmware loader there
+(`firmware_class.path`, searched before `/lib/firmware`) and puts the options into `/run/modprobe.d`; the next boot
+uses the system's firmware again whatever happened. `fwstrip.py SRC DST NAME...` copies microcode files with the PSP
+signature wrapper cut off (`ucode_array_offset_bytes` + 0x100, `ucode_size_bytes` − 0x200), as ps5-linux loads them
+on a PS5 with no PSP.
+
+Direct loading (2026-10-31): `fw_load_type=0` makes amdgpu load cyan_skillfish2's microcode itself instead of
+through the PSP (`amdgpu_ucode_get_load_type`). With the eight files stripped (pfp, me, ce, rlc, mec, mec2, sdma,
+sdma1) the BC-250 does not come up: `ring kiq_0.2.1.0 test failed (-110)`, `KCQ enable failed`, `hw_init of IP
+block <gfx_v10_0> failed`, a MODE1 reset and no `/dev/dri`. The board itself boots (SSH), and the next boot is
+normal. The same files and code start a PS5 under ps5-linux, so the BC-250's firmware set-up keeps the MEC from
+running directly loaded microcode, or needs a step this path lacks; not known which.
+
 ## Companion pieces
 
 - `tools/bc250-lodhw/kyty-lodhw`: the root helper. Op 14 invalidates the KFD VMIDs' TLBs (invalidation
