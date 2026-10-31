@@ -352,6 +352,9 @@ static_assert(offsetof(Packet, flags) == 0xc);
 int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet);
 int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count);
+int KYTY_SYSV_ABI AgcDriverAgrSubmitDcb(const Packet* packet);
+int KYTY_SYSV_ABI AgcDriverAgrSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
+                                              const uint32_t* dcb_sizes_in_dwords, uint32_t count);
 int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet);
 int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_context,
                                                      uint32_t* const* command_buffers,

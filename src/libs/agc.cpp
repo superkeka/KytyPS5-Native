@@ -5084,8 +5084,9 @@ static void LogSubmit(const char* what, uint32_t queue, uint32_t size_in_dwords)
 	run  = 1;
 }
 
-// `queue`: the guest graphics queue (0 when the call names none); the native path gives each one a gfx
-// ring of its own while amdgpu has rings for them, as the PS5 does a title's main and AGR rings.
+// `queue`: the guest graphics queue (0 when the call names none, kGuestAgrQueue for the AGR ring); the
+// native path gives each one a gfx ring of its own while amdgpu has rings for them, as the PS5 does a
+// title's main and AGR rings, else they share one.
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords, uint32_t queue = 0) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	EXIT_IF(g_renderer == nullptr);
@@ -5145,6 +5146,67 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 
 		if (dcb != nullptr) {
 			submit_dcb(dcb, size_in_dwords);
+		}
+	}
+
+	return OK;
+}
+
+// sceAgcDriverAgrSubmitDcb and sceAgcDriverAgrSubmitMultiDcbs. The PS5 kernel runs these on the
+// title's second graphics ring, the "AGR" ring: gfx pipe 0 queue 1, with registers of its own and a
+// higher queue priority than the main ring. The native path runs them as a guest graphics queue of
+// their own (kGuestAgrQueue) next to queue 0. The log notes the first call with its thread, then every
+// call whose count is a power of two.
+static void NoteAgrSubmit(const char* what, uint32_t dcbs, uint32_t dwords, uint32_t flags) {
+	static std::atomic<uint64_t> calls {0};
+	const uint64_t               n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((n & (n - 1)) != 0) {
+		return;
+	}
+	char name[32] = "?";
+	pthread_getname_np(pthread_self(), name, sizeof(name));
+	std::fprintf(stderr, "agc: AGR %s call %" PRIu64 " (thread %s): %u DCBs, %u dwords, flags 0x%02x\n", what, n, name, dcbs,
+	             dwords, flags);
+}
+
+int KYTY_SYSV_ABI AgcDriverAgrSubmitDcb(const Packet* packet) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(packet == nullptr);
+
+	AgcTrace("\t addr   = 0x%016" PRIx64 "\n"
+	     "\t dw_num = 0x%08" PRIx32 "\n"
+	     "\t flags  = 0x%02" PRIx8 "\n",
+	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
+
+	NoteAgrSubmit("SubmitDcb", 1, packet->dw_num, packet->flags);
+	submit_dcb(packet->addr, packet->dw_num, Libs::Graphics::NativeGpu::kGuestAgrQueue);
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcDriverAgrSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
+                                              const uint32_t* dcb_sizes_in_dwords, uint32_t count) {
+	PRINT_NAME();
+
+	AgcTrace("\t count = %" PRIu32 "\n", count);
+
+	if (count == 0) {
+		return OK;
+	}
+	if (dcb_gpu_addrs == nullptr || dcb_sizes_in_dwords == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	uint32_t dwords = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		dwords += dcb_sizes_in_dwords[i];
+	}
+	NoteAgrSubmit("SubmitMultiDcbs", count, dwords, 0);
+
+	for (uint32_t i = 0; i < count; i++) {
+		if (dcb_gpu_addrs[i] != nullptr) {
+			submit_dcb(dcb_gpu_addrs[i], dcb_sizes_in_dwords[i], Libs::Graphics::NativeGpu::kGuestAgrQueue);
 		}
 	}
 
