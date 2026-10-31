@@ -110,10 +110,31 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `regindex-sh`, `-shc`, `-ctx`, `-uc` | 0x63 / 0x9F / 0x64 (AMD's `LOAD_*_REG_INDEX`) with one pair, read back with `COPY_DATA`; `shc` loads a compute register from a graphics-type header |
 | `regindex-uc342`, `-sh-nr`, `-ctx-nr` | the same packets without register reads, a `WRITE_DATA` after them as the proof |
 | `labelvis` | a `RELEASE_MEM` label without cache write-back seen by the CPU, then a `WAIT_REG_MEM` on a dword the CPU writes, per MTYPE (`LABELVIS_KIND=nc\|uc\|cc\|wc\|default`, one per run; `LABELVIS_DST=1` sends the label to L2, `LABELVIS_EVENT` sets the event dword) |
+| `shadow` | CP register shadowing: `CONTEXT_CONTROL` shadow enables and `LOAD_*_REG` addresses, then 13 registers written by SET, by register table and by SET in an IB2; where each value lands in the shadow buffer (`SHADOW_CLASSES`, `SHADOW_LOAD=0`) |
+| `shadow-restore` | `shadow`, then the SH registers loaded back from the shadow in later jobs and read: with every load on, and twice with amdgpu's load enables (a second DRM context's job in between) |
+| `shadow-pushpop` | libSceAgc's context push and pop (`CONTEXT_CONTROL` + `CLEAR_STATE` CMD 1 / 2) inside a set-up shadow, the shadow copied out after each step |
 
 `--awake SEC` keeps one wave spinning on the compute ring while the case runs, so the graphics block
 never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of freeing buffers
 (which waits on the stopped ring).
+
+`shadow`, `shadow-restore` and `shadow-pushpop` check whether the CP shadows register writes into memory itself, as PAL
+and Mesa use it for mid command buffer preemption and the PS5's CP for libSceAgc's context push and pop. The first job
+turns shadowing on (`CONTEXT_CONTROL` 0x81018002 / 0x81018002), points the CP at a zeroed buffer S with `LOAD_UCONFIG_REG`,
+`LOAD_CONTEXT_REG` and `LOAD_SH_REG` (Mesa's layout: SH space at +0, context at +0x1000, UCONFIG at +0x9000; one range per
+test register), writes 13 harmless context, SH and UCONFIG registers by SET, by a one-pair 0x9F / 0x63 / 0x64 table as
+libSceAgc writes them and by a SET in an IB2, and turns shadowing off again (as every job of the three does before it
+ends). The case then prints where each value landed in S against `S + region + (register - space start)`, what the
+LOADs left in the SH registers (the CPU's sentinels in S: loaded) and anything else the CP wrote. SH registers are read
+back with `COPY_DATA`; context and UCONFIG registers never are (those reads stop the ring). `SHADOW_CLASSES=ctx,sh,cs,uc`
+picks the shadow enables; `SHADOW_LOAD=0` adds LOADs from a second region set 1 MiB in with loading off (does such a
+LOAD still move the address?). `shadow-restore` then clobbers the SH registers and loads them back from S in a second
+job, then twice more with the load enables left as amdgpu set them (on only after another context ran on the ring): right
+after our own job and after a second DRM context's job. `shadow-pushpop` copies S out after each step of libSceAgc's push
+(`CONTEXT_CONTROL` 0 / 0x80018001, `CLEAR_STATE` 1), a SET, its pop (0 / 0x80018003, `CLEAR_STATE` 2), a SET and a plain
+`CLEAR_STATE`; whether the pop restored the registers takes a draw and is not checked. Run each alone, e.g.
+`./bc250-native-probe --danger shadow --awake 5`; a microcode that writes the shadow somewhere else may fault the ring,
+`shadow-pushpop` most of all (where AMD's F32 microcode keeps a pushed state is not public).
 
 ### Direct-execution probes (2026-10-27, two gfx rings, `sched_policy=2`)
 

@@ -2362,6 +2362,609 @@ static bool DangerRegIndexNoRead(Device* d, Common* c, uint32_t op, uint32_t off
 	return ok;
 }
 
+// CP register shadowing, as PAL and Mesa set it up on gfx9-gfx10.3 for mid command buffer preemption (PAL
+// gfx9QueueContexts.cpp WritePerSubmitPreamble, Mesa ac_shadowed_regs.c ac_create_shadowing_ib_preamble):
+// CONTEXT_CONTROL's second dword turns on writing SET_*_REG values to memory per register class, the LOAD_*_REG
+// packets tell the CP where each class's shadow is (and load from it), and a register at R of a space starting at B
+// is kept at that address + (R - B) (PAL: once "the LOADs are done and HW knows the shadow memory", a SET initializes
+// "the register and also the shadow memory"). Does the BC-250's microcode do it, for the register tables
+// (0x9F/0x63/0x64) too? On the PS5 the CP does libSceAgc's context push and pop with it.
+
+#define CC_UPDATE    (1u << 31) // CONTEXT_CONTROL: update the load enables (dword 1) or the shadow enables (dword 2)
+#define CC_CONTEXT   (1u << 1)  // the same bit per register class in both dwords
+#define CC_UCONFIG   (1u << 15)
+#define CC_GFX_SH    (1u << 16)
+#define CC_CS_SH     (1u << 24)
+#define CC_ALL       (CC_CONTEXT | CC_UCONFIG | CC_GFX_SH | CC_CS_SH)
+#define CONTEXT_BASE 0x28000u
+
+// The shadow buffer S, laid out as Mesa's (sid.h SI_SHADOWED_*): SH space, context space, UCONFIG space. SHADOW_LOAD=0
+// points the CP at a second set of regions 1 MiB in.
+#define SHADOW_SH_AT  0x0000u
+#define SHADOW_CTX_AT 0x1000u
+#define SHADOW_UC_AT  0x9000u
+#define SHADOW_SET_B  0x100000u
+#define SHADOW_SIZE   (2 * MiB)
+
+typedef struct {
+	const char* name;
+	uint32_t    reg;  // byte address
+	char        cls;  // 'x' context, 's' graphics SH, 'c' compute SH (SET and LOAD with the compute-type header),
+	                  // 'u' UCONFIG
+	char        how;  // 's' SET, 't' a one-pair register table (0x9F/0x63/0x64 with libSceAgc's graphics-type
+	                  // header), 'i' SET in an IB2
+	bool        load; // in the LOAD ranges (as on PAL's Navi10 restore lists); the SH ones are also read back
+	uint32_t    rest; // UCONFIG: left in the register afterwards (Mesa's gfx10 preamble values)
+} ShadowReg;
+
+static const ShadowReg k_shadow_regs[] = {
+    {"PA_SC_SCREEN_SCISSOR_TL", 0x28030u, 'x', 's', true, 0},
+    {"PA_SC_SCREEN_SCISSOR_BR", 0x28034u, 'x', 's', true, 0},
+    {"PA_SC_WINDOW_OFFSET", 0x28200u, 'x', 't', true, 0},
+    {"PA_SC_GENERIC_SCISSOR_TL", 0x28240u, 'x', 'i', true, 0},
+    {"SPI_SHADER_USER_DATA_PS_0", 0xb030u, 's', 's', true, 0},
+    {"SPI_SHADER_USER_DATA_PS_1", 0xb034u, 's', 's', true, 0},
+    {"SPI_SHADER_USER_DATA_PS_2", 0xb038u, 's', 't', true, 0},
+    {"COMPUTE_USER_DATA_0", 0xb900u, 'c', 's', true, 0},
+    {"COMPUTE_USER_DATA_1", 0xb904u, 'c', 's', true, 0},
+    {"COMPUTE_USER_DATA_2", 0xb908u, 'c', 't', true, 0}, // a graphics-type 0x63, as My First GT's DCB dispatches
+    {"GE_MAX_VTX_INDX", 0x30964u, 'u', 's', true, 0xffffffffu},
+    {"GE_INDX_OFFSET", 0x30928u, 'u', 't', true, 0},
+    {"SQ_THREAD_TRACE_USERDATA_2", 0x30d08u, 'u', 's', false, 0}, // on PAL's never-shadowed list
+};
+
+// S, and T (64 KiB): +0x000 the SH registers after the LOADs, +0x080 after the writes, +0x100 markers, +0x200 the
+// register tables (8 bytes per register), +0x400 the IB2s (32 bytes per register), +0x800 shadow-restore's reads
+// (0x80 per job), +0xa00 shadow-pushpop's copies of S.
+typedef struct {
+	Bo s;
+	Bo t;
+} ShadowBufs;
+
+static uint32_t ShadowMagic(size_t k) { // what the test writes
+	return 0x5ad00000u | ((uint32_t)k << 8) | (uint32_t)k;
+}
+
+static uint32_t ShadowSentinel(size_t k, int set) { // what the CPU leaves at a loaded register's place in S
+	return (set != 0 ? 0x20ad0000u : 0x10ad0000u) | (uint32_t)k;
+}
+
+static uint32_t ShadowPre(size_t k) { // the SH registers before the LOADs
+	return 0x0e7e0000u | (uint32_t)k;
+}
+
+static uint32_t ShadowSpace(char cls) {
+	return cls == 'x' ? CONTEXT_BASE : cls == 'u' ? UCONFIG_BASE : SH_REG_BASE;
+}
+
+static uint32_t ShadowRegion(char cls) {
+	return cls == 'x' ? SHADOW_CTX_AT : cls == 'u' ? SHADOW_UC_AT : SHADOW_SH_AT;
+}
+
+static uint32_t ShadowBit(char cls) {
+	return cls == 'x' ? CC_CONTEXT : cls == 'u' ? CC_UCONFIG : cls == 's' ? CC_GFX_SH : CC_CS_SH;
+}
+
+static bool ShadowIsSh(const ShadowReg* r) {
+	return r->cls == 's' || r->cls == 'c';
+}
+
+// Byte offset in S of a register's shadow, in region set 0 or SHADOW_SET_B.
+static uint32_t ShadowAt(const ShadowReg* r, uint32_t set) {
+	return set + ShadowRegion(r->cls) + (r->reg - ShadowSpace(r->cls));
+}
+
+static const char* ShadowClassName(char cls) {
+	return cls == 'x' ? "ctx" : cls == 's' ? "sh" : cls == 'c' ? "cs" : "uc";
+}
+
+static const char* ShadowHowName(const ShadowReg* r) {
+	if (r->how == 't') {
+		return r->cls == 'x' ? "0x9F" : r->cls == 'u' ? "0x64" : "0x63";
+	}
+	return r->how == 'i' ? "IB2 SET" : "SET";
+}
+
+static void IbContextControl(Ib* ib, uint32_t load, uint32_t shadow) {
+	IbPush(ib, Pkt3Gfx(0x28u, 2));
+	IbPush(ib, load);
+	IbPush(ib, shadow);
+}
+
+static void IbWriteData(Ib* ib, uint64_t va, uint32_t value) {
+	IbPush(ib, Pkt3Gfx(0x37u, 4)); // WRITE_DATA, memory, write confirm
+	IbPush(ib, (5u << 8) | (1u << 20));
+	IbPush(ib, (uint32_t)va);
+	IbPush(ib, (uint32_t)(va >> 32));
+	IbPush(ib, value);
+}
+
+// COPY_DATA of a dword from memory (SRC_SEL 2) to memory (DST_SEL 5), write confirm.
+static void IbCopyMemToMem(Ib* ib, uint64_t src, uint64_t dst) {
+	IbPush(ib, Pkt3Gfx(0x40u, 5));
+	IbPush(ib, 2u | (5u << 8) | (1u << 20));
+	IbPush(ib, (uint32_t)src);
+	IbPush(ib, (uint32_t)(src >> 32));
+	IbPush(ib, (uint32_t)dst);
+	IbPush(ib, (uint32_t)(dst >> 32));
+}
+
+// SET_CONTEXT_REG / SET_SH_REG / SET_UCONFIG_REG of one test register.
+static void IbShadowSet(Ib* ib, const ShadowReg* r, uint32_t value) {
+	const uint32_t op = r->cls == 'x' ? 0x69u : r->cls == 'u' ? 0x79u : 0x76u;
+	IbPush(ib, r->cls == 'c' ? Pkt3(op, 2) : Pkt3Gfx(op, 2));
+	IbPush(ib, (r->reg - ShadowSpace(r->cls)) / 4);
+	IbPush(ib, value);
+}
+
+// LOAD_UCONFIG_REG, LOAD_CONTEXT_REG, LOAD_SH_REG with the graphics-type then the compute-type header (both into the
+// SH region, as PAL), from S + set: one range per test register of the LOAD lists, so nothing else is loaded.
+static void IbShadowLoads(Ib* ib, uint64_t s_va, uint32_t set) {
+	static const char order[] = "uxsc";
+	for (int o = 0; o < 4; o++) {
+		const char cls = order[o];
+		uint32_t   n   = 0;
+		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+			n += k_shadow_regs[k].cls == cls && k_shadow_regs[k].load;
+		}
+		if (n == 0) {
+			continue;
+		}
+		const uint32_t op = cls == 'x' ? 0x61u : cls == 'u' ? 0x5eu : 0x5fu;
+		const uint64_t va = s_va + set + ShadowRegion(cls);
+		IbPush(ib, cls == 'c' ? Pkt3(op, 2 + 2 * n) : Pkt3Gfx(op, 2 + 2 * n));
+		IbPush(ib, (uint32_t)va); // BASE_ADDRESS, dword aligned
+		IbPush(ib, (uint32_t)(va >> 32));
+		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+			const ShadowReg* r = &k_shadow_regs[k];
+			if (r->cls == cls && r->load) {
+				IbPush(ib, (r->reg - ShadowSpace(cls)) / 4); // REG_OFFSET
+				IbPush(ib, 1u);                              // NUM_DWORDS
+			}
+		}
+	}
+}
+
+// COPY_DATA of every SH test register to T + at. SH reads are safe; context and UCONFIG reads stop the ring.
+static void IbShadowReadSh(Ib* ib, uint64_t t_va, uint32_t at) {
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		if (ShadowIsSh(&k_shadow_regs[k])) {
+			IbCopyRegToMem(ib, k_shadow_regs[k].reg, t_va + at + 4u * k);
+		}
+	}
+}
+
+// Shadowing and loading off (Kyty's preamble does the same), then the UCONFIG test registers back to Mesa's values.
+static void IbShadowOff(Ib* ib) {
+	IbContextControl(ib, CC_UPDATE, CC_UPDATE);
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		if (k_shadow_regs[k].cls == 'u') {
+			IbShadowSet(ib, &k_shadow_regs[k], k_shadow_regs[k].rest);
+		}
+	}
+}
+
+static bool ShadowSetup(Device* d, ShadowBufs* b) {
+	memset(b, 0, sizeof(*b));
+	int r = MemCreate(d, &b->s, MEM_GTT, SHADOW_SIZE, NULL);
+	if (r == 0) {
+		r = BoBind(d, &b->s, 0x0720000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &b->t, MEM_GTT, 64 * KiB, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &b->t, 0x0721000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &b->t);
+		BoDestroy(d, &b->s);
+		return false;
+	}
+	memset(b->s.cpu, 0, SHADOW_SIZE);
+	memset(b->t.cpu, 0, 64 * KiB);
+	uint32_t* s = (uint32_t*)b->s.cpu;
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		if (k_shadow_regs[k].load) {
+			s[ShadowAt(&k_shadow_regs[k], 0) / 4]            = ShadowSentinel(k, 0);
+			s[ShadowAt(&k_shadow_regs[k], SHADOW_SET_B) / 4] = ShadowSentinel(k, 1);
+		}
+	}
+	__sync_synchronize();
+	return true;
+}
+
+// Runs one job on the gfx ring and waits 2 s. One that does not finish ends the process: freeing buffers would wait
+// on the stopped ring.
+static void ShadowRun(Device* d, Common* c, ShadowBufs* b, const Ib* ib, const char* what) {
+	Bo*      bos[] = {&b->s, &b->t};
+	uint64_t seq   = 0;
+	int      r     = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, ib, bos, 2, &seq);
+	int      w     = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 2.0) : r;
+	int64_t  st    = ContextState(d);
+	printf("  %s (%u dw): %s, ctx 0x%" PRIx64 "\n", what, ib->n, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st);
+	if (w != 0 || st != 0) {
+		_exit(3);
+	}
+}
+
+// Names a byte offset of S: the register whose shadow place it is.
+static void ShadowWhere(uint32_t off, char* buf, size_t size) {
+	const uint32_t set = off >= SHADOW_SET_B ? SHADOW_SET_B : 0;
+	const uint32_t o   = off - set;
+	const char*    b   = set != 0 ? ", set B" : "";
+	if (o < SHADOW_CTX_AT) {
+		snprintf(buf, size, " (SH 0x%05x%s)", SH_REG_BASE + o, b);
+	} else if (o < SHADOW_UC_AT) {
+		snprintf(buf, size, " (context 0x%05x%s)", CONTEXT_BASE + o - SHADOW_CTX_AT, b);
+	} else if (o < SHADOW_UC_AT + 0x10000u) {
+		snprintf(buf, size, " (UCONFIG 0x%05x%s)", UCONFIG_BASE + o - SHADOW_UC_AT, b);
+	} else {
+		buf[0] = 0;
+	}
+}
+
+// Non-zero dwords of S away from every test register's place: whatever else the CP wrote. Prints the first 8.
+static uint32_t ShadowOthers(const ShadowBufs* b) {
+	const uint32_t* s     = (const uint32_t*)b->s.cpu;
+	uint32_t        count = 0;
+	for (uint32_t i = 0; i < SHADOW_SIZE / 4; i++) {
+		bool place = s[i] == 0;
+		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs) && !place; k++) {
+			place = i * 4 == ShadowAt(&k_shadow_regs[k], 0) || i * 4 == ShadowAt(&k_shadow_regs[k], SHADOW_SET_B);
+		}
+		if (!place) {
+			if (count < 8) {
+				char where[48];
+				ShadowWhere(i * 4, where, sizeof(where));
+				printf("  other dword in S: +0x%06x = 0x%08x%s\n", i * 4, s[i], where);
+			}
+			count++;
+		}
+	}
+	printf("  other non-zero dwords in S: %u\n", count);
+	return count;
+}
+
+// The first job: the SH test registers set with shadowing off, then shadowing on for `classes` with every load on and
+// the LOADs pointing the CP at S (a PAL / Mesa preamble); with load_off, LOADs from the second region set follow with
+// loading off (do they still move the address?). The SH registers are read, the test values written by SET, by
+// register table and by SET in an IB2, the SH registers read again, a marker. Shadowing goes off before the job ends:
+// the next job on the ring may be another process's, and amdgpu's CONTEXT_CONTROL before an IB leaves the shadow
+// enables alone (RADV's, radeonsi's and Kyty's preambles turn them off themselves).
+static void ShadowIb1(Ib* ib, const ShadowBufs* b, uint32_t classes, bool load_off) {
+	const uint64_t t  = b->t.va;
+	uint32_t*      tm = (uint32_t*)b->t.cpu;
+	IbContextControl(ib, CC_UPDATE, CC_UPDATE);
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		if (ShadowIsSh(&k_shadow_regs[k])) {
+			IbShadowSet(ib, &k_shadow_regs[k], ShadowPre(k));
+		}
+	}
+	IbContextControl(ib, CC_UPDATE | CC_ALL, CC_UPDATE | classes);
+	IbShadowLoads(ib, b->s.va, 0);
+	if (load_off) {
+		IbContextControl(ib, CC_UPDATE, CC_UPDATE | classes);
+		IbShadowLoads(ib, b->s.va, SHADOW_SET_B);
+	}
+	IbShadowReadSh(ib, t, 0x000);
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		const ShadowReg* r = &k_shadow_regs[k];
+		if (r->how == 's') {
+			IbShadowSet(ib, r, ShadowMagic(k));
+		} else if (r->how == 't') {
+			const uint32_t at = 0x200u + 8u * (uint32_t)k;
+			tm[at / 4]        = (r->reg - ShadowSpace(r->cls)) / 4; // {offset in its space, value}
+			tm[at / 4 + 1]    = ShadowMagic(k);
+			IbPush(ib, Pkt3Gfx(r->cls == 'x' ? 0x9fu : r->cls == 'u' ? 0x64u : 0x63u, 4));
+			IbPush(ib, (uint32_t)(t + at) & ~3u); // INDEX 0: direct address
+			IbPush(ib, (uint32_t)((t + at) >> 32));
+			IbPush(ib, 0x80000000u); // DATA_FORMAT offset_and_data, REG_OFFSET 0
+			IbPush(ib, 1u);          // one pair
+		} else {
+			const uint32_t at   = 0x400u + 0x20u * (uint32_t)k;
+			Ib             body = {.n = 0};
+			IbShadowSet(&body, r, ShadowMagic(k));
+			IbPad(&body);
+			memcpy((uint8_t*)b->t.cpu + at, body.dw, body.n * 4u);
+			IbPush(ib, Pkt3Gfx(0x3fu, 3)); // INDIRECT_BUFFER
+			IbPush(ib, (uint32_t)(t + at));
+			IbPush(ib, (uint32_t)((t + at) >> 32));
+			IbPush(ib, body.n | (1u << 23)); // IB_SIZE, VALID
+		}
+	}
+	IbShadowReadSh(ib, t, 0x080);
+	IbWriteData(ib, t + 0x100, 0x5ad0e001u);
+	IbShadowOff(ib);
+	IbWriteData(ib, t + 0x104, 0x5ad0e002u);
+	IbPad(ib);
+	__sync_synchronize();
+}
+
+static const char* ShadowLoaded(uint32_t v, size_t k) {
+	return v == ShadowSentinel(k, 0)   ? "set A"
+	       : v == ShadowSentinel(k, 1) ? "set B"
+	       : v == ShadowPre(k)         ? "unchanged"
+	                                   : "other";
+}
+
+// Where each test value landed in S against its place (in either region set with load_off); true when every register
+// of a class with shadowing on was shadowed exactly at its place.
+static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
+	const uint32_t* s = (const uint32_t*)b->s.cpu;
+	const uint32_t* t = (const uint32_t*)b->t.cpu;
+	printf("  marker after the writes %s, after shadowing off %s\n", t[0x40] == 0x5ad0e001u ? "landed" : "MISSING",
+	       t[0x41] == 0x5ad0e002u ? "landed" : "MISSING");
+	printf("  SH registers after the LOADs (set A: loaded from S%s; unchanged: not loaded), then after the writes:\n",
+	       load_off ? " with loading on, set B: with loading off" : "");
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		if (ShadowIsSh(&k_shadow_regs[k])) {
+			printf("    %-26s 0x%08x %-9s 0x%08x%s\n", k_shadow_regs[k].name, t[k], ShadowLoaded(t[k], k), t[0x20 + k],
+			       t[0x20 + k] == ShadowMagic(k) ? "" : " (not the written value)");
+		}
+	}
+	bool all = t[0x40] == 0x5ad0e001u;
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		const ShadowReg* r     = &k_shadow_regs[k];
+		const uint32_t   at    = ShadowAt(r, 0);
+		const uint32_t   at_b  = ShadowAt(r, SHADOW_SET_B);
+		uint32_t         found = 0;
+		uint32_t         first = 0;
+		for (uint32_t i = 0; i < SHADOW_SIZE / 4; i++) {
+			if (s[i] == ShadowMagic(k)) {
+				first = found == 0 ? i * 4 : first;
+				found++;
+			}
+		}
+		char where[96];
+		if (found == 0) {
+			snprintf(where, sizeof(where), "not in S (its place +0x%05x holds 0x%08x)", at, s[at / 4]);
+		} else if (found == 1 && first == at) {
+			snprintf(where, sizeof(where), "at its place +0x%05x", at);
+		} else if (found == 1 && first == at_b) {
+			snprintf(where, sizeof(where), "at its place in set B +0x%06x", at_b);
+		} else {
+			snprintf(where, sizeof(where), "%u times, first at +0x%06x (its place +0x%05x)", found, first, at);
+		}
+		const bool on = (classes & ShadowBit(r->cls)) != 0;
+		printf("  %-26s %-3s %-7s shadow %-3s: %s\n", r->name, ShadowClassName(r->cls), ShadowHowName(r),
+		       on ? "on" : "off", where);
+		if (on) {
+			all = all && found == 1 && (first == at || (load_off && first == at_b));
+		}
+	}
+	// SETs made with shadowing off: the SH values before the LOADs, the UCONFIG values put back at the end.
+	uint32_t leaked = 0;
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		const ShadowReg* r = &k_shadow_regs[k];
+		for (uint32_t i = 0; i < SHADOW_SIZE / 4 && ShadowIsSh(r); i++) {
+			leaked += s[i] == ShadowPre(k);
+		}
+		leaked += r->cls == 'u' && r->rest != 0 && s[ShadowAt(r, 0) / 4] == r->rest;
+	}
+	printf("  SET values written with shadowing off found in S: %u\n", leaked);
+	ShadowOthers(b);
+	return all;
+}
+
+static int CtxAlloc(Device* d, uint32_t* id) {
+	union drm_amdgpu_ctx ctx;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+	int r     = Ioctl(d->fd, DRM_IOCTL_AMDGPU_CTX, &ctx);
+	if (r == 0) {
+		*id = ctx.out.alloc.ctx_id;
+	}
+	return r;
+}
+
+static void CtxFree(Device* d, uint32_t id) {
+	union drm_amdgpu_ctx ctx;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.in.op     = AMDGPU_CTX_OP_FREE_CTX;
+	ctx.in.ctx_id = id;
+	Ioctl(d->fd, DRM_IOCTL_AMDGPU_CTX, &ctx);
+}
+
+// A restore job: the SH test registers clobbered with shadowing off, CONTEXT_CONTROL with `load` (CC_UPDATE | CC_ALL:
+// every load on, as a PAL / Mesa preamble; 0: the load enables left as amdgpu's CONTEXT_CONTROL set them for this IB)
+// and shadowing on, the LOADs from S, the SH registers read to T + at, a marker, shadowing off.
+static void ShadowIbRestore(Ib* ib, const ShadowBufs* b, uint32_t load, uint32_t at, uint32_t clobber) {
+	IbContextControl(ib, load, CC_UPDATE);
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		if (ShadowIsSh(&k_shadow_regs[k])) {
+			IbShadowSet(ib, &k_shadow_regs[k], clobber | (uint32_t)k);
+		}
+	}
+	IbContextControl(ib, load, CC_UPDATE | CC_ALL);
+	IbShadowLoads(ib, b->s.va, 0);
+	IbShadowReadSh(ib, b->t.va, at);
+	IbWriteData(ib, b->t.va + at + 0x7c, 0x5ad0e003u);
+	IbShadowOff(ib);
+	IbPad(ib);
+}
+
+// 2: every SH test register holds what S holds, 1: every one kept the clobber (nothing loaded), 0: anything else.
+static int ShadowRestored(const ShadowBufs* b, uint32_t at, uint32_t clobber, const char* what) {
+	const uint32_t* s        = (const uint32_t*)b->s.cpu;
+	const uint32_t* t        = (const uint32_t*)b->t.cpu + at / 4;
+	uint32_t        n        = 0;
+	uint32_t        same     = 0;
+	uint32_t        kept     = 0;
+	uint32_t        shadowed = 0;
+	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+		const ShadowReg* r = &k_shadow_regs[k];
+		if (!ShadowIsSh(r)) {
+			continue;
+		}
+		const uint32_t want = s[ShadowAt(r, 0) / 4];
+		n++;
+		same += t[k] == want;
+		kept += t[k] == (clobber | (uint32_t)k);
+		shadowed += t[k] == want && want == ShadowMagic(k);
+	}
+	printf("  %s: %u of %u SH registers hold S's value (%u of them written there by the CP), %u not loaded, marker %s\n",
+	       what, same, n, shadowed, kept, t[0x1f] == 0x5ad0e003u ? "landed" : "MISSING");
+	if (same != n && kept != n) {
+		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
+			const ShadowReg* r = &k_shadow_regs[k];
+			if (ShadowIsSh(r)) {
+				printf("    %-26s 0x%08x (S 0x%08x)\n", r->name, t[k], s[ShadowAt(r, 0) / 4]);
+			}
+		}
+	}
+	return same == n ? 2 : kept == n ? 1 : 0;
+}
+
+// shadow-restore, after the shadowing job: a second job loads S back with every load on (a PAL / Mesa preamble) and
+// reads the SH registers: do they hold what the CP shadowed? The context and UCONFIG test registers are loaded too but
+// cannot be read back (a COPY_DATA read of either stops the ring); the marker after the LOADs shows the CP ran them.
+// Then twice with the load enables left as amdgpu set them: its CONTEXT_CONTROL before each IB turns every load on
+// only after another context ran on the ring (gfx_v10_0_ring_emit_cntxcntl, AMDGPU_HAVE_CTX_SWITCH), so the LOADs
+// should load after a second DRM context's job and not right after our own.
+static bool ShadowRestore(Device* d, Common* c, ShadowBufs* b) {
+	Ib ib = {.n = 0};
+	ShadowIbRestore(&ib, b, CC_UPDATE | CC_ALL, 0x800, 0xc10b0000u);
+	ShadowRun(d, c, b, &ib, "restore job, every load on");
+	const int explicit_loads = ShadowRestored(b, 0x800, 0xc10b0000u, "  loaded back");
+	uint32_t  other          = 0;
+	int       r              = CtxAlloc(d, &other);
+	if (r != 0) {
+		printf("  second context: %s\n", ErrStr(r));
+		return explicit_loads == 2;
+	}
+	ib.n = 0;
+	ShadowIbRestore(&ib, b, 0, 0x880, 0xc20b0000u);
+	ShadowRun(d, c, b, &ib, "restore job, amdgpu's load enables, right after our own job");
+	const int same_ctx = ShadowRestored(b, 0x880, 0xc20b0000u, "  loaded back");
+	ib.n = 0;
+	IbWriteData(&ib, b->t.va + 0x9fc, 0x0be0be0bu);
+	IbPad(&ib);
+	const uint32_t own = d->ctx;
+	d->ctx             = other;
+	ShadowRun(d, c, b, &ib, "a job of a second DRM context");
+	d->ctx = own;
+	ib.n   = 0;
+	ShadowIbRestore(&ib, b, 0, 0x900, 0xc30b0000u);
+	ShadowRun(d, c, b, &ib, "restore job, amdgpu's load enables, after the other context");
+	const int switched = ShadowRestored(b, 0x900, 0xc30b0000u, "  loaded back");
+	CtxFree(d, other);
+	printf("  amdgpu's load enables: %s\n",
+	       same_ctx == 1 && switched == 2   ? "the LOADs load only after another context ran"
+	       : same_ctx == 2 && switched == 2 ? "the LOADs loaded both times (not gated, or another process ran in between)"
+	                                        : "neither pattern (see above)");
+	return explicit_loads == 2;
+}
+
+// shadow / shadow-restore. SHADOW_CLASSES (e.g. "ctx,uc"; default "ctx,sh,cs,uc") picks the shadow enables of the
+// first job, SHADOW_LOAD=0 adds its second LOADs with loading off; shadow-restore uses neither.
+static bool DangerShadow(Device* d, Common* c, bool restore) {
+	const char* cls_env  = getenv("SHADOW_CLASSES");
+	const char* load_env = getenv("SHADOW_LOAD");
+	uint32_t    classes  = CC_ALL;
+	if (cls_env != NULL && !restore) {
+		classes = (strstr(cls_env, "ctx") != NULL ? CC_CONTEXT : 0u) | (strstr(cls_env, "sh") != NULL ? CC_GFX_SH : 0u) |
+		          (strstr(cls_env, "cs") != NULL ? CC_CS_SH : 0u) | (strstr(cls_env, "uc") != NULL ? CC_UCONFIG : 0u);
+	}
+	const bool load_off = !restore && load_env != NULL && load_env[0] == '0';
+	printf("== danger %s: CP register shadowing (CONTEXT_CONTROL shadow enables, LOAD_*_REG addresses) on the gfx ring\n",
+	       restore ? "shadow-restore" : "shadow");
+	ShadowBufs b;
+	if (!ShadowSetup(d, &b)) {
+		return false;
+	}
+	printf("  S at 0x%" PRIx64 " (SH +0x%x, context +0x%x, UCONFIG +0x%x), CONTEXT_CONTROL 0x%08x 0x%08x%s\n", b.s.va,
+	       SHADOW_SH_AT, SHADOW_CTX_AT, SHADOW_UC_AT, CC_UPDATE | CC_ALL, CC_UPDATE | classes,
+	       load_off ? ", then 0x80000000 (loading off) and LOADs from set B (+1 MiB)" : "");
+	Ib ib = {.n = 0};
+	ShadowIb1(&ib, &b, classes, load_off);
+	ShadowRun(d, c, &b, &ib, "shadowing job");
+	bool ok = ShadowCheck1(&b, classes, load_off);
+	if (restore) {
+		ok = ShadowRestore(d, c, &b) && ok;
+	}
+	BoDestroy(d, &b.t);
+	BoDestroy(d, &b.s);
+	return ok;
+}
+
+// shadow-pushpop: libSceAgc's context push and pop as it writes them (AgcDcbContextStateOp in src/libs/agc.cpp:
+// CONTEXT_CONTROL 0 / 0x80018001 then CLEAR_STATE CMD 1 for a push, 0 / 0x80018003 then CMD 2 for a pop; AMD's F32
+// PFP/ME packet lists name CMD 1-3 PUSH_STATE, POP_STATE, PUSH_CLEAR_STATE) inside a set-up shadow, the context
+// places of S copied out after each step (COPY_DATA from memory): what do push and pop do to the shadow, is a SET
+// between them shadowed, is shadowing on after the pop, does a plain CLEAR_STATE write the shadow? Whether the pop
+// restored the registers takes a draw and is not checked here.
+static bool DangerShadowPushPop(Device* d, Common* c) {
+	printf("== danger shadow-pushpop: libSceAgc's CONTEXT_CONTROL + CLEAR_STATE push and pop inside a set-up shadow\n");
+	ShadowBufs b;
+	if (!ShadowSetup(d, &b)) {
+		return false;
+	}
+	const ShadowReg* tl   = &k_shadow_regs[0];
+	const ShadowReg* br   = &k_shadow_regs[1];
+	const uint64_t   stl  = b.s.va + ShadowAt(tl, 0);
+	const uint64_t   sbr  = b.s.va + ShadowAt(br, 0);
+	const uint64_t   copy = b.t.va + 0xa00;
+	Ib               ib   = {.n = 0};
+	IbContextControl(&ib, CC_UPDATE, CC_UPDATE);
+	IbContextControl(&ib, CC_UPDATE | CC_ALL, CC_UPDATE | CC_ALL);
+	IbShadowLoads(&ib, b.s.va, 0);
+	IbShadowSet(&ib, tl, 0x7e100001u);
+	IbShadowSet(&ib, br, 0x7e100002u);
+	IbCopyMemToMem(&ib, stl, copy + 0);
+	IbCopyMemToMem(&ib, sbr, copy + 4);
+	IbContextControl(&ib, 0, 0x80018001u); // the push
+	IbPush(&ib, Pkt3Gfx(0x12u, 1));
+	IbPush(&ib, 1u);
+	IbCopyMemToMem(&ib, stl, copy + 8);
+	IbCopyMemToMem(&ib, sbr, copy + 12);
+	IbShadowSet(&ib, tl, 0x7e100003u);
+	IbCopyMemToMem(&ib, stl, copy + 16);
+	IbContextControl(&ib, 0, 0x80018003u); // the pop
+	IbPush(&ib, Pkt3Gfx(0x12u, 1));
+	IbPush(&ib, 2u);
+	IbCopyMemToMem(&ib, stl, copy + 20);
+	IbCopyMemToMem(&ib, sbr, copy + 24);
+	IbShadowSet(&ib, br, 0x7e100004u);
+	IbCopyMemToMem(&ib, sbr, copy + 28);
+	IbPush(&ib, Pkt3Gfx(0x12u, 1)); // a plain CLEAR_STATE
+	IbPush(&ib, 0u);
+	IbCopyMemToMem(&ib, stl, copy + 32);
+	IbCopyMemToMem(&ib, sbr, copy + 36);
+	IbWriteData(&ib, b.t.va + 0x100, 0x5ad0e001u);
+	IbShadowOff(&ib);
+	IbWriteData(&ib, b.t.va + 0x104, 0x5ad0e002u);
+	IbPad(&ib);
+	ShadowRun(d, c, &b, &ib, "push/pop job");
+	const uint32_t* s = (const uint32_t*)b.s.cpu;
+	const uint32_t* t = (const uint32_t*)b.t.cpu;
+	const uint32_t* v = t + 0xa00 / 4;
+	printf("  marker after the steps %s, after shadowing off %s\n", t[0x40] == 0x5ad0e001u ? "landed" : "MISSING",
+	       t[0x41] == 0x5ad0e002u ? "landed" : "MISSING");
+	printf("  S at %s / %s (0x%08x / 0x%08x before the job):\n", tl->name, br->name, ShadowSentinel(0, 0),
+	       ShadowSentinel(1, 0));
+	printf("    after SETs of 0x7e100001 / 0x7e100002  0x%08x / 0x%08x\n", v[0], v[1]);
+	printf("    after the push                         0x%08x / 0x%08x\n", v[2], v[3]);
+	printf("    after a SET of _TL to 0x7e100003       0x%08x\n", v[4]);
+	printf("    after the pop                          0x%08x / 0x%08x\n", v[5], v[6]);
+	printf("    after a SET of _BR to 0x7e100004       0x%08x\n", v[7]);
+	printf("    after a plain CLEAR_STATE              0x%08x / 0x%08x\n", v[8], v[9]);
+	printf("    at the end                             0x%08x / 0x%08x\n", s[ShadowAt(tl, 0) / 4],
+	       s[ShadowAt(br, 0) / 4]);
+	printf("  context shadowing before the push: %s; the push %s S; a SET between push and pop %s; the pop %s S;\n",
+	       v[0] == 0x7e100001u && v[1] == 0x7e100002u ? "on" : "NOT seen",
+	       v[2] != v[0] || v[3] != v[1] ? "changed" : "left", v[4] == 0x7e100003u ? "was shadowed" : "was not shadowed",
+	       v[5] != v[4] || v[6] != v[3] ? "changed" : "left");
+	printf("  a SET after the pop %s; the plain CLEAR_STATE %s S\n",
+	       v[7] == 0x7e100004u ? "was shadowed" : "was not shadowed", v[8] != v[5] || v[9] != v[7] ? "changed" : "left");
+	ShadowOthers(&b);
+	const bool ok = t[0x40] == 0x5ad0e001u && t[0x41] == 0x5ad0e002u;
+	BoDestroy(d, &b.t);
+	BoDestroy(d, &b.s);
+	return ok;
+}
+
 // UCONFIG registers that PS5 command buffers write (per KytyPS5's PM4 handlers) but RADV never
 // does, plus one RADV-written control per ring. Each register is read, written with its low bit
 // flipped, read back and restored within one IB, so other processes never see the change.
@@ -2565,7 +3168,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr}\n");
+	printf("danger cases (owner approval required, run alone): vmfault long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem condib labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
 }
 
 int main(int argc, char** argv) {
@@ -2660,6 +3263,12 @@ int main(int argc, char** argv) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x63u, (0xb900u - 0xb000u) / 4, "COMPUTE_USER_DATA_0");
 		} else if (strcmp(danger, "regindex-ctx-nr") == 0) {
 			ok = DangerRegIndexNoRead(&d, &c, 0x9fu, (0x28030u - 0x28000u) / 4, "PA_SC_SCREEN_SCISSOR_TL");
+		} else if (strcmp(danger, "shadow") == 0) {
+			ok = DangerShadow(&d, &c, false);
+		} else if (strcmp(danger, "shadow-restore") == 0) {
+			ok = DangerShadow(&d, &c, true);
+		} else if (strcmp(danger, "shadow-pushpop") == 0) {
+			ok = DangerShadowPushPop(&d, &c);
 		} else if (strncmp(danger, "regindex-", 9) == 0) {
 			ok = DangerRegIndex(&d, &c, danger + 9);
 		} else {
