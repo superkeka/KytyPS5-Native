@@ -959,6 +959,9 @@ public:
 	// own fences raise theirs with 0. SetGuestInterruptsCtx0: those too (a patched amdgpu with
 	// bc250_gfx_eop_events=2 logs an id-0 interrupt raised inside an IB, where amdgpu's fences are not).
 	void SetGuestInterruptsOnGpu(bool on) { m_guest_irq = on; }
+	// A title's interrupt raised by the tracker fires before the GPU work after its release (on by default; off: at the
+	// next GPU wait or the segment's end, sharing that store).
+	void SetInterruptsAtRelease(bool on) { m_irq_at_release = on; }
 	void SetGuestInterruptsCtx0(bool on) { m_guest_irq_ctx0 = on; }
 	// With native labels: a DCB's flip (AgcDcbSetFlip) is requested as soon as the GPU passes it, a
 	// tracker point (woken by the EOP interrupt), as the PS5 kernel queues a title's flip from the
@@ -1221,6 +1224,7 @@ private:
 	bool                         m_cpu_timestamps = false;
 	bool                         m_tracker_writes = false;
 	bool                         m_guest_irq      = false;
+	bool                         m_irq_at_release = true;
 	bool                         m_guest_irq_ctx0 = false;
 	bool                         m_eop_flips      = false;
 	uint32_t                     m_fence_seq      = 0;

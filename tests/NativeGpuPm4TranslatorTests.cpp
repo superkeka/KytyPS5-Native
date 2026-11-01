@@ -1932,11 +1932,29 @@ void TestGpuTimestamp() {
 		}
 		tracker += (p.op == 0x49u && p.body[2] == static_cast<uint32_t>(kTrackerVa)) ? 1u : 0u;
 	}
-	Check(gfx_bit && tracker == 1, "gfx timestamp has no shader bit; both interrupts share one tracker packet");
-	Check(r.segments[0].points.size() == 3 && r.segments[0].points[0].dw == r.segments[0].points[2].dw &&
-	          r.segments[0].points[0].kind == TrackerPoint::Kind::Interrupt &&
-	          r.segments[0].points[1].kind == TrackerPoint::Kind::Interrupt,
-	      "interrupts with a dispatch between them still share the end packet");
+	Check(gfx_bit && tracker == 2, "gfx timestamp has no shader bit; the first interrupt's tracker packet, then the end's");
+	{
+		const auto& ip = r.segments[0].points;
+		uint32_t    dispatch_dw = 0;
+		for (uint32_t dw = 0; dw < r.ib.size(); dw++) {
+			if ((r.ib[dw] >> 30u) == 3u && ((r.ib[dw] >> 8u) & 0xffu) == IT_DISPATCH_DIRECT) {
+				dispatch_dw = dw;
+			}
+		}
+		Check(ip.size() == 3 && ip[0].kind == TrackerPoint::Kind::Interrupt && ip[1].kind == TrackerPoint::Kind::Interrupt &&
+		          ip[0].dw < dispatch_dw && ip[1].dw == ip[2].dw && ip[1].dw > dispatch_dw,
+		      "an interrupt fires before the GPU work after its release; the last shares the end packet");
+	}
+	{
+		Pm4Translator late;
+		TestOracle    lo;
+		late.SetNativeLabels(&lo, kTrackerVa);
+		late.SetFenceAddress(kFenceVa);
+		late.SetInterruptsAtRelease(false);
+		const auto  rl = late.Translate(dcb);
+		const auto& lp = rl.segments[0].points;
+		Check(rl.ok && lp.size() == 3 && lp[0].dw == lp[2].dw, "off: interrupts with a dispatch between them share the end packet");
+	}
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a GPU timestamp passes the gfx check");
 

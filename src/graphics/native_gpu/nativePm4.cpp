@@ -3056,7 +3056,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// before a GPU wait: on the PS5 an interrupt fires where its release runs, and a title may submit
 	// the writer of what it waits for only once it has seen that interrupt (My First Gran Turismo
 	// stopped when its interrupts waited for the end of a segment its own wait held up).
+	bool irq_pending = false; // an interrupt point is queued: store the points before the next GPU work
 	auto flush_points = [&]() {
+		irq_pending = false;
 		if (queued_points.empty()) {
 			return;
 		}
@@ -3347,6 +3349,27 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				default: break;
 			}
 		}
+		// A title's EOP interrupt fires where its release runs, as on the PS5, not at the next GPU wait or the
+		// segment's end: the points queued since are stored before the next GPU work (releases and labels right
+		// after it still share the store).
+		if (irq_pending) {
+			switch (op) {
+				case IT_DRAW_INDIRECT:
+				case IT_DRAW_INDEX_INDIRECT:
+				case IT_DRAW_INDIRECT_MULTI:
+				case IT_DRAW_INDEX_INDIRECT_MULTI:
+				case IT_DRAW_INDEX_2:
+				case IT_DRAW_INDEX_OFFSET_2:
+				case IT_DRAW_INDEX_AUTO:
+				case IT_DISPATCH_DIRECT:
+				case IT_DISPATCH_INDIRECT:
+				case IT_DMA_DATA:
+					flush_points();
+					irq_pending = false;
+					break;
+				default: break;
+			}
+		}
 		switch (op) {
 			case IT_RELEASE_MEM: // libSceAgc's, as agc.cpp writes it: the same body as Kyty's NOP marker
 			case IT_NOP: {
@@ -3533,6 +3556,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						irq.kind = TrackerPoint::Kind::Interrupt;
 						irq.ctx  = bptr[6] & 0x07ffffffu;
 						tracker_point(irq);
+						irq_pending = m_irq_at_release;
 						stats.interrupts++;
 						NoteOnce(16u + int_sel, int_sel == 1 ? "RELEASE_MEM INT_SEL 1 (EOP interrupt)"
 						                                     : (int_sel == 2 ? "RELEASE_MEM INT_SEL 2 (EOP interrupt)"

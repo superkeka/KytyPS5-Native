@@ -4832,6 +4832,11 @@ private:
 			m_acb_translator.SetPfpSyncIndirect(true);
 			std::fprintf(stderr, "native shadow: PFP_SYNC_ME before indirect draws and dispatches\n");
 		}
+		if (EnvIs("KYTY_NATIVE_GPU_IRQ_AT_RELEASE", "0")) {
+			m_translator.SetInterruptsAtRelease(false);
+			m_acb_translator.SetInterruptsAtRelease(false);
+			std::fprintf(stderr, "native shadow: title interrupts at the next GPU wait or segment end (KYTY_NATIVE_GPU_IRQ_AT_RELEASE=0)\n");
+		}
 		if (EnvIs("KYTY_NATIVE_GPU_CP_DMA_IDLE", "0")) {
 			m_translator.SetCpDmaIdle(false);
 			m_acb_translator.SetCpDmaIdle(false);
