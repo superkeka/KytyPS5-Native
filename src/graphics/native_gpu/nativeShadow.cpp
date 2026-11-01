@@ -4832,6 +4832,10 @@ private:
 			m_acb_translator.SetPfpSyncIndirect(true);
 			std::fprintf(stderr, "native shadow: PFP_SYNC_ME before indirect draws and dispatches\n");
 		}
+		// DRAW_INDEX_OFFSET_2 runs as the title wrote it; KYTY_NATIVE_GPU_DRAW_OFFSET_VERBATIM=0 makes it DRAW_INDEX_2.
+		if (!EnvIs("KYTY_NATIVE_GPU_DRAW_OFFSET_VERBATIM", "0")) {
+			m_translator.SetDrawIndexOffsetVerbatim(true);
+		}
 		if (EnvIs("KYTY_NATIVE_GPU_IRQ_AT_RELEASE", "0")) {
 			m_translator.SetInterruptsAtRelease(false);
 			m_acb_translator.SetInterruptsAtRelease(false);

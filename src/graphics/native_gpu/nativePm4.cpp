@@ -1056,6 +1056,7 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			case IT_DRAW_INDEX_INDIRECT:
 			case IT_INDEX_BASE:
 			case IT_DRAW_INDEX_2:
+			case IT_DRAW_INDEX_OFFSET_2: // as written with SetDrawIndexOffsetVerbatim
 			case IT_DRAW_INDEX_AUTO:
 			case IT_NUM_INSTANCES:
 			case IT_PFP_SYNC_ME:
@@ -4265,19 +4266,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.index_state++;
 				break;
 			case IT_DRAW_INDEX_OFFSET_2: { // MAX_SIZE, INDEX_OFFSET, INDEX_COUNT, DRAW_INITIATOR
-				// The PS5's CP firmware has its own handler for this packet (PFP and ME); MAX_SIZE is the
-				// indices left from INDEX_OFFSET, and games send offsets past it. The BC-250's amdgpu
-				// firmware draws nothing for it: ASTRO BOT was black with the packet as written, with
-				// MAX_SIZE as the end of the range, with INDEX_BASE or INDEX_BUFFER_SIZE resent before
-				// it, and with the base moved to the offset and INDEX_OFFSET 0 (no hang in any). So the
-				// translator does the firmware's part: DRAW_INDEX_2 at the offset's address, as Kyty's
-				// own command processor does.
+				// As written (SetDrawIndexOffsetVerbatim, the native default): the BC-250's CP draws it once the
+				// queue resets set the index buffer up as libSceAgc's do (AgcDcbResetQueue op 0x10: INDEX_BASE 0,
+				// INDEX_BUFFER_SIZE 0xffffffff). With Kyty's former reset (a CLEAR_STATE) ASTRO BOT was black
+				// with the packet as written, which looked like a firmware gap. Otherwise DRAW_INDEX_2 at the
+				// offset's address, as Kyty's own command processor does.
 				if (body_count < 4) {
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				log_draw(op, bptr[2], 0, false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
+				} else if (m_draw_offset_verbatim) {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				} else {
 					const uint32_t index_type  = reg(uc, 0x243u) & 0x3u; // VGT_INDEX_TYPE: 0 16-bit, 1 32-bit, 2 8-bit
 					const uint64_t index_bytes = index_type == 1u ? 4u : (index_type == 2u ? 1u : 2u);

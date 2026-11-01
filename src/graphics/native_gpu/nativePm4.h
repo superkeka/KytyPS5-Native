@@ -1040,6 +1040,8 @@ public:
 	void SetNoPreamble(bool on) { m_no_preamble = on; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
+	// DRAW_INDEX_OFFSET_2 (0x35) as the title wrote it, not as DRAW_INDEX_2 at the offset's address.
+	void SetDrawIndexOffsetVerbatim(bool on) { m_draw_offset_verbatim = on; }
 	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
 	// scan every stage's user-data SGPRs (PS, VS, GS, ES, HS, LS) and USER_DATA_ADDR; dispatches
 	// scan COMPUTE_USER_DATA_0..15. Descriptor tables those pointers name are read two levels deep
@@ -1234,6 +1236,7 @@ private:
 	bool                         m_compact_refs = false;
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
+	bool                         m_draw_offset_verbatim = false;
 	bool                         m_pfp_sync_indirect = false;
 	bool                         m_cp_dma_idle       = true;
 	bool                         m_waits_verbatim    = false;
