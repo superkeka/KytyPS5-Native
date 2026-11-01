@@ -2242,42 +2242,198 @@ uint32_t KYTY_SYSV_ABI AgcCbQueueEndOfPipeActionGetSize() {
 	return 32;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
-	PRINT_NAME();
+// libSceAgc's queue resets (2026-11-01, from its code): a start marker (SQ_THREAD_TRACE_USERDATA_2 0x342), each op bit's
+// block in a fixed order, an end marker. `idx` selects the state AgcInit set up for a version (the default context, SH
+// and UCONFIG register tables); bit 15 of op picks the current one. The marker carries 0xce000000 | op (bit 21: AgcInit
+// not called by the title; bit 22: a call from outside libSceAgc, never here) and the version.
+static uint32_t reset_marker(uint32_t op) {
+	return 0xce000000u | (AgcRegisterDefaultsVersion() == UINT32_MAX ? 1u << 21u : 0u) | (op & 0xffffu);
+}
 
-	AgcTrace("\t op    = 0x%08" PRIx32 "\n", op);
+// The SH and UCONFIG default tables of the version in use, as AgcInit builds them for the resets: {register, value}
+// pairs of the public and internal defaults, guest memory the GPU reads. The context table and the push/pop flag are
+// the context-state op's (context_state_memory). libSceAgc keeps the last 8 UCONFIG entries as a tail op bit 0x800
+// sets on its own; here they are the last 8 of the table in register order.
+struct ResetTables {
+	uint32_t* sh       = nullptr;
+	uint32_t  sh_count = 0;
+	uint32_t* uc       = nullptr;
+	uint32_t  uc_count = 0;
+	uint32_t  version  = UINT32_MAX;
+};
+static constexpr uint32_t RESET_TABLE_PAIRS = 0x400u;
+static constexpr uint32_t RESET_UC_TAIL     = 8u;
 
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-	EXIT_NOT_IMPLEMENTED((op & ~0x1c2u) != 0);
+static ResetTables* reset_tables() {
+	static std::mutex           mutex;
+	static ResetTables          t;
+	std::lock_guard<std::mutex> lock(mutex);
+	if (t.sh == nullptr) {
+		const uint64_t addr = LibKernel::Memory::AllocateRuntimeMemory(0, 16ull * RESET_TABLE_PAIRS, Common::VirtualMemory::Mode::ReadWrite,
+		                                                                "agc reset tables");
+		EXIT_NOT_IMPLEMENTED(addr == 0);
+		t.sh = reinterpret_cast<uint32_t*>(addr);
+		t.uc = t.sh + 2u * RESET_TABLE_PAIRS;
+	}
+	const uint32_t ver = AgcRegisterDefaultsVersion();
+	if (t.version != ver) {
+		const auto defaults = AgcStartStateDefaults(ver);
+		EXIT_NOT_IMPLEMENTED(defaults.sh.size() > RESET_TABLE_PAIRS || defaults.uconfig.size() > RESET_TABLE_PAIRS);
+		for (size_t i = 0; i < defaults.sh.size(); i++) {
+			t.sh[2 * i]     = defaults.sh[i].first;
+			t.sh[2 * i + 1] = defaults.sh[i].second;
+		}
+		for (size_t i = 0; i < defaults.uconfig.size(); i++) {
+			t.uc[2 * i]     = defaults.uconfig[i].first;
+			t.uc[2 * i + 1] = defaults.uconfig[i].second;
+		}
+		t.sh_count = static_cast<uint32_t>(defaults.sh.size());
+		t.uc_count = static_cast<uint32_t>(defaults.uconfig.size());
+		t.version  = ver;
+	}
+	return &t;
+}
 
-	auto* cmd = buf->AllocateDW(2);
-
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
-
-	cmd[0] = KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_DISPATCH_RESET);
-	cmd[1] = 0;
-
+static uint32_t* put_indirect(uint32_t* cmd, uint32_t op, const void* table, uint32_t count) {
+	const auto addr = reinterpret_cast<uint64_t>(table);
+	*cmd++          = KYTY_PM4(5, op, 0u);
+	*cmd++          = static_cast<uint32_t>(addr) & ~0x3u;
+	*cmd++          = static_cast<uint32_t>(addr >> 32u);
+	*cmd++          = 0x80000000u;
+	*cmd++          = count & 0x3fffu;
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state) {
+uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t idx) {
 	PRINT_NAME();
 
 	AgcTrace("\t op    = 0x%08" PRIx32 "\n"
-	         "\t state = 0x%08" PRIx32 "\n",
-	         op, state);
+	         "\t idx   = %" PRIu32 "\n",
+	         op, idx);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-	EXIT_NOT_IMPLEMENTED((op & ~0xfffu) != 0);
+	EXIT_NOT_IMPLEMENTED((op & ~0x81c2u) != 0);
 
-	auto* cmd = buf->AllocateDW(2);
+	// Start marker, CS_PARTIAL_FLUSH (0x80), the version's ACB setup blob (2; not built here), the caches (0x40, 0x100),
+	// end marker.
+	auto* start = buf->AllocateDW(4);
+	EXIT_NOT_IMPLEMENTED(start == nullptr);
+	start[0] = 0xc0027900u;
+	start[1] = 0x342u;
+	start[2] = reset_marker(op);
+	start[3] = AgcRegisterDefaultsVersion() == UINT32_MAX ? 0u : AgcRegisterDefaultsVersion();
+	if ((op & 0x80u) != 0) {
+		auto* cmd = buf->AllocateDW(2);
+		EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+		cmd[0] = 0xc0004600u;
+		cmd[1] = 0x00000407u;
+	}
+	if ((op & 0x2u) != 0) {
+		static std::atomic<bool> told {false};
+		if (!told.exchange(true)) {
+			std::fprintf(stderr, "agc: AgcAcbResetQueue op 2 (the version's ACB setup blob) is left out\n");
+		}
+	}
+	if ((op & 0x140u) != 0) {
+		AgcAcbAcquireMem(buf, (op & 0x100u) != 0 ? 0xc3a1u : 0xc1u, nullptr, 0, 0);
+	}
+	auto* end = buf->AllocateDW(3);
+	EXIT_NOT_IMPLEMENTED(end == nullptr);
+	end[0] = 0xc0017900u;
+	end[1] = 0x342u;
+	end[2] = (reset_marker(op) & 0xcf600000u) | 0x800000u;
 
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	return start;
+}
 
-	cmd[0] = KYTY_PM4(2, Pm4::IT_CLEAR_STATE, 0u);
-	cmd[1] = state & 0xfu;
+uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t idx) {
+	PRINT_NAME();
 
-	return cmd;
+	AgcTrace("\t op    = 0x%08" PRIx32 "\n"
+	         "\t idx   = %" PRIu32 "\n",
+	         op, idx);
+
+	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+	EXIT_NOT_IMPLEMENTED((op & ~0x8fffu) != 0);
+
+	const ContextStateMemory* ctx = context_state_memory();
+	const ResetTables*        t   = reset_tables();
+	const uint32_t            uc  = (op & 0x804u) == 0x804u ? t->uc_count
+	                                : (op & 0x4u) != 0      ? t->uc_count - std::min(RESET_UC_TAIL, t->uc_count)
+	                                                        : std::min(RESET_UC_TAIL, t->uc_count);
+	const uint32_t* uc_table = (op & 0x804u) == 0x800u ? t->uc + 2u * (t->uc_count - uc) : t->uc;
+	const uint64_t  flags    = reinterpret_cast<uint64_t>(ctx->flags);
+	const uint32_t  marker   = reset_marker(op);
+
+	const uint32_t size = 1u + 4u + ((op & 0x80u) != 0 ? 2u : 0u) + ((op & 0x100u) != 0 ? 2u : 0u) + ((op & 0x400u) != 0 ? 16u : 0u) +
+	                      ((op & 0x1u) != 0 ? 5u : 0u) + ((op & 0x2u) != 0 ? 5u : 0u) + ((op & 0x804u) != 0 ? 5u : 0u) +
+	                      ((op & 0x8u) != 0 ? 2u : 0u) + ((op & 0x10u) != 0 ? 8u : 0u) + ((op & 0x20u) != 0 ? 8u : 0u) +
+	                      ((op & 0x40u) != 0 ? 12u : 0u) + 3u;
+	auto* first = buf->AllocateDW(size);
+	EXIT_NOT_IMPLEMENTED(first == nullptr);
+	auto* cmd = first;
+	*cmd++    = 0xffff1000u; // AgcCbNop(buf, 1)
+	for (uint32_t v: {0xc0027904u, 0x342u, marker, AgcRegisterDefaultsVersion() == UINT32_MAX ? 0u : AgcRegisterDefaultsVersion()}) {
+		*cmd++ = v;
+	}
+	if ((op & 0x80u) != 0) { // CS_PARTIAL_FLUSH
+		*cmd++ = 0xc0004600u;
+		*cmd++ = 0x00000407u;
+	}
+	if ((op & 0x100u) != 0) { // VS_PARTIAL_FLUSH
+		*cmd++ = 0xc0004600u;
+		*cmd++ = 0x00000410u;
+	}
+	if ((op & 0x400u) != 0) { // a pushed context popped: COND_EXEC on the push flag, CLEAR_STATE 2, the flag back to {0, 1}
+		for (uint32_t v: {0xc0032200u, static_cast<uint32_t>(flags) & ~3u, static_cast<uint32_t>(flags >> 32u), 0u, 0x0000000bu, 0xc0001200u,
+		                  0x00000002u, 0xc0071e00u, 0x40000267u, static_cast<uint32_t>(flags), static_cast<uint32_t>(flags >> 32u), 0u, 1u,
+		                  0u, 0u, 6u}) {
+			*cmd++ = v;
+		}
+	}
+	if ((op & 0x1u) != 0) { // the default context
+		cmd = put_indirect(cmd, Pm4::IT_SET_CONTEXT_REG_INDIRECT, ctx->table, CONTEXT_STATE_TABLE_PAIRS);
+	}
+	if ((op & 0x2u) != 0) { // the default SH registers
+		cmd = put_indirect(cmd, Pm4::IT_SET_SH_REG_INDIRECT, t->sh, t->sh_count);
+	}
+	if ((op & 0x804u) != 0) { // the default UCONFIG registers (4: all but the tail, 0x800: the tail)
+		cmd = put_indirect(cmd, Pm4::IT_SET_UCONFIG_REG_INDIRECT, uc_table, uc);
+	}
+	if ((op & 0x8u) != 0) { // NUM_INSTANCES 1
+		*cmd++ = 0xc0002f00u;
+		*cmd++ = 0x00000001u;
+	}
+	if ((op & 0x10u) != 0) { // the index buffer: VGT_INDEX_TYPE 16-bit, INDEX_BASE 0, INDEX_BUFFER_SIZE 0xffffffff
+		for (uint32_t v: {0xc0017a00u, 0x20000243u, 0x00000480u, 0xc0012600u, 0u, 0u, 0xc0001300u, 0xffffffffu}) {
+			*cmd++ = v;
+		}
+	}
+	if ((op & 0x20u) != 0) { // the indirect-argument base (SET_BASE 1) to 0, compute then graphics
+		for (uint32_t v: {0xc0021102u, 1u, 0u, 0u, 0xc0021100u, 1u, 0u, 0u}) {
+			*cmd++ = v;
+		}
+	}
+	if ((op & 0x40u) != 0) { // caches: ACQUIRE_MEM, then the CB/DB meta flushes 0x2e and 0x2c
+		for (uint32_t v: {0xc0065800u, 0x86007fc0u, 0xfffffffeu, 0x000000ffu, 0x00000001u, 0u, 0x00000019u, 0x0000c3e1u, 0xc0004600u, 0x0000002eu,
+		                  0xc0004600u, 0x0000002cu}) {
+			*cmd++ = v;
+		}
+	}
+	if ((op & 0x200u) != 0) {
+		// libSceAgc writes event 0x38 (index 1) with address 0x07fffc00, a page nothing maps here: a GPU write there would be
+		// a VM fault, which stops the ring on this board.
+		static std::atomic<bool> told {false};
+		if (!told.exchange(true)) {
+			std::fprintf(stderr, "agc: AgcDcbResetQueue op 0x200 (event 0x38 at 0x07fffc00) is left out\n");
+		}
+	}
+	*cmd++ = 0xc0017904u;
+	*cmd++ = 0x342u;
+	*cmd++ = (marker & 0xcf600000u) | 0x800000u;
+	EXIT_NOT_IMPLEMENTED(cmd != first + size);
+
+	return first;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,

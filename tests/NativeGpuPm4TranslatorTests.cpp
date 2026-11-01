@@ -754,6 +754,35 @@ void TestContextStatePushPop() {
 	Check(last == 0x1111u, "the pop restores the pushed CB_COLOR0_BASE");
 }
 
+// AgcDcbResetQueue op 0x400 (libSceAgc's form): COND_EXEC on the push flag over CLEAR_STATE 2 and the flag's swap back.
+// The COND_EXEC is left out; the pop restores a pushed context and does nothing without one.
+void TestResetQueuePop() {
+	auto reset_pop = [](std::vector<uint32_t>& dcb) {
+		dcb.insert(dcb.end(), {0xc0032200u, 0x0025e000u, 0x2u, 0u, 0x0000000bu, 0xc0001200u, 2u, 0xc0071e00u, 0x40000267u, 0x0025e000u, 0x2u, 0u, 1u,
+		                       0u, 0u, 6u});
+	};
+	for (const bool pushed: {true, false}) {
+		Pm4Translator         t;
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x1111u}, false);
+		if (pushed) {
+			Append(dcb, 0x12u /* IT_CLEAR_STATE */, {1u}, false); // push
+		}
+		Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x2222u}, false);
+		reset_pop(dcb);
+		auto     r    = t.Translate(dcb);
+		uint32_t last = 0;
+		for (const auto& p: Decode(r.ib)) {
+			if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x318u) {
+				last = p.body[1];
+			}
+		}
+		Check(r.ok && r.stats.context_checks == 1 && Count(Decode(r.ib), 0x22u) == 0 && Count(Decode(r.ib), 0x1Eu) == 1,
+		      "the reset's pop translates: COND_EXEC left out, the flag swap kept");
+		Check(last == (pushed ? 0x1111u : 0x2222u), pushed ? "after a push it restores the pushed context" : "without a push it changes nothing");
+	}
+}
+
 void TestWaitBarrier() {
 	Pm4Translator t;
 	t.SetFenceAddress(0x2000001000ull);
@@ -2395,6 +2424,11 @@ void TestFlattenIndirectBuffers() {
 	buf.insert(buf.end(), nop_b.begin(), nop_b.end());
 	Check(FlattenIndirectBuffers(buf, &out) && out == std::vector<uint32_t>({0xc0001000u, 0x1111u, 0xc0001000u, 0xbbbbu}),
 	      "a call runs the target, then the rest");
+	// libSceAgc's one-dword NOP (AgcCbNop(buf, 1): count 0x3fff), as its queue resets begin, is one dword.
+	std::vector<uint32_t> filler = {0xffff1000u, 0xc0001000u, 0x2222u};
+	buf                          = ib(filler, false);
+	out.clear();
+	Check(FlattenIndirectBuffers(buf, &out) && out == filler, "a called buffer that starts with the one-dword NOP");
 
 	// libSceAgc's branch with compare function 0 (AgcCbBranch, 14 dwords; Stray's calls): its then target is
 	// called. A branch on memory (function 3) is not inlined.
@@ -4179,6 +4213,7 @@ int main() {
 	TestIndirectDraws();
 	TestIndirectMultiDraws();
 	TestContextStatePushPop();
+	TestResetQueuePop();
 	TestWaitBarrier();
 	TestCompactRefs();
 	TestGdsReleaseMem();

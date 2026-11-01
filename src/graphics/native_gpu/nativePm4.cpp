@@ -1140,7 +1140,7 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 	};
 	for (size_t dw = 0; dw < in.size();) {
 		const uint32_t header = in[dw];
-		const uint32_t len    = (header >> 30u) == 3u ? ((header >> 16u) & 0x3fffu) + 2u : 1u;
+		const uint32_t len    = (header >> 30u) == 3u ? PacketSizeDw(header) : 1u;
 		if (dw + len > in.size()) {
 			return stop("packet past the end", dw);
 		}
@@ -2038,7 +2038,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			dw++;
 			continue;
 		}
-		const uint32_t size = ((header >> 16u) & 0x3fffu) + 2u;
+		const uint32_t size = PacketSizeDw(header);
 		const uint32_t op   = (header >> 8u) & 0xffu;
 		if ((op == IT_SET_CONTEXT_REG_INDIRECT || op == IT_SET_SH_REG_INDIRECT || op == IT_SET_UCONFIG_REG_INDIRECT) && size >= 5 &&
 		    dw + 4 < dcb.size()) {
@@ -4543,6 +4543,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// push or pop in a row (INT_SEL 4, context id with bit 27 set), run when its flag is set. That is
 				// the PS5 kernel's; both are left out. Any other COND_EXEC refuses the buffer.
 				const uint32_t next = dw + size;
+				// AgcDcbResetQueue op 0x400: on the push flag, a pop (CLEAR_STATE 2) and the flag's swap back to {0, 1}. The
+				// shadow pops only while a push is outstanding, and without one the swap writes what the flag holds, so
+				// both go on as written and the COND_EXEC is left out.
+				if (!m_compute_ring && body_count >= 4 && (bptr[3] & 0x3fffu) == 11u && next + 11u <= dcb.size() &&
+				    dcb[next] == 0xc0001200u && dcb[next + 1] == 2u && dcb[next + 2] == 0xc0071e00u) {
+					stats.context_checks++;
+					break;
+				}
 				if (m_compute_ring || body_count < 4 || (bptr[3] & 0x3fffu) != 8u || next + 8u > dcb.size() ||
 				    dcb[next] != 0xc0064900u || ((dcb[next + 2] >> 24u) & 0x7u) != 4u || (dcb[next + 7] & 0x08000000u) == 0) {
 					return fail(op, dw, RefuseWhy::CondExecForm);

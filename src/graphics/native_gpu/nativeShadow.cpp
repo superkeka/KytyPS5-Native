@@ -6272,7 +6272,8 @@ private:
 		size_t                                     next_mark = 0;
 		for (uint32_t dw = 0; dw < whole.size();) {
 			const uint32_t header = whole[dw];
-			const uint32_t size   = (header >> 30u) == 3u ? ((header >> 16u) & 0x3fffu) + 2u : 1u;
+			// The filler NOP (count 0x3fff), which libSceAgc writes too (AgcCbNop of one dword), is one dword.
+			const uint32_t size   = (header >> 30u) != 3u || (header & 0x3fffff00u) == 0x3fff1000u ? 1u : ((header >> 16u) & 0x3fffu) + 2u;
 			if ((header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x22u && size >= 5) { // COND_EXEC: EXEC_COUNT dwords follow
 				cond_until = std::max(cond_until, dw + size + (whole[dw + 4] & 0x3fffu));
 			}

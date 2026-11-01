@@ -146,8 +146,8 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
                                         uint8_t interrupt, uint32_t interrupt_ctx_id);
 uint32_t KYTY_SYSV_ABI  AgcCbQueueEndOfPipeActionGetSize();
 int KYTY_SYSV_ABI       AgcDebugRaiseException(uint32_t exception_id);
-uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op);
-uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state);
+uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t idx);
+uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t idx);
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
                                                         uint32_t       video_out_handle,
                                                         uint32_t       display_buffer_index);
