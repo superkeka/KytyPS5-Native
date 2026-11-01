@@ -2568,12 +2568,14 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		}
 		// LABELVIS_GO_UC=1: the CPU's go word in a UC buffer of its own, so the job keeps running after the label
 		// (no end-of-job cache flush) and the wait still sees the CPU's write whatever the label's mapping.
-		const bool go_uc = getenv("LABELVIS_GO_UC") != NULL;
+		// LABELVIS_GO_NC=1: the same, but that buffer mapped NC (a poll line of its own, no label in it).
+		const bool go_nc = getenv("LABELVIS_GO_NC") != NULL;
+		const bool go_uc = getenv("LABELVIS_GO_UC") != NULL || go_nc;
 		Bo         go_bo = {0};
 		if (go_uc) {
 			r = MemCreate(d, &go_bo, MEM_GTT, 64 * KiB, NULL);
 			if (r == 0) {
-				r = BoBind(d, &go_bo, 0x0710000000ull + k * 0x100000ull, AMDGPU_VM_MTYPE_UC);
+				r = BoBind(d, &go_bo, 0x0710000000ull + k * 0x100000ull, go_nc ? AMDGPU_VM_MTYPE_NC : AMDGPU_VM_MTYPE_UC);
 			}
 			if (r != 0) {
 				printf("  %-7s: go buffer setup failed: %s\n", kinds[k].name, ErrStr(r));
@@ -2640,8 +2642,46 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		*go = 1;
 		__sync_synchronize();
 		const double t_go = NowSec();
-		int          w    = WaitOn(d, ip, 0, seq, 1.0);
+		// LABELVIS_RESCUE_MS: if the wait has not seen the CPU's go by then, a job on the other ring stores the go
+		// through GL2 (RELEASE_MEM to L2), which the waiting CP sees: the ring never stays stopped, and the time
+		// tells who ended the wait (the CPU's store: about 0; the rescue: the rescue time).
+		const char*  rescue_ms = getenv("LABELVIS_RESCUE_MS");
+		int          w         = WaitOn(d, ip, 0, seq, rescue_ms != NULL ? strtod(rescue_ms, NULL) / 1000.0 : 1.0);
+		bool         rescued   = false;
+		if (w == 1 && rescue_ms != NULL) {
+			Bo rib;
+			int rr = MemCreate(d, &rib, MEM_GTT_USWC, 64 * KiB, NULL);
+			if (rr == 0) {
+				rr = BoBind(d, &rib, 0x0720000000ull + k * 0x100000ull, 0);
+			}
+			if (rr == 0) {
+				const uint32_t rip  = cs ? AMDGPU_HW_IP_GFX : AMDGPU_HW_IP_COMPUTE;
+				Ib             rescue = {.n = 0};
+				IbPush(&rescue, rip == AMDGPU_HW_IP_GFX ? Pkt3Gfx(0x49u, 7) : Pkt3(0x49u, 7)); // RELEASE_MEM to L2
+				IbPush(&rescue, 0x28u | (5u << 8));
+				IbPush(&rescue, (1u << 29) | (1u << 16));
+				IbPush(&rescue, (uint32_t)go_va);
+				IbPush(&rescue, (uint32_t)(go_va >> 32));
+				IbPush(&rescue, 1u);
+				IbPush(&rescue, 0u);
+				IbPush(&rescue, 0u);
+				IbPad(&rescue);
+				Bo*      rbos[] = {&mem, &go_bo};
+				uint64_t rseq   = 0;
+				if (SubmitOn(d, rip, 0, &rib, &rescue, rbos, go_uc ? 2 : 1, &rseq) == 0) {
+					WaitOn(d, rip, 0, rseq, 1.0);
+					rescued = true;
+				}
+				w = WaitOn(d, ip, 0, seq, 1.0);
+			}
+			BoDestroy(d, &rib);
+		}
 		const double t_done = NowSec() - t_go;
+		if (rescue_ms != NULL) {
+			printf("  %-7s: wait %s %.2f ms after the CPU's go (wait CACHE_POLICY %u)\n", kinds[k].name,
+			       rescued ? (w == 0 ? "ended by the GPU rescue" : "NOT ended even by the rescue") : "saw the CPU's go",
+			       t_done * 1e3, wait_pol >> 25);
+		}
 		int64_t      st     = ContextState(d);
 		if (seen >= 0) {
 			printf("  %-7s: label seen by the CPU after %.1f us; the CPU's go seen, job done %.2f ms after it (job %s), dwords "
