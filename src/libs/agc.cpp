@@ -1580,8 +1580,9 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 
 	auto vaddr = reinterpret_cast<uint64_t>(target);
 
-	cmd[1] = static_cast<uint32_t>(vaddr & 0xffffffffu);
-	cmd[2] = (cmd[2] & 0xffff0000u) | static_cast<uint32_t>((vaddr >> 32u) & 0xffffu);
+	// As libSceAgc: bits 1:0 of the low dword kept, the whole high dword written.
+	cmd[1] = (cmd[1] & 0x3u) | (static_cast<uint32_t>(vaddr) & ~0x3u);
+	cmd[2] = static_cast<uint32_t>(vaddr >> 32u);
 	cmd[3] = (cmd[3] & 0xfff00000u) | (size_in_dwords & 0xfffffu);
 
 	return OK;
@@ -1738,7 +1739,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operat
 		case 1:
 		case 3: {
 			mark_first();
-			if (!context_state_save_restore(buf, 1, mem)) {
+			// The push's kernel context id carries the operation (libSceAgc passes 3 for a push then clear).
+			if (!context_state_save_restore(buf, operation, mem)) {
 				return nullptr;
 			}
 			break;
@@ -1944,6 +1946,13 @@ static constexpr uint32_t BranchPacketSizeDw = 14;
 
 static void write_branch_target(uint32_t* words, uint64_t address, uint8_t cache_policy,
                                  uint32_t size_in_dwords) {
+	// No target (libSceAgc): address, size and cache policy all 0, so the CP never runs an IB at VA 0.
+	if (address == 0) {
+		words[0] = words[0] & 0x3u;
+		words[1] = 0;
+		words[2] = words[2] & 0xcff00000u;
+		return;
+	}
 	words[0] = (words[0] & 0x3u) | (static_cast<uint32_t>(address) & ~0x3u);
 	words[1] = static_cast<uint32_t>(address >> 32u);
 	words[2] = (words[2] & 0xcff00000u) | (size_in_dwords & 0xfffffu) |
@@ -2181,7 +2190,9 @@ int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
 
 	LOGF("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
 
-	return OK;
+	// libSceAgc's driver raises a kernel debug exception for id 1 and returns an error either way (0x8a6d0003 after
+	// a raised one); no debugger here, so nothing is raised.
+	return static_cast<int>(0x8a6d0003u);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint16_t gcr_cntl,
@@ -2830,6 +2841,8 @@ static constexpr uint32_t AGC_MARKER_SET_TAG                    = 0xc0000000u; /
 static constexpr uint32_t AGC_MARKER_PUSH_TAG                   = 0xc1000000u;
 static constexpr uint32_t AGC_MARKER_POP_TAG                    = 0xc2000000u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG     = 0xc6000008u;
+static constexpr uint32_t AGC_DRAW_INDEX_INDIRECT_MULTI_BEGIN_TAG = 0xc6000005u;
+static constexpr uint32_t AGC_DRAW_INDEX_MULTI_INSTANCED_BEGIN_TAG = 0xc6000006u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_64_TAG       = 0xc8020000u;
@@ -2904,9 +2917,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 	EXIT_NOT_IMPLEMENTED(object_ids == nullptr);
 	EXIT_NOT_IMPLEMENTED((reinterpret_cast<uint64_t>(index_addr) & 1u) != 0);
 
-	auto* cmd = buf->AllocateDW(9);
+	// libSceAgc brackets the packet with internal-data tags (0xc6000006 ... 0xc6000000).
+	auto* start = buf->AllocateDW(AGC_INTERNAL_DATA_PACKET_SIZE_DW + 9u + AGC_INTERNAL_DATA_PACKET_SIZE_DW);
 
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	EXIT_NOT_IMPLEMENTED(start == nullptr);
+	write_agc_internal_data_packet(start, AGC_DRAW_INDEX_MULTI_INSTANCED_BEGIN_TAG);
+	auto* cmd = start + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
+	write_agc_internal_data_packet(cmd + 9u, AGC_DRAW_INDIRECT_MULTI_END_TAG);
 
 	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
 	auto object_vaddr = reinterpret_cast<uint64_t>(object_ids);
@@ -2921,13 +2938,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 	cmd[7] = instance_count;
 	cmd[8] = decode_draw_index_initiator(modifier) | 0x80u;
 
-	return cmd;
+	return start;
 }
 
 uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstancedGetSize() {
 	PRINT_NAME();
 
-	return 9u * 4u;
+	return (AGC_INTERNAL_DATA_PACKET_SIZE_DW + 9u + AGC_INTERNAL_DATA_PACKET_SIZE_DW) * 4u;
 }
 
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
@@ -3175,7 +3192,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((count_indirect & ~1u) != 0);
 
-	auto* cmd = buf->AllocateDW(10);
+	// libSceAgc brackets the packet with internal-data tags (0xc6000005 ... 0xc6000000).
+	auto* start = buf->AllocateDW(AGC_INTERNAL_DATA_PACKET_SIZE_DW + 10u + AGC_INTERNAL_DATA_PACKET_SIZE_DW);
+	EXIT_NOT_IMPLEMENTED(start == nullptr);
+	write_agc_internal_data_packet(start, AGC_DRAW_INDEX_INDIRECT_MULTI_BEGIN_TAG);
+	auto* cmd = start + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
+	write_agc_internal_data_packet(cmd + 10u, AGC_DRAW_INDIRECT_MULTI_END_TAG);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -3204,7 +3226,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	cmd[8] = stride_in_bytes;
 	cmd[9] = decode_draw_index_initiator(modifier);
 
-	return cmd;
+	return start;
 }
 
 uint32_t KYTY_SYSV_ABI AgcDcbDrawIndirectGetSize() {
@@ -3334,6 +3356,24 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	if ((packet_gcr_cntl & 0xc000u) == 0x4000u) {
 		packet_gcr_cntl |= 0x8000u;
 	}
+	// A DB action (cb_db_op bit 26), as libSceAgc writes it: DB_DEST_BASE_ENA, the whole address range, the GL1 and
+	// GL2 actions on all of it instead of a range, and GLI_INV 2 (range) as 1 (all). Only with KYTY_AGC_DB_ACTION=1:
+	// Demon's Souls hung its first frame in load mode with this form (not without CP shadowing); not yet understood.
+	static const bool db_action = [] {
+		const char* v = std::getenv("KYTY_AGC_DB_ACTION");
+		return v != nullptr && v[0] == '1';
+	}();
+	if ((cb_db_op & (1u << 26u)) != 0 && db_action) {
+		cmd[1] |= 0x4000u;
+		cmd[2] = 0xfffffffeu;
+		cmd[3] = 0xffu;
+		cmd[4] = 1u;
+		cmd[5] = 0u;
+		packet_gcr_cntl &= ~((1u << 3u) | (1u << 12u));
+		if ((packet_gcr_cntl & 0x3u) == 0x2u) {
+			packet_gcr_cntl = (packet_gcr_cntl & ~0x3u) | 0x1u;
+		}
+	}
 	cmd[7] = packet_gcr_cntl & 0x7ffffu;
 
 	return cmd;
@@ -3402,9 +3442,24 @@ uint32_t KYTY_SYSV_ABI AgcDcbCondExecGetSize() {
 	return 20;
 }
 
+// libSceAgc checks nothing here (the DCB form does): the packet is written with the address and count masked, so the
+// guarded dwords stay guarded whatever the arguments.
 uint32_t* KYTY_SYSV_ABI AgcAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                        uint32_t num_dwords) {
-	return AgcDcbCondExec(buf, address, num_dwords);
+	if (buf == nullptr) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(5);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	const auto addr = reinterpret_cast<uint64_t>(address);
+	cmd[0]          = 0xc0032200u;
+	cmd[1]          = static_cast<uint32_t>(addr) & ~0x3u;
+	cmd[2]          = static_cast<uint32_t>(addr >> 32u);
+	cmd[3]          = 0;
+	cmd[4]          = num_dwords & 0x3fffu;
+	return cmd;
 }
 
 uint32_t KYTY_SYSV_ABI AgcAcbCondExecGetSize() {
@@ -3467,7 +3522,8 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 
 	const auto address_value = reinterpret_cast<uint64_t>(address);
 	const bool signal        = (op == 6u);
-	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
+	// An ACB's markers: header bit 2 clear (libSceAgc sets it in DCBs only).
+	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 0u);
 	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = (signal ? AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG : AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
@@ -3485,7 +3541,10 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 	semaphore[3] = (static_cast<uint32_t>(op) << 29u) | ((signal_type & 0x1u) << 20u) |
 	               ((mailbox & 0x1u) << 16u);
 	if (!signal) {
+		const bool was_acb         = g_agc_internal_data_in_acb;
+		g_agc_internal_data_in_acb = true;
 		write_agc_internal_data_packet(semaphore + 4, AGC_MEM_SEMAPHORE_END_TAG);
+		g_agc_internal_data_in_acb = was_acb;
 	}
 
 	return cmd;
@@ -4267,8 +4326,8 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 
 	return size_dw == AGC_INTERNAL_DATA_PACKET_SIZE_DW &&
 	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG || payload[1] == AGC_MEM_SEMAPHORE_END_TAG ||
-	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG ||
-	        payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
+	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG || payload[1] == AGC_DRAW_INDEX_INDIRECT_MULTI_BEGIN_TAG ||
+	        payload[1] == AGC_DRAW_INDEX_MULTI_INSTANCED_BEGIN_TAG || payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
