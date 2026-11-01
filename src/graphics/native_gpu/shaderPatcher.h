@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_NATIVE_GPU_SHADERPATCHER_H_
 #define EMULATOR_SRC_GRAPHICS_NATIVE_GPU_SHADERPATCHER_H_
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -54,6 +55,15 @@ struct Dot2cScan {
 	uint32_t dwords       = 0;     // dwords swept, s_endpgm included
 	bool     ended        = false; // true if an s_endpgm (or a subroutine's s_setpc_b64 return) ended the sweep
 	bool     decode_error = false; // true if an instruction could not be decoded
+	// s_getreg_b32 (SOPK 0x12) and s_setreg_b32 / s_setreg_imm32_b32 (0x13 / 0x15) by hwreg id, SIMM16 [5:0]: HW_ID (4,
+	// gfx9's), HW_ID1 (23) and HW_ID2 (24) tell a wave where it runs.
+	std::array<uint32_t, 64> getreg {};
+	std::array<uint32_t, 64> setreg {};
+	std::array<uint16_t, 4>  hwid_simm {}; // the distinct SIMM16 of those HW_ID reads (OFFSET, SIZE: which fields)
+	uint32_t                 hwid_simm_n = 0;
+	// The dot instructions by opcode: v_dot2c_f32_f16, v_dot4c_i32_i8 (VOP2), v_dot2_f32_f16 .. v_dot8_u32_u4 (VOP3P
+	// 0x13 .. 0x19).
+	std::array<uint32_t, 9>  dot_by_op {};
 };
 
 // Linear-sweeps a shader whose exact length is unknown, counting v_dot2c_f32_f16 sites and the

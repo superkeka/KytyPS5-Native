@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -220,6 +221,109 @@ struct Pm4TranslateStats {
 	uint32_t cp_shadow_fmask_gpu = 0;
 	uint32_t cp_shadow_dcc_gpu   = 0;
 	uint32_t cp_shadow_dcc_back  = 0; // and the DCC given back on the GPU (EmitCpShadowDccRestore)
+};
+
+// KYTY_NATIVE_GPU_AUDIT (Pm4Translator::SetAudit): the title's sync packets field by field, from its own dwords (not
+// what the IB got), for the backend's run totals. T is uint32_t in a result, uint64_t in the backend's sums.
+enum class AuditSync : uint8_t { Wait, Wait64, Release, ReleaseMarker, WriteData, Acquire, Count };
+template <typename T>
+struct SyncAuditT {
+	static constexpr size_t kForms = static_cast<size_t>(AuditSync::Count);
+	std::array<T, kForms>                packets {};
+	std::array<std::array<T, 4>, kForms> policy {};      // CACHE_POLICY [26:25] (ACQUIRE_MEM has none: 0)
+	std::array<std::array<T, 4>, kForms> engine {};      // ENGINE_SEL: waits [9:8], WRITE_DATA [31:30], ACQUIRE_MEM bit 31
+	std::array<T, kForms>                odd {};         // packets with a bit set outside the fields the layout names
+	std::array<T, kForms>                policy_lost {}; // CACHE_POLICY not 0, and the GPU runs a packet of the translator's
+	std::array<std::array<T, 8>, 2>      wait_function {};  // [64-bit]
+	std::array<std::array<T, 4>, 2>      wait_mem_space {};
+	std::array<std::array<T, 4>, 2>      wait_operation {};
+	std::array<std::array<T, 64>, 2>     release_event {};  // [Kyty's NOP marker] EVENT_TYPE
+	std::array<std::array<T, 13>, 2>     release_gcr {};    // GCR_CNTL bit i (event dword bit 12 + i)
+	std::array<std::array<T, 4>, 2>      release_dst_sel {};
+	std::array<std::array<T, 8>, 2>      release_int_sel {};
+	std::array<std::array<T, 8>, 2>      release_data_sel {};
+	std::array<T, 16>                    write_dst_sel {};
+	T                                    write_confirm = 0;
+	T                                    write_markers = 0; // libSceAgc's debug-marker strings, not in the WRITE_DATA counts
+	std::array<T, 19>                    acquire_gcr {};    // GCR_CNTL (body dword 6) bit i
+	std::array<uint32_t, kForms>         odd_bits {};       // those bits, ORed (a release's event dword)
+	std::array<uint32_t, 2>              release_select_odd {}; // and a release's select dword
+
+	template <typename U>
+	void Add(const SyncAuditT<U>& o) {
+		Sum(packets, o.packets);
+		Sum(policy, o.policy);
+		Sum(engine, o.engine);
+		Sum(odd, o.odd);
+		Sum(policy_lost, o.policy_lost);
+		Sum(wait_function, o.wait_function);
+		Sum(wait_mem_space, o.wait_mem_space);
+		Sum(wait_operation, o.wait_operation);
+		Sum(release_event, o.release_event);
+		Sum(release_gcr, o.release_gcr);
+		Sum(release_dst_sel, o.release_dst_sel);
+		Sum(release_int_sel, o.release_int_sel);
+		Sum(release_data_sel, o.release_data_sel);
+		Sum(write_dst_sel, o.write_dst_sel);
+		Sum(write_confirm, o.write_confirm);
+		Sum(write_markers, o.write_markers);
+		Sum(acquire_gcr, o.acquire_gcr);
+		for (size_t i = 0; i < kForms; i++) {
+			odd_bits[i] |= o.odd_bits[i];
+		}
+		release_select_odd[0] |= o.release_select_odd[0];
+		release_select_odd[1] |= o.release_select_odd[1];
+	}
+
+private:
+	template <typename A, typename B>
+	static void Sum(A& to, const B& from) {
+		if constexpr (std::is_arithmetic_v<A>) {
+			to += from;
+		} else {
+			for (size_t i = 0; i < to.size(); i++) {
+				Sum(to[i], from[i]);
+			}
+		}
+	}
+};
+using Pm4SyncAudit = SyncAuditT<uint32_t>;
+
+// Why a buffer was refused (SetAudit: Pm4TranslateResult::refusals); the backend's own refusals after a translation
+// (the packet check, GDS shaders) follow the translator's.
+enum class RefuseWhy : uint8_t {
+	Collected, // the end of the walk, refusing for the packets collected on the way (each recorded where it was)
+	NotType3,
+	Truncated,
+	Unknown,
+	GraphicsOnMec,
+	UconfigOnMec,
+	ShortBody,
+	ReleaseDataSel,
+	ReleaseGds,
+	RegisterWait,
+	DmaForm,
+	WriteDataRegister,
+	ContextControlOnMec,
+	CondExecForm,
+	AtomicForm,
+	InPlace,
+	Validate,
+	ValidateResume,
+	GdsShader,
+	GdsShaderLearn,
+	Count
+};
+const char* RefuseWhyName(RefuseWhy why);
+// The first packet of one opcode and reason that refused a buffer, and how many of them did.
+struct Pm4Refusal {
+	uint32_t                op    = 0; // 0x100: not a type-3 header
+	RefuseWhy               why   = RefuseWhy::Unknown;
+	uint32_t                count = 0;
+	uint32_t                dw    = 0; // the first one's dword offset
+	uint32_t                last  = 0; // the latest one's (a packet refusing for each of its entries counts once)
+	uint32_t                nd    = 0;
+	std::array<uint32_t, 5> d {};      // its header and leading body dwords
 };
 
 // CP register shadowing (Pm4Translator::SetCpShadow, KYTY_NATIVE_GPU_CP_SHADOW). With the CONTEXT_CONTROL
@@ -489,6 +593,16 @@ struct Pm4Segment {
 	// CP shadowing: the segment starts with a shadow preamble (its exit guard aside), so it restores its
 	// state wherever it runs. A streamed chunk's first segment has none.
 	bool                      cp_shadow_head = false;
+	// SetAudit: the guest waits the segment runs as GPU waits or barriers, in order (the held wait not among them),
+	// for the backend's measurements; nothing in the IB depends on it.
+	struct AuditWait {
+		WaitCond wait;
+		uint32_t next_point = 0;     // the first point after it, an index in `points`
+		bool     barrier    = false; // LabelOracle::Plan::Met: a barrier (else the wait itself)
+		bool     local      = false; // a write earlier in the buffer decided it
+		bool     met        = false; // memory met it when it was translated
+	};
+	std::vector<AuditWait>    audit_waits;
 };
 
 // Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
@@ -698,6 +812,10 @@ struct Pm4TranslateResult {
 	// segment does not carry on from the piece before it in the same job.
 	bool                    cp_shadow = false;
 	std::vector<uint32_t>   cp_shadow_resume;
+	// SetAudit: the guest's sync packets field by field, and what refused the buffer (each opcode and reason once, at
+	// most 8), up to where the walk stopped.
+	Pm4SyncAudit            sync;
+	std::vector<Pm4Refusal> refusals;
 };
 
 // Translates guest DCBs into self-contained IBs, keeping a CPU shadow of every register the guest
@@ -958,6 +1076,9 @@ public:
 	void SetWriteDataNative(uint32_t mode) { m_write_data_native = mode; }
 	// How much memory a user-data value that may be an image base (address >> 8) makes resident.
 	void SetGuessSpan(uint64_t bytes) { m_guess_span = bytes != 0 ? bytes : 1; }
+	// KYTY_NATIVE_GPU_AUDIT: the result also records the guest's sync packets (Pm4TranslateResult::sync), what refused
+	// the buffer (refusals) and each segment's GPU waits (Pm4Segment::audit_waits). The IB is the same.
+	void SetAudit(bool on) { m_audit = on; }
 
 	// Diagnostics: report every draw/dispatch whose resources reach [addr, addr + size) in
 	// Pm4TranslateResult::find_hits (user data, then tables two levels deep). 0 size: off.
@@ -1113,6 +1234,7 @@ private:
 	uint32_t                     m_write_data_native = 0;
 	bool                         m_collect_refs      = true;
 	bool                         m_draw_log          = false;
+	bool                         m_audit             = false; // SetAudit
 	bool                         m_lod_scan          = false;
 	uint32_t                     m_lod_scan_dwords   = 1024;
 	LodGuestReadFn               m_lod_read          = nullptr;

@@ -91,6 +91,675 @@ bool EnvOn(const char* name) {
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// KYTY_NATIVE_GPU_AUDIT=1: log-only measurements, summed over the whole run. CPU clocks (CLOCK_MONOTONIC) and counters
+// only: nothing the GPU runs changes (no packet is added, removed or altered, no segment or point moves, no buffer is
+// refused that was not; KYTY_NATIVE_GPU_FLIP_TRACE=gpu and KYTY_NATIVE_GPU_STATS change the IBs and play no part). How
+// long the label pipeline's CS jobs take from their submission until the tracker sees their last point, how long the
+// guest waits the GPU is given hold up their ring and who writes what they wait for (PipelineAudit), the fields of the
+// title's sync packets, what refuses buffers and what its shaders read of the hardware (Shadow::PrintAudit). Printed
+// every 30 s of translation, with every tenth flip report, when the path disables itself and at the stop; every line
+// starts with "native audit:".
+bool AuditOn() {
+	static const bool on = EnvOn("KYTY_NATIVE_GPU_AUDIT");
+	return on;
+}
+// Flips so far (ShadowFlipStats), for the records.
+std::atomic<uint64_t> g_audit_flip {0};
+// A buffer translated a second time is not counted again: LabelPipeline::Translate submits it whole after
+// TranslateChunks already did (one chunk, or its first chunk refused).
+thread_local bool t_audit_retry = false;
+// Buffers Kyty's command processor runs whole [DCB, ACB, AGR][refused, nothing to run], and DCBs a refused chunk after
+// the first cut short (the rest of each dropped), with the dwords dropped.
+std::atomic<uint64_t> g_audit_to_kyty[3][2] {};
+std::atomic<uint64_t> g_audit_chunk_dropped {0};
+std::atomic<uint64_t> g_audit_chunk_dropped_dw {0};
+
+// A run-wide distribution in ms over six bucket edges, with the count, the sum and the largest value.
+struct AuditHist {
+	std::array<uint64_t, 7> n {};
+	uint64_t                count = 0;
+	double                  sum   = 0.0;
+	double                  max   = 0.0;
+	void Add(double ms, const std::array<double, 6>& edges) {
+		size_t b = 0;
+		while (b < edges.size() && ms >= edges[b]) {
+			b++;
+		}
+		n[b]++;
+		count++;
+		sum += ms;
+		max = std::max(max, ms);
+	}
+	[[nodiscard]] double Avg() const { return count != 0 ? sum / static_cast<double>(count) : 0.0; }
+	// "<16 ms 3, <100 1, ...", every bucket.
+	[[nodiscard]] std::string Text(const char* const (&names)[7]) const {
+		std::string s;
+		char        buf[48];
+		for (size_t b = 0; b < n.size(); b++) {
+			std::snprintf(buf, sizeof(buf), "%s%s %llu", b == 0 ? "" : ", ", names[b], static_cast<unsigned long long>(n[b]));
+			s += buf;
+		}
+		return s;
+	}
+};
+constexpr std::array<double, 6> kAuditJobEdges     = {16.0, 100.0, 500.0, 1000.0, 2000.0, 5000.0};
+constexpr std::array<double, 6> kAuditWaitEdges    = {0.1, 1.0, 4.0, 16.0, 100.0, 1000.0};
+constexpr const char*           kAuditJobBuckets[7]  = {"<16 ms", "<100", "<500", "<1 s", "<2 s", "<5 s", ">=5 s"};
+constexpr const char*           kAuditWaitBuckets[7] = {"<0.1 ms", "<1", "<4", "<16", "<100", "<1 s", ">=1 s"};
+// As in the flip stats ("held for ..."), and pieces given to the GPU at the first look.
+constexpr const char* kAuditHoldReasons[kHoldReasons + 1] = {"cross-ring unsubmitted", "write does not satisfy", "CPU writer",
+                                                             "partial cover",          "no writer yet",          "no native form",
+                                                             "not held"};
+
+// A fixed-capacity FIFO, allocated at its first use; when it is full the newest is dropped (and counted).
+template <typename T, size_t N>
+struct AuditFifo {
+	std::vector<T> buf;
+	size_t         head    = 0;
+	size_t         size    = 0;
+	uint64_t       dropped = 0;
+	T*             Push() {
+		if (buf.empty()) {
+			buf.resize(N);
+		}
+		if (size == N) {
+			dropped++;
+			return nullptr;
+		}
+		T* t = &buf[(head + size++) % N];
+		*t   = T {};
+		return t;
+	}
+	T&   At(size_t i) { return buf[(head + i) % N]; }
+	void PopFront() {
+		head = (head + 1) % N;
+		size--;
+	}
+	void PopBack() { size--; }
+};
+
+// What LabelPipeline::Emit tells Shadow::AppendBatch about a piece: its guest queue, its ring's last tracker point once
+// it is appended (LabelPipeline's 64-bit sequence) and the guest waits it gives the GPU.
+struct AuditPiece {
+	uint32_t queue      = 0;
+	uint64_t last_point = 0;
+	uint32_t waits      = 0;
+};
+// The pieces of the batch a ring collects (Shadow, under its m_mutex): one CS job once it is submitted.
+struct AuditBatch {
+	double   first_t    = 0.0; // its first piece appended
+	uint64_t last_point = 0;
+	uint32_t pieces     = 0;
+	uint32_t waits      = 0;
+	uint8_t  queues     = 0; // 1 guest queue 0, 2 the AGR queue, 4 compute queues (ACBs in a gfx ring)
+	void     Add(const AuditPiece& p, double now) {
+		first_t    = pieces == 0 ? now : first_t;
+		last_point = std::max(last_point, p.last_point);
+		pieces++;
+		waits += p.waits;
+		queues = static_cast<uint8_t>(queues | (p.queue == kGuestAgrQueue ? 2u : IsGuestComputeQueue(p.queue) ? 4u : 1u));
+	}
+};
+// A CS job, from its submission until the tracker has seen its last point.
+struct AuditJob {
+	uint64_t last_point  = 0;
+	uint64_t flip        = 0;
+	uint64_t dcb         = 0;   // Shadow's DCB submits so far (each chunk counts)
+	double   t_sub       = 0.0; // its CS ioctl began
+	double   t_first     = 0.0; // its first piece was appended
+	double   t_last_part = 0.0; // a stream: its last part published, or its chain ended (the CP waited for the CPU until then)
+	uint32_t dw          = 0;
+	uint32_t parts       = 1;
+	uint32_t pieces      = 0;
+	uint32_t waits       = 0;
+	uint8_t  queues      = 0;
+	bool     stream      = false; // a streamed DCB's head: the later parts chain on in the same job
+	bool     open        = false; // and its chain has not ended
+};
+// A guest wait the GPU was given: as written (or in our form), a barrier, or a held piece's wait released as either.
+enum class AuditWaitKind : uint8_t { Native, Barrier, HeldGpu, HeldBarrier, Count };
+// Who last wrote the label when the wait was emitted, as far as the pipeline emitted it: the waiter's own buffer, its
+// queue, another guest queue in its ring, another ring or KFD queue, the tracker on the CPU, none seen.
+enum class AuditWho : uint8_t { SameBuffer, SameQueue, OtherQueue, OtherRing, Cpu, None, Count };
+// That write then: still ahead (its segment's end not reached), landed with memory meeting the wait, or a later write
+// needed (landed or none, memory not meeting it).
+enum class AuditWhen : uint8_t { Ahead, Landed, Later, Count };
+struct AuditWaitRec {
+	WaitCond      wait;
+	uint64_t      before       = 0; // its ring's points before (0: none yet) and after it
+	uint64_t      after        = 0;
+	uint64_t      flip         = 0;
+	double        t_emit       = 0.0;
+	double        t_avail      = 0.0; // its CS submitted, or its stream part published (0: not yet)
+	double        hold_ms      = 0.0; // a held piece: how long it was held on the CPU
+	uint32_t      queue        = 0;
+	uint32_t      writer_queue = 0;
+	uint8_t       slot         = 0;
+	uint8_t       writer_slot  = 0;
+	AuditWaitKind kind         = AuditWaitKind::Native;
+	AuditWho      who          = AuditWho::None;
+	AuditWhen     when         = AuditWhen::Later;
+	int8_t        reason       = -1;    // a held piece's hold reason (kAuditHoldReasons), -1 not held
+	bool          met          = false; // memory met it when it was translated
+};
+
+// The label pipeline's part of the audit: CS jobs and GPU waits per tracker slot. Shadow calls it with its m_mutex held
+// (jobs, stream parts, the print), LabelPipeline's worker from Emit and its tracker after a scan with no lock of theirs:
+// the order is Shadow's m_mutex, then this one's. Fixed-capacity queues with drop counts, nothing allocated per packet.
+// Times are bounds from CPU clocks: a point is reached between the tracker's previous scan and the one that saw it.
+class PipelineAudit {
+public:
+	static constexpr uint32_t kSlots = 33; // Shadow::kTrackerSlots
+	using SlotNames                  = std::array<std::array<char, 40>, kSlots>;
+
+	static PipelineAudit& Instance() {
+		static PipelineAudit a;
+		return a;
+	}
+
+	// Shadow::SubmitBufferLocked, before the ioctl: the job, and from now on the GPU has the waits of its pieces. False
+	// when it was not recorded (no room).
+	bool JobBegin(uint32_t slot, const AuditBatch& b, bool stream, double t_sub, size_t dw, uint64_t dcb) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		Slot&                       s = m_slots[slot];
+		Stamp(s, t_sub);
+		AuditJob* j = s.jobs.Push();
+		if (j == nullptr) {
+			return false;
+		}
+		j->last_point  = b.last_point;
+		j->flip        = g_audit_flip.load(std::memory_order_relaxed);
+		j->dcb         = dcb;
+		j->t_sub       = t_sub;
+		j->t_first     = b.first_t;
+		j->t_last_part = t_sub;
+		j->dw          = static_cast<uint32_t>(dw);
+		j->pieces      = b.pieces;
+		j->waits       = b.waits;
+		j->queues      = b.queues;
+		j->stream      = stream;
+		j->open        = stream;
+		return true;
+	}
+	// ... and its ioctl failed (the path disables itself): no job.
+	void JobFailed(uint32_t slot) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_slots[slot].jobs.size != 0) {
+			m_slots[slot].jobs.PopBack();
+		}
+	}
+	// Shadow::StreamFlushLocked: a part of the stream (gfx ring 0) published, `end` the chain's last.
+	void StreamPart(const AuditBatch& b, double t, size_t dw, bool end) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		Stamp(m_slots[0], t);
+		if (AuditJob* j = OpenStream()) {
+			j->last_point  = std::max(j->last_point, b.last_point);
+			j->parts++;
+			j->dw += static_cast<uint32_t>(dw);
+			j->pieces += b.pieces;
+			j->waits += b.waits;
+			j->queues      = static_cast<uint8_t>(j->queues | b.queues);
+			j->t_last_part = t;
+			j->open        = !end;
+			if (end) {
+				FinishJobs(0, t);
+			}
+		}
+	}
+	// Shadow::PublishStreamLocked: the chain ends with an empty trampoline.
+	void StreamClosed(double t) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (AuditJob* j = OpenStream()) {
+			j->open        = false;
+			j->t_last_part = t;
+			FinishJobs(0, t);
+		}
+	}
+	// LabelPipeline::Emit: the waits of a piece just appended to its ring's batch, in ring order.
+	void Waits(std::span<const AuditWaitRec> recs) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		for (const AuditWaitRec& r: recs) {
+			Slot&         s = m_slots[std::min<uint32_t>(r.slot, kSlots - 1)];
+			AuditWaitRec* w = s.waits.Push();
+			if (w == nullptr) {
+				continue;
+			}
+			*w = r;
+			s.unstamped++;
+			if (r.kind == AuditWaitKind::HeldGpu || r.kind == AuditWaitKind::HeldBarrier) {
+				const size_t k = r.reason >= 0 && r.reason < kHoldReasons ? static_cast<size_t>(r.reason) : kHoldReasons;
+				m_t.held_n[k]++;
+				m_t.held_ms[k] += r.hold_ms;
+			}
+		}
+	}
+	// LabelPipeline::Track: the points (slot, sequence) one scan found reached, after `t_lo` (the previous scan began)
+	// and by `t_hi` (this one ended).
+	void Reached(std::span<const std::pair<uint32_t, uint64_t>> points, double t_lo, double t_hi) {
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			const double                res = (t_hi - t_lo) * 1e3;
+			m_t.resolution[res < 0.1 ? 0 : res < 1.0 ? 1 : res < 10.0 ? 2 : 3]++;
+			uint64_t touched = 0;
+			for (const auto& [slot, seq]: points) {
+				Slot& s = m_slots[std::min<uint32_t>(slot, kSlots - 1)];
+				// Points sharing a packet share a number, an empty piece reuses its ring's last one, and the tracker's stuck
+				// path puts the 32-bit slot value in: none of them is a new point.
+				if (seq <= s.reached) {
+					continue;
+				}
+				s.reached                     = seq;
+				s.reach[seq % s.reach.size()] = Reach {seq, t_lo, t_hi};
+				touched |= 1ull << std::min<uint32_t>(slot, kSlots - 1);
+			}
+			for (uint32_t slot = 0; slot < kSlots; slot++) {
+				if ((touched & (1ull << slot)) != 0) {
+					FinishJobs(slot, t_hi);
+					FinishWaits(slot, t_lo, t_hi);
+				}
+			}
+		}
+		PrintLongJobs();
+	}
+
+	// Snapshots under the lock, prints after it. `final`: the waits the GPU has not got past, each ring's (a hang shows
+	// there). `names`: the tracker slots as the backend calls them.
+	void Print(bool final, const SlotNames& names) {
+		struct Unfinished {
+			uint32_t n      = 0;
+			double   oldest = 0.0;
+			bool     open   = false;
+		};
+		struct Unreached {
+			size_t       n = 0;
+			uint64_t     dropped = 0;
+			AuditWaitRec first;
+		};
+		auto                                       t = std::make_unique<Totals>();
+		std::array<Unfinished, kJobClasses>        unfinished {};
+		std::array<Unreached, kSlots>              unreached {};
+		uint64_t                                   jobs_dropped = 0;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			*t = m_t;
+			for (uint32_t slot = 0; slot < kSlots; slot++) {
+				Slot& s = m_slots[slot];
+				jobs_dropped += s.jobs.dropped;
+				for (size_t i = 0; i < s.jobs.size; i++) {
+					const AuditJob& j = s.jobs.At(i);
+					Unfinished&     u = unfinished[JobClass(slot, j.queues)];
+					u.oldest          = u.n == 0 ? j.t_sub : std::min(u.oldest, j.t_sub);
+					u.n++;
+					u.open = u.open || j.open;
+				}
+				unreached[slot].n       = s.waits.size;
+				unreached[slot].dropped = s.waits.dropped;
+				if (s.waits.size != 0) {
+					unreached[slot].first = s.waits.At(0);
+				}
+			}
+		}
+		const double now     = NowSecShadow();
+		bool         any_job = false;
+		for (uint32_t c = 0; c < kJobClasses; c++) {
+			const JobLine&    l = t->jobs[c];
+			const Unfinished& u = unfinished[c];
+			if (l.total.count == 0 && u.n == 0) {
+				continue;
+			}
+			any_job = true;
+			const AuditJob& m = l.max_job;
+			if (l.total.count == 0) {
+				std::fprintf(stderr, "native audit: CS jobs %s: none finished, unfinished %u (oldest %.1f s%s)\n",
+				             JobClassName(c, names).c_str(), u.n, now - u.oldest, u.open ? ", a stream still open" : "");
+				continue;
+			}
+			std::fprintf(stderr,
+			             "native audit: CS jobs %s: %llu, submit to done %s, avg %.2f ms; ring's own time %s; max %.1f ms (flip %llu, DCB "
+			             "%llu, %u dw, %u parts, %u pieces, %u waits, %s, %.1f ms batching); streamed %llu (last part to done avg %.2f "
+			             "ms, max %.1f); unfinished %u (oldest %.1f s%s)\n",
+			             JobClassName(c, names).c_str(), static_cast<unsigned long long>(l.total.count),
+			             l.total.Text(kAuditJobBuckets).c_str(), l.total.Avg(), l.own.Text(kAuditJobBuckets).c_str(), std::max(l.max_ms, 0.0),
+			             static_cast<unsigned long long>(m.flip), static_cast<unsigned long long>(m.dcb), m.dw, m.parts, m.pieces, m.waits,
+			             QueuesText(m.queues).c_str(), std::max(0.0, m.t_sub - m.t_first) * 1e3, static_cast<unsigned long long>(l.streamed),
+			             l.streamed != 0 ? l.tail_sum / static_cast<double>(l.streamed) : 0.0, l.tail_max, u.n, u.n != 0 ? now - u.oldest : 0.0,
+			             u.open ? ", a stream still open" : "");
+		}
+		bool any_wait = false;
+		for (uint32_t c = 0; c < kWaitClasses; c++) {
+			for (uint32_t k = 0; k < static_cast<uint32_t>(AuditWaitKind::Count); k++) {
+				const WaitLine& l = t->waits[c][k];
+				if (l.n == 0) {
+					continue;
+				}
+				any_wait = true;
+				std::string who;
+				for (uint32_t o = 0; o < static_cast<uint32_t>(AuditWho::Count); o++) {
+					const WhoLine& w = l.who[o];
+					if (w.n == 0) {
+						continue;
+					}
+					char buf[192];
+					std::snprintf(buf, sizeof(buf), "%s%s %llu (ahead %llu, landed %llu, later %llu; span <= avg %.2f ms, max %.1f)",
+					              who.empty() ? "" : ", ", kWhoNames[o], static_cast<unsigned long long>(w.n),
+					              static_cast<unsigned long long>(w.when[0]), static_cast<unsigned long long>(w.when[1]),
+					              static_cast<unsigned long long>(w.when[2]), w.sum / static_cast<double>(w.n), w.max);
+					who += buf;
+				}
+				char held[96] = "";
+				if (k == static_cast<uint32_t>(AuditWaitKind::HeldGpu) || k == static_cast<uint32_t>(AuditWaitKind::HeldBarrier)) {
+					std::snprintf(held, sizeof(held), "; held on the CPU avg %.2f ms, max %.1f", l.hold_sum / static_cast<double>(l.n), l.hold_max);
+				}
+				std::fprintf(stderr,
+				             "native audit: GPU waits %s, %s: %llu (%llu sharing a span), span <= avg %.2f ms, max %.1f (%s); span >= max %.1f "
+				             "ms; by writer at emission: %s%s\n",
+				             WaitClassName(c, names).c_str(), kKindNames[k], static_cast<unsigned long long>(l.n),
+				             static_cast<unsigned long long>(l.shared), l.span.Avg(), l.span.max, l.span.Text(kAuditWaitBuckets).c_str(), l.lo_max,
+				             who.c_str(), held);
+			}
+		}
+		// The longest spans: all 16 in a final report, the first 4 in the others.
+		for (size_t i = 0; i < (final ? t->top_n : std::min<size_t>(t->top_n, 4)); i++) {
+			const Top&          top = t->top[i];
+			const AuditWaitRec& w   = top.w;
+			char                held[96] = "";
+			if (w.kind == AuditWaitKind::HeldGpu || w.kind == AuditWaitKind::HeldBarrier) {
+				std::snprintf(held, sizeof(held), ", held %.1f ms (%s)", w.hold_ms,
+				              kAuditHoldReasons[w.reason >= 0 && w.reason < kHoldReasons ? w.reason : kHoldReasons]);
+			}
+			std::fprintf(stderr,
+			             "native audit: top wait %zu: span %.2f..%.2f ms, %s on %s queue 0x%x, flip %llu: 0x%llx %s%s ref 0x%llx mask 0x%llx "
+			             "func %u%s, writer %s%s\n",
+			             i + 1, top.lo, top.hi, kKindNames[static_cast<size_t>(w.kind)], WaitClassName(WaitClass(w.slot, w.queue), names).c_str(),
+			             w.queue, static_cast<unsigned long long>(w.flip), static_cast<unsigned long long>(w.wait.addr), w.wait.wide ? "64" : "32",
+			             w.wait.pfp ? " pfp" : "", static_cast<unsigned long long>(w.wait.ref), static_cast<unsigned long long>(w.wait.mask),
+			             w.wait.function, w.met ? ", met when translated" : "", WriterText(w, names).c_str(), held);
+		}
+		if (any_wait) {
+			std::string held;
+			for (size_t r = 0; r <= kHoldReasons; r++) {
+				if (t->held_n[r] != 0) {
+					char buf[96];
+					std::snprintf(buf, sizeof(buf), "%s%s %llu (%.1f ms)", held.empty() ? "" : ", ", kAuditHoldReasons[r],
+					              static_cast<unsigned long long>(t->held_n[r]), t->held_ms[r]);
+					held += buf;
+				}
+			}
+			std::fprintf(stderr,
+			             "native audit: held pieces by reason (as in the flip stats): %s; tracker scans that found points within 0.1 ms "
+			             "%llu, 1 ms %llu, 10 ms %llu, later %llu\n",
+			             held.empty() ? "none" : held.c_str(), static_cast<unsigned long long>(t->resolution[0]),
+			             static_cast<unsigned long long>(t->resolution[1]), static_cast<unsigned long long>(t->resolution[2]),
+			             static_cast<unsigned long long>(t->resolution[3]));
+		}
+		uint64_t waits_dropped = 0;
+		for (uint32_t slot = 0; slot < kSlots; slot++) {
+			const Unreached& u = unreached[slot];
+			waits_dropped += u.dropped;
+			if (!final || u.n == 0) {
+				continue;
+			}
+			const AuditWaitRec& w = u.first;
+			std::fprintf(stderr,
+			             "native audit: waits not reached on %s: %zu (oldest emitted %.1f s ago: %s, queue 0x%x, 0x%llx %s ref 0x%llx mask "
+			             "0x%llx func %u, writer %s)\n",
+			             names[slot].data(), u.n, now - w.t_emit, kKindNames[static_cast<size_t>(w.kind)], w.queue,
+			             static_cast<unsigned long long>(w.wait.addr), w.wait.wide ? "64" : "32", static_cast<unsigned long long>(w.wait.ref),
+			             static_cast<unsigned long long>(w.wait.mask), w.wait.function, WriterText(w, names).c_str());
+		}
+		if (jobs_dropped + waits_dropped != 0) {
+			std::fprintf(stderr, "native audit: not recorded for want of room: %llu CS jobs, %llu waits\n",
+			             static_cast<unsigned long long>(jobs_dropped), static_cast<unsigned long long>(waits_dropped));
+		}
+		if (!any_job && !any_wait) {
+			std::fprintf(stderr, "native audit: no CS jobs or GPU waits measured (the label pipeline measures them: KYTY_NATIVE_GPU_PRIMARY "
+			                     "with its THREAD and LABELS)\n");
+		}
+	}
+
+private:
+	// Job classes: gfx ring 0 by the guest queues of its pieces (AuditBatch::queues, 0-7), then slot n at 7 + n. Wait
+	// classes: gfx ring 0 by the waiting guest queue (0 queue 0, 1 the AGR queue, 2 a compute queue), then slot n at 2 + n.
+	static constexpr uint32_t kJobClasses  = 8 + kSlots - 1;
+	static constexpr uint32_t kWaitClasses = 3 + kSlots - 1;
+	static constexpr size_t   kKinds       = static_cast<size_t>(AuditWaitKind::Count);
+	static constexpr size_t   kWhos        = static_cast<size_t>(AuditWho::Count);
+	static constexpr const char* kKindNames[kKinds] = {"waits", "barriers", "held, then GPU waits", "held, then barriers"};
+	static constexpr const char* kWhoNames[kWhos]   = {"same buffer", "same queue", "other queue in the ring", "other ring",
+	                                                   "CPU (tracker)", "none seen"};
+	static constexpr const char* kWhenNames[static_cast<size_t>(AuditWhen::Count)] = {"ahead", "landed", "later"};
+
+	static uint32_t JobClass(uint32_t slot, uint8_t queues) { return slot == 0 ? (queues & 7u) : 7u + slot; }
+	static uint32_t WaitClass(uint32_t slot, uint32_t queue) {
+		return slot != 0 ? 2u + slot : queue == kGuestAgrQueue ? 1u : IsGuestComputeQueue(queue) ? 2u : 0u;
+	}
+	// "same queue (ahead) on KFD queue 1 (guest 0x20) queue 0x20": who wrote the label and where (when that is another
+	// queue's or ring's piece, or the tracker's point).
+	static std::string WriterText(const AuditWaitRec& w, const SlotNames& names) {
+		std::string s = std::string(kWhoNames[static_cast<size_t>(w.who)]) + " (" + kWhenNames[static_cast<size_t>(w.when)] + ")";
+		if (w.who != AuditWho::SameBuffer && w.who != AuditWho::None) {
+			char buf[80];
+			std::snprintf(buf, sizeof(buf), " on %s queue 0x%x", names[std::min<uint32_t>(w.writer_slot, kSlots - 1)].data(), w.writer_queue);
+			s += buf;
+		}
+		return s;
+	}
+	static std::string QueuesText(uint8_t queues) {
+		static const char* const kQueue[3] = {"q0", "AGR", "ACB"};
+		std::string              s;
+		for (uint32_t i = 0; i < 3; i++) {
+			if ((queues & (1u << i)) != 0) {
+				s += (s.empty() ? "" : "+") + std::string(kQueue[i]);
+			}
+		}
+		return s.empty() ? "no queue" : s;
+	}
+	static std::string JobClassName(uint32_t c, const SlotNames& names) {
+		return c < 8 ? std::string(names[0].data()) + " (" + QueuesText(static_cast<uint8_t>(c)) + ")" : std::string(names[c - 7].data());
+	}
+	static std::string WaitClassName(uint32_t c, const SlotNames& names) {
+		static const char* const kQueue[3] = {"q0", "AGR", "ACB"};
+		return c < 3 ? std::string(names[0].data()) + " (" + kQueue[c] + ")" : std::string(names[c - 2].data());
+	}
+
+	struct Reach {
+		uint64_t seq = 0;
+		double   lo  = 0.0;
+		double   hi  = 0.0;
+	};
+	struct Slot {
+		AuditFifo<AuditJob, 512>      jobs;
+		AuditFifo<AuditWaitRec, 2048> waits;
+		size_t                        unstamped  = 0;   // waits pushed since the last job or stream part (the newest)
+		uint64_t                      reached    = 0;   // the highest point reached
+		uint64_t                      last_after = ~0ull; // the last finished wait's point after it (waits sharing a span)
+		double                        prev_done  = 0.0; // the previous job's end (an in-order ring's own time)
+		std::array<Reach, 256>        reach {};         // when each recent point was reached, by sequence
+	};
+	struct JobLine {
+		AuditHist total;
+		AuditHist own; // from the later of its submission and the end of the ring's job before it
+		uint64_t  streamed = 0;
+		double    tail_sum = 0.0, tail_max = 0.0;
+		double    max_ms   = -1.0;
+		AuditJob  max_job;
+	};
+	struct WhoLine {
+		uint64_t                n   = 0;
+		double                  sum = 0.0;
+		double                  max = 0.0;
+		std::array<uint64_t, 3> when {};
+	};
+	struct WaitLine {
+		uint64_t                    n      = 0;
+		uint64_t                    shared = 0;
+		AuditHist                   span; // the upper bound
+		double                      lo_max   = 0.0;
+		double                      hold_sum = 0.0;
+		double                      hold_max = 0.0;
+		std::array<WhoLine, kWhos> who {};
+	};
+	struct Top {
+		AuditWaitRec w;
+		double       lo = 0.0;
+		double       hi = 0.0;
+	};
+	struct Totals {
+		std::array<JobLine, kJobClasses>                           jobs {};
+		std::array<std::array<WaitLine, kKinds>, kWaitClasses>     waits {};
+		std::array<Top, 16>                                        top {};
+		size_t                                                     top_n = 0;
+		std::array<uint64_t, kHoldReasons + 1>                     held_n {};
+		std::array<double, kHoldReasons + 1>                       held_ms {};
+		std::array<uint64_t, 4>                                    resolution {};
+	};
+	struct LongJob {
+		uint32_t slot = 0;
+		AuditJob job;
+		double   ms = 0.0;
+	};
+
+	// The waits pushed since the last stamp go to the GPU at `t`.
+	static void Stamp(Slot& s, double t) {
+		const size_t n = std::min(s.unstamped, s.waits.size);
+		for (size_t i = s.waits.size - n; i < s.waits.size; i++) {
+			s.waits.At(i).t_avail = t;
+		}
+		s.unstamped = 0;
+	}
+	// The stream's head job (gfx ring 0) while its chain is open: one of the last jobs of the ring.
+	AuditJob* OpenStream() {
+		Slot& s = m_slots[0];
+		for (size_t i = s.jobs.size; i > 0 && i + 4 > s.jobs.size; i--) {
+			if (s.jobs.At(i - 1).open) {
+				return &s.jobs.At(i - 1);
+			}
+		}
+		return nullptr;
+	}
+	const Reach* Find(const Slot& s, uint64_t seq) const {
+		const Reach& r = s.reach[seq % s.reach.size()];
+		return r.seq == seq ? &r : nullptr;
+	}
+	// Jobs whose last point is reached, in ring order; an open stream stops the ring's (nothing comes after it there).
+	// `t_hi`: the reach's upper bound when that point is no longer in the reach ring.
+	void FinishJobs(uint32_t slot, double t_hi) {
+		Slot& s = m_slots[slot];
+		while (s.jobs.size != 0) {
+			const AuditJob& j = s.jobs.At(0);
+			if (j.open || j.last_point > s.reached) {
+				break;
+			}
+			const Reach* r     = Find(s, j.last_point);
+			const double done  = r != nullptr ? r->hi : t_hi;
+			const double total = std::max(0.0, done - j.t_sub) * 1e3;
+			const double own   = std::max(0.0, done - std::max(j.t_sub, s.prev_done)) * 1e3;
+			s.prev_done        = std::max(s.prev_done, done);
+			JobLine& l         = m_t.jobs[JobClass(slot, j.queues)];
+			l.total.Add(total, kAuditJobEdges);
+			l.own.Add(own, kAuditJobEdges);
+			if (j.stream) {
+				const double tail = std::max(0.0, done - j.t_last_part) * 1e3;
+				l.streamed++;
+				l.tail_sum += tail;
+				l.tail_max = std::max(l.tail_max, tail);
+			}
+			if (total > l.max_ms) {
+				l.max_ms  = total;
+				l.max_job = j;
+			}
+			if (total >= 500.0 && m_long_n < m_long.size() && m_long_logged < 32) {
+				m_long_logged++;
+				m_long[m_long_n++] = LongJob {slot, j, total};
+			}
+			s.jobs.PopFront();
+		}
+	}
+	// Waits whose point after them is reached: the span between the points around them (from when the GPU had it), the
+	// upper bound from the earliest the one before could be reached to the latest the one after was, the lower bound
+	// the other way round.
+	void FinishWaits(uint32_t slot, double t_lo, double t_hi) {
+		Slot& s = m_slots[slot];
+		while (s.waits.size != 0) {
+			const AuditWaitRec& w = s.waits.At(0);
+			if (w.after > s.reached) {
+				break;
+			}
+			const Reach* a        = Find(s, w.after);
+			const Reach* b        = w.before != 0 ? Find(s, w.before) : nullptr;
+			const double avail    = std::max(w.t_avail, w.t_emit);
+			const double start_lo = std::max(b != nullptr ? b->lo : 0.0, avail);
+			const double start_hi = std::max(b != nullptr ? b->hi : 0.0, avail);
+			const double end_lo   = std::max(a != nullptr ? a->lo : t_lo, avail);
+			const double end_hi   = a != nullptr ? a->hi : t_hi;
+			const double hi       = std::max(0.0, end_hi - start_lo) * 1e3;
+			const double lo       = std::max(0.0, end_lo - start_hi) * 1e3;
+			const bool   shared   = w.after == s.last_after;
+			s.last_after          = w.after;
+			WaitLine& l           = m_t.waits[WaitClass(slot, w.queue)][static_cast<size_t>(w.kind)];
+			// Each wait gets the bounds of its span; waits sharing one are counted (their times overlap), and only the
+			// first of them can be a top entry.
+			l.n++;
+			l.shared += shared ? 1u : 0u;
+			l.span.Add(hi, kAuditWaitEdges);
+			l.lo_max = std::max(l.lo_max, lo);
+			if (!shared) {
+				InsertTop(w, lo, hi);
+			}
+			WhoLine& o = l.who[static_cast<size_t>(w.who)];
+			o.n++;
+			o.sum += hi;
+			o.when[static_cast<size_t>(w.when)]++;
+			o.max = std::max(o.max, hi);
+			l.hold_sum += w.hold_ms;
+			l.hold_max = std::max(l.hold_max, w.hold_ms);
+			if (s.unstamped == s.waits.size) {
+				s.unstamped--; // reached before its stamp (a stream part's points can run before StreamPart)
+			}
+			s.waits.PopFront();
+		}
+	}
+	// The 16 longest spans, longest first.
+	void InsertTop(const AuditWaitRec& w, double lo, double hi) {
+		auto& top = m_t.top;
+		if (m_t.top_n == top.size() && hi <= top.back().hi) {
+			return;
+		}
+		size_t i = m_t.top_n < top.size() ? m_t.top_n++ : top.size() - 1;
+		for (; i > 0 && top[i - 1].hi < hi; i--) {
+			top[i] = top[i - 1];
+		}
+		top[i] = Top {w, lo, hi};
+	}
+	// Jobs of 500 ms and more as they finish (the first 32 of the run), after the lock.
+	void PrintLongJobs() {
+		std::array<LongJob, 4> longs;
+		size_t                 n = 0;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			n = m_long_n;
+			std::copy_n(m_long.begin(), n, longs.begin());
+			m_long_n = 0;
+		}
+		for (size_t i = 0; i < n; i++) {
+			const AuditJob& j = longs[i].job;
+			std::fprintf(stderr,
+			             "native audit: long CS job: %.1f ms from submit to done on tracker slot %u (%s), flip %llu, DCB %llu, %u dw, %u "
+			             "parts, %u pieces, %u waits%s\n",
+			             longs[i].ms, longs[i].slot, QueuesText(j.queues).c_str(), static_cast<unsigned long long>(j.flip),
+			             static_cast<unsigned long long>(j.dcb), j.dw, j.parts, j.pieces, j.waits, j.stream ? ", streamed" : "");
+		}
+	}
+
+	std::mutex             m_mutex;
+	std::array<Slot, kSlots> m_slots {};
+	Totals                 m_t;
+	std::array<LongJob, 4> m_long {}; // finished long jobs not printed yet (at most 4 at a time)
+	size_t                 m_long_n      = 0;
+	uint32_t               m_long_logged = 0;
+};
+PipelineAudit& Audit() { return PipelineAudit::Instance(); }
+
 // An amdgpu module parameter as a number; -1 when it cannot be read.
 int AmdgpuParam(const char* name) {
 	char path[128];
@@ -805,6 +1474,17 @@ public:
 		for (uint32_t i = 0; i < result.stats.event_index.size(); i++) {
 			m_event_index_hist[i] += result.stats.event_index[i];
 		}
+		// KYTY_NATIVE_GPU_AUDIT: each buffer once, here: before an ACB dry run returns, and before the refusals below.
+		const int audit_kind = acb ? 1 : agr ? 2 : 0;
+		if (m_audit && !t_audit_retry) {
+			AuditTranslatedLocked(audit_kind, frame, result, flat_why);
+			if (const double now = NowSecShadow(); m_audit_print_s == 0.0) {
+				m_audit_print_s = now;
+			} else if (now - m_audit_print_s >= 30.0) {
+				m_audit_print_s = now;
+				PrintAudit("every 30 s", false, true);
+			}
+		}
 		for (const auto& h: result.find_hits) {
 			const auto key = std::make_tuple(h.shader, h.user_reg, h.depth, h.word);
 			if (m_find_seen.insert(key).second && m_find_seen.size() <= 64) {
@@ -940,6 +1620,7 @@ public:
 			if (m_agr_translator != nullptr) {
 				m_agr_translator->SetSkippedPixelShaders(skip);
 			}
+			AuditShadowRefusalLocked(audit_kind, frame, RefuseWhy::GdsShaderLearn, 0, 0, {});
 			m_refused++;
 			return false;
 		}
@@ -950,6 +1631,8 @@ public:
 						std::fprintf(stderr, "native shadow: frame %llu left to Kyty: shader 0x%llx uses GDS\n",
 						             static_cast<unsigned long long>(frame), static_cast<unsigned long long>(va));
 					}
+					const uint32_t shader[2] = {static_cast<uint32_t>(va), static_cast<uint32_t>(va >> 32u)};
+					AuditShadowRefusalLocked(audit_kind, frame, RefuseWhy::GdsShader, 0, 0, shader);
 					m_refused++;
 					return false;
 				}
@@ -1021,6 +1704,8 @@ public:
 					             "native shadow: %s %llu left to Kyty by the packet check: op 0x%02x (header 0x%08x) at dw %u\n",
 					             kind, static_cast<unsigned long long>(frame), (result.ib[bad] >> 8u) & 0xffu, result.ib[bad], bad);
 				}
+				AuditShadowRefusalLocked(audit_kind, frame, RefuseWhy::Validate, (result.ib[bad] >> 8u) & 0xffu, bad,
+				                         std::span<const uint32_t>(result.ib).subspan(bad));
 				m_refused++;
 				return false;
 			}
@@ -1031,6 +1716,8 @@ public:
 					std::fprintf(stderr, "native shadow: %s %llu left to Kyty by the packet check of its resume: header 0x%08x at dw %u\n", kind,
 					             static_cast<unsigned long long>(frame), result.cp_shadow_resume[bad], bad);
 				}
+				AuditShadowRefusalLocked(audit_kind, frame, RefuseWhy::ValidateResume, (result.cp_shadow_resume[bad] >> 8u) & 0xffu, bad,
+				                         std::span<const uint32_t>(result.cp_shadow_resume).subspan(bad));
 				m_refused++;
 				return false;
 			}
@@ -1842,6 +2529,9 @@ public:
 				}
 #endif
 			}
+			if (m_audit && ++m_audit_reports % 10 == 0) {
+				PrintAudit("every tenth flip report", false, true);
+			}
 			std::lock_guard<std::mutex> chain_lock(m_chain_mutex);
 			if (m_chain_n > 0) {
 				const double per_buf = 1e3 / static_cast<double>(m_chain_n);
@@ -2049,6 +2739,7 @@ public:
 			m_agr_translator->SetFenceAddress(m_submitter->ScratchVa() + kTrackerOffset + kGfx1Slot * kTrackerStride + 12);
 		}
 		m_agr_translator->SetGpuTimes(0, 0, 0);
+		m_agr_translator->SetAudit(m_audit);
 #endif
 	}
 
@@ -2293,8 +2984,9 @@ public:
 	double TimeoutSec() const { return m_timeout_sec; }
 
 	// Native labels: appends a ready segment to the batch FlushBatch submits. `slot` 0 is the gfx
-	// ring; with ACB rings, slot n > 0 is compute ring n - 1. `piece`: what CP shadowing needs to know of it.
-	void AppendBatch(std::span<const uint32_t> ib, uint32_t slot = 0, const CpShadowPiece& piece = {}) {
+	// ring; with ACB rings, slot n > 0 is compute ring n - 1. `piece`: what CP shadowing needs to know of it. `audit`:
+	// what KYTY_NATIVE_GPU_AUDIT needs to know of it.
+	void AppendBatch(std::span<const uint32_t> ib, uint32_t slot = 0, const CpShadowPiece& piece = {}, const AuditPiece& audit = {}) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const uint32_t         ring  = m_acb_rings && slot < kTrackerSlots ? slot : 0;
@@ -2309,6 +3001,10 @@ public:
 			} else {
 				SubmitBufferLocked(batch, ring);
 			}
+		}
+		// After that flush: the piece is in the next job.
+		if (AuditOn()) {
+			m_audit_batch[ring].Add(audit, NowSecShadow());
 		}
 		if (cs != nullptr) {
 			const uint64_t guards = cs->guards;
@@ -2327,6 +3023,7 @@ public:
 		(void)ib;
 		(void)slot;
 		(void)piece;
+		(void)audit;
 #endif
 	}
 
@@ -2817,6 +3514,11 @@ public:
 			std::lock_guard<std::mutex> l(m_ps5_mutex);
 			std::fprintf(stderr, "native shadow: %d PS5 registers put back (kyty-lodhw logs each)\n", m_ps5_hw.RestoreRegs());
 		}
+		// KYTY_NATIVE_GPU_AUDIT: what was measured, and what the rings had not got past. Without the lock only the
+		// pipeline's part (its own lock and atomics).
+		if (AuditOn()) {
+			PrintAudit("stop", true, lock.owns_lock());
+		}
 #else
 		(void)why;
 #endif
@@ -3212,6 +3914,9 @@ private:
 		__sync_synchronize();
 		*reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamFlagOffset) = n;
 		__sync_synchronize();
+		if (va == 0 && AuditOn()) {
+			Audit().StreamClosed(NowSecShadow());
+		}
 	}
 	void StreamFlushLocked(std::vector<uint32_t>& batch) {
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -3274,6 +3979,10 @@ private:
 			return;
 		}
 		PublishStreamLocked(m_stream_pending, va, ib.size());
+		if (AuditOn()) { // the head's job goes on, and its waits are the GPU's from now on
+			Audit().StreamPart(m_audit_batch[0], NowSecShadow(), ib.size(), end);
+			m_audit_batch[0] = {};
+		}
 		m_stream_chunks++;
 		if (cs != nullptr) {
 			m_cps_resumes += front.empty() ? 0u : 1u;
@@ -3297,6 +4006,8 @@ private:
 	void SubmitBufferLocked(std::vector<uint32_t>& batch, uint32_t slot, bool chains = false) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		CpShadowBatch* cs = CpShadowBatchLocked(slot);
+		// KYTY_NATIVE_GPU_AUDIT: the batch's pieces become this CS job (none: not the label pipeline's).
+		const AuditBatch audit = slot < kTrackerSlots ? std::exchange(m_audit_batch[slot], AuditBatch {}) : AuditBatch {};
 		if (batch.empty() || m_disabled || m_submitter == nullptr || m_stopping.load(std::memory_order_acquire)) {
 			batch.clear();
 			if (cs != nullptr) {
@@ -3322,6 +4033,9 @@ private:
 			EmitCpShadowOff(batch);
 			m_cps_job_ends += cs != nullptr ? 1u : 0u;
 		}
+		// Recorded before the ioctl: the tracker may see the job's points before it returns.
+		const bool audit_job = AuditOn() && audit.pieces != 0 &&
+		                       Audit().JobBegin(slot, audit, chains, NowSecShadow(), batch.size(), m_frames);
 		std::vector<uint32_t>   handles = m_gem->CreatedHandles();
 		NativeSubmitter::Result r       = m_submitter->Submit(batch, handles, m_timeout_sec, target);
 		if (!m_hang_dump.empty() && r.submitted && slot < kTrackerSlots) {
@@ -3339,6 +4053,9 @@ private:
 		}
 		batch.clear();
 		if (!r.submitted) {
+			if (audit_job) {
+				Audit().JobFailed(slot);
+			}
 			std::fprintf(stderr, "native shadow: batch submit failed: %s (%zu BOs, ip %u ring %u)\n", std::strerror(-r.err),
 			             handles.size(), target.ip_type, target.ring);
 			Disable("submit error");
@@ -3952,6 +4669,13 @@ private:
 		}
 		LoadAgcStartState();
 		m_stats = EnvOn("KYTY_NATIVE_GPU_STATS");
+		m_audit = AuditOn();
+		m_translator.SetAudit(m_audit);
+		m_acb_translator.SetAudit(m_audit);
+		m_audit_start = NowSecShadow();
+		if (m_audit) {
+			std::fprintf(stderr, "native audit: on (KYTY_NATIVE_GPU_AUDIT): CPU clocks and counters only, the GPU runs the same packets\n");
+		}
 		m_dump_shaders = EnvOn("KYTY_NATIVE_GPU_DUMP_SHADERS");
 		m_log_unmapped = EnvOn("KYTY_NATIVE_GPU_LOG_UNMAPPED");
 		if (EnvOn("KYTY_NATIVE_GPU_NO_DCC")) {
@@ -4238,6 +4962,9 @@ private:
 		             reason, static_cast<unsigned long long>(m_completed),
 		             m_completed > 0 ? m_gpu_ms_total / static_cast<double>(m_completed) : 0.0,
 		             m_dot2c_sites, m_shaders_scanned);
+		if (m_audit) {
+			PrintAudit("disabled", true, true);
+		}
 	}
 
 	void DetectShaders(const std::vector<uint64_t>& addrs) {
@@ -4251,6 +4978,9 @@ private:
 			m_shaders_scanned++;
 			m_dot2c_sites += scan.sites;
 			m_dot_ops += scan.dot_ops;
+			if (m_audit) {
+				AuditShaderLocked(va, scan);
+			}
 			if (m_shaders_scanned % 500u == 0) {
 				std::fprintf(stderr, "native shadow: %u shaders scanned so far: %u v_dot2c_f32_f16 sites, %u other dot ops\n",
 				             m_shaders_scanned, m_dot2c_sites, m_dot_ops);
@@ -4299,6 +5029,323 @@ private:
 				}
 			}
 		}
+	}
+
+	// KYTY_NATIVE_GPU_AUDIT: a translated buffer's sync packets and refusals (Pm4Translator::SetAudit), by queue kind (0
+	// DCBs of guest queue 0, 1 ACBs, 2 the AGR queue's DCBs).
+	void AuditTranslatedLocked(int k, uint64_t frame, const Pm4TranslateResult& result, const std::string& flat_why) {
+		m_audit_buffers[k][result.ok ? 0 : 1]++;
+		m_audit_sync[k][result.ok ? 0 : 1].Add(result.sync);
+		for (const Pm4Refusal& f: result.refusals) {
+			// An INDIRECT_BUFFER or REWIND left in the buffer: FlattenIndirectBuffers says why.
+			AuditRefusalLocked(k, frame, f, f.op == 0x3fu || f.op == 0x59u ? flat_why : std::string(), false);
+		}
+	}
+	// Submit's own refusals after a translation. `at`: the translated IB from the offending packet (the packet check), or
+	// a GDS shader's address.
+	void AuditShadowRefusalLocked(int k, uint64_t frame, RefuseWhy why, uint32_t op, uint32_t dw, std::span<const uint32_t> at) {
+		if (!m_audit || t_audit_retry) {
+			return;
+		}
+		Pm4Refusal f;
+		f.op    = op;
+		f.why   = why;
+		f.count = 1;
+		f.dw    = dw;
+		f.last  = dw;
+		f.nd    = static_cast<uint32_t>(std::min(at.size(), f.d.size()));
+		std::copy_n(at.begin(), f.nd, f.d.begin());
+		AuditRefusalLocked(k, frame, f, std::string(), true);
+	}
+	void AuditRefusalLocked(int k, uint64_t frame, const Pm4Refusal& f, const std::string& why, bool translated) {
+		const auto key = std::make_tuple(k, static_cast<uint8_t>(f.why), f.op);
+		auto       it  = m_audit_refusals.find(key);
+		if (it == m_audit_refusals.end()) {
+			if (m_audit_refusals.size() >= 128) {
+				m_audit_refusals_more++;
+				return;
+			}
+			it = m_audit_refusals.emplace(key, AuditRefusal {}).first;
+		}
+		AuditRefusal& a = it->second;
+		a.buffers++;
+		a.packets += f.count;
+		if (a.ex_n < a.ex.size()) {
+			a.ex[a.ex_n]    = f;
+			a.ex_at[a.ex_n] = {frame, g_audit_flip.load(std::memory_order_relaxed)};
+			a.ex_n++;
+		}
+		if (a.why.empty() && !why.empty()) {
+			a.why = why;
+		}
+		a.translated = a.translated || translated;
+	}
+	// A shader scanned for the first time (DetectShaders): its hwreg reads and writes, its dot instructions.
+	void AuditShaderLocked(uint64_t va, const Dot2cScan& scan) {
+		for (size_t id = 0; id < scan.getreg.size(); id++) {
+			m_audit_getreg[id][0] += scan.getreg[id];
+			m_audit_getreg[id][1] += scan.getreg[id] != 0 ? 1u : 0u;
+			m_audit_setreg[id][0] += scan.setreg[id];
+			m_audit_setreg[id][1] += scan.setreg[id] != 0 ? 1u : 0u;
+		}
+		for (size_t i = 0; i < scan.dot_by_op.size(); i++) {
+			m_audit_dot[i][0] += scan.dot_by_op[i];
+			m_audit_dot[i][1] += scan.dot_by_op[i] != 0 ? 1u : 0u;
+		}
+		if (scan.getreg[4] + scan.getreg[23] + scan.getreg[24] != 0) {
+			if (m_audit_hwid_shaders < m_audit_hwid_va.size()) {
+				m_audit_hwid_va[m_audit_hwid_shaders] = va;
+			}
+			m_audit_hwid_shaders++;
+		}
+		for (uint32_t i = 0; i < scan.hwid_simm_n; i++) {
+			const auto end = m_audit_hwid_fields.begin() + m_audit_hwid_fields_n;
+			const auto it  = std::find_if(m_audit_hwid_fields.begin(), end, [&](const auto& e) { return e.first == scan.hwid_simm[i]; });
+			if (it != end) {
+				it->second++;
+			} else if (m_audit_hwid_fields_n < m_audit_hwid_fields.size()) {
+				*end = {scan.hwid_simm[i], 1};
+				m_audit_hwid_fields_n++;
+			}
+		}
+	}
+	// "i:n" (or "name:n") for each non-zero count, "none" without any.
+	template <typename A>
+	static std::string AuditCounts(const A& a, const char* const* names = nullptr, bool hex = false) {
+		std::string s;
+		char        buf[64];
+		for (size_t i = 0; i < a.size(); i++) {
+			if (a[i] == 0) {
+				continue;
+			}
+			const auto n = static_cast<unsigned long long>(a[i]);
+			if (names != nullptr) {
+				std::snprintf(buf, sizeof(buf), "%s%s:%llu", s.empty() ? "" : " ", names[i], n);
+			} else {
+				std::snprintf(buf, sizeof(buf), hex ? "%s0x%zx:%llu" : "%s%zu:%llu", s.empty() ? "" : " ", i, n);
+			}
+			s += buf;
+		}
+		return s.empty() ? "none" : s;
+	}
+	// The report. With `locked` (m_mutex held) the translators' part (sync packets, refusals, shaders) first, then the
+	// label pipeline's (its own atomics and lock): its outcomes, CS jobs and GPU waits; `final` adds what the rings had not
+	// got past.
+	void PrintAudit(const char* why, bool final, bool locked) {
+		std::fprintf(stderr, "native audit: report (%s) after %.0f s, flip %llu\n", why, NowSecShadow() - m_audit_start,
+		             static_cast<unsigned long long>(g_audit_flip.load(std::memory_order_relaxed)));
+		if (locked) {
+			PrintAuditSyncLocked();
+			PrintAuditRefusalsLocked();
+			PrintAuditShadersLocked();
+		}
+		auto to_kyty = [](int k, int r) { return static_cast<unsigned long long>(g_audit_to_kyty[k][r].load(std::memory_order_relaxed)); };
+		std::fprintf(stderr,
+		             "native audit: buffers Kyty's command processor runs whole: dcb %llu refused / %llu with nothing to run, acb %llu / %llu, "
+		             "agr %llu / %llu; DCBs cut short by a refused chunk %llu (%llu dwords dropped)\n",
+		             to_kyty(0, 0), to_kyty(0, 1), to_kyty(1, 0), to_kyty(1, 1), to_kyty(2, 0), to_kyty(2, 1),
+		             static_cast<unsigned long long>(g_audit_chunk_dropped.load(std::memory_order_relaxed)),
+		             static_cast<unsigned long long>(g_audit_chunk_dropped_dw.load(std::memory_order_relaxed)));
+		PipelineAudit::SlotNames names {};
+		for (uint32_t s = 0; s < kTrackerSlots; s++) {
+			char* const  n   = names[s].data();
+			const size_t len = names[s].size();
+			if (GfxSlot(s)) {
+				std::snprintf(n, len, "gfx ring %u", s == 0 ? 0u : 1u);
+				continue;
+			}
+#if KYTY_GEM_BACKING_SUPPORTED
+			if (m_submitter != nullptr && m_submitter->OnKfdQueue(s - 1)) {
+				const uint32_t g = m_kfd_guest_queue[s - 1].load();
+				if (g == 0 || g == kSharedKfdQueue) {
+					std::snprintf(n, len, "KFD queue %u%s", s - 1, g == 0 ? "" : " (shared)");
+				} else {
+					std::snprintf(n, len, "KFD queue %u (guest 0x%x)", s - 1, g - 1u);
+				}
+				continue;
+			}
+#endif
+			std::snprintf(n, len, "compute ring %u", s - 1);
+		}
+		Audit().Print(final, names);
+	}
+	void PrintAuditSyncLocked() const {
+		static const char* const kKind[3]        = {"dcb", "acb", "agr"};
+		static const char* const kWaitEngine[4]  = {"me", "pfp", "2", "3"};
+		static const char* const kWriteEngine[4] = {"me", "pfp", "ce", "3"};
+		static const char* const kReleaseGcr[13] = {"GLM_WB",   "GLM_INV", "GLV_INV", "GL1_INV", "GL2_US", "GL2_RANGE0", "GL2_RANGE1",
+		                                            "GL2_DISCARD", "GL2_INV", "GL2_WB", "SEQ0",    "SEQ1",   "bit24"};
+		static const char* const kAcquireGcr[19] = {"GLI_INV0", "GLI_INV1", "GL1_RANGE0", "GL1_RANGE1", "GLM_WB", "GLM_INV", "GLK_WB",
+		                                            "GLK_INV",  "GLV_INV",  "GL1_INV",    "GL2_US",     "GL2_RANGE0", "GL2_RANGE1",
+		                                            "GL2_DISCARD", "GL2_INV", "GL2_WB",   "SEQ0",       "SEQ1",   "RANGE_IS_PA"};
+		auto n = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+		std::fprintf(stderr,
+		             "native audit: buffers translated (refused by the translator): dcb %llu (%llu), acb %llu (%llu), agr %llu (%llu); the "
+		             "packet check and GDS shaders refuse after it, those count as translated\n",
+		             n(m_audit_buffers[0][0]), n(m_audit_buffers[0][1]), n(m_audit_buffers[1][0]), n(m_audit_buffers[1][1]),
+		             n(m_audit_buffers[2][0]), n(m_audit_buffers[2][1]));
+		for (int k = 0; k < 3; k++) {
+			for (int r = 0; r < 2; r++) {
+				const SyncAuditT<uint64_t>& s  = m_audit_sync[k][r];
+				const char* const           in = r == 0 ? "" : " in refused buffers";
+				for (int wide = 0; wide < 2; wide++) {
+					const auto f = static_cast<size_t>(wide != 0 ? AuditSync::Wait64 : AuditSync::Wait);
+					if (s.packets[f] != 0) {
+						std::fprintf(stderr,
+						             "native audit: sync %s%s WAIT_REG_MEM%s %llu: CACHE_POLICY %s; ENGINE %s; FUNCTION %s; MEM_SPACE %s; "
+						             "OPERATION %s; odd bits in %llu (0x%08x); policy not given to the GPU %llu\n",
+						             kKind[k], in, wide != 0 ? "_64" : "", n(s.packets[f]), AuditCounts(s.policy[f]).c_str(),
+						             AuditCounts(s.engine[f], kWaitEngine).c_str(), AuditCounts(s.wait_function[wide]).c_str(),
+						             AuditCounts(s.wait_mem_space[wide]).c_str(), AuditCounts(s.wait_operation[wide]).c_str(), n(s.odd[f]),
+						             s.odd_bits[f], n(s.policy_lost[f]));
+					}
+				}
+				for (int marker = 0; marker < 2; marker++) {
+					const auto f = static_cast<size_t>(marker != 0 ? AuditSync::ReleaseMarker : AuditSync::Release);
+					if (s.packets[f] != 0) {
+						std::fprintf(stderr,
+						             "native audit: sync %s%s RELEASE_MEM (%s) %llu: CACHE_POLICY %s; EVENT_TYPE %s; GCR %s; DST_SEL %s; INT_SEL "
+						             "%s; DATA_SEL %s; odd bits in %llu (event 0x%08x, select 0x%08x); policy not given to the GPU %llu "
+						             "(approximately)\n",
+						             kKind[k], in, marker != 0 ? "Kyty's NOP marker" : "libSceAgc's 0x49", n(s.packets[f]),
+						             AuditCounts(s.policy[f]).c_str(), AuditCounts(s.release_event[marker], nullptr, true).c_str(),
+						             AuditCounts(s.release_gcr[marker], kReleaseGcr).c_str(), AuditCounts(s.release_dst_sel[marker]).c_str(),
+						             AuditCounts(s.release_int_sel[marker]).c_str(), AuditCounts(s.release_data_sel[marker]).c_str(), n(s.odd[f]),
+						             s.odd_bits[f], s.release_select_odd[marker], n(s.policy_lost[f]));
+					}
+				}
+				const auto wd = static_cast<size_t>(AuditSync::WriteData);
+				if (s.packets[wd] + s.write_markers != 0) {
+					std::fprintf(stderr,
+					             "native audit: sync %s%s WRITE_DATA %llu, and %llu debug-marker strings: CACHE_POLICY %s; ENGINE %s; DST_SEL %s; "
+					             "WR_CONFIRM %llu; odd bits in %llu (0x%08x)\n",
+					             kKind[k], in, n(s.packets[wd]), n(s.write_markers), AuditCounts(s.policy[wd]).c_str(),
+					             AuditCounts(s.engine[wd], kWriteEngine).c_str(), AuditCounts(s.write_dst_sel).c_str(), n(s.write_confirm),
+					             n(s.odd[wd]), s.odd_bits[wd]);
+				}
+				const auto ac = static_cast<size_t>(AuditSync::Acquire);
+				if (s.packets[ac] != 0) {
+					std::fprintf(stderr, "native audit: sync %s%s ACQUIRE_MEM %llu: ENGINE %s; GCR %s; odd bits in %llu (GCR_CNTL 0x%08x)\n",
+					             kKind[k], in, n(s.packets[ac]), AuditCounts(s.engine[ac]).c_str(),
+					             AuditCounts(s.acquire_gcr, kAcquireGcr).c_str(), n(s.odd[ac]), s.odd_bits[ac]);
+				}
+			}
+		}
+	}
+	void PrintAuditRefusalsLocked() const {
+		static const char* const kKind[3] = {"dcb", "acb", "agr"};
+		size_t                   lines    = 0;
+		for (const auto& [key, a]: m_audit_refusals) {
+			if (lines++ == 24) {
+				std::fprintf(stderr, "native audit: refused: %zu more kinds\n", m_audit_refusals.size() - 24);
+				break;
+			}
+			const auto [k, why_index, op] = key;
+			const auto why                = static_cast<RefuseWhy>(why_index);
+			const bool shader             = why == RefuseWhy::GdsShader || why == RefuseWhy::GdsShaderLearn;
+			char       op_text[16] = "-";
+			if (op == 0x100u) {
+				std::snprintf(op_text, sizeof(op_text), "none");
+			} else if (!shader) {
+				std::snprintf(op_text, sizeof(op_text), "0x%02x", op);
+			}
+			std::string ex;
+			for (uint32_t i = 0; i < a.ex_n; i++) {
+				const Pm4Refusal& f = a.ex[i];
+				char              buf[160];
+				int               len = std::snprintf(buf, sizeof(buf), "%s submit %llu flip %llu", i == 0 ? "" : ";",
+				                                      static_cast<unsigned long long>(a.ex_at[i].first),
+				                                      static_cast<unsigned long long>(a.ex_at[i].second));
+				if (shader && f.nd >= 2) {
+					len += std::snprintf(buf + len, sizeof(buf) - len, " shader 0x%llx",
+					                     static_cast<unsigned long long>(f.d[0] | (static_cast<uint64_t>(f.d[1]) << 32u)));
+				} else if (f.nd != 0) {
+					len += std::snprintf(buf + len, sizeof(buf) - len, " dw %u:", f.dw);
+					for (uint32_t d = 0; d < f.nd; d++) {
+						len += std::snprintf(buf + len, sizeof(buf) - len, " %08x", f.d[d]);
+					}
+				}
+				ex += buf;
+			}
+			std::fprintf(stderr, "native audit: refused %s op %s (%s): %llu buffers, %llu packets%s%s%s; e.g.%s\n", kKind[k], op_text,
+			             RefuseWhyName(why), static_cast<unsigned long long>(a.buffers), static_cast<unsigned long long>(a.packets),
+			             a.translated ? ", after the translation (the dwords are the IB's)" : "", a.why.empty() ? "" : ", not inlined: ",
+			             a.why.c_str(), ex.empty() ? " none" : ex.c_str());
+		}
+		if (m_audit_refusals_more != 0) {
+			std::fprintf(stderr, "native audit: refused: %llu more buffers of kinds not kept\n",
+			             static_cast<unsigned long long>(m_audit_refusals_more));
+		}
+	}
+	void PrintAuditShadersLocked() const {
+		static const char* const kDot[9] = {"v_dot2c_f32_f16", "v_dot4c_i32_i8", "v_dot2_f32_f16", "v_dot2_i32_i16", "v_dot2_u32_u16",
+		                                    "v_dot4_i32_i8",   "v_dot4_u32_u8",  "v_dot8_i32_i4",  "v_dot8_u32_u4"};
+		// gfx10's hwreg ids.
+		auto hwreg = [](size_t id) -> const char* {
+			switch (id) {
+				case 1: return "MODE";
+				case 2: return "STATUS";
+				case 3: return "TRAPSTS";
+				case 4: return "HW_ID";
+				case 5: return "GPR_ALLOC";
+				case 6: return "LDS_ALLOC";
+				case 7: return "IB_STS";
+				case 15: return "SH_MEM_BASES";
+				case 16: return "TBA_LO";
+				case 17: return "TBA_HI";
+				case 18: return "TMA_LO";
+				case 19: return "TMA_HI";
+				case 20: return "FLAT_SCR_LO";
+				case 21: return "FLAT_SCR_HI";
+				case 22: return "XNACK_MASK";
+				case 23: return "HW_ID1";
+				case 24: return "HW_ID2";
+				case 25: return "POPS_PACKER";
+				case 29: return "SHADER_CYCLES";
+				default: return "hwreg";
+			}
+		};
+		auto regs = [&](const std::array<std::array<uint64_t, 2>, 64>& a) {
+			std::string s;
+			for (size_t id = 0; id < a.size(); id++) {
+				if (a[id][0] != 0) {
+					char buf[64];
+					std::snprintf(buf, sizeof(buf), "%s%s(%zu) %llu/%llu", s.empty() ? "" : " ", hwreg(id), id,
+					              static_cast<unsigned long long>(a[id][0]), static_cast<unsigned long long>(a[id][1]));
+					s += buf;
+				}
+			}
+			return s.empty() ? std::string("none") : s;
+		};
+		std::string va;
+		for (size_t i = 0; i < std::min<uint64_t>(m_audit_hwid_shaders, m_audit_hwid_va.size()); i++) {
+			char buf[32];
+			std::snprintf(buf, sizeof(buf), "%s0x%llx", i == 0 ? "e.g. " : " ", static_cast<unsigned long long>(m_audit_hwid_va[i]));
+			va += buf;
+		}
+		std::string fields;
+		for (uint32_t i = 0; i < m_audit_hwid_fields_n; i++) {
+			char buf[32];
+			std::snprintf(buf, sizeof(buf), "%s0x%04x:%llu", i == 0 ? "" : " ", m_audit_hwid_fields[i].first,
+			              static_cast<unsigned long long>(m_audit_hwid_fields[i].second));
+			fields += buf;
+		}
+		std::string dots;
+		for (size_t i = 0; i < m_audit_dot.size(); i++) {
+			if (m_audit_dot[i][0] != 0) {
+				char buf[64];
+				std::snprintf(buf, sizeof(buf), "%s%s %llu/%llu", dots.empty() ? "" : ", ", kDot[i],
+				              static_cast<unsigned long long>(m_audit_dot[i][0]), static_cast<unsigned long long>(m_audit_dot[i][1]));
+				dots += buf;
+			}
+		}
+		std::fprintf(stderr,
+		             "native audit: shaders: %u scanned (each address once), %llu read HW_ID, HW_ID1 or HW_ID2%s%s%s; s_getreg "
+		             "(instructions/shaders): %s; s_setreg: %s\n",
+		             m_shaders_scanned, static_cast<unsigned long long>(m_audit_hwid_shaders), va.empty() ? "" : " (", va.c_str(),
+		             va.empty() ? "" : ")", regs(m_audit_getreg).c_str(), regs(m_audit_setreg).c_str());
+		std::fprintf(stderr, "native audit: shaders: HW_ID fields read (SIMM16:shaders) %s; dot instructions (instructions/shaders): %s\n",
+		             fields.empty() ? "none" : fields.c_str(), dots.empty() ? "none" : dots.c_str());
 	}
 
 	std::mutex    m_mutex;
@@ -4513,6 +5560,35 @@ private:
 	uint64_t                m_write_data_dw = 0;
 	uint64_t                m_label_wb_stripped = 0; // Pm4TranslateStats::label_wb_stripped, same flips
 	uint64_t                m_bench_count   = 0; // KYTY_NATIVE_GPU_TRANSLATE_BENCH
+	// KYTY_NATIVE_GPU_AUDIT (AuditOn), summed since the start: the translators' audit by queue kind (0 DCBs of guest
+	// queue 0, 1 ACBs, 2 the AGR queue's DCBs), what refused buffers (by kind, RefuseWhy and opcode, the first two of
+	// each), the shaders' hwregs and dot instructions (DetectShaders), and each ring's batch as a CS job to be.
+	struct AuditRefusal {
+		uint64_t                                     buffers = 0;
+		uint64_t                                     packets = 0;
+		uint32_t                                     ex_n    = 0;
+		std::array<Pm4Refusal, 2>                    ex {};
+		std::array<std::pair<uint64_t, uint64_t>, 2> ex_at {};          // (Submit index, flip)
+		std::string                                  why;               // FlattenIndirectBuffers' reason (0x3f, 0x59)
+		bool                                         translated = false; // refused after the translation: IB dwords
+	};
+	bool                                                       m_audit         = false;
+	double                                                     m_audit_start   = 0.0;
+	double                                                     m_audit_print_s = 0.0; // the last report from Submit
+	uint32_t                                                   m_audit_reports = 0;   // flip reports so far
+	SyncAuditT<uint64_t>                                       m_audit_sync[3][2] {}; // [kind][translated, refused]
+	uint64_t                                                   m_audit_buffers[3][2] {};
+	std::map<std::tuple<int, uint8_t, uint32_t>, AuditRefusal> m_audit_refusals;
+	uint64_t                                                   m_audit_refusals_more = 0;
+	std::array<std::array<uint64_t, 2>, 64>                    m_audit_getreg {}; // by hwreg id: instructions, shaders
+	std::array<std::array<uint64_t, 2>, 64>                    m_audit_setreg {};
+	std::array<std::array<uint64_t, 2>, 9>                     m_audit_dot {};    // Dot2cScan::dot_by_op
+	uint64_t                                                   m_audit_hwid_shaders = 0; // reading HW_ID, HW_ID1 or HW_ID2
+	std::array<uint64_t, 4>                                    m_audit_hwid_va {};      // the first of them
+	std::array<std::pair<uint16_t, uint64_t>, 16>              m_audit_hwid_fields {};  // their SIMM16s, by shaders
+	uint32_t                                                   m_audit_hwid_fields_n = 0;
+	AuditBatch                                                 m_audit_batch[kTrackerSlots];
+	static_assert(PipelineAudit::kSlots == kTrackerSlots, "the audit keeps one record per tracker slot");
 	// KYTY_NATIVE_GPU_FLIP_TRACE=gpu (NoteLabelWriters).
 	struct LabelWriter {
 		double t   = 0;
@@ -5079,14 +6155,23 @@ private:
 		}
 		// The size that matters is the inlined one: a title's DCB is often a few dwords of INDIRECT_BUFFER
 		// calls (GT7: 25 dwords standing for ~100K).
+		bool chunk_submitted = false; // TranslateChunks gave Submit the buffer (KYTY_NATIVE_GPU_AUDIT counted it there)
 		if (job.buffer != nullptr && m_native && (job.queue == 0 || job.queue == kGuestAgrQueue) && (m_chunk_dw != 0 || m_chunk_guest) &&
-		    TranslateChunks(job, done, queue)) {
+		    TranslateChunks(job, done, queue, &chunk_submitted)) {
 			return;
 		}
-		if (job.buffer == nullptr || !m_native ||
-		    !Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), compute, &r, nullptr,
-		                               job.queue == kGuestAgrQueue) ||
-		    r.segments.empty()) {
+		const bool translatable = job.buffer != nullptr && m_native;
+		bool       submitted    = false;
+		if (translatable) {
+			const bool retry = std::exchange(t_audit_retry, chunk_submitted);
+			submitted        = Shadow::Instance().Submit(std::span<const uint32_t>(job.buffer, job.size_dw), compute, &r, nullptr,
+			                                             job.queue == kGuestAgrQueue);
+			t_audit_retry    = retry;
+		}
+		if (!submitted || r.segments.empty()) {
+			if (translatable && AuditOn()) {
+				g_audit_to_kyty[compute ? 1 : job.queue == kGuestAgrQueue ? 2 : 0][submitted ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+			}
 			done->whole = true;
 			queue.push_back(Piece {{}, {}, std::move(done)});
 			return;
@@ -5142,7 +6227,8 @@ private:
 	// previous chunk left the registers. `then` comes after the last. A chunk never ends inside a
 	// COND_EXEC's range. False (nothing done) when the first chunk is refused, or when the buffer cannot be
 	// inlined yet: it then goes the usual way. docs/native-gpu-streamed-dcbs.md.
-	bool TranslateChunks(Job& job, std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
+	// `submitted`: set once a chunk went to Submit (a false return then translates the buffer a second time).
+	bool TranslateChunks(Job& job, std::shared_ptr<Done>& done, std::deque<Piece>& queue, bool* submitted) {
 		// The AGR queue's buffers are cut the same way, each chunk a piece of its own with its preamble (its translator
 		// restores where a buffer starts): the stream is queue 0's.
 		const bool agr = job.queue == kGuestAgrQueue;
@@ -5206,6 +6292,7 @@ private:
 		if (chunks.size() < 2) {
 			// Small enough to go whole: translated from what was inlined here, not inlined again.
 			Pm4TranslateResult r;
+			*submitted = true;
 			if (!Shadow::Instance().Submit(whole, false, &r, &source, agr) || r.segments.empty()) {
 				return false;
 			}
@@ -5252,6 +6339,7 @@ private:
 				Shadow::Instance().SetPreambleFromStart(true);
 				Shadow::Instance().SetNoPreamble(continues);
 			}
+			*submitted    = true;
 			const bool ok = Shadow::Instance().Submit(whole.subspan(cb, ce - cb), false, &r, &part, agr);
 			if (!agr) {
 				Shadow::Instance().SetPreambleFromStart(false);
@@ -5265,6 +6353,10 @@ private:
 				if (m_chunk_refused++ < 8) {
 					std::fprintf(stderr, "native shadow: chunk %zu of %zu of a DCB refused; the rest of it is dropped\n", c,
 					             chunks.size());
+				}
+				if (AuditOn()) {
+					g_audit_chunk_dropped.fetch_add(1, std::memory_order_relaxed);
+					g_audit_chunk_dropped_dw.fetch_add(whole.size() - cb, std::memory_order_relaxed);
 				}
 				queue.push_back(Piece {{}, {}, std::move(done)});
 				return true;
@@ -5476,6 +6568,9 @@ private:
 							m_hold_reason[queue] = m_last_hold_reason;
 							m_hold_start_value[queue] = ReadLabel(pieces.front().seg.wait);
 							TraceLabel('H', queue, pieces.front().seg.wait.addr, pieces.front().seg.wait.ref);
+							if (AuditOn()) {
+								m_audit_hold_from[queue] = NowSecShadow();
+							}
 						}
 						NoteStaleHold(queue, pieces.front());
 						break;
@@ -5492,6 +6587,13 @@ private:
 							g_hold_reason_us[r].fetch_add(us, std::memory_order_relaxed);
 						}
 					}
+					// KYTY_NATIVE_GPU_AUDIT: how long the piece Emit gets was held, and why (2 s and more too).
+					m_audit_hold_ms     = 0.0;
+					m_audit_hold_reason = -1;
+					if (AuditOn() && pieces.front().seg.held && m_hold_since.count(queue) != 0) {
+						m_audit_hold_ms     = (NowSecShadow() - m_audit_hold_from[queue]) * 1e3;
+						m_audit_hold_reason = m_hold_reason[queue];
+					}
 					m_hold_since.erase(queue);
 					if (pieces.front().seg.held) {
 						TraceLabel(how == Release::Native ? 'G' : 'M', queue, pieces.front().seg.wait.addr, pieces.front().seg.wait.ref);
@@ -5500,6 +6602,104 @@ private:
 					pieces.pop_front();
 					progress = true;
 				}
+			}
+		}
+	}
+
+	// KYTY_NATIVE_GPU_AUDIT (worker side). The label writes this pipeline emitted, the last two at each address
+	// (direct-mapped by address), so a wait's writer is known when the wait is emitted in any configuration (m_ring and
+	// m_last_write are not kept when no wait can be held).
+	struct AuditWrite {
+		uint64_t addr   = 0;
+		uint64_t value  = 0;
+		uint64_t landed = 0; // its segment's end point
+		double   t_emit = 0.0;
+		uint32_t queue  = 0;
+		uint8_t  slot   = 0;
+		bool     known  = false;
+		bool     gpu    = false;
+	};
+	struct AuditWriteSlot {
+		AuditWrite cur;
+		AuditWrite prev;
+	};
+	static constexpr size_t kAuditWriteBits = 14;
+	static size_t           AuditWriteIndex(uint64_t addr) {
+		return static_cast<size_t>(((addr >> 2u) * 0x9e3779b97f4a7c15ull) >> (64u - kAuditWriteBits));
+	}
+	// A block of data counts as a write of its first dword, value unknown.
+	void AuditNoteWrite(const LabelWrite& w, uint32_t queue, uint32_t slot, double now) {
+		if (m_audit_writes.empty()) {
+			m_audit_writes.resize(size_t {1} << kAuditWriteBits);
+		}
+		AuditWriteSlot& e = m_audit_writes[AuditWriteIndex(w.addr)];
+		e.prev            = e.cur.addr == w.addr ? e.cur : AuditWrite {};
+		e.cur = AuditWrite {w.addr, w.value, m_seq, now, queue, static_cast<uint8_t>(slot), w.known && w.span_dw <= 2, w.gpu};
+	}
+	// Who last wrote the wait's label (the newer of the two writes there whose value meets it, else the newest), and where
+	// that write is now: still ahead in its ring, landed with memory meeting the wait, or a later write needed.
+	void AuditWriter(AuditWaitRec& r, bool local) const {
+		if (local) {
+			r.who  = AuditWho::SameBuffer;
+			r.when = AuditWhen::Ahead;
+			return;
+		}
+		const AuditWrite* w = nullptr;
+		if (!m_audit_writes.empty()) {
+			const AuditWriteSlot& e = m_audit_writes[AuditWriteIndex(r.wait.addr)];
+			if (e.cur.addr == r.wait.addr) {
+				const bool cur_meets  = e.cur.known && r.wait.Met(e.cur.value);
+				const bool prev_meets = e.prev.addr == r.wait.addr && e.prev.known && r.wait.Met(e.prev.value);
+				w                     = !cur_meets && prev_meets ? &e.prev : &e.cur;
+			}
+		}
+		const bool memory_meets = r.wait.addr != 0 && r.wait.Met(ReadLabel(r.wait));
+		if (w == nullptr) {
+			r.who  = AuditWho::None;
+			r.when = memory_meets ? AuditWhen::Landed : AuditWhen::Later;
+			return;
+		}
+		r.writer_slot  = w->slot;
+		r.writer_queue = w->queue;
+		r.who          = !w->gpu ? AuditWho::Cpu : w->queue == r.queue ? AuditWho::SameQueue : w->slot == r.slot ? AuditWho::OtherQueue
+		                                                                                                         : AuditWho::OtherRing;
+		r.when = !Shadow::Instance().Reached(w->landed, w->slot) ? AuditWhen::Ahead : memory_meets ? AuditWhen::Landed : AuditWhen::Later;
+	}
+	// The records of the waits piece `p` gives the GPU: the held wait at its front (between the ring's point before the
+	// piece and its first), then the segment's own (Pm4Segment::audit_waits), each between the points around it.
+	void AuditWaitsOf(uint32_t queue, uint32_t slot, uint64_t slot_prev, const Piece& p, Release how, const std::vector<Entry>& entries,
+	                  double now) {
+		m_audit_recs.clear();
+		if (p.ib.empty() || entries.empty()) {
+			return;
+		}
+		const uint64_t flip = g_audit_flip.load(std::memory_order_relaxed);
+		auto add = [&](const WaitCond& wait, AuditWaitKind kind, uint64_t before, uint64_t after, bool local, bool met) {
+			AuditWaitRec r;
+			r.wait   = wait;
+			r.before = before;
+			r.after  = after;
+			r.flip   = flip;
+			r.t_emit = now;
+			r.queue  = queue;
+			r.slot   = static_cast<uint8_t>(slot);
+			r.kind   = kind;
+			r.met    = met;
+			if (kind == AuditWaitKind::HeldGpu || kind == AuditWaitKind::HeldBarrier) {
+				r.hold_ms = m_audit_hold_ms;
+				r.reason  = static_cast<int8_t>(m_audit_hold_reason);
+			}
+			AuditWriter(r, local);
+			m_audit_recs.push_back(r);
+		};
+		if (p.seg.held) {
+			add(p.seg.wait, how == Release::Native ? AuditWaitKind::HeldGpu : AuditWaitKind::HeldBarrier, slot_prev, entries[0].seq, false,
+			    false);
+		}
+		for (const auto& a: p.seg.audit_waits) {
+			if (a.next_point < entries.size()) {
+				add(a.wait, a.barrier ? AuditWaitKind::Barrier : AuditWaitKind::Native,
+				    a.next_point == 0 ? slot_prev : entries[a.next_point - 1].seq, entries[a.next_point].seq, a.local, a.met);
 			}
 		}
 	}
@@ -5516,6 +6716,7 @@ private:
 			}
 		}
 		const uint32_t     slot = SlotOf(queue);
+		const uint64_t     slot_prev = m_slot_seq[slot]; // the ring's point before this piece (KYTY_NATIVE_GPU_AUDIT)
 		std::vector<Entry> entries;
 		uint32_t           packet  = ~0u;
 		const bool         relayed = Shadow::Instance().IrqEvent() != 0 && Shadow::Instance().IrqRelayed(slot);
@@ -5540,6 +6741,13 @@ private:
 			// No GPU work: done once everything ahead of it on its own ring is.
 			entries.push_back(Entry {m_slot_seq[slot], queue, slot, TrackerPoint {}, p.done});
 		}
+		// KYTY_NATIVE_GPU_AUDIT: the guest waits the piece gives the GPU, between which points of its ring, and who wrote
+		// their labels last (before this piece's own writes go in), for PipelineAudit. CPU reads only.
+		const bool   audit     = AuditOn();
+		const double audit_now = audit ? NowSecShadow() : 0.0;
+		if (audit) {
+			AuditWaitsOf(queue, slot, slot_prev, p, how, entries, audit_now);
+		}
 		if (m_last_write.size() > 65536) {
 			m_last_write.clear();
 		}
@@ -5550,6 +6758,9 @@ private:
 		const bool holds_possible = !AllWaitsOnGpu() || m_gfx_shared;
 		for (const auto& w: p.seg.writes) {
 			TraceLabel(w.gpu ? 'W' : 'C', queue, w.addr, w.value);
+			if (audit) {
+				AuditNoteWrite(w, queue, slot, audit_now);
+			}
 			if (!holds_possible) {
 				continue;
 			}
@@ -5583,8 +6794,12 @@ private:
 				             p.ib[bad]);
 				Shadow::Instance().DisableNow("packet check");
 			} else {
-				Shadow::Instance().AppendBatch(p.ib, slot, CpShadowPiece {p.cp_own, p.seg.cp_shadow_head, p.cp_resume});
+				Shadow::Instance().AppendBatch(p.ib, slot, CpShadowPiece {p.cp_own, p.seg.cp_shadow_head, p.cp_resume},
+				                               AuditPiece {queue, m_slot_seq[slot], audit ? static_cast<uint32_t>(m_audit_recs.size()) : 0u});
 				m_appended = true;
+				if (audit && !m_audit_recs.empty()) {
+					Audit().Waits(m_audit_recs); // after the append: a batch it flushed is not their job
+				}
 				// The waits the GPU now has, for a stop: the held wait when it stays, then the segment's own.
 				std::vector<WaitCond> waits;
 				if (p.seg.held && how == Release::Native) {
@@ -5611,10 +6826,13 @@ private:
 #if defined(__linux__)
 		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul);
 #endif
-		double stuck_since = 0.0;
-		double busy_since  = 0.0; // GPU busy for the flip stats: while tracker points are outstanding
+		double     stuck_since = 0.0;
+		double     busy_since  = 0.0; // GPU busy for the flip stats: while tracker points are outstanding
+		const bool audit       = AuditOn();
 		for (;;) {
 			std::vector<Entry> ready;
+			double             scan_from = 0.0; // KYTY_NATIVE_GPU_AUDIT: before the scan's first look at a slot, after its last
+			double             scan_to   = 0.0;
 			{
 				std::unique_lock<std::mutex> lock(m_track_mutex);
 				if (m_entries.empty() && busy_since != 0.0) {
@@ -5623,6 +6841,7 @@ private:
 				}
 				m_track_cv.wait(lock, [this] { return !m_entries.empty(); });
 				busy_since = busy_since == 0.0 ? NowSecShadow() : busy_since;
+				scan_from  = audit ? NowSecShadow() : 0.0;
 				// In order within a ring, independently across rings: a compute queue waiting on the GPU
 				// for a label (a KFD queue does, as on PS5) must not hold up the gfx ring's points, whose
 				// end-of-frame events are what lets the title submit the buffer that writes that label.
@@ -5637,6 +6856,19 @@ private:
 						++it;
 					}
 				}
+				scan_to = audit ? NowSecShadow() : 0.0;
+			}
+			if (audit) {
+				// A point this scan found reached was not at the previous scan's start (in ring order), and is by now.
+				// Before Run: Kyty's continuations there take long. Not what a drain lets through unreached.
+				if (!ready.empty() && m_native && !m_drain) {
+					m_audit_reached.clear();
+					for (const auto& e: ready) {
+						m_audit_reached.emplace_back(e.slot, e.seq);
+					}
+					Audit().Reached(m_audit_reached, m_audit_scan_prev, scan_to);
+				}
+				m_audit_scan_prev = scan_from;
 			}
 			if (!ready.empty()) {
 				stuck_since = 0.0;
@@ -5927,12 +7159,21 @@ private:
 	std::map<uint32_t, int>                 m_hold_reason; // queue -> why its front piece was first held
 	uint64_t                                m_released_observed = 0;
 	std::atomic<uint64_t>                   m_last_cs {0};
+	// KYTY_NATIVE_GPU_AUDIT, worker side: the writes (AuditNoteWrite), the records of the piece being emitted, and the
+	// hold of a held piece (Pump: when it began, and for the piece Emit gets how long and why).
+	std::vector<AuditWriteSlot>             m_audit_writes;
+	std::vector<AuditWaitRec>               m_audit_recs;
+	std::map<uint32_t, double>              m_audit_hold_from;
+	double                                  m_audit_hold_ms     = 0.0;
+	int                                     m_audit_hold_reason = -1;
 	// Tracker side.
 	std::mutex                              m_track_mutex;
 	std::condition_variable                 m_track_cv;
 	std::deque<Entry>                       m_entries;
 	bool                                    m_drain = false;
 	std::deque<std::vector<uint32_t>>       m_tails;
+	double                                     m_audit_scan_prev = 0.0; // KYTY_NATIVE_GPU_AUDIT: the previous scan began
+	std::vector<std::pair<uint32_t, uint64_t>> m_audit_reached;         // and what this one found reached
 };
 
 } // namespace
@@ -5999,6 +7240,9 @@ void ShadowNoteDcbSubmit() {
 
 void ShadowFlipStats(double present_seconds) {
 	static const bool on = EnvOn("KYTY_NATIVE_GPU_FLIP_STATS");
+	if (AuditOn()) {
+		g_audit_flip.fetch_add(1, std::memory_order_relaxed); // every flip, for KYTY_NATIVE_GPU_AUDIT's records
+	}
 	if (on && Shadow::Instance().Active()) {
 		Shadow::Instance().FlipStats(present_seconds);
 	}

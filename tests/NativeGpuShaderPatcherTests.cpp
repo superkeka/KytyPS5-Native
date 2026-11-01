@@ -261,6 +261,22 @@ void TestCountsDotOps() {
 	Check(scan.ended && !scan.decode_error, "dot sample decodes to s_endpgm");
 	Check(scan.sites == 1, "one v_dot2c_f32_f16 site");
 	Check(scan.dot_ops == 3, "three VOP3P dot instructions");
+	Check(scan.dot_by_op[0] == 1 && scan.dot_by_op[2] == 1 && scan.dot_by_op[5] == 1 && scan.dot_by_op[7] == 1 && scan.dot_by_op[1] == 0,
+	      "each dot instruction by its opcode");
+}
+
+void TestCountsHwregs() {
+	// s_getreg_b32 s1, hwreg(HW_REG_HW_ID1); s_getreg_b32 s1, hwreg(HW_REG_HW_ID2); HW_ID1 again; s_getreg_b32 s1,
+	// hwreg(HW_REG_HW_ID1, 0, 4) (other fields); s_setreg_b32 hwreg(HW_REG_MODE), s0; s_setreg_imm32_b32 hwreg(HW_REG_MODE), 0
+	// (a literal follows); v_dot4c_i32_i8 v0, v1, v2; s_endpgm.
+	const std::vector<uint32_t> code = {0xb901f817u, 0xb901f818u, 0xb901f817u, 0xb9011817u, 0xb980f801u,
+	                                    0xba80f801u, 0x00000000u, 0x1a000501u, SEndpgm};
+	const auto scan = CountDot2c(code);
+	Check(scan.ended && !scan.decode_error && scan.instructions == 8, "hwreg sample decodes to s_endpgm");
+	Check(scan.getreg[23] == 3 && scan.getreg[24] == 1 && scan.setreg[1] == 2 && scan.getreg[1] == 0, "s_getreg and s_setreg by hwreg id");
+	Check(scan.hwid_simm_n == 3 && scan.hwid_simm[0] == 0xf817u && scan.hwid_simm[1] == 0xf818u && scan.hwid_simm[2] == 0x1817u,
+	      "the distinct fields of the HW_ID reads");
+	Check(scan.aperture_ops == 0 && scan.dot_ops == 1 && scan.dot_by_op[1] == 1, "no aperture read; one v_dot4c_i32_i8");
 }
 
 int main() {
@@ -277,6 +293,7 @@ int main() {
 	TestDecodeErrorPatchesNothing();
 	TestCountsFlatAndApertures();
 	TestCountsDotOps();
+	TestCountsHwregs();
 	std::puts("NativeGpuShaderPatcherTests: all cases passed");
 	return 0;
 }

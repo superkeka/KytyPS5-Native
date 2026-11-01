@@ -280,12 +280,16 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 		}
 		if ((w >> 31u) == 0u && (w >> 25u) == OpVop2Dot2cF32F16) {
 			scan.sites++;
+			scan.dot_by_op[0]++;
 		}
 		// The other dot instructions gfx1013 lacks: VOP2 v_dot4c_i32_i8 (0x0d) and VOP3P v_dot2_f32_f16
 		// .. v_dot8_u32_u4 (0x13..0x19).
-		if (((w >> 31u) == 0u && (w >> 25u) == 0x0du) || ((w >> 23u) == 0x198u && ((w >> 16u) & 0x7fu) >= 0x13u &&
-		                                                   ((w >> 16u) & 0x7fu) <= 0x19u)) {
+		if ((w >> 31u) == 0u && (w >> 25u) == 0x0du) {
 			scan.dot_ops++;
+			scan.dot_by_op[1]++;
+		} else if ((w >> 23u) == 0x198u && ((w >> 16u) & 0x7fu) >= 0x13u && ((w >> 16u) & 0x7fu) <= 0x19u) {
+			scan.dot_ops++;
+			scan.dot_by_op[2u + ((w >> 16u) & 0x7fu) - 0x13u]++;
 		}
 		// DS (gfx10): bits 31:26 = 0x36, OP in 25:18, GDS in bit 17.
 		if ((w >> 26u) == 0x36u) {
@@ -307,6 +311,18 @@ Dot2cScan CountDot2c(std::span<const uint32_t> code, uint32_t max_dwords) {
 		const auto aperture_src = [](uint32_t src) { return src >= 235u && src <= 238u; };
 		const uint32_t enc9 = w >> 23u;
 		const bool     sopk = (w >> 28u) == 0xbu && enc9 < 0x17du; // SOP1/SOPC/SOPP share the 0xb nibble
+		if (sopk && (enc9 & 0x1fu) == 0x12u) {
+			const uint32_t id = w & 0x3fu;
+			scan.getreg[id]++;
+			const auto simm = static_cast<uint16_t>(w & 0xffffu);
+			const auto end  = scan.hwid_simm.begin() + scan.hwid_simm_n;
+			if ((id == 4u || id == 23u || id == 24u) && scan.hwid_simm_n < scan.hwid_simm.size() &&
+			    std::find(scan.hwid_simm.begin(), end, simm) == end) {
+				scan.hwid_simm[scan.hwid_simm_n++] = simm;
+			}
+		} else if (sopk && ((enc9 & 0x1fu) == 0x13u || (enc9 & 0x1fu) == 0x15u)) {
+			scan.setreg[w & 0x3fu]++;
+		}
 		if (sopk && (enc9 & 0x1fu) == 0x12u && (w & 0x3fu) == 15u) {
 			scan.aperture_ops++;
 		} else if ((w >> 30u) == 0x2u && !sopk && enc9 != 0x17fu && (aperture_src(w & 0xffu) || aperture_src((w >> 8u) & 0xffu))) {

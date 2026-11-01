@@ -347,6 +347,63 @@ void NoteReleaseForm(uint32_t event, uint32_t control, bool compute) {
 	}
 }
 
+// KYTY_NATIVE_GPU_AUDIT (SetAudit): a sync packet's fields as the title wrote them. `odd`: its bits outside the fields
+// the gfx10 layout names.
+void AuditCommon(Pm4SyncAudit& s, AuditSync form, uint32_t policy, uint32_t engine, uint32_t odd) {
+	const auto f = static_cast<size_t>(form);
+	s.packets[f]++;
+	s.policy[f][policy & 3u]++;
+	s.engine[f][engine & 3u]++;
+	s.odd[f] += odd != 0u ? 1u : 0u;
+	s.odd_bits[f] |= odd;
+}
+// WAIT_REG_MEM(_64) dword 1: FUNCTION [2:0], MEM_SPACE [5:4], OPERATION [7:6], ENGINE_SEL [9:8], CACHE_POLICY [26:25].
+void AuditWait(Pm4SyncAudit& s, bool wide, uint32_t control) {
+	const int k = wide ? 1 : 0;
+	AuditCommon(s, wide ? AuditSync::Wait64 : AuditSync::Wait, control >> 25u, control >> 8u, control & ~0x060003f7u);
+	s.wait_function[k][control & 7u]++;
+	s.wait_mem_space[k][(control >> 4u) & 3u]++;
+	s.wait_operation[k][(control >> 6u) & 3u]++;
+}
+// RELEASE_MEM dword 1: EVENT_TYPE [5:0], EVENT_INDEX [11:8], GCR_CNTL [24:12], CACHE_POLICY [26:25], EXECUTE [28]; dword 2:
+// DST_SEL [17:16], INT_SEL [26:24], DATA_SEL [31:29].
+void AuditRelease(Pm4SyncAudit& s, bool marker, uint32_t event, uint32_t select) {
+	const int       k       = marker ? 1 : 0;
+	const AuditSync form    = marker ? AuditSync::ReleaseMarker : AuditSync::Release;
+	const uint32_t  ev_odd  = event & ~0x17ffff3fu;
+	const uint32_t  sel_odd = select & ~0xe7030000u;
+	AuditCommon(s, form, event >> 25u, 0u, ev_odd);
+	s.odd[static_cast<size_t>(form)] += ev_odd == 0u && sel_odd != 0u ? 1u : 0u; // odd in either dword
+	s.release_select_odd[k] |= sel_odd;
+	s.release_event[k][event & 0x3fu]++;
+	for (uint32_t g = (event >> 12u) & 0x1fffu; g != 0; g &= g - 1u) {
+		s.release_gcr[k][std::countr_zero(g)]++;
+	}
+	s.release_dst_sel[k][(select >> 16u) & 3u]++;
+	s.release_int_sel[k][(select >> 24u) & 7u]++;
+	s.release_data_sel[k][select >> 29u]++;
+}
+// WRITE_DATA dword 1: DST_SEL [11:8], WR_ONE_ADDR [16], WR_CONFIRM [20], CACHE_POLICY [26:25], ENGINE_SEL [31:30].
+// libSceAgc's debug-marker strings are only counted, or they would swamp DST_SEL 0.
+void AuditWriteData(Pm4SyncAudit& s, uint32_t control, bool marker) {
+	if (marker) {
+		s.write_markers++;
+		return;
+	}
+	AuditCommon(s, AuditSync::WriteData, control >> 25u, control >> 30u, control & ~0xc6110f00u);
+	s.write_dst_sel[(control >> 8u) & 0xfu]++;
+	s.write_confirm += (control >> 20u) & 1u;
+}
+// ACQUIRE_MEM: ENGINE in dword 1 bit 31 (with COHER_CNTL), GCR_CNTL [18:0] in body dword 6.
+void AuditAcquire(Pm4SyncAudit& s, std::span<const uint32_t> body) {
+	const uint32_t control = !body.empty() ? body[0] : 0u;
+	const uint32_t gcr     = body.size() >= 7 ? body[6] : 0u;
+	AuditCommon(s, AuditSync::Acquire, 0u, control >> 31u, gcr & ~0x7ffffu);
+	for (uint32_t g = gcr & 0x7ffffu; g != 0; g &= g - 1u) {
+		s.acquire_gcr[std::countr_zero(g)]++;
+	}
+}
+
 void EmitRelease32(std::vector<uint32_t>& ib, uint64_t addr, uint32_t value, bool compute, uint32_t event = kFlushEventCntl) {
 	ib.push_back(Pkt3(IT_RELEASE_MEM, 7, compute));
 	ib.push_back(event);
@@ -418,6 +475,32 @@ bool GuestWaitControlOk(uint32_t control) {
 }
 
 } // namespace
+
+const char* RefuseWhyName(RefuseWhy why) {
+	static const char* const kNames[static_cast<size_t>(RefuseWhy::Count)] = {
+	    "collected",
+	    "not a type-3 header",
+	    "past the end",
+	    "unknown opcode",
+	    "graphics opcode on MEC",
+	    "geometry UCONFIG on MEC",
+	    "body too short",
+	    "RELEASE_MEM DATA_SEL",
+	    "GDS release without a partition",
+	    "register wait",
+	    "DMA_DATA form",
+	    "WRITE_DATA to a register",
+	    "CONTEXT_CONTROL on MEC",
+	    "COND_EXEC form",
+	    "ATOMIC_MEM form",
+	    "run in place with ours around it",
+	    "packet check",
+	    "packet check of the resume",
+	    "GDS shader",
+	    "GDS shader skip learning",
+	};
+	return why < RefuseWhy::Count ? kNames[static_cast<size_t>(why)] : "?";
+}
 
 uint64_t SatisfyingValue(const WaitCond& w, uint64_t current) {
 	const uint64_t ref = w.ref & w.mask;
@@ -3053,7 +3136,33 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		stats.waits_split++;
 	};
 
-	auto fail = [&](uint32_t op, uint32_t dw) {
+	// SetAudit: what refuses the buffer, each opcode and reason once with how often, and the first one's dwords.
+	auto note_refusal = [&](uint32_t op, uint32_t at, RefuseWhy why) {
+		if (!m_audit || why == RefuseWhy::Collected) {
+			return;
+		}
+		const uint32_t key = op > 0xffu ? 0x100u : op;
+		for (auto& f: r.refusals) {
+			if (f.op == key && f.why == why) {
+				f.count += f.last != at ? 1u : 0u;
+				f.last = at;
+				return;
+			}
+		}
+		if (r.refusals.size() < 8 && at < dcb.size()) {
+			Pm4Refusal f;
+			f.op    = key;
+			f.why   = why;
+			f.count = 1;
+			f.dw    = at;
+			f.last  = at;
+			f.nd    = static_cast<uint32_t>(std::min<size_t>(f.d.size(), dcb.size() - at));
+			std::copy_n(dcb.begin() + at, f.nd, f.d.begin());
+			r.refusals.push_back(f);
+		}
+	};
+	auto fail = [&](uint32_t op, uint32_t dw, RefuseWhy why = RefuseWhy::Unknown) {
+		note_refusal(op, dw, why);
 		r.ok         = false;
 		r.unknown_op = op;
 		r.unknown_dw = dw;
@@ -3148,11 +3257,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		bool           reg_write   = false; // it writes registers: with CP shadowing its segment is not dropped
 		const uint32_t header = dcb[dw];
 		if ((header >> 30u) != 3u) {
-			return fail(0xffffffffu, dw); // not a type-3 packet
+			return fail(0xffffffffu, dw, RefuseWhy::NotType3); // not a type-3 packet
 		}
 		const uint32_t size = PacketSizeDw(header);
 		if (size == 0 || dw + size > dcb.size()) {
-			return fail((header >> 8u) & 0xffu, dw);
+			return fail((header >> 8u) & 0xffu, dw, RefuseWhy::Truncated);
 		}
 		const uint32_t op          = (header >> 8u) & 0xffu;
 		cur_op                     = op;
@@ -3213,6 +3322,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.unknown_dw = dw;
 					}
 					r.unknown_ops.insert(op);
+					note_refusal(op, dw, RefuseWhy::GraphicsOnMec);
 					dw += size;
 					continue;
 				default: break;
@@ -3223,6 +3333,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_NOP: {
 				stats.nops += op == IT_NOP ? 1 : 0;
 				const uint32_t marker = op == IT_RELEASE_MEM ? R_RELEASE_MEM : (header >> 2u) & 0x3fu;
+				if (m_audit && marker == R_RELEASE_MEM && body_count >= 2) {
+					AuditRelease(r.sync, op == IT_NOP, bptr[0], bptr[1]);
+				}
 				if (marker == R_FLIP) {
 					stats.marker_flip++;
 					if (labels && m_eop_flips && body_count >= 5) {
@@ -3244,7 +3357,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				} else if (marker == R_RELEASE_MEM && labels) {
 					stats.marker_release++;
 					if (body_count < 7) {
-						return fail(op, dw);
+						return fail(op, dw, RefuseWhy::ShortBody);
 					}
 					const uint64_t dst = static_cast<uint64_t>(bptr[2]) | (static_cast<uint64_t>(bptr[3]) << 32u);
 					const uint64_t value = static_cast<uint64_t>(bptr[4]) | (static_cast<uint64_t>(bptr[5]) << 32u);
@@ -3260,12 +3373,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						sel = 0;
 					}
 					if (sel == 5 && !m_gds) {
+						if (r.unknown_ops.empty()) { // the refusal's log line names it
+							r.unknown_op = op;
+							r.unknown_dw = dw;
+						}
 						r.unknown_ops.insert(op); // GDS data without a GDS partition: leave the buffer to Kyty
+						note_refusal(op, dw, RefuseWhy::ReleaseGds);
 						break;
 					}
 					if (sel != 0 && sel != 1 && sel != 2 && sel != 3 && sel != 5) {
 						r.unknown_detail = {bptr[0], bptr[1]};
-						return fail(op, dw);
+						return fail(op, dw, RefuseWhy::ReleaseDataSel);
 					}
 					// The guest's packet as written: a DCB release without an interrupt, in an end-of-pipe
 					// event the ring runs (LabelEventOk), with no data (cache actions alone) or data to memory
@@ -3401,6 +3519,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						                                     : (int_sel == 2 ? "RELEASE_MEM INT_SEL 2 (EOP interrupt)"
 						                                                     : "RELEASE_MEM INT_SEL 4 (interrupt only)"));
 					}
+					// SetAudit: a CACHE_POLICY no GPU packet carries (approximately): a tracker point stands for the
+					// release (a CPU write, a CPU timestamp, a tracker interrupt), a timestamp in our form, or
+					// LabelEventCntl's fallback to the barrier's event. GDS data keeps the guest's event dword.
+					if (m_audit && (bptr[0] & kReleasePolicy) != 0u && !as_written && sel != 5 &&
+					    (cpu_point || data_sel == 3 || (interrupt && !irq_on_gpu) ||
+					     (LabelEventCntl(bptr[0]) & kReleasePolicy) != (bptr[0] & kReleasePolicy))) {
+						r.sync.policy_lost[static_cast<size_t>(op == IT_NOP ? AuditSync::ReleaseMarker : AuditSync::Release)]++;
+					}
 				} else if (marker == R_RELEASE_MEM) {
 					stats.marker_release++;
 					if (body_count >= 4) {
@@ -3531,6 +3657,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							r.unknown_dw = dw;
 						}
 						r.unknown_ops.insert(op);
+						note_refusal(op, dw, RefuseWhy::UconfigOnMec);
 						break;
 					}
 				}
@@ -3585,7 +3712,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_SET_SH_REG_INDIRECT:
 			case IT_SET_UCONFIG_REG_INDIRECT: {
 				if (body_count < 4) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				const uint64_t addr = (static_cast<uint64_t>(bptr[0]) & 0xfffffffcull) |
 				                      (static_cast<uint64_t>(bptr[1]) << 32u);
@@ -3699,6 +3826,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 								r.unknown_dw = dw;
 							}
 							r.unknown_ops.insert(op);
+							note_refusal(op, dw, RefuseWhy::UconfigOnMec);
 							continue;
 						}
 						uc[off] = value;
@@ -3721,8 +3849,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// primary (non-shadow) native path will have to honour.
 				const bool     wide     = op == IT_WAIT_REG_MEM_64;
 				const uint32_t need     = wide ? 8u : 6u;
-				if (body_count < need || (bptr[0] & 0x10u) == 0) {
-					return fail(op, dw); // register waits are refused
+				if (m_audit && body_count >= 1) {
+					AuditWait(r.sync, wide, bptr[0]);
+				}
+				if (body_count < need) {
+					return fail(op, dw, RefuseWhy::ShortBody);
+				}
+				if ((bptr[0] & 0x10u) == 0) {
+					return fail(op, dw, RefuseWhy::RegisterWait); // register waits are refused
 				}
 				const uint64_t addr = (static_cast<uint64_t>(bptr[1]) & (wide ? ~0x7ull : ~0x3ull)) |
 				                      (static_cast<uint64_t>(bptr[2] & 0x3ffffu) << 32u);
@@ -3778,7 +3912,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						flush_points();
 					}
 					const bool timed = plan == LabelOracle::Plan::Native && m_time_pairs != 0 && !m_compute_ring;
-					const uint64_t wait_pair = m_time_wait_va + 16ull * (m_time_waits % m_time_pairs);
+					const uint64_t wait_pair = timed ? m_time_wait_va + 16ull * (m_time_waits % m_time_pairs) : 0u;
 					if (timed) {
 						EmitClockCopy(body, wait_pair);
 					}
@@ -3787,6 +3921,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					                        (m_compute_ring ? MecGuestWaitOk(bptr[0]) : m_waits_verbatim && GuestWaitControlOk(bptr[0]));
 					if (as_written) {
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
+					// SetAudit: the title's CACHE_POLICY, lost unless the GPU runs its own packet (our wait, a barrier, a hold).
+					if (m_audit && ((bptr[0] >> 25u) & 3u) != 0u && !as_written) {
+						r.sync.policy_lost[static_cast<size_t>(wide ? AuditSync::Wait64 : AuditSync::Wait)]++;
 					}
 					const bool emitted = plan == LabelOracle::Plan::Native && (as_written || EmitNativeWait(body, w, m_compute_ring));
 					if (emitted) {
@@ -3812,6 +3950,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							}
 						}
 					}
+					// SetAudit: a wait the GPU runs, or a barrier, with the index of the first point after it (flush_points
+					// has run for a GPU wait). A held one is the next segment's `wait`.
+					if (m_audit && plan != LabelOracle::Plan::Split) {
+						segs.back().audit_waits.push_back(
+						    {w, static_cast<uint32_t>(segs.back().points.size()), plan == LabelOracle::Plan::Met, own_label, met});
+					}
 					switch (plan) {
 						case LabelOracle::Plan::Native:
 							stats.waits_native++;
@@ -3833,6 +3977,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// The guest waits for its own end-of-pipe label: everything before has finished and its
 				// writes are visible. The label itself is written by Kyty later, so give the GPU the same
 				// guarantee with a fence of ours.
+				if (m_audit && ((bptr[0] >> 25u) & 3u) != 0u) {
+					r.sync.policy_lost[static_cast<size_t>(wide ? AuditSync::Wait64 : AuditSync::Wait)]++;
+				}
 				emit_barrier(pfp);
 				break;
 			}
@@ -3849,7 +3996,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				if (body_count < 6 || !DmaDataAllowed(bptr[0], bptr[5], m_gds)) {
 					r.unknown_detail = {bptr[0], body_count >= 6 ? bptr[5] : 0u};
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::DmaForm);
 				}
 				{
 					const uint32_t src_sel = (bptr[0] >> 29u) & 0x3u;
@@ -3891,6 +4038,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			case IT_WRITE_DATA:
+				if (m_audit && body_count >= 1) {
+					AuditWriteData(r.sync, bptr[0], body_count >= 3 && TraceUserDataWrite(bptr[0], bptr[1], bptr[2]));
+				}
 				// A debug marker's string (libSceAgc, to SQ_THREAD_TRACE_USERDATA_3): as written on the gfx ring, as
 				// its 0x342 tag; MEC stops on thread-trace registers, so a compute ring drops it.
 				if (body_count >= 3 && TraceUserDataWrite(bptr[0], bptr[1], bptr[2])) {
@@ -3906,8 +4056,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// Kyty is still reading the command buffer, and the game starts rewriting it (Dead
 				// Cells: a truncated packet in Kyty's parser on entering gameplay). Kyty performs the
 				// write itself, in order, so the native IB leaves it out.
-				if (body_count < 3 || !WriteDataToMemory(bptr[0])) {
-					return fail(op, dw);
+				if (body_count < 3) {
+					return fail(op, dw, RefuseWhy::ShortBody);
+				}
+				if (!WriteDataToMemory(bptr[0])) {
+					return fail(op, dw, RefuseWhy::WriteDataRegister);
 				}
 				{
 					const uint64_t dst = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
@@ -4026,7 +4179,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// older one (address low, flags with address bits 39:32), as Kyty's CpOpSetPredication
 				// tells them apart; the native IB always gets the gfx10 form.
 				if (body_count < 2) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				constexpr uint32_t kFlagsMask = 0x00071100u; // PRED_BOOL, HINT, PRED_OP
 				uint32_t           flags      = 0;
@@ -4048,7 +4201,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			case IT_INDEX_BASE: // the index buffer for draws that do not carry their own
 				if (body_count < 2) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
@@ -4076,7 +4229,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// translator does the firmware's part: DRAW_INDEX_2 at the offset's address, as Kyty's
 				// own command processor does.
 				if (body_count < 4) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				log_draw(op, bptr[2], 0, false);
 				if (skip_draw()) {
@@ -4118,7 +4271,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_DRAW_INDIRECT_MULTI:
 			case IT_DRAW_INDEX_INDIRECT_MULTI: {
 				if (body_count < 9) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				const uint64_t args = log_set_base + bptr[0];
 				log_draw(op, 0, args, false);
@@ -4182,7 +4335,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			case IT_SET_BASE: // BASE_INDEX, address: where indirect draw/dispatch arguments live
 				if (body_count < 3) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				if (m_compute_ring) {
@@ -4205,7 +4358,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// The guest packet already carries ADDR_LO, ADDR_HI, DISPATCH_INITIATOR. MEC reads
 					// that form; the gfx-ring SET_BASE rewrite would be the wrong engine.
 					if (body_count < 3) {
-						return fail(op, dw);
+						return fail(op, dw, RefuseWhy::ShortBody);
 					}
 					body.push_back(dcb[dw] | 2u);
 					body.insert(body.end(), dcb.begin() + dw + 1, dcb.begin() + dw + size);
@@ -4218,7 +4371,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						// DISPATCH_INITIATOR); the gfx ring reads DATA_OFFSET from a SET_BASE base instead,
 						// so set the base to that address and dispatch at offset 0, as RADV does.
 						if (body_count < 3) {
-							return fail(op, dw);
+							return fail(op, dw, RefuseWhy::ShortBody);
 						}
 						const uint64_t args = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
 						body.push_back(Pkt3(IT_SET_BASE, 3, true));
@@ -4267,6 +4420,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				collect_refs();
 				break;
 			case IT_ACQUIRE_MEM:
+				if (m_audit) {
+					AuditAcquire(r.sync, std::span<const uint32_t>(bptr, body_count));
+				}
 				if (m_acquire_full && !m_compute_queue) {
 					body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // FLUSH_AND_INV_CB_META, index 0
 					body.push_back(0x2eu);
@@ -4335,7 +4491,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// libSceAgc's around a context push or pop turns on register shadowing, which needs the kernel's
 				// shadow memory; the translator keeps the context in its shadow and sets its own preamble.
 				if (m_compute_ring) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::ContextControlOnMec);
 				}
 				break;
 			case IT_COND_EXEC: {
@@ -4345,7 +4501,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const uint32_t next = dw + size;
 				if (m_compute_ring || body_count < 4 || (bptr[3] & 0x3fffu) != 8u || next + 8u > dcb.size() ||
 				    dcb[next] != 0xc0064900u || ((dcb[next + 2] >> 24u) & 0x7u) != 4u || (dcb[next + 7] & 0x08000000u) == 0) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::CondExecForm);
 				}
 				stats.context_checks++;
 				dw += 8u; // the RELEASE_MEM
@@ -4354,7 +4510,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_ATOMIC_MEM:
 				// libSceAgc's flag swap around a context push or pop: as written on the gfx ring.
 				if (m_compute_ring || body_count != 8 || (bptr[0] & 0x7fu) != 0x67u) {
-					return fail(op, dw);
+					return fail(op, dw, RefuseWhy::AtomicForm);
 				}
 				if (direct) {
 					in_place = true;
@@ -4421,6 +4577,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				}
 				r.unknown_ops.insert(op);
+				note_refusal(op, dw, RefuseWhy::Unknown);
 				break;
 		}
 		// MecPlainOp: the title's header (no shader-type bit) where the packet is passed on.
@@ -4437,7 +4594,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		const bool same_seg = segs.size() == segs_before;
 		if (in_place && (!same_seg || body.size() != body_before)) {
-			return fail(op, dw); // a packet run in place has nothing of ours around it
+			return fail(op, dw, RefuseWhy::InPlace); // a packet run in place has nothing of ours around it
 		}
 		const bool same = in_place || (same_seg && body.size() - body_before == size &&
 		                               std::memcmp(body.data() + body_before, dcb.data() + dw, size * 4u) == 0);
@@ -4485,7 +4642,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		const uint32_t first_op = r.unknown_op;
 		const uint32_t first_dw = r.unknown_dw;
 		auto           unknown  = std::move(r.unknown_ops);
-		fail(first_op, first_dw);
+		fail(first_op, first_dw, RefuseWhy::Collected);
 		r.unknown_ops = std::move(unknown);
 		return r;
 	}

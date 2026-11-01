@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -3831,6 +3832,236 @@ void TestCpShadowCbInserts() {
 	}
 }
 
+// KYTY_NATIVE_GPU_AUDIT (SetAudit): the guest's sync packets field by field, from its own dwords.
+size_t Form(Libs::Graphics::NativeGpu::AuditSync s) {
+	return static_cast<size_t>(s);
+}
+
+void TestAuditSyncFields() {
+	using Libs::Graphics::NativeGpu::AuditSync;
+	Pm4Translator t;
+	t.SetAudit(true);
+	t.SetFenceAddress(kFenceVa);
+	static uint32_t label   = 1;
+	static uint64_t label64 = 1;
+	const uint64_t  a       = reinterpret_cast<uint64_t>(&label);
+	const uint64_t  a64     = reinterpret_cast<uint64_t>(&label64);
+	std::vector<uint32_t> dcb;
+	// WAIT_REG_MEM: EQUAL on memory by the PFP, CACHE_POLICY 1. WAIT_REG_MEM_64: GREATER_EQUAL, a reserved bit (12) set.
+	Append(dcb, 0x3Cu, {3u | (1u << 4u) | (1u << 8u) | (1u << 25u), static_cast<uint32_t>(a), static_cast<uint32_t>(a >> 32u), 1u, 0xffffffffu, 4u},
+	       false);
+	Append(dcb, 0x93u,
+	       {5u | (1u << 4u) | (1u << 12u), static_cast<uint32_t>(a64), static_cast<uint32_t>(a64 >> 32u), 1u, 0u, 0xffffffffu, 0u, 4u}, false);
+	// libSceAgc's RELEASE_MEM (BOTTOM_OF_PIPE_TS, end of pipe, GLM_WB, CACHE_POLICY 2, 32-bit data to L2) and Kyty's marker.
+	AppendGuestRelease(dcb, 1, 0, 0x202000300ull, 5, 1, 0x28u | (5u << 8u) | (1u << 12u) | (2u << 25u));
+	AppendReleaseMarker(dcb, 1, 0, 0x202000304ull, 6, 0);
+	// WRITE_DATA to memory with WR_CONFIRM and CACHE_POLICY 3, and a libSceAgc debug-marker string.
+	Append(dcb, IT_WRITE_DATA, {(5u << 8u) | (1u << 20u) | (3u << 25u), 0x02020400u, 0x2u, 7u}, false);
+	Append(dcb, IT_WRITE_DATA, {0u, 0xc343u, 0u, 0x41414141u}, false);
+	// ACQUIRE_MEM: the engine bit, GL2_INV and GL2_WB.
+	Append(dcb, IT_ACQUIRE_MEM, {1u << 31u, 0xffffffffu, 0xffu, 0u, 0u, 4u, (1u << 14u) | (1u << 15u)}, false);
+	const auto  r = t.Translate(dcb);
+	const auto& s = r.sync;
+	Check(r.ok && r.refusals.empty(), "the audited buffer translates");
+	Check(s.packets[Form(AuditSync::Wait)] == 1 && s.policy[Form(AuditSync::Wait)][1] == 1 && s.engine[Form(AuditSync::Wait)][1] == 1 &&
+	          s.wait_function[0][3] == 1 && s.wait_mem_space[0][1] == 1 && s.wait_operation[0][0] == 1 && s.odd[Form(AuditSync::Wait)] == 0,
+	      "WAIT_REG_MEM's fields");
+	Check(s.packets[Form(AuditSync::Wait64)] == 1 && s.wait_function[1][5] == 1 && s.odd[Form(AuditSync::Wait64)] == 1 &&
+	          s.odd_bits[Form(AuditSync::Wait64)] == (1u << 12u),
+	      "WAIT_REG_MEM_64's fields, the reserved bit reported");
+	Check(s.policy_lost[Form(AuditSync::Wait)] == 1 && s.policy_lost[Form(AuditSync::Wait64)] == 0,
+	      "the barrier a wait becomes drops its CACHE_POLICY");
+	Check(s.packets[Form(AuditSync::Release)] == 1 && s.policy[Form(AuditSync::Release)][2] == 1 && s.release_event[0][0x28] == 1 &&
+	          s.release_gcr[0][0] == 1 && s.release_dst_sel[0][1] == 1 && s.release_data_sel[0][1] == 1 && s.release_int_sel[0][0] == 1,
+	      "libSceAgc's RELEASE_MEM fields");
+	Check(s.packets[Form(AuditSync::ReleaseMarker)] == 1 && s.release_event[1][0x28] == 1 && s.policy[Form(AuditSync::ReleaseMarker)][0] == 1,
+	      "Kyty's marker counted apart");
+	Check(s.packets[Form(AuditSync::WriteData)] == 1 && s.write_markers == 1 && s.write_dst_sel[5] == 1 && s.write_confirm == 1 &&
+	          s.policy[Form(AuditSync::WriteData)][3] == 1,
+	      "WRITE_DATA's fields, debug-marker strings apart");
+	Check(s.packets[Form(AuditSync::Acquire)] == 1 && s.engine[Form(AuditSync::Acquire)][1] == 1 && s.acquire_gcr[14] == 1 &&
+	          s.acquire_gcr[15] == 1 && s.odd[Form(AuditSync::Acquire)] == 0,
+	      "ACQUIRE_MEM's engine and GCR bits");
+	// Summed as the backend does, into 64-bit counts.
+	Libs::Graphics::NativeGpu::SyncAuditT<uint64_t> sum;
+	sum.Add(s);
+	sum.Add(s);
+	Check(sum.packets[Form(AuditSync::Wait)] == 2 && sum.release_gcr[0][0] == 2 && sum.odd_bits[Form(AuditSync::Wait64)] == (1u << 12u),
+	      "sums add the counts and OR the bits");
+	Pm4Translator off;
+	off.SetFenceAddress(kFenceVa);
+	const auto ro = off.Translate(dcb);
+	Check(ro.ok && ro.sync.packets[Form(AuditSync::Wait)] == 0 && ro.sync.packets[Form(AuditSync::Release)] == 0,
+	      "without the audit nothing is recorded");
+}
+
+// policy_lost: the title asked a CACHE_POLICY, and the GPU runs a packet of the translator's instead of the title's.
+void TestAuditPolicyLost() {
+	using Libs::Graphics::NativeGpu::AuditSync;
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	t.SetAudit(true);
+	o.plan = LabelOracle::Plan::Native;
+	static uint32_t label = 0;
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(dcb, 0x3Cu, {3u | (1u << 4u) | (2u << 25u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0xffffffffu, 4u},
+	       false);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	const auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.waits_native == 1 && r.sync.policy_lost[Form(AuditSync::Wait)] == 1, "the wait in our form loses its policy");
+	t.SetWaitsVerbatim(true);
+	const auto rv = t.Translate(dcb);
+	Check(rv.ok && rv.stats.waits_native == 1 && rv.sync.policy_lost[Form(AuditSync::Wait)] == 0, "as written it keeps it");
+
+	// Releases in the guest's event keep it (CACHE_POLICY 3, libSceAgc's), the barrier's event (EVENT_INDEX 0, which
+	// LabelEventCntl does not keep) and an interrupt the tracker raises do not.
+	std::vector<uint32_t> rel;
+	AppendGuestRelease(rel, 1, 0, 0x202000300ull, 5, 1);
+	AppendGuestRelease(rel, 1, 0, 0x202000304ull, 5, 0, 0x06000014u);
+	AppendGuestRelease(rel, 0, 2, 0, 0);
+	AppendGuestRelease(rel, 1, 0, 0x202000308ull, 5);
+	const auto rr = t.Translate(rel);
+	Check(rr.ok && rr.sync.packets[Form(AuditSync::Release)] == 4 && rr.sync.policy[Form(AuditSync::Release)][3] == 4 &&
+	          rr.sync.policy_lost[Form(AuditSync::Release)] == 2,
+	      "two of four releases lose their policy");
+}
+
+// audit_waits: each wait a segment runs as a GPU wait or a barrier, with the first point after it.
+void TestAuditWaitsRecorded() {
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	t.SetAudit(true);
+	static uint32_t label = 0;
+	static uint32_t other = 0;
+	const uint64_t  a     = reinterpret_cast<uint64_t>(&label);
+	const uint64_t  b     = reinterpret_cast<uint64_t>(&other);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(dcb, 1, 2, a, 1, 5); // the GPU writes the label (a wake point), then an interrupt (another)
+	AppendWait(dcb, a, 1);                   // decided by that write: a GPU wait
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendWait(dcb, b, 3); // the oracle: met, a barrier
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	o.plan       = LabelOracle::Plan::Met;
+	const auto r = t.Translate(dcb);
+	Check(r.ok && r.segments.size() == 1 && r.segments[0].audit_waits.size() == 2 && r.segments[0].points.size() == 3,
+	      "both waits recorded in their segment");
+	const auto& w = r.segments[0].audit_waits;
+	const auto& p = r.segments[0].points;
+	Check(!w[0].barrier && w[0].local && !w[0].met && w[0].wait.addr == a && w[0].wait.ref == 1 && w[0].next_point == 2 &&
+	          p[0].kind == TrackerPoint::Kind::Wake && p[1].kind == TrackerPoint::Kind::Interrupt && p[0].dw == p[1].dw,
+	      "the GPU wait comes after the points flushed before it");
+	Check(w[1].barrier && !w[1].local && w[1].wait.addr == b && w[1].next_point == 2 && p[2].kind == TrackerPoint::Kind::End && p[2].dw > p[1].dw,
+	      "the barrier comes before the segment's end");
+	// A held wait is not among them: it is the next segment's.
+	o.plan        = LabelOracle::Plan::Split;
+	const auto rs = t.Translate(dcb);
+	Check(rs.ok && rs.segments.size() == 2 && rs.segments[1].held && rs.segments[0].audit_waits.size() == 1 && rs.segments[1].audit_waits.empty(),
+	      "the held wait is the segment's `wait`");
+}
+
+// refusals: what refused the buffer, each opcode and reason once.
+void TestAuditRefusalReasons() {
+	using Libs::Graphics::NativeGpu::RefuseWhy;
+	Pm4Translator t;
+	t.SetAudit(true);
+	t.SetFenceAddress(kFenceVa);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(dcb, 0x3Cu, {3u, 0x1234u, 0u, 1u, 0xffffffffu, 4u}, false); // MEM_SPACE 0: a register wait
+	const auto r = t.Translate(dcb);
+	Check(!r.ok && r.refusals.size() == 1 && r.refusals[0].why == RefuseWhy::RegisterWait && r.refusals[0].op == 0x3Cu &&
+	          r.refusals[0].dw == 5 && r.refusals[0].count == 1 && r.refusals[0].nd == 5 && r.refusals[0].d[0] == dcb[5] &&
+	          r.refusals[0].d[1] == 3u,
+	      "a register wait refuses the buffer with its reason and dwords");
+	// Soft refusals: each packet once, the end of the walk not again.
+	std::vector<uint32_t> soft;
+	Append(soft, 0xA1u, {0u}, false);
+	Append(soft, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(soft, 0xA1u, {1u}, false);
+	Append(soft, 0xB2u, {0u, 0u}, false);
+	const auto rs = t.Translate(soft);
+	Check(!rs.ok && rs.refusals.size() == 2 && rs.refusals[0].op == 0xA1u && rs.refusals[0].why == RefuseWhy::Unknown &&
+	          rs.refusals[0].count == 2 && rs.refusals[0].dw == 0 && rs.refusals[1].op == 0xB2u && rs.refusals[1].count == 1,
+	      "unknown opcodes once per packet");
+	Check(std::string(Libs::Graphics::NativeGpu::RefuseWhyName(RefuseWhy::RegisterWait)) == "register wait", "reasons have names");
+	// A GDS release without a partition is a soft refusal that names its packet now (the log said op 0x00 at dw 0).
+	Pm4Translator g;
+	TestOracle    o;
+	g.SetNativeLabels(&o, kTrackerVa);
+	g.SetAudit(true);
+	std::vector<uint32_t> gds;
+	Append(gds, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendReleaseMarker(gds, 5, 0, 0x1000u, 0, 0);
+	const auto rg = g.Translate(gds);
+	Check(!rg.ok && rg.unknown_op == IT_NOP && rg.unknown_dw == 5 && rg.refusals.size() == 1 && rg.refusals[0].why == RefuseWhy::ReleaseGds,
+	      "the GDS release names its packet");
+}
+
+// With the audit on, the GPU gets the same IB, segments and points, and the same buffers are refused.
+void TestAuditIbUnchanged() {
+	static uint32_t labels[4] = {0u, 1u, 0u, 0u};
+	const auto      at        = [](int i) { return reinterpret_cast<uint64_t>(&labels[i]); };
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x240u, 0x11u}, true);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendGuestRelease(dcb, 1, 0, at(0), 1);
+	AppendWait(dcb, at(0), 1); // local
+	AppendReleaseMarker(dcb, 1, 2, at(2), 7, 3);
+	Append(dcb, 0x3Cu, {3u | (1u << 4u) | (3u << 25u), static_cast<uint32_t>(at(1)), static_cast<uint32_t>(at(1) >> 32u), 1u, 0xffffffffu, 4u},
+	       false);
+	Append(dcb, IT_WRITE_DATA, {(5u << 8u) | (1u << 20u), static_cast<uint32_t>(at(3)), static_cast<uint32_t>(at(3) >> 32u), 9u}, false);
+	Append(dcb, IT_WRITE_DATA, {0u, 0xc343u, 0u, 0x41414141u}, false);
+	Append(dcb, IT_ACQUIRE_MEM, {0u, 0xffffffffu, 0xffu, 0u, 0u, 4u, 1u << 14u}, false);
+	Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+	AppendWait(dcb, at(2), 8); // the oracle decides
+	Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+	std::vector<uint32_t> refused = dcb;
+	Append(refused, 0xA1u, {0u}, false);
+	for (const auto plan: {LabelOracle::Plan::Native, LabelOracle::Plan::Met, LabelOracle::Plan::Split}) {
+		for (const bool compute: {false, true}) {
+			Pm4Translator on, off;
+			TestOracle    o_on, o_off;
+			const std::pair<Pm4Translator*, TestOracle*> both[2] = {{&on, &o_on}, {&off, &o_off}};
+			for (const auto& [t, o]: both) {
+				o->plan = plan;
+				t->SetNativeLabels(o, kTrackerVa);
+				t->SetFenceAddress(kFenceVa);
+				t->SetComputeQueue(compute);
+				t->SetComputeRing(compute);
+			}
+			on.SetAudit(true);
+			for (const auto* buffer: {&dcb, &refused, &dcb}) {
+				const auto a = on.Translate(*buffer);
+				const auto b = off.Translate(*buffer);
+				Check(a.ok == b.ok && a.ib == b.ib && a.cpu_tail == b.cpu_tail && a.segments.size() == b.segments.size() &&
+				          std::memcmp(&a.stats, &b.stats, sizeof(a.stats)) == 0,
+				      "the audit leaves the IB and the stats alone");
+				for (size_t k = 0; k < a.segments.size(); k++) {
+					const Pm4Segment& x = a.segments[k];
+					const Pm4Segment& y = b.segments[k];
+					bool              same = x.begin == y.begin && x.end == y.end && x.held == y.held && x.barrier_dw == y.barrier_dw &&
+					            x.barrier_len == y.barrier_len && x.wait_dw == y.wait_dw && x.wait_len == y.wait_len &&
+					            x.points.size() == y.points.size() && x.gpu_waits.size() == y.gpu_waits.size() && y.audit_waits.empty();
+					for (size_t i = 0; same && i < x.points.size(); i++) {
+						same = x.points[i].dw == y.points[i].dw && x.points[i].kind == y.points[i].kind;
+					}
+					Check(same, "and the segments and their points");
+				}
+				Check(b.refusals.empty() && (a.ok || !a.refusals.empty()), "refusals are recorded with the audit only");
+				Check(compute || buffer == &refused || (a.ok && (plan != LabelOracle::Plan::Split || a.segments.size() == 3)),
+				      "the gfx buffer translates (cut at both of its waits the oracle decides when it splits)");
+			}
+		}
+	}
+}
+
 int main() {
 	// The cases count the packets a DCB turns into; the preamble's start values (PIXEL_PIPE_STAT_CONTROL,
 	// the CP draw state) are board settings with their own switches, left out here.
@@ -3914,6 +4145,11 @@ int main() {
 	TestCpShadowPushPopCpu();
 	TestCpShadowPushPopGpu();
 	TestCpShadowCbInserts();
+	TestAuditSyncFields();
+	TestAuditPolicyLost();
+	TestAuditWaitsRecorded();
+	TestAuditRefusalReasons();
+	TestAuditIbUnchanged();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;
 }
