@@ -283,6 +283,7 @@ public:
 				}
 			}).detach();
 		}
+		m_gem->SetKfdQueuesUsed();
 		return true;
 	}
 	[[nodiscard]] volatile uint8_t* ScratchCpu() const {
@@ -464,6 +465,9 @@ public:
 				const double tf = NowSec();
 				const bool   ok = m_kfd_tlb_flush ? m_kfd_tlb_flush() : m_gem->FlushKfdTlb();
 				m_kfd_va_changes = changes;
+				if (ok) {
+					m_gem->ReleaseRetired(changes);
+				}
 				if (m_kfd_tlb_flushes++ < 8 || !ok) {
 					std::fprintf(stderr, "NativeSubmitter: KFD TLB flush after GEM_VA changes %s, %.1f ms\n", ok ? "done" : "FAILED",
 					             (NowSec() - tf) * 1e3);

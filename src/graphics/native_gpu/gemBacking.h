@@ -260,10 +260,14 @@ public:
 			const uint64_t start    = i * BlockSize();
 			self->m_blocks[i].size = (size - start < BlockSize()) ? size - start : BlockSize();
 		}
+		// The dummy is a block buffer too (always valid with map residency), so that its mappings, like the blocks',
+		// may go with explicit sync (VaExplicit) and submissions need not list it.
 		void* dummy_cpu = MAP_FAILED;
-		if (self->CreateBo(BlockSize(), &self->m_dummy)) {
-			dummy_cpu = ::mmap(nullptr, BlockSize(), PROT_READ | PROT_WRITE, MAP_SHARED,
-			                   self->m_dummy.dmabuf_fd, 0);
+		if (self->CreateBlockBo(BlockSize(), &self->m_dummy)) {
+			dummy_cpu = self->m_dummy.dmabuf_fd >= 0
+			                ? ::mmap(nullptr, BlockSize(), PROT_READ | PROT_WRITE, MAP_SHARED, self->m_dummy.dmabuf_fd, 0)
+			                : ::mmap(nullptr, BlockSize(), PROT_READ | PROT_WRITE, MAP_SHARED, self->m_drm_fd,
+			                         static_cast<off_t>(self->m_dummy.mmap_offset));
 		}
 		if (dummy_cpu == MAP_FAILED) {
 			std::fprintf(stderr, "GemBacking: dummy buffer setup failed\n");
@@ -298,6 +302,9 @@ public:
 			::munmap(m_dummy_cpu, BlockSize());
 		}
 		CloseBo(m_dummy);
+		for (auto& r: m_retired) {
+			CloseBo(r.second);
+		}
 		CloseBo(m_tlb_bo);
 		if (m_kfd_fd >= 0) {
 			::close(m_kfd_fd);
@@ -444,6 +451,14 @@ public:
 		std::lock_guard<std::mutex> lock(m_lock);
 		EraseViewsUnlocked(vaddr, size);
 		m_views_generation++;
+		// With explicit sync the unmap does not wait for this VM's jobs, so a job still running on the range must not
+		// fault (on this board a GPU VM fault halts the wave and the ring with it): the range goes PRT, which reads zeros
+		// and drops writes, the way a PRT aperture's holes behave, and the next mapping there replaces it.
+		if (m_va_explicit) {
+			const bool ok = VaOp(AMDGPU_VA_OP_REPLACE, 0, vaddr, 0, size, AMDGPU_VM_PAGE_PRT) == 0;
+			MarkVaStale();
+			return ok;
+		}
 		const bool ok = VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, size) == 0;
 		MarkVaStale();
 		MapPrtHolesUnlocked(vaddr, size);
@@ -775,12 +790,36 @@ public:
 	// The KFD process of this VM: with KYTY_NATIVE_GPU_KFD_MEMORY its blocks are KFD buffers, and KFD
 	// user-mode queues (KYTY_NATIVE_GPU_KFD_QUEUES) run in it. -1 / 0 when neither is on.
 	[[nodiscard]] int      KfdFd() const { return m_kfd_fd; }
+	// KFD queues run in this VM: buffers moved off are freed after a KFD TLB flush (ReleaseRetired).
+	void SetKfdQueuesUsed() { m_kfd_queues_used.store(true, std::memory_order_release); }
 
 	// How many times a GPU mapping the GPU may have cached was removed or replaced (FlushKfdTlb). A new
 	// mapping of an address nothing mapped needs no flush, and that is most of a title's mapping;
 	// counting every GEM_VA flushed (and with it preempted every KFD queue) all the time.
 	[[nodiscard]] uint64_t VaChanges() const { return m_va_changes.load(std::memory_order_acquire); }
 	void MarkVaStale() const { m_va_changes.fetch_add(1, std::memory_order_release); }
+
+	// A buffer whose GPU mappings moved elsewhere is freed only once KFD queues no longer translate to it. A CS job
+	// can not reach it (freeing an always-valid buffer syncs to every submission of the VM), but a KFD queue keeps its
+	// TLB entries until the next KFD TLB flush (FlushKfdTlb, the submitter's flush before a KFD submission), and with
+	// explicit-sync page-table updates nothing else delays the free: an ACB still running could write through them
+	// into freed pages. The submitter calls ReleaseRetired after each flush
+	// with the VaChanges it covered; without KFD queues the buffer is freed at once.
+	// It never waits for m_lock (held across a GEM_VA, which can wait for the GPU work this submission is part of, see
+	// CreatedHandles): a later flush frees what this one could not.
+	void ReleaseRetired(uint64_t flushed_changes) {
+		std::unique_lock<std::mutex> lock(m_lock, std::try_to_lock);
+		if (!lock.owns_lock()) {
+			return;
+		}
+		std::erase_if(m_retired, [&](auto& r) {
+			if (r.first > flushed_changes) {
+				return false;
+			}
+			CloseBo(r.second);
+			return true;
+		});
+	}
 
 	// KFD queues reach the VM through the KFD VMIDs' TLBs, which a render-node GEM_VA change does not
 	// flush: a CS flushes its own job's VMID, and nothing runs for a KFD queue (kfd_probe avremap: a
@@ -849,7 +888,9 @@ public:
 				handles.push_back(block.bo.handle);
 			}
 		}
-		handles.push_back(m_dummy.handle);
+		if (!m_dummy.always_valid) {
+			handles.push_back(m_dummy.handle);
+		}
 		for (const auto& [vaddr, ext]: m_external) {
 			if (ext.handle != 0) {
 				handles.push_back(ext.handle);
@@ -1030,6 +1071,28 @@ private:
 			Ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &d);
 			m_va_syncobj = 0;
 		}
+		InitVaExplicit();
+	}
+
+	// Every GEM_VA carries AMDGPU_VM_EXPLICIT_SYNC (KYTY_NATIVE_GPU_VA_EXPLICIT=0: none), as the PS5 kernel writes page
+	// tables without waiting for the GPU. Without it an unmap or a REPLACE (a promotion off the dummy, a view
+	// rebound) waits in the kernel for every CS job of this VM (EQ_OWNER), and the one SDMA entity runs page-table
+	// updates in order, so every update behind it waits too (50 ms and more under GT7's loads). The kernel honours
+	// it for a freed mapping only when its buffer is always valid or the mapping is PRT (amdgpu_vm.c,
+	// amdgpu_vm_update_ctx_add_freed_mapping): the blocks and the dummy are, external ranges stay implicit. Unmaps
+	// then leave PRT behind (UnbindView). Needs map residency (always-valid blocks); probed with a CLEAR.
+	void InitVaExplicit() {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_VA_EXPLICIT");
+		if ((v != nullptr && v[0] == '0') || !AlwaysValidWanted()) {
+			return;
+		}
+		m_va_explicit = true;
+		if (VaOp(AMDGPU_VA_OP_CLEAR, 0, kVaProbeAddress, 0, 0x1000) != 0) {
+			m_va_explicit = false;
+			std::fprintf(stderr, "GemBacking: this kernel takes no AMDGPU_VM_EXPLICIT_SYNC; page-table updates sync implicitly\n");
+			return;
+		}
+		std::fprintf(stderr, "GemBacking: page-table updates with explicit sync (KYTY_NATIVE_GPU_VA_EXPLICIT=0 turns it off); unmaps leave PRT\n");
 	}
 	// Waits for the page-table update of the last VaOp, up to `timeout_ms`. False on a timeout or an error.
 	bool WaitVaUpdates(int timeout_ms = 50) const {
@@ -1113,7 +1176,7 @@ private:
 		std::memset(&v, 0, sizeof(v));
 		v.handle       = handle;
 		v.operation    = op;
-		v.flags        = page_flags;
+		v.flags        = page_flags | (m_va_explicit ? kVmExplicitSync : 0u);
 		v.va_address   = vaddr;
 		v.offset_in_bo = offset_in_bo;
 		v.map_size     = size;
@@ -1383,6 +1446,14 @@ private:
 		return p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
 	}
 
+	void RetireBoUnlocked(Bo& bo) {
+		if (!m_kfd_queues_used.load(std::memory_order_acquire)) {
+			CloseBo(bo);
+			return;
+		}
+		m_retired.emplace_back(VaChanges(), bo);
+		bo = Bo {};
+	}
 	void CloseBo(Bo& bo) const {
 		if (bo.dmabuf_fd >= 0) {
 			::close(bo.dmabuf_fd);
@@ -1761,7 +1832,7 @@ private:
 		if (from_cpu != nullptr) {
 			MarkVaStale(); // the GPU mappings moved from a buffer the GPU used
 			::munmap(from_cpu, block.size);
-			CloseBo(block.bo);
+			RetireBoUnlocked(block.bo);
 			block.bo = bo;
 			std::fprintf(stderr, "GemBacking: block %llu moved to an exportable buffer\n", static_cast<unsigned long long>(index));
 			return true;
@@ -1996,6 +2067,8 @@ private:
 	};
 	mutable std::array<VaRecent, 64> m_va_recent {}; // the last VaOps, for the slow-wait log
 	static constexpr uint64_t     kVaProbeAddress = 0x6f0000000000ull; // InitVaTimeline's CLEAR, nothing maps it
+	static constexpr uint32_t     kVmExplicitSync = 1u << 10u;         // AMDGPU_VM_EXPLICIT_SYNC (Linux 6.11)
+	bool                          m_va_explicit   = false;             // InitVaExplicit
 	int                           m_mem_fd = -1;
 	int                           m_kfd_fd  = -1; // KYTY_NATIVE_GPU_KFD_MEMORY: see InitKfd
 	uint32_t                      m_kfd_gpu = 0;
@@ -2005,6 +2078,8 @@ private:
 	mutable std::mutex            m_handles_mutex;       // m_last_handles
 	mutable std::vector<uint32_t> m_last_handles;        // CreatedHandles' last list
 	mutable std::atomic<uint64_t> m_va_changes {0};      // VaOp calls (FlushKfdTlb)
+	std::vector<std::pair<uint64_t, Bo>> m_retired;         // (VaChanges when moved off, buffer): ReleaseRetired
+	std::atomic<bool>             m_kfd_queues_used {false}; // SetKfdQueuesUsed
 	mutable uint64_t              m_kfd_va_next = 0x600000000000ull; // private VAs of the KFD allocations
 	uint8_t*                      m_alias  = nullptr;
 	uint64_t                      m_size   = 0;
