@@ -2543,6 +2543,15 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		uint32_t    mtype;
 	} kinds[] = {{"default", 0}, {"nc", AMDGPU_VM_MTYPE_NC}, {"uc", AMDGPU_VM_MTYPE_UC}, {"wc", AMDGPU_VM_MTYPE_WC}, {"cc", AMDGPU_VM_MTYPE_CC}};
 	const char* only = getenv("LABELVIS_KIND"); // one mapping type per run: a wait that never sees the CPU stops the ring
+	// LABELVIS_RING=compute: the job on compute ring 0 (a stopped compute queue is reset without CP shadowing in the
+	// way). LABELVIS_WAIT_POLICY: WAIT_REG_MEM's CACHE_POLICY [26:25] (0 LRU, 1 STREAM, 2 NOA, 3 BYPASS) on the
+	// wait for the CPU's go word, which a GL2 line of an NC mapping keeps from the poll.
+	const char*    ring_name = getenv("LABELVIS_RING");
+	const bool     cs        = ring_name != NULL && strcmp(ring_name, "compute") == 0;
+	const uint32_t ip        = cs ? AMDGPU_HW_IP_COMPUTE : AMDGPU_HW_IP_GFX;
+	const char*    policy    = getenv("LABELVIS_WAIT_POLICY");
+	const uint32_t wait_pol  = policy != NULL ? ((uint32_t)strtoul(policy, NULL, 0) & 3u) << 25 : 0u;
+	printf("  %s ring, wait CACHE_POLICY %u\n", cs ? "compute" : "gfx", wait_pol >> 25);
 	for (size_t k = 0; k < ARRAY_SIZE(kinds); k++) {
 		if (only != NULL && strcmp(only, kinds[k].name) != 0) {
 			continue;
@@ -2567,7 +2576,7 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		// the label to L2 (DST_SEL 1), as libSceAgc writes them, instead of memory.
 		const char* ev  = getenv("LABELVIS_EVENT");
 		const char* dst = getenv("LABELVIS_DST");
-		IbPush(&ib, Pkt3Gfx(0x49u, 7)); // RELEASE_MEM
+		IbPush(&ib, cs ? Pkt3(0x49u, 7) : Pkt3Gfx(0x49u, 7)); // RELEASE_MEM
 		IbPush(&ib, ev != NULL ? (uint32_t)strtoul(ev, NULL, 0) : 0x28u | (5u << 8));
 		// LABELVIS_WIDE=1: a 64-bit label (DATA_SEL 2), its high dword 0x5eed0000 + kind.
 		const bool wide = getenv("LABELVIS_WIDE") != NULL;
@@ -2577,8 +2586,8 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		IbPush(&ib, 0x1abe1000u + (uint32_t)k);
 		IbPush(&ib, wide ? 0x5eed0000u + (uint32_t)k : 0u);
 		IbPush(&ib, 0);
-		IbPush(&ib, Pkt3Gfx(0x3cu, 6)); // WAIT_REG_MEM: memory, equal, ME
-		IbPush(&ib, 3u | (1u << 4));
+		IbPush(&ib, cs ? Pkt3(0x3cu, 6) : Pkt3Gfx(0x3cu, 6)); // WAIT_REG_MEM: memory, equal, ME
+		IbPush(&ib, 3u | (1u << 4) | wait_pol);
 		IbPush(&ib, (uint32_t)(mem.va + 64));
 		IbPush(&ib, (uint32_t)((mem.va + 64) >> 32));
 		IbPush(&ib, 1u);
@@ -2586,15 +2595,20 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		IbPush(&ib, 4u);
 		IbPad(&ib);
 		uint64_t seq = 0;
-		r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+		r            = SubmitOn(d, ip, 0, &c->ib, &ib, bos, 1, &seq);
 		if (r != 0) {
 			printf("  %-7s: submit failed: %s\n", kinds[k].name, ErrStr(r));
 			BoDestroy(d, &mem);
 			continue;
 		}
-		const double t0   = NowSec();
-		double       seen = -1;
-		while (NowSec() - t0 < 0.05) {
+		// LABELVIS_SEEN_MS (default 50): how long the CPU looks for the label before it writes the go word. After a
+		// boot whose SDMA interrupts run on the fallback timer the job can start late, and a go written before the
+		// wait polls is no test of what the poll sees.
+		const char*  seen_ms = getenv("LABELVIS_SEEN_MS");
+		const double limit   = seen_ms != NULL ? strtod(seen_ms, NULL) / 1000.0 : 0.05;
+		const double t0      = NowSec();
+		double       seen    = -1;
+		while (NowSec() - t0 < limit) {
 			if (m[0] == 0x1abe1000u + (uint32_t)k) {
 				seen = NowSec() - t0;
 				break;
@@ -2602,13 +2616,16 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		}
 		m[16] = 1;
 		__sync_synchronize();
-		int     w  = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0);
-		int64_t st = ContextState(d);
+		const double t_go = NowSec();
+		int          w    = WaitOn(d, ip, 0, seq, 1.0);
+		const double t_done = NowSec() - t_go;
+		int64_t      st     = ContextState(d);
 		if (seen >= 0) {
-			printf("  %-7s: label seen by the CPU after %.1f us (job %s), dwords 0x%08x 0x%08x\n", kinds[k].name, seen * 1e6,
-			       w == 1 ? "TIMEOUT" : ErrStr(w), m[0], m[1]);
+			printf("  %-7s: label seen by the CPU after %.1f us; the CPU's go seen, job done %.2f ms after it (job %s), dwords "
+			       "0x%08x 0x%08x\n",
+			       kinds[k].name, seen * 1e6, t_done * 1e3, w == 1 ? "TIMEOUT" : ErrStr(w), m[0], m[1]);
 		} else {
-			printf("  %-7s: label NOT seen in 50 ms (job %s, after the fence 0x%08x)\n", kinds[k].name,
+			printf("  %-7s: label NOT seen in %.0f ms (job %s, after the fence 0x%08x)\n", kinds[k].name, limit * 1e3,
 			       w == 1 ? "TIMEOUT" : ErrStr(w), m[0]);
 		}
 		if (w != 0 || st != 0) {

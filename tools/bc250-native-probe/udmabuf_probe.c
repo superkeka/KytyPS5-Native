@@ -5,7 +5,8 @@
 // Result on the BC-250 (2026-10-23): import and GPU->CPU work, and a CS with 64 imported blocks
 // listed costs 0.056 ms, but the GPU does not snoop the CPU cache on these pages: a CPU write still
 // in a dirty cache line is invisible to the GPU (correct only after clflush). Imported foreign
-// dma-bufs are not usable as coherent guest memory; amdgpu's own GTT buffers are.
+// dma-bufs are not usable as coherent guest memory; amdgpu's own GTT buffers are. The same on the stock
+// 7.2.7 kernel (2026-11-01, three runs): the GPU copied the stale value of a CPU write until clflush.
 // An earlier version also mapped unused blocks AMDGPU_VM_PAGE_PRT: a GPU access there hung the job
 // and took the board down. Do not use PRT on this board.
 // Build: cc -O2 -o udmabuf_probe udmabuf_probe.c (amdgpu uAPI headers). /dev/udmabuf must be openable.
