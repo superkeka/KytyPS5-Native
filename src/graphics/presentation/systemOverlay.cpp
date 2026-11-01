@@ -1427,15 +1427,17 @@ struct SystemOverlay::Impl {
 		                                   ImGuiWindowFlags_NoSavedSettings |
 		                                   ImGuiWindowFlags_AlwaysAutoResize;
 		const bool                 signin = snapshot.kind == SystemDialog::Kind::Signin;
+		const bool                 notice = snapshot.kind == SystemDialog::Kind::Notice;
 		ImGui::Begin("##SystemDialog", nullptr, flags);
-		ImGui::TextUnformatted(signin ? "Sign in to PlayStation Network" : "Error");
+		ImGui::TextUnformatted(notice ? snapshot.title.c_str() : signin ? "Sign in to PlayStation Network" : "Error");
 		ImGui::Separator();
 		const auto error_code = static_cast<uint32_t>(snapshot.error_code);
-		ImGui::TextWrapped("%s", signin ? "PlayStation Network sign-in is unavailable."
+		ImGui::TextWrapped("%s", notice ? snapshot.text.c_str()
+		                         : signin ? "PlayStation Network sign-in is unavailable."
 		                         : error_code == 0x80550006u
 		                             ? "You are not signed in to PlayStation Network."
 		                             : "An error has occurred.");
-		if (!signin) {
+		if (!signin && !notice) {
 			ImGui::TextDisabled("Error code: 0x%08X", error_code);
 		}
 		const float button_width = std::min(140.0f * scale, ImGui::GetContentRegionAvail().x);

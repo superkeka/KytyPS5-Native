@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <string>
+
 namespace Libs::Dialog {
 
 namespace CommonDialog {
@@ -70,12 +72,14 @@ int KYTY_SYSV_ABI MsgDialogProgressBarSetMsg(int target, const char* msg);
 
 namespace SystemDialog {
 
-enum class Kind { Error, Signin };
+enum class Kind { Error, Signin, Notice };
 
 struct HostSnapshot {
-	Kind     kind;
-	uint64_t generation;
-	int32_t  error_code;
+	Kind        kind;
+	uint64_t    generation;
+	int32_t     error_code;
+	std::string title; // Notice
+	std::string text;
 };
 
 struct VisualState {
@@ -88,6 +92,8 @@ bool        GetHostSnapshot(HostSnapshot* snapshot);
 VisualState GetVisualState() noexcept;
 void        SetVisibilityCallback(void (*callback)());
 bool        HostClose(uint64_t generation);
+// Kyty's own message in the same dialog (an OK box), not the title's: queued, shown when no dialog of the title is.
+void        HostNotice(std::string title, std::string text);
 
 } // namespace SystemDialog
 

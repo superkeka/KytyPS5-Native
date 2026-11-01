@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/native_gpu/gemBacking.h"
+#include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
@@ -2576,8 +2577,15 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	if (auto* gem = GetGemBacking(); gem != nullptr) {
 		gem->SetMemoryType(addr, len, memory_type);
 		// PS5 residency: direct memory is the GPU's from its allocation (KYTY_NATIVE_GPU_RESIDENCY=alloc).
-		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc()) {
-			gem->PromoteBackingAtAlloc(addr, len);
+		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc() && !gem->PromoteBackingAtAlloc(addr, len) &&
+		    gem->AllocFailed()) {
+			static std::atomic<bool> told {false};
+			if (!told.exchange(true)) {
+				Libs::Dialog::SystemDialog::HostNotice(
+				    "Not enough memory",
+				    "The game's memory could not be reserved: expect stutter and lower performance.\n"
+				    "Close other apps and launch the game without --keep-steam.");
+			}
 		}
 	}
 #endif

@@ -1,4 +1,5 @@
 #include "graphics/native_gpu/nativeShadow.h"
+#include "libs/dialog.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -34,7 +35,7 @@ std::string ReadLine(const std::string& path) {
 
 // One line on what the system gives the native backend, so a log shows the mode a game ran in: the
 // kernel, CPUs, the BIOS VRAM split, GTT and the amdgpu queue settings (README, Requirements).
-void PrintSystem(const std::string& device_dir) {
+bool PrintSystem(const std::string& device_dir) {
 	auto mib = [&](const char* name) { return std::strtoull(ReadLine(device_dir + name).c_str(), nullptr, 10) >> 20u; };
 	auto param = [](const char* name) {
 		std::string v = ReadLine(std::string("/sys/module/amdgpu/parameters/") + name);
@@ -55,6 +56,7 @@ void PrintSystem(const std::string& device_dir) {
 	             std::strtoull(ReadLine("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq").c_str(), nullptr, 10) / 1000,
 	             mib("mem_info_vram_total"), gtt, sched.c_str(), vm.c_str(), cwsr.c_str(), patched ? "patched" : "stock",
 	             recommended ? "recommended" : "NOT the recommended one");
+	return recommended;
 }
 #endif
 
@@ -71,7 +73,12 @@ void ApplyNativeDefaults() {
 		if (std::strtoul(ReadLine(dir + "vendor").c_str(), nullptr, 16) != 0x1002u || (device != 0x13feu && device != 0x13dau)) {
 			continue;
 		}
-		PrintSystem(dir);
+		if (!PrintSystem(dir)) {
+			Libs::Dialog::SystemDialog::HostNotice(
+			    "System settings not recommended",
+			    "The kernel's amdgpu options or GTT size differ from the recommended ones: expect lower performance "
+			    "or hangs.\nApply the recommended settings from the README (Requirements) and reboot.");
+		}
 		const char* name = device == 0x13feu ? "BC-250" : "PS5";
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU"); v != nullptr && v[0] == '0') {
 			std::fprintf(stderr, "native GPU: %s (1002:%04x), native mode off (KYTY_NATIVE_GPU=0)\n", name, device);

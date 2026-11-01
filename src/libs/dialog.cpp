@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <mutex>
 
 // NOLINTNEXTLINE(modernize-concat-nested-namespaces)
@@ -27,6 +28,8 @@ struct DialogState {
 std::mutex  g_dialog_mutex;
 DialogState g_error;
 DialogState g_signin;
+DialogState g_notice; // HostNotice: running while one is shown
+std::deque<std::pair<std::string, std::string>> g_notices;
 uint64_t    g_dialog_generation        = 0;
 uint64_t    g_dialog_revision          = 0;
 int32_t     g_error_code               = 0;
@@ -63,13 +66,26 @@ bool GetHostSnapshot(HostSnapshot* snapshot) {
 		*snapshot = {Kind::Error, g_error.generation, g_error_code};
 		return true;
 	}
+	if (g_notice.status == DIALOG_STATUS_RUNNING && !g_notices.empty()) {
+		*snapshot = {Kind::Notice, g_notice.generation, 0, g_notices.front().first, g_notices.front().second};
+		return true;
+	}
 	return false;
 }
 
 VisualState GetVisualState() noexcept {
 	std::scoped_lock lock(g_dialog_mutex);
 	const bool       signin = g_signin.status == DIALOG_STATUS_RUNNING;
-	return {g_error.status == DIALOG_STATUS_RUNNING || signin, signin, g_dialog_revision};
+	return {g_error.status == DIALOG_STATUS_RUNNING || signin || g_notice.status == DIALOG_STATUS_RUNNING, signin,
+	        g_dialog_revision};
+}
+
+void HostNotice(std::string title, std::string text) {
+	std::unique_lock lock(g_dialog_mutex);
+	g_notices.emplace_back(std::move(title), std::move(text));
+	if (g_notice.status != DIALOG_STATUS_RUNNING) {
+		SetDialogStatus(g_notice, DIALOG_STATUS_RUNNING, lock);
+	}
 }
 
 void SetVisibilityCallback(void (*callback)()) {
@@ -79,7 +95,18 @@ void SetVisibilityCallback(void (*callback)()) {
 
 bool HostClose(uint64_t generation) {
 	std::unique_lock lock(g_dialog_mutex);
-	auto&            dialog = g_signin.status == DIALOG_STATUS_RUNNING ? g_signin : g_error;
+	if (g_signin.status != DIALOG_STATUS_RUNNING && g_error.status != DIALOG_STATUS_RUNNING &&
+	    g_notice.status == DIALOG_STATUS_RUNNING && generation == g_notice.generation) {
+		// The next queued notice gets a generation of its own.
+		g_notices.pop_front();
+		SetDialogStatus(g_notice, DIALOG_STATUS_FINISHED, lock);
+		lock.lock();
+		if (!g_notices.empty()) {
+			SetDialogStatus(g_notice, DIALOG_STATUS_RUNNING, lock);
+		}
+		return true;
+	}
+	auto& dialog = g_signin.status == DIALOG_STATUS_RUNNING ? g_signin : g_error;
 	if (dialog.status != DIALOG_STATUS_RUNNING || generation != dialog.generation) {
 		return false;
 	}

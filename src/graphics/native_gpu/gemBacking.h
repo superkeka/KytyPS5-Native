@@ -165,6 +165,9 @@ public:
 		return on;
 	}
 
+	// True once PromoteBackingAtAlloc ran out of RAM: the game no longer runs in the PS5 mode.
+	[[nodiscard]] bool AllocFailed() const { return m_alloc_failed.load(std::memory_order_acquire); }
+
 	// True while every block with GPU access was made resident at map time.
 	[[nodiscard]] bool MapComplete() const { return ResidencyAtMap() && !m_map_overflow.load(std::memory_order_acquire); }
 
