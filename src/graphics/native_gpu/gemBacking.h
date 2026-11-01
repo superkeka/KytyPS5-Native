@@ -342,6 +342,9 @@ public:
 				CloseBo(block.bo);
 			}
 		}
+		for (auto& [start, carve]: m_carves) {
+			CloseBo(carve.bo);
+		}
 		if (m_dummy_cpu != nullptr) {
 			::munmap(m_dummy_cpu, BlockSize());
 		}
@@ -391,24 +394,24 @@ public:
 
 	// Maps the backing bytes [offset, offset + size) at guest address `vaddr` with protection
 	// `prot` (PROT_* flags): the memfd for blocks that are not resident, the block's dma-buf for
-	// resident ones. On success the region is mapped at exactly `vaddr` and recorded as a view, so a
-	// later promotion of its blocks can move it.
+	// resident ones, the carve for a display buffer's bytes. On success the region is mapped at exactly
+	// `vaddr` and recorded as a view, so a later promotion of its blocks can move it.
 	bool MapView(uint64_t vaddr, uint64_t size, uint64_t offset, int prot) {
 		if (size == 0 || !EnsureRange(offset, size)) {
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
-		bool ok = ForEachBlockPiece(offset, size, [&](uint64_t index, uint64_t inner, uint64_t done, uint64_t part) {
-			const Block& block = m_blocks[index];
-			void* const  dst   = reinterpret_cast<void*>(vaddr + done);
-			const bool   mapped =
-			    block.resident ? MapBoPiece(block.bo, block.size, inner, part, prot, dst)
-			                   : ::mmap(dst, part, prot, MAP_SHARED | MAP_FIXED, m_mem_fd, static_cast<off_t>(offset + done)) == dst;
+		bool ok = ForEachBackingPiece(offset, size,
+		                              [&](const Bo& bo, uint64_t bo_size, uint64_t inner, bool resident, bool carved, uint64_t done, uint64_t part) {
+			void* const dst = reinterpret_cast<void*>(vaddr + done);
+			const bool  mapped =
+			    resident ? MapBoPiece(bo, bo_size, inner, part, prot, dst)
+			             : ::mmap(dst, part, prot, MAP_SHARED | MAP_FIXED, m_mem_fd, static_cast<off_t>(offset + done)) == dst;
 			if (!mapped) {
-				std::fprintf(stderr, "GemBacking: view mmap at 0x%llx (+0x%llx, block %llu) failed: %s\n",
-				             static_cast<unsigned long long>(vaddr + done),
-				             static_cast<unsigned long long>(part), static_cast<unsigned long long>(index),
-				             std::strerror(errno));
+				std::fprintf(stderr, "GemBacking: view mmap at 0x%llx (+0x%llx, %s %llu) failed: %s\n",
+				             static_cast<unsigned long long>(vaddr + done), static_cast<unsigned long long>(part),
+				             carved ? "carve of display buffer bytes at" : "block",
+				             static_cast<unsigned long long>(carved ? offset + done - inner : (offset + done) / BlockSize()), std::strerror(errno));
 				return false;
 			}
 			return true;
@@ -423,17 +426,21 @@ public:
 
 	// Maps backing bytes [offset, offset + size) into this device's GPU VM at `vaddr`, the same
 	// address the CPU view uses, so guest pointers are valid on the GPU unchanged: resident blocks
-	// map their buffer, the others the dummy. REPLACE drops whatever was mapped there before. All
-	// guest memory is mapped readable, writable and executable (shaders live in guest memory).
+	// map their buffer, the others the dummy, a display buffer's bytes their carve (plain page flags, as
+	// CarveGuestRange maps them). REPLACE drops whatever was mapped there before. All guest memory is
+	// mapped readable, writable and executable (shaders live in guest memory).
 	bool BindView(uint64_t vaddr, uint64_t size, uint64_t offset) {
 		if (size == 0 || !EnsureRange(offset, size)) {
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
 		VaSync                      va_sync(*this, !InPrtApertureUnlocked(vaddr, size));
-		const bool ok = ForEachBlockPiece(offset, size, [&](uint64_t index, uint64_t inner, uint64_t done, uint64_t part) {
-			const uint32_t handle = m_blocks[index].resident ? m_blocks[index].bo.handle : m_dummy.handle;
-			return VaReplace(handle, vaddr + done, inner, offset + done, part) == 0;
+		const bool ok = ForEachBackingPiece(offset, size,
+		                                    [&](const Bo& bo, uint64_t, uint64_t inner, bool resident, bool carved, uint64_t done, uint64_t part) {
+			if (carved) {
+				return VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, vaddr + done, inner, part) == 0;
+			}
+			return VaReplace(resident ? bo.handle : m_dummy.handle, vaddr + done, inner, offset + done, part) == 0;
 		});
 		auto it = m_views.find(vaddr);
 		if (it != m_views.end() && it->second.size == size && it->second.offset == offset) {
@@ -560,10 +567,11 @@ public:
 		return promoted;
 	}
 
-	// [vaddr, vaddr + size) as pieces of resident block buffers, in guest order, for consumers that
-	// import the buffers' dma-bufs (zero-copy presentation). False unless every byte is resident.
+	// [vaddr, vaddr + size) as pieces of resident buffers, in guest order, for consumers that import the
+	// buffers' dma-bufs (zero-copy presentation). Consecutive bytes of one buffer are one piece, so a
+	// carved display buffer is a single piece of its VRAM buffer. False unless every byte is resident.
 	struct DmabufPiece {
-		int      fd;        // the block buffer's dma-buf
+		int      fd;        // the buffer's dma-buf
 		uint64_t bo_size;   // its size
 		uint64_t bo_offset; // where the piece starts in it
 		uint64_t len;
@@ -579,21 +587,19 @@ public:
 				ok = false;
 				return;
 			}
-			while (len > 0) {
-				const uint64_t index = backing / BlockSize();
-				const uint64_t inner = backing % BlockSize();
-				const Block&   block = m_blocks[index];
-				const uint64_t piece = std::min(len, block.size - inner);
-				if (!block.resident || block.bo.dmabuf_fd < 0) {
-					ok = false;
-					return;
+			ok = ForEachBackingPiece(backing, len, [&](const Bo& bo, uint64_t bo_size, uint64_t inner, bool resident, bool, uint64_t, uint64_t part) {
+				if (!resident || bo.dmabuf_fd < 0) {
+					return false;
 				}
-				out.push_back(DmabufPiece {block.bo.dmabuf_fd, block.size, inner, piece});
-				backing += piece;
-				len -= piece;
-				covered += piece;
-				next += piece;
-			}
+				if (!out.empty() && out.back().fd == bo.dmabuf_fd && out.back().bo_offset + out.back().len == inner) {
+					out.back().len += part;
+				} else {
+					out.push_back(DmabufPiece {bo.dmabuf_fd, bo_size, inner, part});
+				}
+				covered += part;
+				next += part;
+				return true;
+			});
 		});
 		return ok && covered == size;
 	}
@@ -618,18 +624,21 @@ public:
 	// the always-valid blocks behind guest addresses [vaddr, vaddr + size) move to ordinary buffers
 	// (data copied, views and GPU mappings moved over), listed in every submission again. `idle` runs
 	// first, without the lock, if any block has to move: the old buffers are freed, so it must leave
-	// the GPU idle. Returns how many blocks moved.
+	// the GPU idle. Returns how many blocks moved. Carved bytes (CarveGuestRange) are exported already
+	// and move nothing: a range wholly carved returns 0 without `idle`.
 	template <typename Idle>
 	uint32_t ExportGuestRange(uint64_t vaddr, uint64_t size, Idle&& idle) {
 		std::vector<uint64_t> indices;
 		{
 			std::lock_guard<std::mutex> lock(m_lock);
 			ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t, uint64_t backing, uint64_t len) {
-				for (uint64_t index = backing / BlockSize(); index <= (backing + len - 1) / BlockSize(); index++) {
-					if (m_blocks[index].resident && m_blocks[index].bo.always_valid) {
-						indices.push_back(index);
+				ForEachUncarvedUnlocked(backing, len, [&](uint64_t start, uint64_t part) {
+					for (uint64_t index = start / BlockSize(); index <= (start + part - 1) / BlockSize(); index++) {
+						if (m_blocks[index].resident && m_blocks[index].bo.always_valid) {
+							indices.push_back(index);
+						}
 					}
-				}
+				});
 			});
 		}
 		if (indices.empty()) {
@@ -911,7 +920,8 @@ public:
 	}
 
 	// Every GEM buffer a submission must list as resident: the resident blocks (unless always valid),
-	// the dummy and the external ranges. Grows as blocks are promoted.
+	// the dummy, the external ranges and the carves (never always valid: an always-valid buffer cannot be
+	// exported for the display, so each submission validates them). Grows as blocks are promoted.
 	// While another thread holds m_lock (a GEM_VA can wait in the kernel for the GPU work that maps
 	// the old range, and that work may be waiting for the very submission asking here: My First Gran
 	// Turismo deadlocked so), the last list is returned. A block promoted meanwhile is listed by the
@@ -926,7 +936,7 @@ public:
 			lock.lock();
 		}
 		std::vector<uint32_t> handles;
-		handles.reserve(m_blocks.size() + m_external.size() + 1);
+		handles.reserve(m_blocks.size() + m_external.size() + m_carves.size() + 1);
 		for (const auto& block: m_blocks) {
 			if (block.resident && !block.bo.always_valid) {
 				handles.push_back(block.bo.handle);
@@ -934,6 +944,9 @@ public:
 		}
 		if (!m_dummy.always_valid) {
 			handles.push_back(m_dummy.handle);
+		}
+		for (const auto& [start, carve]: m_carves) {
+			handles.push_back(carve.bo.handle);
 		}
 		for (const auto& [vaddr, ext]: m_external) {
 			if (ext.handle != 0) {
@@ -947,14 +960,24 @@ public:
 		return handles;
 	}
 
-	// Looks up the GEM buffer backing `offset`. Returns false if `offset` is out of range or its
+	// Looks up the GEM buffer backing `offset` and where `offset` lies in it: the carve holding it
+	// (CarveGuestRange), else its block's buffer. Returns false if `offset` is out of range or its
 	// block is not resident.
 	bool Lookup(uint64_t offset, uint32_t* handle, uint64_t* offset_in_block) const {
 		if (offset >= m_size) {
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
-		const uint64_t              index = offset / BlockSize();
+		if (const auto c = FindCarveUnlocked(offset); c != m_carves.end()) {
+			if (handle != nullptr) {
+				*handle = c->second.bo.handle;
+			}
+			if (offset_in_block != nullptr) {
+				*offset_in_block = offset - c->first;
+			}
+			return true;
+		}
+		const uint64_t index = offset / BlockSize();
 		if (!m_blocks[index].resident) {
 			return false;
 		}
@@ -965,6 +988,208 @@ public:
 			*offset_in_block = offset - index * BlockSize();
 		}
 		return true;
+	}
+
+	// Display buffers as scan-out buffers (KYTY_DIRECT_PRESENT, see nativeShadow.h). On the PS5 a display
+	// buffer is ordinary GPU memory that the display engine reads where the title rendered it, so a flip
+	// moves no pixels. Here the display is gamescope and, through it, a DCN plane, which take a client
+	// buffer for scan-out only as one dma-buf in contiguous VRAM: without amdgpu.sg_display, which stays as
+	// the system has it, the display pins scan-out buffers in VRAM, and the GTT blocks are neither one
+	// buffer nor VRAM. So at registration the backing of a display buffer moves into a VRAM buffer of its
+	// own, a carve, mapped at the same guest addresses for the CPU and the GPU.
+	struct CarveInfo {
+		int      dmabuf_fd = -1; // owned by GemBacking, valid while the backing lives; consumers dup() it
+		uint32_t handle    = 0;  // in DrmFd()
+		uint64_t bo_size   = 0;
+		uint64_t bo_offset = 0;  // where `vaddr` starts in the buffer (0 for an exact carve)
+	};
+
+	// Moves the backing behind guest [vaddr, vaddr + size) into one VRAM scan-out buffer: every CPU
+	// mapping of those backing bytes (all views, the alias slot) and every GPU mapping (views mapped for
+	// the GPU) follows, at the same addresses. The block buffers under it stay as they are, so nothing is
+	// freed and nothing waits for the GPU. A range already inside a carve returns that carve (bo_offset
+	// is the range's offset inside it) and marks it registered again. False, and nothing changed, when
+	// the range is not one contiguous range of the backing, a view of it is executable, it overlaps a
+	// carve only partly, the budget refuses (KYTY_DIRECT_PRESENT_VRAM_MIB, default 160: the carves
+	// together, no more) or a step before the move fails. Blocks for the copy (a few ms for 32 MiB) and
+	// for the page-table updates (VaSync, at most 50 ms); takes m_lock.
+	// GPU writes to the range between the copy and the GPU remap still go to the old block buffer and
+	// are lost: registration comes before a buffer is first rendered, as on the PS5, and the old buffer
+	// stays valid, so nothing faults.
+	bool CarveGuestRange(uint64_t vaddr, uint64_t size, CarveInfo* out) {
+		if (size == 0 || out == nullptr) {
+			return false;
+		}
+		if (((vaddr | size) & (kCarvePage - 1)) != 0) {
+			std::fprintf(stderr, "GemBacking: display buffer 0x%llx (+0x%llx) not carved: not page aligned\n",
+			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+			return false;
+		}
+		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
+		uint64_t                    b = 0;
+		if (!ResolveContiguousUnlocked(vaddr, size, &b)) {
+			std::fprintf(stderr, "GemBacking: display buffer 0x%llx (+0x%llx) not carved: not one contiguous range of direct memory\n",
+			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+			return false;
+		}
+		if (const auto c = FindCarveUnlocked(b); c != m_carves.end() && b + size <= c->first + c->second.size) {
+			c->second.registered = true;
+			*out                 = CarveInfo {c->second.bo.dmabuf_fd, c->second.bo.handle, c->second.size, b - c->first};
+			return true;
+		}
+		if (CarveOverlapsUnlocked(b, size)) {
+			std::fprintf(stderr, "GemBacking: display buffer 0x%llx (+0x%llx) not carved: it overlaps another display buffer's carve in part\n",
+			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+			return false;
+		}
+		// The data is copied from the block buffers, so every block under the range must be one. With
+		// residency at allocation (the default) they all are already.
+		for (uint64_t index = b / BlockSize(); index <= (b + size - 1) / BlockSize(); index++) {
+			if (m_blocks[index].code || (!m_blocks[index].resident && !PromoteBlockUnlocked(index))) {
+				std::fprintf(stderr, "GemBacking: display buffer 0x%llx (+0x%llx) not carved: block %llu %s\n",
+				             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+				             static_cast<unsigned long long>(index), m_blocks[index].code ? "holds executable views" : "could not be made resident");
+				return false;
+			}
+		}
+		if (m_carved_bytes + size > CarveBudget()) {
+			std::fprintf(stderr, "GemBacking: display buffer 0x%llx (+%llu MiB) not carved: %llu MiB carved already, budget %llu MiB "
+			                     "(KYTY_DIRECT_PRESENT_VRAM_MIB)\n",
+			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size >> 20u),
+			             static_cast<unsigned long long>(m_carved_bytes >> 20u), static_cast<unsigned long long>(CarveBudget() >> 20u));
+			return false;
+		}
+		Bo bo;
+		if (!CreateScanoutBo(size, &bo)) {
+			return false;
+		}
+		// Sources: the block buffers, each mapped whole (cached GTT). Destination: the carve through its
+		// dma-buf (VRAM through the BAR, write-combined). Kept in a heap job, see MoveBlock.
+		auto job     = std::make_unique<MoveJob>();
+		job->size    = size;
+		job->bo      = &bo;
+		job->bo_size = size;
+		job->bo_cpu  = MapBoWhole(bo, size);
+		std::vector<std::pair<uint8_t*, uint64_t>> sources; // (mapping, size), unmapped at the end
+		bool                                       ok = job->bo_cpu != nullptr;
+		for (uint64_t done = 0; ok && done < size;) {
+			const uint64_t at    = b + done;
+			const uint64_t index = at / BlockSize();
+			const uint64_t inner = at - index * BlockSize();
+			const uint64_t part  = std::min(size - done, m_blocks[index].size - inner);
+			uint8_t* const from  = MapBoWhole(m_blocks[index].bo, m_blocks[index].size);
+			if (from == nullptr) {
+				ok = false;
+				break;
+			}
+			sources.emplace_back(from, m_blocks[index].size);
+			job->copies.push_back(CopySrc {from + inner, part, done});
+			done += part;
+		}
+		// Every CPU mapping of the backing range: the alias slot, then each view piece split at protection
+		// boundaries, as PromoteBlockUnlocked does. Offsets are from `b`, the carve's first byte.
+		std::vector<std::pair<uint64_t, uint64_t>> gpu_pieces; // (guest address, offset in the carve)
+		std::vector<uint64_t>                      gpu_lengths;
+		bool                                       executable = false;
+		if (ok) {
+			job->pieces.push_back(MovePiece {reinterpret_cast<uint64_t>(m_alias + b), size, PROT_READ | PROT_WRITE, 0});
+			std::optional<HostMaps> maps;
+			for (const auto& [view_addr, view]: m_views) {
+				const uint64_t vs = std::max(view.offset, b);
+				const uint64_t ve = std::min(view.offset + view.size, b + size);
+				if (vs >= ve) {
+					continue;
+				}
+				const uint64_t guest = view_addr + (vs - view.offset);
+				if (!maps) {
+					maps.emplace();
+				}
+				maps->ForEach(guest, ve - vs, [&](uint64_t s, uint64_t len, int prot) {
+					job->pieces.push_back(MovePiece {s, len, prot, vs - b + (s - guest)});
+					executable = executable || (prot & PROT_EXEC) != 0;
+				});
+				if (view.gpu) {
+					gpu_pieces.emplace_back(guest, vs - b);
+					gpu_lengths.push_back(ve - vs);
+				}
+			}
+		}
+		if (!ok || executable) {
+			// A dma-buf cannot be mapped executable, and a range the guest runs code from is no display buffer.
+			std::fprintf(stderr, "GemBacking: display buffer 0x%llx (+0x%llx) not carved: %s\n", static_cast<unsigned long long>(vaddr),
+			             static_cast<unsigned long long>(size), executable ? "a view of it is executable" : "a CPU mapping failed");
+			for (const auto& [p, n]: sources) {
+				::munmap(p, n);
+			}
+			if (job->bo_cpu != nullptr) {
+				::munmap(job->bo_cpu, size);
+			}
+			CloseBo(bo);
+			return false;
+		}
+		RunOnMover(job.get());
+		if (!job->moved) {
+			// As for a block promotion: some mappings may already be on the carve and a failed MAP_FIXED may
+			// have dropped the old one, so there is nothing consistent to roll back to. The carve is kept.
+			std::fprintf(stderr, "GemBacking: remapping display buffer 0x%llx onto its carve failed: %s\n",
+			             static_cast<unsigned long long>(vaddr), std::strerror(errno));
+		}
+		for (const auto& [p, n]: sources) {
+			::munmap(p, n);
+		}
+		::munmap(job->bo_cpu, size);
+		// GPU mappings of every view of the range now map the carve. Plain page flags: the coherent MTYPE
+		// is for system memory the CPU shares, and the CPU does not share display buffers.
+		for (size_t i = 0; i < gpu_pieces.size(); i++) {
+			VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, gpu_pieces[i].first, gpu_pieces[i].second, gpu_lengths[i]);
+		}
+		MarkVaStale(); // KFD queues may hold translations to the block buffers: flushed before the next KFD submission
+		m_carves[b] = Carve {bo, size, true};
+		m_carved_bytes += size;
+		uint64_t usable = 0;
+		uint64_t used   = 0;
+		VramHeapUnlocked(&usable, &used);
+		std::fprintf(stderr, "GemBacking: display buffer 0x%llx (+%llu MiB) carved into VRAM BO %u (VRAM used %llu/%llu MiB, %llu MiB carved)\n",
+		             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size >> 20u), bo.handle,
+		             static_cast<unsigned long long>(used >> 20u), static_cast<unsigned long long>(usable >> 20u),
+		             static_cast<unsigned long long>(m_carved_bytes >> 20u));
+		*out = CarveInfo {bo.dmabuf_fd, bo.handle, size, 0};
+		return true;
+	}
+
+	// The carve holding [vaddr, vaddr + size) stops (or starts) being a registered display buffer. The
+	// carve itself stays: its data lives there for the process lifetime, and registering the same range
+	// again reuses it.
+	void SetCarveRegistered(uint64_t vaddr, uint64_t size, bool registered) {
+		std::lock_guard<std::mutex> lock(m_lock);
+		uint64_t                    b = 0;
+		if (size == 0 || !ResolveContiguousUnlocked(vaddr, size, &b)) {
+			return;
+		}
+		if (const auto c = FindCarveUnlocked(b); c != m_carves.end() && b + size <= c->first + c->second.size) {
+			c->second.registered = registered;
+		}
+	}
+
+	// True when guest [vaddr, vaddr + size) lies wholly in one carve.
+	[[nodiscard]] bool IsCarved(uint64_t vaddr, uint64_t size) const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		uint64_t                    b = 0;
+		if (size == 0 || m_carves.empty() || !ResolveContiguousUnlocked(vaddr, size, &b)) {
+			return false;
+		}
+		const auto c = FindCarveUnlocked(b);
+		return c != m_carves.end() && b + size <= c->first + c->second.size;
+	}
+
+	// The CPU-visible VRAM heap (AMDGPU_INFO_MEMORY's cpu_accessible_vram): usable and used bytes, for the
+	// whole device. False when the query fails. Takes no lock.
+	[[nodiscard]] bool VramHeap(uint64_t* usable, uint64_t* used) const { return VramHeapUnlocked(usable, used); }
+
+	[[nodiscard]] uint64_t CarvedBytes() const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		return m_carved_bytes;
 	}
 
 private:
@@ -981,6 +1206,16 @@ private:
 		bool     resident = false;
 		bool     code     = false; // holds executable views: stays in the memfd (see PromoteBlockUnlocked)
 	};
+	// A display buffer's backing bytes [key, key + size) in a VRAM buffer of their own (CarveGuestRange),
+	// from offset 0 of `bo`. Keyed by backing offset, not guest address, so every view of those bytes
+	// follows it: guest aliases, a later MapView of the same direct memory and the alias slot. The bytes
+	// of the block buffers under it are no longer mapped anywhere. Never undone.
+	struct Carve {
+		Bo       bo;                 // VRAM, explicit sync, exported (bo.dmabuf_fd >= 0), not always valid
+		uint64_t size       = 0;     // the buffer's size
+		bool     registered = false; // a video-out display buffer right now
+	};
+	static constexpr uint64_t kCarvePage = 4096;
 	// A guest view: `size` bytes of the backing from `offset`, mapped at the key address; `gpu` when
 	// it is also mapped into the GPU VM.
 	struct View {
@@ -1457,6 +1692,95 @@ private:
 		return true;
 	}
 
+	// A carve's buffer: VRAM, never GTT, so it scans out without amdgpu.sg_display. Contiguous from the
+	// start, so the display's pin at a flip never has to move it (a pin that fails makes gamescope abort);
+	// CPU-visible for the views and the alias slot; explicit sync, as the PS5 shows a buffer: a flip is
+	// queued only after the title's release, and the title waits through labels. With implicit sync every
+	// CS listing the buffer would add a write fence that gamescope waits for before it latches the frame.
+	// A render-node buffer, not KFD memory, which cannot be explicit sync. Exported like CreateBo.
+	bool CreateScanoutBo(uint64_t size, Bo* out) const {
+		union drm_amdgpu_gem_create c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.bo_size         = size;
+		c.in.alignment       = 2ull * 1024 * 1024;
+		c.in.domains         = AMDGPU_GEM_DOMAIN_VRAM;
+		// VRAM_CONTIGUOUS is the kernel's own flag: GEM_CREATE refuses it from userspace (EINVAL). The display's pin
+		// places the buffer where scan-out needs it.
+		const uint64_t wants = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | AMDGPU_GEM_CREATE_EXPLICIT_SYNC;
+		c.in.domain_flags    = wants;
+		int r                = Ioctl(DRM_IOCTL_AMDGPU_GEM_CREATE, &c); // the kernel zeroes `c.in` and returns `c.out`
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: VRAM scan-out GEM_CREATE of %llu KiB failed: %s; the display buffer stays in GTT\n",
+			             static_cast<unsigned long long>(size >> 10u), std::strerror(-r));
+			return false;
+		}
+		// What the kernel made of it: on this APU every VRAM buffer reports GTT among its domains too (where
+		// it may be evicted to, and where GEM_CREATE falls back to when VRAM is short), and CPU_ACCESS_REQUIRED
+		// is dropped because all of the VRAM is CPU-visible (probe 1.11: so even for 256 KiB). The display's pin
+		// moves the buffer into VRAM for scan-out. A buffer without VRAM among its domains or without explicit sync
+		// is not kept.
+		struct drm_amdgpu_gem_create_in created;
+		struct drm_amdgpu_gem_op        op;
+		std::memset(&created, 0, sizeof(created));
+		std::memset(&op, 0, sizeof(op));
+		op.handle            = c.out.handle;
+		op.op                = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
+		op.value             = reinterpret_cast<uintptr_t>(&created);
+		if ((r = Ioctl(DRM_IOCTL_AMDGPU_GEM_OP, &op)) != 0 || (created.domains & AMDGPU_GEM_DOMAIN_VRAM) == 0 ||
+		    (created.domain_flags & AMDGPU_GEM_CREATE_EXPLICIT_SYNC) == 0) {
+			std::fprintf(stderr, "GemBacking: VRAM scan-out buffer of %llu KiB not available (domains 0x%llx, flags 0x%llx%s%s); the "
+			                     "display buffer stays in GTT\n",
+			             static_cast<unsigned long long>(size >> 10u), static_cast<unsigned long long>(created.domains),
+			             static_cast<unsigned long long>(created.domain_flags), r != 0 ? ", GEM_OP: " : "", r != 0 ? std::strerror(-r) : "");
+			GemClose(c.out.handle);
+			return false;
+		}
+		struct drm_prime_handle p;
+		std::memset(&p, 0, sizeof(p));
+		p.handle = c.out.handle;
+		p.flags  = DRM_CLOEXEC | DRM_RDWR;
+		if ((r = Ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD, &p)) != 0) {
+			std::fprintf(stderr, "GemBacking: dma-buf export of a scan-out buffer failed: %s\n", std::strerror(-r));
+			GemClose(c.out.handle);
+			return false;
+		}
+		out->handle    = c.out.handle;
+		out->dmabuf_fd = p.fd;
+		return true;
+	}
+
+	// KYTY_DIRECT_PRESENT_VRAM_MIB (default 160): what the carves may take of VRAM together. Measured with
+	// ASTRO BOT running, 512 MiB of CPU-visible VRAM had 473 MiB in use, ~364 MiB of it Kyty's own Vulkan
+	// allocations and ~160 MiB Xwayland's, none pinned (TTM moves them to GTT when VRAM runs short), so the
+	// rule is this cap alone. A refusal leaves the buffer in GTT, presented through Vulkan.
+	static uint64_t CarveBudget() {
+		static const uint64_t budget = [] {
+			const char* v = std::getenv("KYTY_DIRECT_PRESENT_VRAM_MIB");
+			return (v != nullptr && v[0] != '\0' ? std::strtoull(v, nullptr, 0) : 160ull) << 20u;
+		}();
+		return budget;
+	}
+
+	bool VramHeapUnlocked(uint64_t* usable, uint64_t* used) const {
+		struct drm_amdgpu_memory_info mem;
+		struct drm_amdgpu_info        request;
+		std::memset(&mem, 0, sizeof(mem));
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer = reinterpret_cast<uintptr_t>(&mem);
+		request.return_size    = sizeof(mem);
+		request.query          = AMDGPU_INFO_MEMORY;
+		if (Ioctl(DRM_IOCTL_AMDGPU_INFO, &request) != 0) {
+			return false;
+		}
+		if (usable != nullptr) {
+			*usable = mem.cpu_accessible_vram.usable_heap_size;
+		}
+		if (used != nullptr) {
+			*used = mem.cpu_accessible_vram.heap_usage;
+		}
+		return true;
+	}
+
 	// Maps bytes [inner, inner + len) of `bo` (of `bo_size` bytes) at exactly `dst` with `prot`,
 	// replacing whatever was there. A dma-buf maps from any page offset; an always-valid buffer is
 	// mapped whole elsewhere, the piece moved to `dst` (one mremap, atomic for other threads) and the
@@ -1518,21 +1842,117 @@ private:
 		bo = Bo {};
 	}
 
-	// Calls cb(block index, offset in block, offset from `offset`, length) for each block piece of
-	// backing range [offset, offset + size); stops at the first false.
+	// Calls cb(buffer, its size, offset in it, resident, carved, offset from `offset`, length) for each
+	// piece of backing range [offset, offset + size), split at block and carve boundaries: a carved piece
+	// gives its carve's buffer (resident and carved), any other its block's buffer (an empty Bo when the
+	// block is not resident). Stops at the first false. The caller holds m_lock.
 	template <typename Cb>
-	bool ForEachBlockPiece(uint64_t offset, uint64_t size, Cb&& cb) const {
+	bool ForEachBackingPiece(uint64_t offset, uint64_t size, Cb&& cb) const {
 		uint64_t done = 0;
 		while (done < size) {
-			const uint64_t at    = offset + done;
-			const uint64_t index = at / BlockSize();
-			const uint64_t inner = at - index * BlockSize();
-			const uint64_t part  = std::min(size - done, m_blocks[index].size - inner);
-			if (!cb(index, inner, done, part)) {
-				return false;
+			const uint64_t at   = offset + done;
+			uint64_t       part = size - done;
+			auto           next = m_carves.upper_bound(at);
+			if (next != m_carves.begin() && at < std::prev(next)->first + std::prev(next)->second.size) {
+				const auto& [start, carve] = *std::prev(next);
+				part                       = std::min(part, start + carve.size - at);
+				if (!cb(carve.bo, carve.size, at - start, true, true, done, part)) {
+					return false;
+				}
+			} else {
+				const uint64_t index = at / BlockSize();
+				const uint64_t inner = at - index * BlockSize();
+				const Block&   block = m_blocks[index];
+				part                 = std::min(part, block.size - inner);
+				if (next != m_carves.end()) {
+					part = std::min(part, next->first - at);
+				}
+				if (!cb(block.bo, block.size, inner, block.resident, false, done, part)) {
+					return false;
+				}
 			}
 			done += part;
 		}
+		return true;
+	}
+
+	// The carve holding backing offset `offset`, or m_carves.end().
+	[[nodiscard]] std::map<uint64_t, Carve>::const_iterator FindCarveUnlocked(uint64_t offset) const {
+		auto it = m_carves.upper_bound(offset);
+		if (it == m_carves.begin()) {
+			return m_carves.end();
+		}
+		--it;
+		return offset < it->first + it->second.size ? it : m_carves.end();
+	}
+	[[nodiscard]] std::map<uint64_t, Carve>::iterator FindCarveUnlocked(uint64_t offset) {
+		auto it = m_carves.upper_bound(offset);
+		if (it == m_carves.begin()) {
+			return m_carves.end();
+		}
+		--it;
+		return offset < it->first + it->second.size ? it : m_carves.end();
+	}
+
+	// True when some carve overlaps backing range [offset, offset + size).
+	[[nodiscard]] bool CarveOverlapsUnlocked(uint64_t offset, uint64_t size) const {
+		auto it = m_carves.lower_bound(offset);
+		if (it != m_carves.end() && it->first < offset + size) {
+			return true;
+		}
+		return it != m_carves.begin() && std::prev(it)->first + std::prev(it)->second.size > offset;
+	}
+
+	// Calls cb(start, length) for each part of backing range [offset, offset + size) outside every carve.
+	template <typename Cb>
+	void ForEachUncarvedUnlocked(uint64_t offset, uint64_t size, Cb&& cb) const {
+		if (m_carves.empty()) {
+			cb(offset, size);
+			return;
+		}
+		const uint64_t end = offset + size;
+		uint64_t       at  = offset;
+		auto           it  = m_carves.upper_bound(offset);
+		if (it != m_carves.begin()) {
+			--it;
+		}
+		for (; it != m_carves.end() && it->first < end && at < end; ++it) {
+			const uint64_t cs = it->first;
+			const uint64_t ce = it->first + it->second.size;
+			if (ce <= at) {
+				continue;
+			}
+			if (cs > at) {
+				cb(at, cs - at);
+			}
+			at = std::max(at, ce);
+		}
+		if (at < end) {
+			cb(at, end - at);
+		}
+	}
+
+	// The backing offset `*backing` behind guest [vaddr, vaddr + size) when views map all of it, in order,
+	// onto one contiguous backing range. The caller holds m_lock.
+	bool ResolveContiguousUnlocked(uint64_t vaddr, uint64_t size, uint64_t* backing) const {
+		uint64_t b          = 0;
+		uint64_t next       = vaddr;
+		bool     first      = true;
+		bool     contiguous = true;
+		ForEachViewOverlap(vaddr, size, [&](uint64_t, uint64_t guest, uint64_t at, uint64_t len) {
+			if (first) {
+				b     = at;
+				first = false;
+			}
+			if (guest != next || at != b + (guest - vaddr)) {
+				contiguous = false;
+			}
+			next = guest + len;
+		});
+		if (first || !contiguous || next != vaddr + size) {
+			return false;
+		}
+		*backing = b;
 		return true;
 	}
 
@@ -1692,26 +2112,34 @@ private:
 		uint64_t addr;
 		uint64_t len;
 		int      prot;
-		uint64_t inner; // offset in the block
+		uint64_t inner; // offset in the new buffer
+	};
+	// One memcpy of a move: `len` bytes from `from` (an old buffer's CPU mapping) to `dst` in the new buffer.
+	struct CopySrc {
+		const uint8_t* from;
+		uint64_t       len;
+		uint64_t       dst;
 	};
 	struct MoveJob {
-		uint64_t               index  = 0;
-		uint64_t               start  = 0; // backing offset of the block
-		uint64_t               size   = 0;
-		uint8_t*               bo_cpu   = nullptr;
-		const Bo*              bo       = nullptr; // the block's new buffer
-		const uint8_t*         from_cpu = nullptr; // the block's old buffer, when it had one
+		uint64_t               index   = UINT64_MAX; // the block whose memfd data extents are copied; UINT64_MAX none
+		uint64_t               start   = 0;          // backing offset of that block
+		uint64_t               size    = 0;          // bytes of the new buffer that are filled and mapped
+		uint8_t*               bo_cpu  = nullptr;
+		const Bo*              bo      = nullptr;    // the new buffer
+		uint64_t               bo_size = 0;          // its size
+		std::vector<CopySrc>   copies;               // from old buffers, when there were some
 		std::vector<MovePiece> pieces;
-		bool                   moved  = false;
-		bool                   done   = false;
+		bool                   moved   = false;
+		bool                   done    = false;
 	};
 
-	// The move proper: write-protect every CPU mapping of the block, copy its data extents into the
-	// buffer, map everything onto the buffer with its protection back. A guest write meanwhile faults
-	// and waits in WaitIfPromoting. It runs on the mover thread, whose stack is ordinary host memory:
-	// a guest thread's stack can live in the very block being moved (games allocate thread stacks
-	// in direct memory, and Kyty runs on guest stacks), and a thread that write-protects its own
-	// stack faults on its next push and waits for itself forever.
+	// The move proper: write-protect every CPU mapping of the bytes being moved, copy them into the new
+	// buffer (from old buffers, and a block's data extents from the memfd), map everything onto the
+	// buffer with its protection back. A guest write meanwhile faults and waits in WaitIfPromoting. It
+	// runs on the mover thread, whose stack is ordinary host memory: a guest thread's stack can live in
+	// the very block being moved (games allocate thread stacks in direct memory, and Kyty runs on guest
+	// stacks), and a thread that write-protects its own stack faults on its next push and waits for
+	// itself forever. Used for a block's promotion and for a display buffer's carve.
 	void MoveBlock(MoveJob* job) const {
 		s_promoting.fetch_add(1, std::memory_order_acq_rel);
 		for (const auto& p: job->pieces) {
@@ -1719,26 +2147,28 @@ private:
 				::mprotect(reinterpret_cast<void*>(p.addr), p.len, p.prot & ~PROT_WRITE);
 			}
 		}
+		for (const auto& c: job->copies) {
+			std::memcpy(job->bo_cpu + c.dst, c.from, c.len);
+		}
 		// pread rather than a mapping of the memfd, which would allocate pages for the holes; holes
 		// stay zero in the buffer.
-		if (job->from_cpu != nullptr) {
-			std::memcpy(job->bo_cpu, job->from_cpu, job->size);
-		}
-		ForEachDataExtent(job->index, [&](uint64_t at, uint64_t len) {
-			uint64_t done = 0;
-			while (done < len) {
-				const ssize_t n = ::pread(m_mem_fd, job->bo_cpu + at + done, len - done,
-				                          static_cast<off_t>(job->start + at + done));
-				if (n <= 0) {
-					break;
+		if (job->index != UINT64_MAX) {
+			ForEachDataExtent(job->index, [&](uint64_t at, uint64_t len) {
+				uint64_t done = 0;
+				while (done < len) {
+					const ssize_t n = ::pread(m_mem_fd, job->bo_cpu + at + done, len - done,
+					                          static_cast<off_t>(job->start + at + done));
+					if (n <= 0) {
+						break;
+					}
+					done += static_cast<uint64_t>(n);
 				}
-				done += static_cast<uint64_t>(n);
-			}
-		});
+			});
+		}
 		bool moved = true;
 		for (const auto& p: job->pieces) {
 			void* const dst = reinterpret_cast<void*>(p.addr);
-			moved = MapBoPiece(*job->bo, job->size, p.inner, p.len, p.prot, dst) && moved;
+			moved = MapBoPiece(*job->bo, job->bo_size, p.inner, p.len, p.prot, dst) && moved;
 		}
 		job->moved = moved;
 		s_promoting.fetch_sub(1, std::memory_order_acq_rel);
@@ -1819,16 +2249,23 @@ private:
 		// move runs on the mover thread and must not write to this thread's stack (see MoveBlock).
 		uint64_t touched = 0; // bytes the CPU had written, the rest of the block is padding
 		ForEachDataExtent(index, [&](uint64_t, uint64_t len) { touched += len; });
-		auto job    = std::make_unique<MoveJob>();
-		job->index  = index;
-		job->start  = start;
-		job->size   = block.size;
-		job->bo_cpu = bo_cpu;
-		job->bo     = &bo;
-		job->from_cpu = from_cpu;
+		auto job     = std::make_unique<MoveJob>();
+		job->index   = index;
+		job->start   = start;
+		job->size    = block.size;
+		job->bo_cpu  = bo_cpu;
+		job->bo      = &bo;
+		job->bo_size = block.size;
+		if (from_cpu != nullptr) {
+			job->copies.push_back(CopySrc {from_cpu, block.size, 0});
+		}
+		// Carved bytes of the block (a display buffer's, CarveGuestRange) are mapped from their carve and
+		// stay so: the whole block is copied, those stale bytes included, but nothing maps them here.
 		std::vector<std::pair<uint64_t, uint64_t>> gpu_pieces; // (guest address, offset in block)
 		std::vector<uint64_t>                      gpu_lengths;
-		job->pieces.push_back(MovePiece {reinterpret_cast<uint64_t>(m_alias + start), block.size, PROT_READ | PROT_WRITE, 0});
+		ForEachUncarvedUnlocked(start, block.size, [&](uint64_t s, uint64_t len) {
+			job->pieces.push_back(MovePiece {reinterpret_cast<uint64_t>(m_alias + s), len, PROT_READ | PROT_WRITE, s - start});
+		});
 		bool                  executable = false;
 		std::optional<HostMaps> maps; // read once, at the first view of the block
 		for (const auto& [view_addr, view]: m_views) {
@@ -1837,18 +2274,20 @@ private:
 			if (vs >= ve) {
 				continue;
 			}
-			const uint64_t guest = view_addr + (vs - view.offset);
-			if (!maps) {
-				maps.emplace();
-			}
-			maps->ForEach(guest, ve - vs, [&](uint64_t s, uint64_t len, int prot) {
-				job->pieces.push_back(MovePiece {s, len, prot, vs - start + (s - guest)});
-				executable = executable || (prot & PROT_EXEC) != 0;
+			ForEachUncarvedUnlocked(vs, ve - vs, [&](uint64_t us, uint64_t ulen) {
+				const uint64_t guest = view_addr + (us - view.offset);
+				if (!maps) {
+					maps.emplace();
+				}
+				maps->ForEach(guest, ulen, [&](uint64_t s, uint64_t len, int prot) {
+					job->pieces.push_back(MovePiece {s, len, prot, us - start + (s - guest)});
+					executable = executable || (prot & PROT_EXEC) != 0;
+				});
+				if (view.gpu) {
+					gpu_pieces.emplace_back(guest, us - start);
+					gpu_lengths.push_back(ulen);
+				}
 			});
-			if (view.gpu) {
-				gpu_pieces.emplace_back(guest, vs - start);
-				gpu_lengths.push_back(ve - vs);
-			}
 		}
 		// A dma-buf cannot be mapped executable: a block the guest runs code from stays in the memfd.
 		if (executable) {
@@ -2145,7 +2584,9 @@ private:
 	std::array<std::pair<uint64_t, uint64_t>, 3> m_prt {}; // PRT apertures (start, size), SetPrtAperture
 	std::atomic<bool>             m_map_overflow {false}; // a block with GPU access stayed out of map-time residency
 	std::atomic<bool>             m_alloc_failed {false}; // PromoteBackingAtAlloc ran out of RAM: not the PS5 mode
-	mutable std::mutex            m_lock;     // guards blocks, views, m_external and the dummy
+	std::map<uint64_t, Carve>     m_carves;             // backing start -> display buffer carve; disjoint (CarveGuestRange)
+	uint64_t                      m_carved_bytes = 0;   // their sizes summed (CarveBudget)
+	mutable std::mutex            m_lock;     // guards blocks, views, m_external, the carves and the dummy
 };
 
 } // namespace Libs::Graphics::NativeGpu

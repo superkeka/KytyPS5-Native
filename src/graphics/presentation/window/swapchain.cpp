@@ -16,11 +16,14 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window/directPresent.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -268,6 +271,12 @@ public:
 
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
+	// Destroys the swapchain, its images and semaphores once the last present that used them is done,
+	// and keeps the surface, the overlay pipeline and the system overlay's Vulkan state for the next
+	// Create(). Used while direct flips show the guest's own buffers: the swapchain is then only VRAM
+	// and, under gamescope's WSI layer, an override that hides the window's own (Present) content.
+	void                 Release(CommandScheduler& scheduler);
+	[[nodiscard]] bool   Exists() const noexcept { return m_handle != nullptr; }
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
@@ -281,6 +290,7 @@ public:
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
 	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
+	[[nodiscard]] bool HdrActive() const noexcept { return m_hdr_active; }
 	bool SetHdr(bool hdr) {
 		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
 		m_hdr_requested = hdr;
@@ -290,6 +300,8 @@ public:
 private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
+	void DestroyOverlayObjects();
+	void DestroySwapchainObjects();
 	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
 	                 const vk::Rect2D& rect);
 
@@ -314,6 +326,8 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
+	// Image count of a released swapchain whose overlay objects were kept (0: none kept).
+	uint32_t                       m_kept_image_count    = 0;
 };
 
 struct Presenter::Impl {
@@ -323,6 +337,11 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		NoteSwapchain();
+		direct = DirectPresenter::Create(owner.window);
+		if (direct != nullptr && hdr_ever.load()) {
+			direct->Disable("HDR");
+		}
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -331,6 +350,15 @@ struct Presenter::Impl {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
+		NoteSwapchain();
+	}
+
+	// An HDR10 swapchain ends direct flips for the session: gamescope stops taking the X window's own
+	// commits once the window has had a non-sRGB colour space, and a DRI3 pixmap carries no HDR metadata.
+	void NoteSwapchain() {
+		if (swapchain.HdrActive() && !hdr_ever.exchange(true) && direct != nullptr) {
+			direct->Disable("HDR");
+		}
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -363,6 +391,11 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	// Direct flips completed as FLIP since the last Vulkan present.
+	std::atomic<uint32_t> direct_streak {0};
+	std::atomic_bool      hdr_ever {false};
+	// Last, so it is destroyed first: its event thread stops before anything else goes.
+	std::unique_ptr<DirectPresenter> direct;
 };
 
 vk::SurfaceFormatKHR Swapchain::SelectFormat() {
@@ -403,6 +436,7 @@ void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
+	const vk::Format kept_format = m_format;
 
 	// Capture the size before querying surface capabilities. If the window changes
 	// during creation, the next presentation will detect the newer size.
@@ -519,6 +553,15 @@ void Swapchain::Create() {
 	}
 	m_image_index = static_cast<uint32_t>(-1);
 	m_frame_index = 0;
+
+	// After Release(), the overlay pipeline and the system overlay were built for the released
+	// swapchain's format and image count; they stay only if this one has the same.
+	if (m_kept_image_count != 0) {
+		if (kept_format != m_format || m_kept_image_count != m_images.size()) {
+			DestroyOverlayObjects();
+		}
+		m_kept_image_count = 0;
+	}
 }
 
 Swapchain::~Swapchain() {
@@ -527,7 +570,7 @@ Swapchain::~Swapchain() {
 
 void Swapchain::Destroy() {
 	if (m_handle == nullptr && m_image_acquired.empty() && m_render_complete.empty() &&
-	    m_image_views.empty()) {
+	    m_image_views.empty() && m_kept_image_count == 0) {
 		return;
 	}
 	auto& graphics = m_window.graphic_ctx;
@@ -536,6 +579,31 @@ void Swapchain::Destroy() {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
+	DestroyOverlayObjects();
+	DestroySwapchainObjects();
+	m_format           = vk::Format::eUndefined;
+	m_kept_image_count = 0;
+}
+
+void Swapchain::Release(CommandScheduler& scheduler) {
+	if (m_handle == nullptr) {
+		return;
+	}
+	auto& graphics = m_window.graphic_ctx;
+	// The last present command buffer has run once its tick is done. The presentation engine's wait on
+	// the render-complete semaphores is queue work too, so the queue is drained as well before the
+	// semaphores and the swapchain go; this happens once per switch to direct flips.
+	scheduler.Wait(scheduler.CurrentTick() - 1);
+	{
+		Common::LockGuard queue_lock(graphics.queue_mutex);
+		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+	}
+	m_kept_image_count = ImageCount();
+	DestroySwapchainObjects();
+}
+
+void Swapchain::DestroyOverlayObjects() {
+	auto& graphics = m_window.graphic_ctx;
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -547,7 +615,10 @@ void Swapchain::Destroy() {
 	m_overlay_layout      = nullptr;
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
+}
 
+void Swapchain::DestroySwapchainObjects() {
+	auto& graphics = m_window.graphic_ctx;
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
 			graphics.device.destroySemaphore(semaphore, nullptr);
@@ -568,7 +639,6 @@ void Swapchain::Destroy() {
 	}
 
 	m_handle        = nullptr;
-	m_format        = vk::Format::eUndefined;
 	m_extent        = {};
 	m_window_extent = {};
 	m_image_index   = static_cast<uint32_t>(-1);
@@ -1068,12 +1138,19 @@ void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
+	direct_streak.store(0, std::memory_order_relaxed);
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
 	const auto* main_frame = layers[0].frame;
 	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
 	                         swapchain.SetHdr(main_frame->hdr);
-	// Some window systems keep presenting an old swapchain after a resize.
-	if (hdr_changed || swapchain.NeedsResize()) {
+	if (!swapchain.Exists()) {
+		// Released while direct flips ran; this present (menu, toast, fallback flip) needs it again.
+		swapchain.Create();
+		frames.SetFormat(swapchain.Format());
+		NoteSwapchain();
+		std::fprintf(stderr, "direct present: Vulkan swapchain created again\n");
+	} else if (hdr_changed || swapchain.NeedsResize()) {
+		// Some window systems keep presenting an old swapchain after a resize.
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
@@ -1111,6 +1188,55 @@ void Presenter::Impl::Present() {
 
 void Presenter::Discard(Frame& frame) {
 	m_impl->frames.Release(&frame);
+}
+
+DirectPresenter* Presenter::Direct() const noexcept {
+	return m_impl->direct.get();
+}
+
+void Presenter::OnDirectShown() noexcept {
+	m_impl->direct_streak.fetch_add(1, std::memory_order_relaxed);
+}
+
+static bool KeepSwapchainForDirect() {
+	static const bool keep = [] {
+		const char* v = std::getenv("KYTY_DIRECT_PRESENT_KEEP_SWAPCHAIN");
+		return v != nullptr && v[0] == '1';
+	}();
+	return keep;
+}
+
+void Presenter::MaintainDirect() {
+	// About half a second of direct flips: a toast or the cursor flickering on and off does not make
+	// the swapchain go and come back every few frames.
+	constexpr uint32_t kStreak = 30;
+	auto&              impl    = *m_impl;
+	if (impl.direct == nullptr || impl.direct_streak.load(std::memory_order_relaxed) < kStreak ||
+	    KeepSwapchainForDirect() || GetSystemOverlayVisualState().active || PerformanceOverlayEnabled()) {
+		return;
+	}
+	Common::LockGuard lock(impl.present_mutex);
+	// A Vulkan present may have run in between; it resets the streak under this lock.
+	const uint32_t streak = impl.direct_streak.load(std::memory_order_relaxed);
+	if (!impl.swapchain.Exists() || streak < kStreak) {
+		return;
+	}
+	impl.swapchain.Release(impl.present_scheduler);
+	std::fprintf(stderr, "direct present: Vulkan swapchain released after %u direct flips\n", streak);
+}
+
+void Presenter::SetMainLayer(Frame& frame) {
+	Common::LockGuard lock(m_impl->present_mutex);
+	m_impl->frames.ValidateForPresent(&frame);
+	auto& main = m_impl->layers[0];
+	if (main.frame != nullptr && main.frame != &frame) {
+		m_impl->frames.Release(main.frame);
+	}
+	main = {&frame, 0, false};
+}
+
+bool Presenter::HdrSwapchainEverUsed() const noexcept {
+	return m_impl->hdr_ever.load();
 }
 
 WindowContext::WindowContext() = default;

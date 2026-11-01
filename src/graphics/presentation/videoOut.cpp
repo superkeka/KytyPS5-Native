@@ -20,6 +20,8 @@
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window/directPresent.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -33,7 +35,10 @@
 #include <atomic>
 #include <fmt/format.h>
 #include <list>
+#include <span>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -57,6 +62,7 @@ constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
 constexpr int      VIDEO_OUT_BUS_TYPE_HMD2_MAIN                          = 32;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
+constexpr int      VIDEO_OUT_FLIP_MODE_HSYNC                            = 2;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_FLIP_MODE_SLAVE                            = 8;
 constexpr int      VIDEO_OUT_FLIP_MODE_MASTER                           = 9;
@@ -186,6 +192,29 @@ struct BufferAttributeGroup {
 	[[nodiscard]] Graphics::ImageInfo ImageInfo(const VideoOutBuffer& buffer) const;
 };
 
+// Direct presentation (KYTY_DIRECT_PRESENT=1). On the PS5 the display engine scans the display buffer
+// itself out; here a display buffer that became one VRAM scan-out BO at registration
+// (NativeGpu::ShadowCarveDisplayBuffer) is a DRI3 pixmap of the window, and its flips are
+// PresentPixmaps (Graphics::DirectPresenter) instead of copies through Kyty's Vulkan presenter.
+struct DirectSlot {
+	uint32_t pixmap  = 0; // 0: the buffer's flips take the Vulkan path
+	uint32_t width   = 0;
+	uint32_t height  = 0;
+	uint64_t address = 0; // the carved range, released at unregistration (size 0: not carved)
+	uint64_t size    = 0;
+};
+
+// On the PS5 the display engine reads a buffer from the vblank that shows it until the vblank that
+// shows another, and only then may the title render into it again. Here the reader is the display
+// (Xwayland, gamescope, a DCN plane) from the buffer's PresentPixmap to its IdleNotify.
+struct DisplayHold {
+	uint32_t          presents  = 0; // PresentPixmaps of the buffer whose IdleNotify has not come
+	uint64_t          flip_id   = 0; // the request of the last of them, as IsSafeForRendering counts it
+	FlipRequestSource source    = FlipRequestSource::Cpu;
+	uint64_t          eop_order = 0;
+	double            since     = 0; // monotonic seconds: the last present, or when it left the screen
+};
+
 struct VideoOutConfig {
 	Common::Mutex                       mutex;
 	Common::CondVar                     vblank_cond;
@@ -216,17 +245,24 @@ struct VideoOutConfig {
 	// WaitUntilSafeForRendering waits for 0. Plain host memory the guest shares, zeroed at Open. It
 	// lives as long as the driver, so a release still in flight after Close never writes freed memory.
 	alignas(64) std::array<uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> labels {};
+	// Direct presentation, per buffer index from its registration. `holds` outlive the registration
+	// and the port: they end at the display's IdleNotify (FlipQueue::OnDirectIdle).
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX>  direct {};
+	std::array<DisplayHold, VIDEO_OUT_BUFFER_NUM_MAX> holds {};
+	uint64_t direct_last_target = 0;     // target MSC of the port's last direct present (0: none yet)
+	bool     last_shown_direct  = false; // the buffer on screen was shown directly, not by Kyty's presenter
+	uint64_t direct_shown       = 0;     // direct flips shown on this port
 };
 
 class FlipQueue {
 public:
-	explicit FlipQueue(Graphics::Presenter& presenter): m_presenter(presenter) {
+	explicit FlipQueue(Graphics::Presenter& presenter): m_presenter(presenter), m_direct(presenter.Direct()) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	}
 	~FlipQueue();
 	KYTY_CLASS_NO_COPY(FlipQueue);
 
-	bool Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
+	bool Reserve(VideoOutConfig& cfg, int index, int flip_mode, int64_t flip_arg, FlipRequestSource source,
 	             uint64_t& request_id);
 	void Cancel(VideoOutConfig& cfg);
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
@@ -251,7 +287,29 @@ public:
 		return m_eop_order;
 	}
 
+	// Direct presentation (KYTY_DIRECT_PRESENT=1; null presenter otherwise, and nothing below runs).
+	[[nodiscard]] Graphics::DirectPresenter* Direct() const noexcept { return m_direct; }
+	// Off for the session: the display stopped answering, it copies instead of flipping, or the
+	// connection is lost. Flips requested from then on take the Vulkan path.
+	[[nodiscard]] bool DirectOff() {
+		Common::LockGuard lock(m_mutex);
+		return m_direct == nullptr || m_direct_off;
+	}
+	// The PS5 kernel's queueing of a flip to the display: a reserved request whose buffer is a
+	// directly shown display buffer goes to the display now (at the EOP interrupt or the CPU submit),
+	// with no GPU work. False, and nothing changed, when the request takes the Vulkan path.
+	// `complete_follows`: the caller will still call Complete for it (SubmitFlipFromGpu).
+	bool TryDirect(uint64_t request_id, bool complete_follows);
+	// DirectPresenter callbacks, on its event thread.
+	void OnDirectComplete(uint64_t token, uint64_t msc, uint64_t ust_us, Graphics::DirectCompleteMode mode);
+	void OnDirectIdle(uint64_t token);
+	void OnDirectLost();
+	// The vblank thread, every tick: a display that stopped answering does not hang the title.
+	void DirectWatchdog(double now);
+
 private:
+	// A direct request goes Reserved -> Ready (TryDirect) -> Presenting (sent to the display) and is
+	// erased at its CompleteNotify (OnDirectComplete).
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
 
 	struct Request {
@@ -270,12 +328,32 @@ private:
 		// EOP flip reserved by SubmitEopFlip: the order in which its end-of-pipe release ran (its
 		// interrupt arrived and queued the preparation); 0 while it has not run.
 		uint64_t eop_order;
+		int      flip_mode;
+		bool     direct;      // shown by a PresentPixmap of `pixmap`, not by the Vulkan presenter
+		uint32_t pixmap;
+		double   direct_sent;     // monotonic seconds when it was sent to the display
+		double   direct_deadline; // the watchdog's limit for its CompleteNotify
 	};
 	void SignalDoneLocked();
 	// Whether a pending request of the buffer holds it (IsSafeForRendering).
 	static bool HoldsBuffer(const Request& r, uint64_t before, uint64_t eop_mark);
 	// Whether a request of r's port older than r and outside r's group is still pending.
 	bool OlderPendingOnPort(const Request& r) const;
+	// Whether a request of r's port older than r has not reached the display yet: one for the Vulkan
+	// presenter (until Flip shows it), or a direct one not sent yet.
+	bool OlderUnsentOnPort(const Request& r) const;
+	// The buffer's label goes to 0 (WaitUntilSafeForRendering may pass) once it is off the screen, the
+	// display no longer holds it, and no pending request other than `except_id` that shows it again
+	// has written 1 (an EOP flip whose release has not run has written nothing).
+	void MaybeClearLabelLocked(VideoOutConfig& cfg, int index, uint64_t except_id);
+	// Sends the port's ready direct requests to the display in request order, each after every older
+	// request of the port reached it. Holds cfg.mutex and m_mutex.
+	void PumpDirectLocked(VideoOutConfig& cfg, double now);
+	// The same from a thread that holds no lock.
+	void PumpDirect();
+	// What Flip does when it shows a request, for a direct one: the flip status, the Flip event, the
+	// label of the buffer it took off the screen. Holds its cfg.mutex and m_mutex; erases it.
+	std::list<Request>::iterator CompleteDirectLocked(std::list<Request>::iterator it, double now);
 
 	Graphics::Presenter& m_presenter;
 	Common::Mutex        m_mutex;
@@ -289,6 +367,22 @@ private:
 	bool                 m_gpu_waiting     = false;
 	uint64_t             m_next_request_id = 1;
 	uint64_t             m_eop_order       = 0;
+
+	struct DirectToken {
+		VideoOutConfig* cfg;
+		int             index;
+	};
+	Graphics::DirectPresenter* m_direct = nullptr;
+	// Every PresentPixmap until its IdleNotify: which buffer the display holds for it.
+	std::unordered_map<uint64_t, DirectToken> m_direct_tokens;
+	// Direct requests from SubmitFlipFromGpu, whose caller still calls Complete.
+	std::unordered_set<uint64_t> m_direct_noop_completes;
+	// Ports other than the main one that have a frame on screen: Kyty's presenter composes them.
+	std::unordered_set<const VideoOutConfig*> m_side_shown;
+	uint32_t m_copy_streak   = 0;
+	bool     m_direct_off    = false; // no new direct requests this session
+	bool     m_direct_failed = false; // nothing more is sent; what was sent completes as skipped
+	uint64_t m_direct_skips  = 0;
 };
 
 struct VideoOutDriver::Impl {
@@ -302,6 +396,7 @@ public:
 	    : m_renderer(presenter.Renderer()), m_presenter(presenter), m_flip_queue(presenter) {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 		Init(width, height);
+		RegisterDirectCallbacks();
 		m_present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
 	}
 	~Impl();
@@ -319,6 +414,7 @@ public:
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
+	Graphics::Presenter&     GetPresenter() const noexcept { return m_presenter; }
 	bool                     IsHdrSupported() const noexcept { return m_presenter.IsHdrSupported(); }
 
 	void VblankBegin();
@@ -326,11 +422,31 @@ public:
 	void PresentThread(std::stop_token token);
 
 private:
+	void RegisterDirectCallbacks();
+	// Direct presentation's vblank-thread work: the watchdog and the swapchain's release.
+	void MaintainDirect();
+	// Before Kyty's presenter draws the system overlay over its last frame (see the definition).
+	bool OverlayFrameReady();
+
 	Common::Mutex            m_mutex;
 	VideoOutConfig           m_video_out_ctx[VIDEO_OUT_NUM_MAX];
 	Graphics::RenderContext& m_renderer;
 	Graphics::Presenter&     m_presenter;
 	FlipQueue                m_flip_queue;
+	// The overlay's copy of a directly shown buffer (OverlayFrameReady), all on the vblank thread but
+	// the hand-over: for which direct flip of the main port it was asked and when, the copy the GPU
+	// thread's completion hands over, which one is the presenter's main layer, and over which one the
+	// overlay was presented.
+	struct OverlayCopy {
+		Common::Mutex               mutex;
+		uint64_t                    serial = 0;
+		Graphics::Presenter::Frame* frame  = nullptr;
+	};
+	uint64_t                     m_overlay_asked_serial = 0;
+	double                       m_overlay_asked_time   = 0;
+	std::shared_ptr<OverlayCopy> m_overlay_copy         = std::make_shared<OverlayCopy>();
+	uint64_t                     m_overlay_ready_serial = 0;
+	uint64_t                     m_overlay_shown_serial = 0;
 	std::jthread             m_present_thread;
 };
 
@@ -586,6 +702,21 @@ static uint32_t EopFlipContext(uint64_t request_id) {
 // so the picture is visible without a headset.
 static std::atomic<bool> g_headset_mirror {false};
 
+// Display buffers that stop being shown directly: their pixmaps go, and their carves stop being
+// registered display buffers (the VRAM BO and the guest mapping stay; GemBacking reuses a carve when
+// the range is registered again). Called without VideoOut locks: freeing a pixmap talks to the X
+// server, and the carve's release takes GemBacking's lock, which no VideoOut lock may be held under.
+static void ReleaseDirectSlots(Graphics::DirectPresenter* direct, std::span<const DirectSlot> slots) {
+	for (const auto& slot: slots) {
+		if (slot.pixmap != 0 && direct != nullptr) {
+			direct->RemoveBuffer(slot.pixmap);
+		}
+		if (slot.size != 0) {
+			Graphics::NativeGpu::ShadowReleaseDisplayBuffer(slot.address, slot.size);
+		}
+	}
+}
+
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
                               int64_t flip_arg, FlipRequestSource source, uint64_t& request_id) {
 	auto* video_out = driver.Get(handle);
@@ -610,7 +741,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	     video_out->bus != VIDEO_OUT_BUS_TYPE_HMD2_MAIN)) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
-	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
+	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_mode, flip_arg, source, request_id)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
 	return OK;
@@ -694,6 +825,11 @@ void VideoOutShutdown() {
 }
 
 VideoOutDriver::Impl::~Impl() {
+	// No DirectPresenter callback runs into the queue from here on (SetCallbacks waits for one in
+	// progress); presents still in flight are never completed, which no one waits for any more.
+	if (auto* direct = m_flip_queue.Direct(); direct != nullptr) {
+		direct->SetCallbacks({});
+	}
 	if (m_present_thread.joinable()) {
 		m_present_thread.request_stop();
 		m_present_thread.join();
@@ -766,69 +902,79 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 }
 
 bool VideoOutDriver::Impl::Close(int handle) {
-	Common::LockGuard lock(m_mutex);
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX> direct_slots {};
+	const bool closed = [&] {
+		Common::LockGuard lock(m_mutex);
 
-	if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !m_video_out_ctx[handle].opened) {
-		return false;
-	}
-
-	auto&               config = m_video_out_ctx[handle];
-	VideoOutEventQueues flip_events;
-	VideoOutEventQueues pre_vblank_events;
-	VideoOutEventQueues vblank_events;
-	VideoOutEventQueues output_mode_events;
-	VideoOutConfig* master = nullptr;
-	{
-		Common::LockGuard config_lock(config.mutex);
-		if (config.closing) {
+		if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !m_video_out_ctx[handle].opened) {
 			return false;
 		}
-		EXIT_IF(config.slave_count != 0);
-		config.opened  = false;
-		config.closing = true;
-		if (++config.generation == 0) {
-			EXIT("video-out port generation wrapped\n");
-		}
-		{
-			Common::LockGuard event_lock(config.events->mutex);
-			flip_events        = std::move(config.events->flip);
-			pre_vblank_events  = std::move(config.events->pre_vblank);
-			vblank_events      = std::move(config.events->vblank);
-			output_mode_events = std::move(config.events->output_mode);
-		}
-		config.flip_rate   = 0;
-		master             = config.master;
-		config.master      = nullptr;
 
-		for (const auto& buffer: config.buffers) {
-			if (buffer.Occupied() &&
-			    (buffer.group_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX ||
-			     buffer.data_address == 0 || !config.groups[buffer.group_index].occupied)) {
-				EXIT("inconsistent registered video-out buffer state\n");
+		auto&               config = m_video_out_ctx[handle];
+		VideoOutEventQueues flip_events;
+		VideoOutEventQueues pre_vblank_events;
+		VideoOutEventQueues vblank_events;
+		VideoOutEventQueues output_mode_events;
+		VideoOutConfig* master = nullptr;
+		{
+			Common::LockGuard config_lock(config.mutex);
+			if (config.closing) {
+				return false;
 			}
+			EXIT_IF(config.slave_count != 0);
+			config.opened  = false;
+			config.closing = true;
+			if (++config.generation == 0) {
+				EXIT("video-out port generation wrapped\n");
+			}
+			{
+				Common::LockGuard event_lock(config.events->mutex);
+				flip_events        = std::move(config.events->flip);
+				pre_vblank_events  = std::move(config.events->pre_vblank);
+				vblank_events      = std::move(config.events->vblank);
+				output_mode_events = std::move(config.events->output_mode);
+			}
+			config.flip_rate   = 0;
+			master             = config.master;
+			config.master      = nullptr;
+
+			for (const auto& buffer: config.buffers) {
+				if (buffer.Occupied() &&
+				    (buffer.group_index >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX ||
+				     buffer.data_address == 0 || !config.groups[buffer.group_index].occupied)) {
+					EXIT("inconsistent registered video-out buffer state\n");
+				}
+			}
+			for (auto& buffer: config.buffers) {
+				buffer = VideoOutBuffer {};
+			}
+			for (auto& group: config.groups) {
+				group = BufferAttributeGroup {};
+			}
+			direct_slots = config.direct;
+			config.direct.fill(DirectSlot {});
+			config.vblank_cond.SignalAll();
 		}
-		for (auto& buffer: config.buffers) {
-			buffer = VideoOutBuffer {};
+		if (master != nullptr) {
+			Common::LockGuard master_lock(master->mutex);
+			master->slave_count--;
 		}
-		for (auto& group: config.groups) {
-			group = BufferAttributeGroup {};
+		m_flip_queue.Cancel(config);
+		if (config.bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN) {
+			g_headset_mirror = false;
 		}
-		config.vblank_cond.SignalAll();
-	}
-	if (master != nullptr) {
-		Common::LockGuard master_lock(master->mutex);
-		master->slave_count--;
-	}
-	m_flip_queue.Cancel(config);
-	if (config.bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN) {
-		g_headset_mirror = false;
-	}
-	m_presenter.ClearLayer(config.bus);
-	DeleteVideoOutEvents(flip_events, VideoOutEventKind::Flip);
-	DeleteVideoOutEvents(pre_vblank_events, VideoOutEventKind::PreVblankStart);
-	DeleteVideoOutEvents(vblank_events, VideoOutEventKind::Vblank);
-	DeleteVideoOutEvents(output_mode_events, VideoOutEventKind::OutputMode);
-	return true;
+		m_presenter.ClearLayer(config.bus);
+		DeleteVideoOutEvents(flip_events, VideoOutEventKind::Flip);
+		DeleteVideoOutEvents(pre_vblank_events, VideoOutEventKind::PreVblankStart);
+		DeleteVideoOutEvents(vblank_events, VideoOutEventKind::Vblank);
+		DeleteVideoOutEvents(output_mode_events, VideoOutEventKind::OutputMode);
+		return true;
+	}();
+	// Outside VideoOut's locks: freeing a pixmap talks to the X server, and the carve's release takes
+	// GemBacking's lock, which is never taken under a VideoOut lock. Presents of these pixmaps still in
+	// flight complete and go idle as usual.
+	ReleaseDirectSlots(m_flip_queue.Direct(), direct_slots);
+	return closed;
 }
 
 VideoOutConfig* VideoOutDriver::Impl::Get(int handle) {
@@ -960,7 +1106,10 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
-			(void)m_presenter.PresentLastFrame();
+			if (OverlayFrameReady()) {
+				(void)m_presenter.PresentLastFrame();
+			}
+			MaintainDirect();
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
 			total_wait +=
 			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
@@ -969,7 +1118,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+		if (!presented && m_presenter.NeedsSystemOverlayRefresh() && OverlayFrameReady()) {
 			if (m_presenter.PresentLastFrame()) {
 				presented = true;
 			} else {
@@ -1003,6 +1152,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			}
 		}
 		VblankEnd();
+		MaintainDirect();
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
@@ -1036,7 +1186,136 @@ static void VoLog(const char* what, int64_t a = 0, int64_t b = 0, int64_t c = 0)
 	std::fprintf(stderr, "vo [%.2f] %s %" PRId64 " %" PRId64 " %" PRId64 "\n", FlipLogMs(), what, a, b, c);
 }
 
-bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
+// Monotonic seconds, for direct presentation's watchdog and display holds.
+static double DirectNow() {
+	return FlipLogMs() * 1e-3;
+}
+
+void VideoOutDriver::Impl::RegisterDirectCallbacks() {
+	auto* direct = m_flip_queue.Direct();
+	if (direct == nullptr) {
+		return;
+	}
+	Graphics::DirectPresentCallbacks callbacks;
+	callbacks.complete = [this](uint64_t token, uint64_t msc, uint64_t ust_us, Graphics::DirectCompleteMode mode) {
+		m_flip_queue.OnDirectComplete(token, msc, ust_us, mode);
+	};
+	callbacks.idle = [this](uint64_t token) { m_flip_queue.OnDirectIdle(token); };
+	// Every direct flip checks the window's size (DirectPresenter::WindowIs), so a resize needs nothing here.
+	callbacks.resized = [](uint32_t width, uint32_t height) {
+		if (LogFlips()) {
+			std::fprintf(stderr, "flip [%.2f]: direct present: window is %ux%u\n", FlipLogMs(), width, height);
+		}
+	};
+	callbacks.lost = [this] { m_flip_queue.OnDirectLost(); };
+	direct->SetCallbacks(std::move(callbacks));
+}
+
+void VideoOutDriver::Impl::MaintainDirect() {
+	if (m_flip_queue.Direct() == nullptr) {
+		return;
+	}
+	m_flip_queue.DirectWatchdog(DirectNow());
+	m_presenter.MaintainDirect();
+}
+
+// Kyty's presenter draws the system overlay (game menu, toasts, cursor) over the last frame it
+// presented itself. When the main port's last flip was shown directly, that frame is older than what
+// is on screen, so the buffer on screen is first copied into a presenter frame on the GPU thread, as a
+// CPU flip is prepared, once per directly shown flip. True when the presenter may present now: always
+// when the last flip was not direct (as without direct presentation); otherwise once that copy is
+// the presenter's main layer, or 200 ms after it was asked for (the overlay then goes over the older
+// frame rather than not at all). With no overlay visible over the direct flip on screen, nothing
+// needs repainting: false.
+bool VideoOutDriver::Impl::OverlayFrameReady() {
+	if (m_flip_queue.Direct() == nullptr) {
+		return true;
+	}
+	// A copy the GPU thread has finished.
+	Graphics::Presenter::Frame* copy        = nullptr;
+	uint64_t                    copy_serial = 0;
+	{
+		Common::LockGuard lock(m_overlay_copy->mutex);
+		copy        = std::exchange(m_overlay_copy->frame, nullptr);
+		copy_serial = m_overlay_copy->serial;
+	}
+	auto&               main    = m_video_out_ctx[1]; // VIDEO_OUT_BUSES[0], the main bus
+	const double        now     = DirectNow();
+	const bool          overlay = Graphics::GetSystemOverlayVisualState().active;
+	uint64_t            serial  = 0;
+	bool                direct  = false;
+	Graphics::ImageInfo info;
+	bool                hdr = false;
+	bool                ask = false;
+	{
+		Common::LockGuard lock(main.mutex);
+		direct = main.opened && !main.closing && main.last_shown_direct;
+		serial = main.direct_shown;
+		// Only for an overlay: a copy per direct flip would be the work direct flips save.
+		if (direct && overlay && m_overlay_asked_serial != serial) {
+			m_overlay_asked_serial = serial;
+			m_overlay_asked_time   = now;
+			const int index        = main.flip_status.currentBuffer;
+			if (index >= 0 && index < VIDEO_OUT_BUFFER_NUM_MAX && main.buffers[index].Occupied() &&
+			    main.buffers[index].group_index < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX &&
+			    main.groups[main.buffers[index].group_index].occupied) {
+				const auto& group = main.groups[main.buffers[index].group_index];
+				info              = group.ImageInfo(main.buffers[index]);
+				hdr               = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
+				ask               = true;
+			}
+		}
+	}
+	// It becomes the main layer only while its flip is still the last one shown. Vulkan flips are
+	// presented on this thread, so none comes between this check and SetMainLayer; a direct flip that
+	// completes meanwhile only makes the next call ask for a newer copy.
+	if (copy != nullptr) {
+		if (direct && copy_serial == serial) {
+			m_presenter.SetMainLayer(*copy);
+			m_overlay_ready_serial = serial;
+		} else {
+			m_presenter.Discard(*copy);
+		}
+	}
+	if (ask) {
+		auto&      presenter = m_presenter;
+		const bool queued    = m_renderer.GetGpu().SubmitHostTask(
+		    [&presenter, info, hdr](Graphics::CommandBuffer& command) -> void* {
+			    // As FlipQueue::Prepare: in primary mode Kyty never rendered the buffer.
+			    if (Graphics::NativeGpu::ShadowShowsNativeFrames()) {
+				    (void)presenter.Renderer().InvalidateMemory(info.data.address, info.data.size,
+				                                                Graphics::NativeGpu::PrimaryRendering());
+			    }
+			    return &presenter.PrepareFrame(command, info, hdr, false);
+		    },
+		    [&presenter, slot = m_overlay_copy, serial](void* frame) {
+			    Common::LockGuard lock(slot->mutex);
+			    if (slot->frame != nullptr) {
+				    presenter.Discard(*slot->frame);
+			    }
+			    slot->frame  = static_cast<Graphics::Presenter::Frame*>(frame);
+			    slot->serial = serial;
+		    });
+		if (!queued) {
+			m_overlay_asked_time = now - 1.0;
+		}
+	}
+	if (!direct) {
+		return true;
+	}
+	// The window shows the direct flip itself; a present is needed only to draw the overlay, or to
+	// take it away again after it was drawn over this flip (over its copy, made then).
+	if (!overlay && m_overlay_shown_serial != serial) {
+		return false;
+	}
+	const bool ready = m_overlay_ready_serial == serial || now - m_overlay_asked_time > 0.2;
+	if (ready) {
+		m_overlay_shown_serial = serial;
+	}
+	return ready;
+}
+
+bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int flip_mode, int64_t flip_arg, FlipRequestSource source,
                         uint64_t& request_id) {
 	Common::LockGuard lock(m_mutex);
 
@@ -1078,6 +1357,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	r.submit_ptc = LibKernel::KernelGetProcessTimeCounter();
 	r.source     = source;
 	r.state      = RequestState::Reserved;
+	r.flip_mode  = flip_mode;
 	if (cfg.slave_count != 0) {
 		for (auto* queue: {&m_requests, &m_cpu_requests}) {
 			for (auto& slave: *queue) {
@@ -1119,8 +1399,11 @@ FlipQueue::~FlipQueue() {
 void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	std::vector<Graphics::Presenter::Frame*> frames;
 	m_mutex.Lock();
+	// A direct request at the display is not waited for: its CompleteNotify may never come. It is kept
+	// with the cancelled ones until it does (or the watchdog drops it); its IdleNotify still ends the
+	// display's hold through the token.
 	while (m_processing && std::any_of(m_requests.begin(), m_requests.end(), [&cfg](const auto& r) {
-		       return r.cfg == &cfg && r.state == RequestState::Presenting;
+		       return r.cfg == &cfg && r.state == RequestState::Presenting && !r.direct;
 	       })) {
 		m_done_cond_var.Wait(&m_mutex);
 	}
@@ -1130,7 +1413,8 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 				++it;
 				continue;
 			}
-			if (it->state == RequestState::Reserved || it->state == RequestState::Recording) {
+			if (it->state == RequestState::Reserved || it->state == RequestState::Recording ||
+			    (it->direct && it->state == RequestState::Presenting)) {
 				auto cancelled = it++;
 				m_cancelled_requests.splice(m_cancelled_requests.end(), *queue, cancelled);
 				continue;
@@ -1144,6 +1428,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 			it = queue->erase(it);
 		}
 	}
+	m_side_shown.erase(&cfg);
 	SignalDoneLocked();
 	m_submit_slot_cond_var.SignalAll();
 	m_submit_cond_var.SignalAll();
@@ -1154,6 +1439,8 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	Common::LockGuard lock(cfg.mutex);
 	cfg.flip_status.flipPendingNum = 0;
 	cfg.flip_status.gcQueueNum     = 0;
+	cfg.direct_last_target         = 0;
+	cfg.last_shown_direct          = false;
 }
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
@@ -1190,6 +1477,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			                                   [request_id](const auto& r) { return r.id > request_id; });
 			request = m_requests.insert(position, *pending);
 			m_cpu_requests.erase(pending);
+		}
+		// Shown directly (TryDirect): nothing to record.
+		if (request->direct) {
+			return;
 		}
 		if (request->state != RequestState::Reserved) {
 			EXIT("cannot prepare video-out request id=%" PRIu64 "\n", request_id);
@@ -1308,6 +1599,11 @@ void FlipQueue::Complete(uint64_t request_id) {
 		std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": recording complete\n", FlipLogMs(), request_id);
 	}
 	m_mutex.Lock();
+	// SubmitFlipFromGpu's request went to the display directly; it may be gone already.
+	if (m_direct_noop_completes.erase(request_id) != 0) {
+		m_mutex.Unlock();
+		return;
+	}
 	auto request = std::find_if(m_requests.begin(), m_requests.end(),
 	                            [request_id](const auto& r) { return r.id == request_id; });
 	if (request != m_requests.end()) {
@@ -1393,7 +1689,15 @@ bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t befo
 	    (cfg.current_flip_source == FlipRequestSource::GpuEop && cfg.current_flip_eop_order != 0
 	         ? cfg.current_flip_eop_order <= eop_mark
 	         : cfg.current_flip_id < before);
-	const bool safe = !shown_holds && std::none_of(m_requests.begin(), m_requests.end(), matches) &&
+	// A directly shown buffer stays held after it left the screen, until the display's IdleNotify
+	// (the PS5's display engine reading it until the next vblank). Counted like the buffer on screen:
+	// a wait placed before the release of the flip that showed it is not held by it.
+	const auto& hold          = cfg.holds[index >= 0 && index < VIDEO_OUT_BUFFER_NUM_MAX ? index : 0];
+	const bool  display_holds = index >= 0 && index < VIDEO_OUT_BUFFER_NUM_MAX && hold.presents != 0 &&
+	                           (hold.source == FlipRequestSource::GpuEop && hold.eop_order != 0
+	                                ? hold.eop_order <= eop_mark
+	                                : hold.flip_id < before);
+	const bool safe = !shown_holds && !display_holds && std::none_of(m_requests.begin(), m_requests.end(), matches) &&
 	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	m_gpu_waiting = !safe;
 	if (LogFlips()) {
@@ -1409,9 +1713,10 @@ bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t befo
 			last_safe     = safe;
 			std::fprintf(stderr,
 			             "flip [%.2f]: buffer %d %s for rendering (current %d from flip %" PRIu64 " eop %" PRIu64
-			             ", flips before %" PRIu64 ", releases up to %" PRIu64 ")\n",
+			             ", flips before %" PRIu64 ", releases up to %" PRIu64 ", display holds %u from flip %" PRIu64 ")\n",
 			             FlipLogMs(), index, safe ? "safe" : "not safe", cfg.flip_status.currentBuffer, cfg.current_flip_id,
-			             cfg.current_flip_eop_order, before, eop_mark);
+			             cfg.current_flip_eop_order, before, eop_mark, display_holds ? hold.presents : 0u,
+			             display_holds ? hold.flip_id : 0);
 			for (const auto* queue: {&m_requests, &m_cpu_requests}) {
 				for (const auto& r: *queue) {
 					if (safe) {
@@ -1490,9 +1795,11 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// request order. A group that is not ready holds back only its own ports: an EOP flip reserved
 	// when its command buffer was written (SubmitEopFlip) stays Reserved for the frame's whole GPU
 	// time, and the other ports' flips do not wait for it.
+	// A direct request is not Kyty's to present (TryDirect sent it or will), but it still holds back
+	// the newer flips of its port until the display completed it (OlderPendingOnPort).
 	uint64_t group = 0;
 	for (const auto& owner: m_requests) {
-		if (owner.group != owner.id) {
+		if (owner.group != owner.id || owner.direct) {
 			continue;
 		}
 		const uint64_t candidate = owner.id;
@@ -1567,21 +1874,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 			it++->state = RequestState::Ready;
 			continue;
 		}
-		auto& r = *it;
-		// The buffer this flip takes off the screen is safe for rendering again: its label goes to 0,
-		// unless a flip still pending shows it again and its release may already have written 1 (one recorded
-		// whose release has not run, Reserved without an EOP order, has written nothing).
+		auto&     r        = *it;
 		const int previous = r.cfg->flip_status.currentBuffer;
-		if (previous >= 0 && previous < VIDEO_OUT_BUFFER_NUM_MAX && previous != r.index) {
-			auto shows_previous = [&r, previous](const auto& o) {
-				return o.cfg == r.cfg && o.index == previous && o.id != r.id &&
-				       !(o.source == FlipRequestSource::GpuEop && o.state == RequestState::Reserved && o.eop_order == 0);
-			};
-			if (std::none_of(m_requests.begin(), m_requests.end(), shows_previous) &&
-			    std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), shows_previous)) {
-				std::atomic_ref<uint64_t>(r.cfg->labels[previous]).store(0, std::memory_order_release);
-			}
-		}
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1591,6 +1885,18 @@ bool FlipQueue::Flip(uint32_t micros) {
 		r.cfg->current_flip_id                      = r.id;
 		r.cfg->current_flip_source                  = r.source;
 		r.cfg->current_flip_eop_order               = r.eop_order;
+		r.cfg->last_shown_direct                    = false;
+		if (r.cfg->bus != VIDEO_OUT_BUS_TYPE_MAIN) {
+			m_side_shown.insert(r.cfg);
+		}
+		// The buffer this flip takes off the screen is safe for rendering again (MaybeClearLabelLocked);
+		// one shown directly before stays held until the display's IdleNotify.
+		if (previous >= 0 && previous < VIDEO_OUT_BUFFER_NUM_MAX && previous != r.index) {
+			if (r.cfg->holds[previous].presents != 0) {
+				r.cfg->holds[previous].since = DirectNow();
+			}
+			MaybeClearLabelLocked(*r.cfg, previous, r.id);
+		}
 		if (LogFlips()) {
 			std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": buffer %d displayed\n", FlipLogMs(), r.id, r.index);
 		}
@@ -1606,6 +1912,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 	for (size_t i = count; i != 0; i--) {
 		requests[i - 1].cfg->mutex.Unlock();
 	}
+	// Direct requests that waited behind this one go to the display now.
+	if (due && m_direct != nullptr) {
+		PumpDirect();
+	}
 	if (due) {
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 		if (Config::GraphicsDebugDumpEnabled() &&
@@ -1614,6 +1924,429 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 	}
 	return due;
+}
+
+bool FlipQueue::OlderUnsentOnPort(const Request& r) const {
+	auto older = [&r](const Request& o) {
+		return o.cfg == r.cfg && o.id < r.id && (!o.direct || o.state == RequestState::Ready);
+	};
+	return std::any_of(m_requests.begin(), m_requests.end(), older) ||
+	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), older);
+}
+
+void FlipQueue::MaybeClearLabelLocked(VideoOutConfig& cfg, int index, uint64_t except_id) {
+	if (index < 0 || index >= VIDEO_OUT_BUFFER_NUM_MAX || index == cfg.flip_status.currentBuffer ||
+	    cfg.holds[index].presents != 0) {
+		return;
+	}
+	auto shows = [&cfg, index, except_id](const Request& o) {
+		return o.cfg == &cfg && o.index == index && o.id != except_id &&
+		       !(o.source == FlipRequestSource::GpuEop && o.state == RequestState::Reserved && o.eop_order == 0);
+	};
+	if (std::any_of(m_requests.begin(), m_requests.end(), shows) ||
+	    std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), shows)) {
+		return;
+	}
+	std::atomic_ref<uint64_t>(cfg.labels[index]).store(0, std::memory_order_release);
+}
+
+// Whether the system overlay or a debug path needs Kyty's presenter for this flip. On the PS5 the
+// system software draws its UI on a display plane of its own; here Kyty's presenter draws it into
+// the frame, so while it is visible the frame is a Vulkan copy.
+static bool DirectBlockedByHost(Graphics::Presenter& presenter) {
+	// DirectPresentWanted() is false too while a flip dump is wanted (KYTY_NATIVE_GPU_DUMP_FLIPS, a
+	// pending "dump N" on the control socket): dumps run in ShadowOnFlip, at the Vulkan path's preparation.
+	return !Graphics::NativeGpu::DirectPresentWanted() || Graphics::GetSystemOverlayVisualState().active ||
+	       Graphics::PerformanceOverlayEnabled() || presenter.HdrSwapchainEverUsed();
+}
+
+bool FlipQueue::TryDirect(uint64_t request_id, bool complete_follows) {
+	if (m_direct == nullptr || DirectBlockedByHost(m_presenter)) {
+		return false;
+	}
+	VideoOutConfig* cfg = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		if (m_direct_off || m_direct_failed) {
+			return false;
+		}
+		for (const auto* queue: {&m_requests, &m_cpu_requests}) {
+			for (const auto& r: *queue) {
+				if (r.id == request_id) {
+					cfg = r.cfg;
+				}
+			}
+		}
+		if (cfg == nullptr) {
+			return false; // cancelled: the Vulkan path retires it
+		}
+	}
+	Common::LockGuard cfg_lock(cfg->mutex);
+	Common::LockGuard lock(m_mutex);
+	std::list<Request>* queue = &m_requests;
+	auto it = std::find_if(m_requests.begin(), m_requests.end(), [request_id](const auto& r) { return r.id == request_id; });
+	if (it == m_requests.end()) {
+		queue = &m_cpu_requests;
+		it    = std::find_if(m_cpu_requests.begin(), m_cpu_requests.end(),
+		                     [request_id](const auto& r) { return r.id == request_id; });
+		if (it == m_cpu_requests.end()) {
+			return false;
+		}
+	}
+	const auto& r = *it;
+	if (r.state != RequestState::Reserved || r.cfg != cfg || m_direct_off || m_direct_failed || !m_direct->Usable() ||
+	    !cfg->opened || cfg->closing || cfg->generation != r.generation || r.index < 0 ||
+	    r.index >= VIDEO_OUT_BUFFER_NUM_MAX) {
+		return false;
+	}
+	const auto& slot = cfg->direct[r.index];
+	// Shown 1:1 on the window, alone, as the title wrote it: a registered direct buffer of the main
+	// port, no flip master or slave, no headset image or other port composed over it, no colour change.
+	if (slot.pixmap == 0 || !cfg->buffers[r.index].Occupied() || cfg->buffers[r.index].data_address != slot.address ||
+	    cfg->bus != VIDEO_OUT_BUS_TYPE_MAIN || cfg->master != nullptr || cfg->slave_count != 0 || r.group != r.id ||
+	    g_headset_mirror.load(std::memory_order_relaxed) || !m_side_shown.empty() || cfg->gamma != 1.0f ||
+	    (cfg->output_mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && cfg->output_mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ) ||
+	    !m_direct->WindowIs(slot.width, slot.height)) {
+		return false;
+	}
+	if (queue == &m_cpu_requests) {
+		// In request order, as Prepare moves it.
+		const auto position = std::find_if(m_requests.begin(), m_requests.end(),
+		                                   [request_id](const auto& o) { return o.id > request_id; });
+		it = m_requests.insert(position, *it);
+		m_cpu_requests.erase(std::find_if(m_cpu_requests.begin(), m_cpu_requests.end(),
+		                                  [request_id](const auto& o) { return o.id == request_id; }));
+	}
+	it->state  = RequestState::Ready;
+	it->direct = true;
+	it->frame  = nullptr;
+	it->pixmap = slot.pixmap;
+	if (complete_follows) {
+		m_direct_noop_completes.insert(request_id);
+	}
+	if (LogFlips()) {
+		std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": buffer %d goes to the display directly (mode %d)\n", FlipLogMs(),
+		             request_id, it->index, it->flip_mode);
+	}
+	PumpDirectLocked(*cfg, DirectNow());
+	return true;
+}
+
+void FlipQueue::PumpDirectLocked(VideoOutConfig& cfg, double now) {
+	for (auto it = m_requests.begin(); it != m_requests.end();) {
+		auto& r = *it;
+		if (r.cfg != &cfg || !r.direct || r.state != RequestState::Ready) {
+			++it;
+			continue;
+		}
+		// The port is closing: Cancel retires its requests.
+		if (!cfg.opened || cfg.closing || cfg.generation != r.generation || OlderUnsentOnPort(r)) {
+			break;
+		}
+		if (cfg.direct[r.index].pixmap != r.pixmap) {
+			// The buffer was unregistered or its attribute changed after this flip was requested: its
+			// pixmap is gone. The flip counts as shown and skipped.
+			std::fprintf(stderr, "direct present: flip %" PRIu64 " of buffer %d skipped, its pixmap is gone\n", r.id,
+			             r.index);
+			it = CompleteDirectLocked(it, now);
+			continue;
+		}
+		r.state           = RequestState::Presenting;
+		r.direct_sent     = now;
+		r.direct_deadline = now;
+		if (m_direct_failed) {
+			// Not sent; the watchdog completes it as skipped on its next tick.
+			++it;
+			continue;
+		}
+		// FIFO by target MSC: each flip stays on screen for at least `interval` vblanks (the flip
+		// rate), the next free vblank when nothing is queued; an immediate (HSYNC) flip goes at once.
+		const uint64_t interval = static_cast<uint64_t>(cfg.flip_rate) + 1;
+		const bool     async    = r.flip_mode == VIDEO_OUT_FLIP_MODE_HSYNC;
+		const uint64_t last_msc = m_direct->LastMsc();
+		uint64_t       target   = 0;
+		if (!async && cfg.direct_last_target != 0) {
+			target = std::max(cfg.direct_last_target + interval, last_msc + 1);
+		}
+		if (!m_direct->Present(r.pixmap, r.id, target, async)) {
+			std::fprintf(stderr, "direct present: sending flip %" PRIu64 " failed; flips take the Vulkan path from now on\n",
+			             r.id);
+			m_direct_off    = true;
+			m_direct_failed = true;
+			++it;
+			continue;
+		}
+		cfg.direct_last_target = target != 0 ? target : last_msc + 1;
+		// 250 ms after the vblank it is due at (counted at 30 Hz, so a 120 Hz output is not shorter).
+		r.direct_deadline = now + 0.25 + static_cast<double>(target > last_msc ? target - last_msc : 1) / 30.0;
+		auto& hold        = cfg.holds[r.index];
+		hold.presents++;
+		hold.flip_id   = r.id;
+		hold.source    = r.source;
+		hold.eop_order = r.eop_order;
+		hold.since     = now;
+		m_direct_tokens[r.id] = {&cfg, r.index};
+		if (LogFlips()) {
+			std::fprintf(stderr,
+			             "flip [%.2f] %" PRIu64 ": buffer %d sent to the display (target msc %" PRIu64 "%s, last %" PRIu64
+			             ", held by %u presents)\n",
+			             FlipLogMs(), r.id, r.index, target, async ? ", async" : "", last_msc, hold.presents);
+		}
+		++it;
+	}
+}
+
+void FlipQueue::PumpDirect() {
+	VideoOutConfig* cfg = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		const auto        ready = std::find_if(m_requests.begin(), m_requests.end(), [](const auto& r) {
+            return r.direct && r.state == RequestState::Ready;
+        });
+		if (ready == m_requests.end()) {
+			return;
+		}
+		cfg = ready->cfg;
+	}
+	Common::LockGuard cfg_lock(cfg->mutex);
+	Common::LockGuard lock(m_mutex);
+	PumpDirectLocked(*cfg, DirectNow());
+}
+
+std::list<FlipQueue::Request>::iterator FlipQueue::CompleteDirectLocked(std::list<Request>::iterator it, double now) {
+	auto&     r        = *it;
+	auto&     cfg      = *r.cfg;
+	const int previous = cfg.flip_status.currentBuffer;
+	cfg.flip_status.count++;
+	cfg.flip_status.processTime              = LibKernel::KernelGetProcessTime();
+	cfg.flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
+	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
+	cfg.flip_status.flipArg                  = r.flip_arg;
+	cfg.flip_status.currentBuffer            = r.index;
+	cfg.current_flip_id                      = r.id;
+	cfg.current_flip_source                  = r.source;
+	cfg.current_flip_eop_order               = r.eop_order;
+	cfg.last_shown_direct                    = true;
+	cfg.direct_shown++;
+	cfg.flip_status.flipPendingNum--;
+	cfg.flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
+	// The buffer it took off the screen: one shown by Kyty's presenter is free now; one shown directly
+	// is still the display's until its IdleNotify.
+	if (previous >= 0 && previous < VIDEO_OUT_BUFFER_NUM_MAX && previous != r.index) {
+		if (cfg.holds[previous].presents != 0) {
+			cfg.holds[previous].since = now;
+		}
+		MaybeClearLabelLocked(cfg, previous, r.id);
+	}
+	if (LogFlips()) {
+		std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": buffer %d displayed directly\n", FlipLogMs(), r.id, r.index);
+	}
+	TriggerVideoOutEvents(cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
+	auto next = m_requests.erase(it);
+	SignalDoneLocked();
+	m_submit_slot_cond_var.SignalAll();
+	return next;
+}
+
+void FlipQueue::OnDirectComplete(uint64_t token, uint64_t msc, uint64_t ust_us, Graphics::DirectCompleteMode mode) {
+	(void)ust_us; // Stage 2: the Flip event's and the vblank's times from the display's.
+	VideoOutConfig* cfg = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		// Its port was closed meanwhile.
+		if (const auto cancelled = std::find_if(m_cancelled_requests.begin(), m_cancelled_requests.end(),
+		                                        [token](const auto& r) { return r.id == token && r.direct; });
+		    cancelled != m_cancelled_requests.end()) {
+			m_cancelled_requests.erase(cancelled);
+			return;
+		}
+		const auto t = m_direct_tokens.find(token);
+		if (t == m_direct_tokens.end()) {
+			return;
+		}
+		cfg = t->second.cfg;
+	}
+	bool     disable = false;
+	bool     main    = false;
+	uint32_t width   = 0;
+	uint32_t height  = 0;
+	{
+		Common::LockGuard cfg_lock(cfg->mutex);
+		Common::LockGuard lock(m_mutex);
+		const auto        it = std::find_if(m_requests.begin(), m_requests.end(), [token](const auto& r) {
+            return r.id == token && r.direct && r.state == RequestState::Presenting;
+        });
+		if (it == m_requests.end()) {
+			return; // the watchdog completed it already
+		}
+		const double now = DirectNow();
+		if (LogFlips()) {
+			std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": the display completed it (mode %d, msc %" PRIu64 ", %.2f ms after sending)\n",
+			             FlipLogMs(), token, static_cast<int>(mode), msc, (now - it->direct_sent) * 1e3);
+		}
+		CompleteDirectLocked(it, now);
+		switch (mode) {
+			case Graphics::DirectCompleteMode::Flip: m_copy_streak = 0; break;
+			case Graphics::DirectCompleteMode::Copy:
+				// Xwayland copies the pixmap into the window instead of handing it to gamescope: a blit on
+				// the shared gfx pipe, more work than Kyty's own path.
+				if (++m_copy_streak >= 3 && !m_direct_off) {
+					m_direct_off = true;
+					disable      = true;
+				}
+				break;
+			case Graphics::DirectCompleteMode::Skip:
+			case Graphics::DirectCompleteMode::Lost:
+				// A lost present (the connection died, or the X server refused it) counts as shown, so
+				// the title goes on; the flips after it take the Vulkan path.
+				if (mode == Graphics::DirectCompleteMode::Lost) {
+					m_direct_off = true;
+				}
+				if (++m_direct_skips <= 10 || m_direct_skips % 600 == 0) {
+					std::fprintf(stderr, "direct present: flip %" PRIu64 " %s (%" PRIu64 " so far)\n", token,
+					             mode == Graphics::DirectCompleteMode::Skip ? "skipped by the display" : "lost",
+					             m_direct_skips);
+				}
+				break;
+		}
+		main   = cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN;
+		width  = cfg->width;
+		height = cfg->height;
+		PumpDirectLocked(*cfg, now);
+	}
+	if (disable) {
+		m_direct->Disable("Xwayland copies the buffers instead of flipping them");
+	}
+	if (main) {
+		Graphics::PerformanceOverlayRecordFlip(width, height);
+	}
+	Graphics::NativeGpu::ShadowOnDirectFlip();
+	if (mode == Graphics::DirectCompleteMode::Flip) {
+		m_presenter.OnDirectShown();
+	}
+}
+
+void FlipQueue::OnDirectIdle(uint64_t token) {
+	VideoOutConfig* cfg = nullptr;
+	{
+		Common::LockGuard lock(m_mutex);
+		const auto        t = m_direct_tokens.find(token);
+		if (t == m_direct_tokens.end()) {
+			return;
+		}
+		cfg = t->second.cfg;
+	}
+	Common::LockGuard cfg_lock(cfg->mutex);
+	Common::LockGuard lock(m_mutex);
+	const auto        t = m_direct_tokens.find(token);
+	if (t == m_direct_tokens.end()) {
+		return; // the watchdog dropped the hold
+	}
+	const int index = t->second.index;
+	m_direct_tokens.erase(t);
+	auto& hold = cfg->holds[index];
+	if (hold.presents != 0) {
+		hold.presents--;
+	}
+	if (LogFlips()) {
+		std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": the display released buffer %d (still held by %u)\n", FlipLogMs(),
+		             token, index, hold.presents);
+	}
+	if (hold.presents == 0) {
+		hold = DisplayHold {};
+		MaybeClearLabelLocked(*cfg, index, 0);
+	}
+	// A GPU thread parked in a wait for this buffer (WaitFlipDone) checks again.
+	SignalDoneLocked();
+}
+
+void FlipQueue::OnDirectLost() {
+	Common::LockGuard lock(m_mutex);
+	if (!m_direct_failed) {
+		std::fprintf(stderr, "direct present: the connection to the display is lost; flips take the Vulkan path\n");
+	}
+	m_direct_off    = true;
+	m_direct_failed = true;
+}
+
+void FlipQueue::DirectWatchdog(double now) {
+	if (m_direct == nullptr) {
+		return;
+	}
+	// The ports with direct requests or display holds (only the main port has them).
+	std::array<VideoOutConfig*, VideoOutDriver::Impl::VIDEO_OUT_NUM_MAX> cfgs {};
+	size_t                                                              count = 0;
+	auto add = [&cfgs, &count](VideoOutConfig* cfg) {
+		if (std::find(cfgs.begin(), cfgs.begin() + count, cfg) == cfgs.begin() + count && count < cfgs.size()) {
+			cfgs[count++] = cfg;
+		}
+	};
+	{
+		Common::LockGuard lock(m_mutex);
+		// Requests of a closed port whose CompleteNotify never came.
+		std::erase_if(m_cancelled_requests, [now](const auto& r) {
+			return r.direct && r.state == RequestState::Presenting && now > r.direct_deadline;
+		});
+		for (const auto& r: m_requests) {
+			if (r.direct) {
+				add(r.cfg);
+			}
+		}
+		for (const auto& [token, held]: m_direct_tokens) {
+			add(held.cfg);
+		}
+	}
+	bool disable = false;
+	for (size_t i = 0; i < count; i++) {
+		auto&             cfg = *cfgs[i];
+		Common::LockGuard cfg_lock(cfg.mutex);
+		Common::LockGuard lock(m_mutex);
+		// A flip the display has not completed 250 ms after its vblank never will be: the display
+		// stopped answering. Direct presentation ends for the session and what was sent counts as
+		// shown and skipped, so the title, its flip status and its waits go on.
+		const bool expired = m_direct_failed || std::any_of(m_requests.begin(), m_requests.end(), [&cfg, now](const auto& r) {
+			                     return r.cfg == &cfg && r.direct && r.state == RequestState::Presenting &&
+			                            now > r.direct_deadline;
+		                     });
+		if (expired) {
+			if (!m_direct_failed) {
+				std::fprintf(stderr, "direct present: the display did not complete a flip 250 ms after its vblank; flips "
+				                     "take the Vulkan path from now on\n");
+				disable = true;
+			}
+			m_direct_off    = true;
+			m_direct_failed = true;
+			for (auto it = m_requests.begin(); it != m_requests.end();) {
+				if (it->cfg == &cfg && it->direct && it->state == RequestState::Presenting) {
+					it = CompleteDirectLocked(it, now);
+				} else {
+					++it;
+				}
+			}
+			// The rest, once the requests before them have reached the display.
+			PumpDirectLocked(cfg, now);
+		}
+		// A buffer off the screen whose IdleNotify has not come within 1 s: the display let it go
+		// without saying so, or never will.
+		for (int index = 0; index < VIDEO_OUT_BUFFER_NUM_MAX; index++) {
+			auto& hold = cfg.holds[index];
+			if (hold.presents == 0 || index == cfg.flip_status.currentBuffer || now - hold.since <= 1.0) {
+				continue;
+			}
+			std::fprintf(stderr, "direct present: buffer %d had no IdleNotify for %.0f ms after it left the screen; "
+			                     "released\n",
+			             index, (now - hold.since) * 1e3);
+			std::erase_if(m_direct_tokens, [&cfg, index](const auto& entry) {
+				return entry.second.cfg == &cfg && entry.second.index == index;
+			});
+			hold = DisplayHold {};
+			MaybeClearLabelLocked(cfg, index, 0);
+			SignalDoneLocked();
+		}
+	}
+	if (disable) {
+		m_direct->Disable("the display stopped answering");
+	}
 }
 
 void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
@@ -1742,6 +2475,100 @@ KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
+// Why the display buffer `info` cannot be shown directly (KYTY_DIRECT_PRESENT=1), or nullptr when it
+// can; `depth` gets the X depth of its pixmap. The display engine reads it as it is, so it must be a
+// layout and size the window shows 1:1: the main port, Prospero's 64 KiB render-target tiling (the AMD
+// 64K_R_X modifier), 4 bytes per pixel with an X depth, no DCC, SDR, the window's size.
+static const char* DirectIneligibility(Graphics::DirectPresenter& direct, Graphics::Presenter& presenter, int bus,
+                                       const VideoOutBufferAttribute2& attribute, const Graphics::ImageInfo& info,
+                                       uint8_t* depth) {
+	*depth = 0;
+	if (!Graphics::NativeGpu::DirectPresentWanted() || !direct.Usable()) {
+		return "direct presentation is off";
+	}
+	if (bus != VIDEO_OUT_BUS_TYPE_MAIN) {
+		return "not the main port";
+	}
+	if (info.tile_mode != Graphics::Prospero::TileMode::kRenderTarget || info.bytes_per_block != 4) {
+		return "not a 4-byte render-target layout";
+	}
+	if (info.HasMetadata()) {
+		return "compressed (DCC)";
+	}
+	if (Graphics::IsHdrVideoOutPixelFormat(attribute.pixel_format) || presenter.HdrSwapchainEverUsed()) {
+		return "HDR";
+	}
+	*depth = direct.DepthFor(attribute.pixel_format);
+	if (*depth == 0) {
+		return "no X depth for the pixel format";
+	}
+	if (info.pitch % 128 != 0) {
+		return "pitch not a multiple of 128";
+	}
+	if (!direct.WindowIs(attribute.width, attribute.height)) {
+		return "size differs from the window";
+	}
+	return nullptr;
+}
+
+// The pixmap of a carved display buffer (0 when the X server refuses it).
+static uint32_t AddDirectPixmap(Graphics::DirectPresenter& direct, const Graphics::NativeGpu::NativeDisplayBuffer& bo,
+                                const Graphics::ImageInfo& info, uint8_t depth) {
+	Graphics::DirectSurface surface {};
+	surface.dmabuf_fd = bo.dmabuf_fd;
+	surface.offset    = bo.bo_offset;
+	surface.width     = info.extent.width;
+	surface.height    = info.extent.height;
+	surface.stride    = info.pitch * info.bytes_per_block;
+	surface.depth     = depth;
+	return direct.AddBuffer(surface);
+}
+
+// A display buffer being registered (sceVideoOutRegisterBuffers2), with direct presentation on: when
+// the window can show it 1:1, its guest range becomes one VRAM scan-out BO at the same address
+// (NativeGpu::ShadowCarveDisplayBuffer) and that BO a pixmap of the window, as the PS5's display
+// engine scans the registered buffer out itself. Done now, before the title renders into it, on the
+// title's thread without VideoOut locks (the copy and the X round trip take tens of milliseconds, at
+// load time). One log line per buffer says which way its flips go.
+static DirectSlot MakeDirectSlot(Graphics::DirectPresenter& direct, Graphics::Presenter& presenter, int bus,
+                                 const BufferAttributeGroup& group, const VideoOutBuffer& buffer, int index,
+                                 uint64_t label) {
+	DirectSlot  slot {};
+	const auto  info  = group.ImageInfo(buffer);
+	uint8_t     depth = 0;
+	const char* why   = DirectIneligibility(direct, presenter, bus, group.attribute, info, &depth);
+	Graphics::NativeGpu::NativeDisplayBuffer bo {};
+	if (why == nullptr) {
+		if (Graphics::NativeGpu::ShadowCarveDisplayBuffer(info.data.address, info.data.size, &bo)) {
+			slot.address = info.data.address;
+			slot.size    = info.data.size;
+			slot.width   = info.extent.width;
+			slot.height  = info.extent.height;
+			slot.pixmap  = AddDirectPixmap(direct, bo, info, depth);
+			if (slot.pixmap == 0) {
+				why = "the X server refused its pixmap";
+			}
+		} else {
+			why = "its memory could not become a VRAM scan-out buffer";
+		}
+	}
+	if (why != nullptr) {
+		std::fprintf(stderr, "direct present: buffer %d (0x%016" PRIx64 ", %ux%u) takes the Vulkan path: %s\n", index,
+		             info.data.address, info.extent.width, info.extent.height, why);
+		return slot;
+	}
+	std::fprintf(stderr,
+	             "direct present: buffer %d (0x%016" PRIx64 ", %ux%u, depth %u) is shown directly, pixmap 0x%x, BO offset "
+	             "0x%" PRIx64 "\n",
+	             index, info.data.address, info.extent.width, info.extent.height, depth, slot.pixmap, bo.bo_offset);
+	// GPU writes between the carve's copy and its remap are lost; a buffer the title already flipped
+	// (its release wrote the label) may have had some.
+	if (label != 0) {
+		std::fprintf(stderr, "direct present: buffer %d was registered after its flip release ran\n", index);
+	}
+	return slot;
+}
+
 KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer_index_start,
                                            const VideoOutBuffers* buffers, int buffer_num,
                                            const VideoOutBufferAttribute2* attribute, int category,
@@ -1842,29 +2669,54 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		(void)group.ImageInfo(registrations.back());
 	}
 
-	Common::LockGuard lock(ctx->mutex);
-	if (ctx->closing) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-	if (ctx->groups[set_index].occupied) {
-		return VIDEO_OUT_ERROR_INVALID_INDEX;
-	}
-	for (int i = 0; i < buffer_num; i++) {
-		if (ctx->buffers[buffer_index_start + i].Occupied()) {
-			return VIDEO_OUT_ERROR_SLOT_OCCUPIED;
+	// Direct presentation (KYTY_DIRECT_PRESENT=1): before the port's lock (MakeDirectSlot).
+	auto*                                            direct = DriverState().GetFlipQueue().Direct();
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX> direct_slots {};
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX> stale_slots {};
+	if (direct != nullptr && !headset) {
+		int bus = 0;
+		{
+			Common::LockGuard lock(ctx->mutex);
+			bus = ctx->bus;
+		}
+		for (int i = 0; i < buffer_num; i++) {
+			const int index = buffer_index_start + i;
+			direct_slots[static_cast<size_t>(i)] =
+			    MakeDirectSlot(*direct, DriverState().GetPresenter(), bus, group, registrations[static_cast<size_t>(i)], index,
+			                   std::atomic_ref<uint64_t>(ctx->labels[index]).load(std::memory_order_acquire));
 		}
 	}
 
-	ctx->groups[set_index] = group;
-	for (int i = 0; i < buffer_num; i++) {
-		ctx->buffers[buffer_index_start + i] = registrations[static_cast<size_t>(i)];
-		const auto& buffer                   = registrations[static_cast<size_t>(i)];
-		LOGF("\tbuffers[%d] = %016" PRIx64 " metadata = %016" PRIx64 " dcc = %08" PRIx32 "\n",
-		     buffer_index_start + i, buffer.data_address, buffer.metadata_address,
-		     attribute->dcc_control);
-	}
+	const int result = [&] {
+		Common::LockGuard lock(ctx->mutex);
+		if (ctx->closing) {
+			return VIDEO_OUT_ERROR_INVALID_HANDLE;
+		}
+		if (ctx->groups[set_index].occupied) {
+			return VIDEO_OUT_ERROR_INVALID_INDEX;
+		}
+		for (int i = 0; i < buffer_num; i++) {
+			if (ctx->buffers[buffer_index_start + i].Occupied()) {
+				return VIDEO_OUT_ERROR_SLOT_OCCUPIED;
+			}
+		}
 
-	return OK;
+		ctx->groups[set_index] = group;
+		for (int i = 0; i < buffer_num; i++) {
+			ctx->buffers[buffer_index_start + i] = registrations[static_cast<size_t>(i)];
+			stale_slots[static_cast<size_t>(i)]  = ctx->direct[buffer_index_start + i];
+			ctx->direct[buffer_index_start + i]  = direct_slots[static_cast<size_t>(i)];
+			const auto& buffer                   = registrations[static_cast<size_t>(i)];
+			LOGF("\tbuffers[%d] = %016" PRIx64 " metadata = %016" PRIx64 " dcc = %08" PRIx32 "\n",
+			     buffer_index_start + i, buffer.data_address, buffer.metadata_address,
+			     attribute->dcc_control);
+		}
+		return OK;
+	}();
+	// A refused registration keeps nothing; a slot left over at a free index (none is expected) goes.
+	ReleaseDirectSlots(direct, std::span(result == OK ? stale_slots : direct_slots).first(static_cast<size_t>(buffer_num)));
+
+	return result;
 }
 
 KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index,
@@ -1888,23 +2740,91 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
 
-	Common::LockGuard lock(ctx->mutex);
-	const auto&       current = ctx->groups[set_index];
-	if (ctx->closing || !current.occupied) {
-		return VIDEO_OUT_ERROR_INVALID_INDEX;
-	}
+	// Direct presentation: the set's pixmaps describe the old attribute. They go now, and flips
+	// requested from here on use pixmaps made for the new one; a carved buffer stays carved, and one
+	// that was not carved at registration is not carved now, after the title may have rendered into it.
+	auto*                                            direct = DriverState().GetFlipQueue().Direct();
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX> old_pixmaps {};
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX> carved {};
+	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX> carved_buffers {};
+	BufferAttributeGroup                             replacement {};
+	int                                              bus = 0;
+	{
+		Common::LockGuard lock(ctx->mutex);
+		const auto&       current = ctx->groups[set_index];
+		if (ctx->closing || !current.occupied) {
+			return VIDEO_OUT_ERROR_INVALID_INDEX;
+		}
 
-	BufferAttributeGroup replacement {
-	    .attribute = *attribute,
-	    .category  = current.category,
-	    .occupied  = true,
-	};
-	for (const auto& buffer: ctx->buffers) {
-		if (buffer.group_index == set_index) {
-			(void)replacement.ImageInfo(buffer);
+		replacement = BufferAttributeGroup {
+		    .attribute = *attribute,
+		    .category  = current.category,
+		    .occupied  = true,
+		};
+		for (const auto& buffer: ctx->buffers) {
+			if (buffer.group_index == set_index) {
+				(void)replacement.ImageInfo(buffer);
+			}
+		}
+		ctx->groups[set_index] = replacement;
+		bus                    = ctx->bus;
+		for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; i++) {
+			auto& slot = ctx->direct[i];
+			if (ctx->buffers[i].group_index != set_index || (slot.pixmap == 0 && slot.size == 0)) {
+				continue;
+			}
+			old_pixmaps[i].pixmap = slot.pixmap;
+			slot.pixmap           = 0;
+			carved[i]             = slot;
+			carved_buffers[i]     = ctx->buffers[i];
 		}
 	}
-	ctx->groups[set_index] = replacement;
+	if (direct == nullptr) {
+		return OK;
+	}
+	ReleaseDirectSlots(direct, old_pixmaps);
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX> unused {};
+	for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; i++) {
+		if (carved[i].size == 0) {
+			continue;
+		}
+		const auto  info  = replacement.ImageInfo(carved_buffers[i]);
+		uint8_t     depth = 0;
+		const char* why   = DirectIneligibility(*direct, DriverState().GetPresenter(), bus, replacement.attribute, info, &depth);
+		Graphics::NativeGpu::NativeDisplayBuffer bo {};
+		uint32_t                                 pixmap = 0;
+		if (why == nullptr && (info.data.address != carved[i].address || info.data.size > carved[i].size)) {
+			why = "the new layout is larger than its VRAM scan-out buffer";
+		}
+		// The range lies in its carve, so this only looks the carve up.
+		if (why == nullptr && !Graphics::NativeGpu::ShadowCarveDisplayBuffer(info.data.address, info.data.size, &bo)) {
+			why = "its VRAM scan-out buffer is gone";
+		}
+		if (why == nullptr) {
+			pixmap = AddDirectPixmap(*direct, bo, info, depth);
+			if (pixmap == 0) {
+				why = "the X server refused its pixmap";
+			}
+		}
+		std::fprintf(stderr, "direct present: buffer %d (%ux%u) after its attribute change %s%s\n", i, info.extent.width,
+		             info.extent.height, why == nullptr ? "is shown directly" : "takes the Vulkan path: ",
+		             why == nullptr ? "" : why);
+		if (pixmap == 0) {
+			continue;
+		}
+		Common::LockGuard lock(ctx->mutex);
+		auto&             slot = ctx->direct[i];
+		if (ctx->closing || ctx->buffers[i].group_index != set_index ||
+		    ctx->buffers[i].data_address != carved_buffers[i].data_address || slot.pixmap != 0 ||
+		    slot.address != carved[i].address) {
+			unused[i].pixmap = pixmap; // unregistered or changed again meanwhile
+			continue;
+		}
+		slot.pixmap = pixmap;
+		slot.width  = info.extent.width;
+		slot.height = info.extent.height;
+	}
+	ReleaseDirectSlots(direct, unused);
 
 	return OK;
 }
@@ -1920,19 +2840,26 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
-	Common::LockGuard lock(ctx->mutex);
-	if (ctx->closing) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-	if (!ctx->groups[set_index].occupied) {
-		return VIDEO_OUT_ERROR_INVALID_INDEX;
-	}
-	ctx->groups[set_index] = BufferAttributeGroup {};
-	for (auto& buffer: ctx->buffers) {
-		if (buffer.group_index == set_index) {
-			buffer = VideoOutBuffer {};
+	std::array<DirectSlot, VIDEO_OUT_BUFFER_NUM_MAX> released {};
+	{
+		Common::LockGuard lock(ctx->mutex);
+		if (ctx->closing) {
+			return VIDEO_OUT_ERROR_INVALID_HANDLE;
+		}
+		if (!ctx->groups[set_index].occupied) {
+			return VIDEO_OUT_ERROR_INVALID_INDEX;
+		}
+		ctx->groups[set_index] = BufferAttributeGroup {};
+		for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; i++) {
+			if (ctx->buffers[i].group_index == set_index) {
+				ctx->buffers[i] = VideoOutBuffer {};
+				released[i]     = ctx->direct[i];
+				ctx->direct[i]  = DirectSlot {};
+			}
 		}
 	}
+	// The display may still hold these buffers: their holds end at their IdleNotify as usual.
+	ReleaseDirectSlots(DriverState().GetFlipQueue().Direct(), released);
 
 	return OK;
 }
@@ -1948,6 +2875,10 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	}
 	if (result != OK) {
 		return result;
+	}
+	// On the PS5 a CPU flip goes to the display at the next vblank whatever the GPU is doing.
+	if (DriverState().GetFlipQueue().TryDirect(request_id, false)) {
+		return OK;
 	}
 	g_video_out_driver->SubmitFlipPreparation(request_id);
 
@@ -1989,6 +2920,11 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	                                      FlipRequestSource::GpuEop, request_id);
 	if (result != OK) {
 		return result;
+	}
+	// The R_FLIP point the GPU has passed: a direct buffer goes to the display now, and the caller's
+	// deferred CompleteFlip finds nothing to complete.
+	if (m_impl->GetFlipQueue().TryDirect(request_id, true)) {
+		return OK;
 	}
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
 
@@ -2074,6 +3010,11 @@ bool VideoOutDriver::EopFlip(uint32_t ctx) {
 	uint64_t request_id = 0;
 	if (!m_impl->GetFlipQueue().TakeEopFlip(ctx, request_id)) {
 		return false;
+	}
+	// As the PS5 kernel does from this interrupt: a direct buffer is queued to the display here, with
+	// no GPU work and no hop to the GPU thread.
+	if (m_impl->GetFlipQueue().TryDirect(request_id, false)) {
+		return true;
 	}
 	if (!m_impl->Renderer().GetGpu().SubmitEopFlipRequest(request_id)) {
 		m_impl->GetFlipQueue().DropEopOrder(request_id);

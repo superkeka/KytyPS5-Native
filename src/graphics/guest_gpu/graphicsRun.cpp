@@ -210,6 +210,24 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	Enqueue(std::move(submission));
 }
 
+bool GuestGpu::SubmitHostTask(std::function<void*(CommandBuffer&)> record, std::function<void(void*)> after) {
+	// Like a CPU flip's preparation it records only Kyty's own presentation work, so it does not
+	// queue behind the command buffers the native pipeline still runs (Enqueue's gate).
+	Submission submission;
+	submission.type        = SubmissionType::HostTask;
+	submission.queue_id    = 0;
+	submission.host_record = std::move(record);
+	submission.host_after  = std::move(after);
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting || m_drained) {
+		return false;
+	}
+	m_queues[0].push_back(std::move(submission));
+	m_submission_count++;
+	m_work_available.Signal();
+	return true;
+}
+
 std::ptrdiff_t GuestGpu::SuspendPointsAhead() {
 	const char* primary = std::getenv("KYTY_NATIVE_GPU_PRIMARY");
 	const char* ahead   = std::getenv("KYTY_NATIVE_GPU_FRAMES_AHEAD");
@@ -523,8 +541,10 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0 && NativeGpu::PrimaryRendering() && gpu->m_queues[0].size() > 1 &&
 				    gpu->m_queues[0].front().blocked) {
 					auto& gfx  = gpu->m_queues[0];
-					auto  flip = std::find_if(gfx.begin() + 1, gfx.end(),
-					                          [](const Submission& s) { return s.type == SubmissionType::FlipPreparation; });
+					// The overlay's redraw of a directly shown buffer (HostTask) is presentation work too.
+					auto  flip = std::find_if(gfx.begin() + 1, gfx.end(), [](const Submission& s) {
+						return s.type == SubmissionType::FlipPreparation || s.type == SubmissionType::HostTask;
+					});
 					if (flip != gfx.end()) {
 						submission = std::move(*flip);
 						gfx.erase(flip);
@@ -656,6 +676,26 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
+		case SubmissionType::HostTask: {
+			// As PrepareCpuFlip: record into the current command buffer outside any guest command
+			// buffer's processing, then hand the result over once that buffer has completed.
+			if (g_current_processor != nullptr) {
+				EXIT("invalid graphics-thread host task\n");
+			}
+			struct ProcessorScope {
+				explicit ProcessorScope(CommandProcessor& processor) { g_current_processor = &processor; }
+				~ProcessorScope() { g_current_processor = nullptr; }
+			};
+			ProcessorScope processor_scope(cp);
+			auto&       scheduler = m_renderer.GetCommandScheduler();
+			void* const result    = submission.host_record ? submission.host_record(scheduler.Current()) : nullptr;
+			if (submission.host_after) {
+				scheduler.DeferPriorityOperation(
+				    [after = std::move(submission.host_after), result] { after(result); });
+			}
+			scheduler.Flush();
+			break;
+		}
 		case SubmissionType::EopFlip: {
 			if (submission.flip_request_id != 0) {
 				cp.EopFlipRequest(submission.flip_request_id);

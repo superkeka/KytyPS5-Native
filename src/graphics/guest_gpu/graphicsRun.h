@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -47,6 +48,12 @@ public:
 	// (VideoOutDriver::EopFlip) has just arrived. False when the GPU is shutting down: the flip is
 	// dropped (never shown).
 	bool SubmitEopFlipRequest(uint64_t request_id);
+	// Host work that records into Kyty's current command buffer on the GPU thread, like a CPU flip's
+	// preparation (it does not wait behind the native pipeline): `record` runs there and returns a
+	// result, and `after` gets that result once the command buffer has completed. Used by VideoOut to
+	// draw the system overlay over a display buffer that was shown directly (without Vulkan). False,
+	// and nothing runs, when the GPU no longer accepts work.
+	bool SubmitHostTask(std::function<void*(CommandBuffer&)> record, std::function<void(void*)> after);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
@@ -62,7 +69,7 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint, EopFlip };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint, EopFlip, HostTask };
 
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
@@ -77,6 +84,8 @@ private:
 		uint64_t                  flip_watermark   = UINT64_MAX;  // NextFlipRequestId() at submission
 		uint64_t                  blocked_since_ms = 0;           // first time Process left it unfinished
 		bool                      blocked_logged   = false;
+		std::function<void*(CommandBuffer&)> host_record;  // HostTask
+		std::function<void(void*)>           host_after;   // HostTask
 	};
 
 	void              Enqueue(Submission submission);

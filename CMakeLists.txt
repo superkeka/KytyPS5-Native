@@ -847,6 +847,24 @@ endif()
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
 
+# Direct scan-out flips (graphics/presentation/window/directPresent.cpp): each display buffer becomes a
+# DRI3 pixmap of the X11 window and a flip is one PresentPixmap, as the PS5 display engine shows the
+# buffer itself. Without xcb-dri3 and xcb-present the stub is built and every flip goes through Vulkan.
+# KYTY_DIRECT_PRESENT=1 in the environment still decides at run time.
+if(LINUX)
+	find_package(PkgConfig QUIET)
+	if(PKG_CONFIG_FOUND)
+		pkg_check_modules(KYTY_XCB IMPORTED_TARGET xcb xcb-dri3 xcb-present)
+	endif()
+	if(KYTY_XCB_FOUND)
+		target_compile_definitions(kyty_emulator PRIVATE KYTY_DIRECT_PRESENT=1)
+		target_link_libraries(kyty_emulator PkgConfig::KYTY_XCB)
+		message(STATUS "Direct present: built with xcb, xcb-dri3 and xcb-present")
+	else()
+		message(STATUS "Direct present: xcb-dri3 or xcb-present not found, flips go through Vulkan only")
+	endif()
+endif()
+
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
 
 include_what_you_use(kyty_emulator "${inc_headers}")

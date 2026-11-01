@@ -14,6 +14,7 @@ int main() {
 
 #else
 
+#include <algorithm>
 #include <cerrno>
 #include <ctime>
 #include <initializer_list>
@@ -472,6 +473,132 @@ int main() {
 		::munmap(host, len);
 		std::printf("NativeGpuGemBackingTests: BindExternal split a holed range into readable slices "
 		            "the GPU used\n");
+	}
+
+	// Case 7: a display buffer across the block 0 / block 1 seam is carved into one VRAM scan-out buffer
+	// (KYTY_DIRECT_PRESENT). Its data survives through every view of those bytes and the alias, which stay
+	// one memory; it is one dma-buf piece; both blocks' offsets resolve into the carve; a new view and a
+	// view straddling the carve's edge map it; the GPU writes into it through the guest address; exporting
+	// the rest of block 1 leaves it alone; the buffer is VRAM. Cases 2 and 4 mapped views
+	// of the same bytes, which must follow too. Skipped without enough CPU-visible VRAM (CI).
+	{
+		uint64_t usable = 0;
+		uint64_t used   = 0;
+		if (!gem->VramHeap(&usable, &used) || usable < (64ull << 20u)) {
+			std::printf("NativeGpuGemBackingTests: carve case skipped (%llu MiB of CPU-visible VRAM)\n",
+			            static_cast<unsigned long long>(usable >> 20u));
+		} else {
+			const uint64_t len  = 0x40000;
+			const uint64_t off  = chunk - len / 2;
+			auto*          view = static_cast<uint32_t*>(ReserveGuest(len));
+			const uint64_t va   = reinterpret_cast<uint64_t>(view);
+			Check(gem->MapView(va, len, off, PROT_READ | PROT_WRITE), "MapView for the carve case failed");
+			Check(gem->BindView(va, len, off), "BindView for the carve case failed");
+			for (uint32_t i = 0; i < len / 4; i++) {
+				view[i] = 0x70000000u + i;
+			}
+			const auto* a = reinterpret_cast<const uint32_t*>(alias + off);
+
+			GemBacking::CarveInfo info;
+			Check(gem->CarveGuestRange(va, len, &info), "CarveGuestRange across the seam failed");
+			Check(info.dmabuf_fd >= 0 && info.handle != 0 && info.bo_size == len && info.bo_offset == 0, "carve info wrong");
+			Check(gem->IsCarved(va, len) && gem->IsCarved(va + 0x1000, 0x1000) && gem->CarvedBytes() == len, "carve not recorded");
+			for (uint32_t i = 0; i < len / 4; i++) {
+				Check(view[i] == 0x70000000u + i, "carve lost data (view)");
+				Check(a[i] == 0x70000000u + i, "carve lost data (alias)");
+			}
+			view[0] = 0x71000000u;
+			Check(a[0] == 0x71000000u, "view write not in the alias after the carve");
+			reinterpret_cast<uint32_t*>(alias + off)[1] = 0x72000000u;
+			Check(view[1] == 0x72000000u, "alias write not in the view after the carve");
+
+			struct drm_amdgpu_gem_create_in created;
+			std::memset(&created, 0, sizeof(created));
+			struct drm_amdgpu_gem_op op;
+			std::memset(&op, 0, sizeof(op));
+			op.handle = info.handle;
+			op.op     = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
+			op.value  = reinterpret_cast<uintptr_t>(&created);
+			Check(Ioctl(gem->DrmFd(), DRM_IOCTL_AMDGPU_GEM_OP, &op) == 0, "GEM_OP GET_GEM_CREATE_INFO failed");
+			Check((created.domains & AMDGPU_GEM_DOMAIN_VRAM) != 0, "the carve is not VRAM");
+			Check((created.domain_flags & AMDGPU_GEM_CREATE_EXPLICIT_SYNC) != 0, "the carve is not explicit sync");
+
+			std::vector<GemBacking::DmabufPiece> pieces;
+			Check(gem->DmabufPieces(va, len, pieces) && pieces.size() == 1, "a carved range must be one dma-buf piece");
+			Check(pieces[0].fd == info.dmabuf_fd && pieces[0].bo_offset == 0 && pieces[0].len == len && pieces[0].bo_size == len,
+			      "carved piece at the wrong place");
+			uint32_t h0 = 0;
+			uint32_t h1 = 0;
+			uint64_t i0 = ~0ull;
+			uint64_t i1 = ~0ull;
+			Check(gem->Lookup(off, &h0, &i0) && gem->Lookup(chunk, &h1, &i1), "lookup after the carve failed");
+			Check(h0 == info.handle && h1 == info.handle && i0 == 0 && i1 == len / 2, "both blocks must resolve into the carve");
+
+			// A new view of the same bytes maps the carve; registering it again returns the same carve.
+			auto*          again    = static_cast<uint32_t*>(ReserveGuest(len));
+			const uint64_t again_va = reinterpret_cast<uint64_t>(again);
+			Check(gem->MapView(again_va, len, off, PROT_READ | PROT_WRITE), "MapView of carved bytes failed");
+			Check(again[5] == 0x70000005u, "a new view does not see the carve");
+			again[6] = 0x73000000u;
+			Check(view[6] == 0x73000000u, "a new view is not the carve");
+			GemBacking::CarveInfo same;
+			Check(gem->CarveGuestRange(again_va, len, &same) && same.handle == info.handle && same.bo_offset == 0, "a second carve of the range must reuse it");
+			Check(gem->CarveGuestRange(va + 0x10000, 0x10000, &same) && same.handle == info.handle && same.bo_offset == 0x10000,
+			      "a range inside a carve must return it with its offset");
+			Check(gem->CarvedBytes() == len, "reusing a carve must not carve again");
+			gem->SetCarveRegistered(va, len, false);
+			Check(gem->IsCarved(va, len), "an unregistered carve stays");
+
+			// A view straddling the carve's start maps block 0's buffer, then the carve; carving it is refused.
+			auto*          edge    = static_cast<uint32_t*>(ReserveGuest(0x20000));
+			const uint64_t edge_va = reinterpret_cast<uint64_t>(edge);
+			Check(gem->MapView(edge_va, 0x20000, off - 0x10000, PROT_READ | PROT_WRITE), "MapView over the carve's edge failed");
+			Check(edge[0x10000 / 4 + 7] == 0x70000007u, "a view over the carve's edge does not see the carve");
+			edge[0] = 0x74000000u;
+			Check(reinterpret_cast<const uint32_t*>(alias + off - 0x10000)[0] == 0x74000000u, "a view over the carve's edge lost block 0");
+			Check(!gem->CarveGuestRange(edge_va, 0x20000, &same), "a range overlapping a carve in part must be refused");
+			Check(gem->CarvedBytes() == len, "a refused carve changed something");
+
+			// The GPU writes through the guest address into the carve, which every submission lists.
+			const int fd = gem->DrmFd();
+			union drm_amdgpu_ctx c;
+			std::memset(&c, 0, sizeof(c));
+			c.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+			Check(Ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &c) == 0, "carve-case context allocation failed");
+			const Buffer ib   = CreateBuffer(fd, 64 * 1024, 0x0086000000ull);
+			const Buffer code = CreateBuffer(fd, 64 * 1024, 0x0087000000ull);
+			std::memcpy(code.cpu, kStoreShader, sizeof(kStoreShader));
+			const std::vector<uint32_t> all = gem->CreatedHandles();
+			Check(std::find(all.begin(), all.end(), info.handle) != all.end(), "submissions must list the carve");
+			RunStore(fd, c.out.alloc.ctx_id, ib, code, va, 0x75000000u, static_cast<uint32_t>(len / 256), all.data(),
+			         static_cast<uint32_t>(all.size()));
+			for (uint32_t i = 0; i < len / 4; i++) {
+				Check(view[i] == 0x75000000u + i, "GPU write into the carve not visible in the view");
+				Check(a[i] == 0x75000000u + i, "GPU write into the carve not visible in the alias");
+			}
+
+			// Exporting the rest of block 1 (always valid by default) moves that block, not the carve.
+			auto*          rest    = static_cast<uint32_t*>(ReserveGuest(0x10000));
+			const uint64_t rest_va = reinterpret_cast<uint64_t>(rest);
+			Check(gem->MapView(rest_va, 0x10000, off + len, PROT_READ | PROT_WRITE), "MapView of the rest of block 1 failed");
+			rest[0] = 0x76000000u;
+			int idles = 0;
+			Check(gem->ExportGuestRange(va, len, [&] { idles++; }) == 0 && idles == 0, "exporting a carved range must move nothing");
+			const uint32_t moved = gem->ExportGuestRange(rest_va, 0x10000, [&] { idles++; });
+			Check(moved <= 1, "exporting the rest of block 1 moved more than block 1");
+			Check(rest[0] == 0x76000000u, "export lost the rest of block 1");
+			for (uint32_t i = 0; i < len / 4; i++) {
+				Check(view[i] == 0x75000000u + i, "export of block 1 changed the carve (view)");
+				Check(a[i] == 0x75000000u + i, "export of block 1 changed the carve (alias)");
+			}
+			Check(gem->Lookup(chunk, &h1, &i1) && h1 == info.handle && i1 == len / 2, "export of block 1 took its carved bytes");
+			Check(gem->Lookup(off + len, &h1, nullptr) && h1 != info.handle, "the rest of block 1 resolves into the carve");
+			view[2] = 0x77000000u;
+			Check(a[2] == 0x77000000u && again[2] == 0x77000000u, "views of the carve split after the export");
+			std::printf("NativeGpuGemBackingTests: a display buffer across blocks was carved into VRAM BO %u (%u block(s) exported "
+			            "beside it)\n",
+			            info.handle, moved);
+		}
 	}
 
 	delete gem;

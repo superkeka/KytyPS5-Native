@@ -89,6 +89,37 @@ bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufP
 // so the presenter can take it as uncompressed; true then.
 bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size);
 
+// Direct scan-out flips (KYTY_DIRECT_PRESENT=1; off unless set, for now). On the PS5 a flip does no GPU
+// work: the title's release has written the frame, and the kernel queues the buffer itself to the display
+// for the next vblank. With this on, display buffers become VRAM scan-out buffers at registration and
+// flips hand them to the display (Xwayland, gamescope, a DCN plane) without Kyty's copies. Wanted only
+// with GEM backing in primary mode (KYTY_NATIVE_GPU_GEM, KYTY_NATIVE_GPU_PRIMARY, not KYTY_NATIVE_GPU_NULL)
+// and without flip dumps (KYTY_NATIVE_GPU_DUMP_FLIPS, a pending "dump N" of KYTY_NATIVE_GPU_CTL), whose
+// frames go through Vulkan. The switches are read once; the rest is checked at each call: false once the
+// native path has failed to start or turned itself off, since Kyty then renders through Vulkan into its
+// own images and the display buffers no longer receive frames. Any thread, lock-free.
+bool DirectPresentWanted();
+
+struct NativeDisplayBuffer {
+	int      dmabuf_fd = -1; // borrowed: valid while the process lives; dup() to keep
+	uint64_t bo_size   = 0;
+	uint64_t bo_offset = 0;  // offset of the buffer's first byte in the buffer (DRI3 offset0)
+};
+// sceVideoOutRegisterBuffers2 (title thread, no VideoOut lock held): the display buffer [addr, addr + size)
+// becomes one VRAM scan-out buffer at the same guest addresses (GemBacking::CarveGuestRange). Idempotent:
+// the same range again returns the same buffer. False, with the buffer left as it was (presented through
+// Vulkan), when DirectPresentWanted() is false or the carve is refused. Never takes the native path's lock
+// and never waits for the GPU; takes tens of milliseconds.
+bool ShadowCarveDisplayBuffer(uint64_t addr, uint64_t size, NativeDisplayBuffer* out);
+// sceVideoOutUnregisterBuffers / close: [addr, addr + size) is no longer a registered display buffer. Its
+// carve stays (and keeps the data), to be reused if the range is registered again. Any thread.
+void ShadowReleaseDisplayBuffer(uint64_t addr, uint64_t size);
+// The display completed a direct flip (the DirectPresenter's event thread): what a Vulkan flip does here
+// through ShadowOnFlip and ShadowFlipStats, less making the buffer resident (a carve is) and the dumps
+// (they force Vulkan flips): the PS5 per-VMID registers, KYTY_NATIVE_GPU_FLIP_STATS / FLIP_TRACE with no
+// presenter time, KYTY_NATIVE_GPU_AUDIT's flip count.
+void ShadowOnDirectFlip();
+
 // sceAgcDriverSetTFRing / sceAgcDriverSetHsOffchipParam: the title's tessellation rings, which native
 // IBs program as the PS5 driver would (VGT_TF_*, VGT_HS_OFFCHIP_PARAM).
 void ShadowSetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint64_t offchip_granularity,

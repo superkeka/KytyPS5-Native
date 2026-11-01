@@ -802,6 +802,12 @@ std::atomic<uint32_t>& DemandedDumps() {
 	static std::atomic<uint32_t> n {0};
 	return n;
 }
+// Of a "dump N" taken by ShadowOnFlip, the flips still to dump. Flips are dumped from the Vulkan path, so
+// DirectPresentWanted is false while this or DemandedDumps is not 0.
+std::atomic<uint32_t>& DumpsLeft() {
+	static std::atomic<uint32_t> n {0};
+	return n;
+}
 
 // Control socket "crumbs N": the next N translated buffers (DCBs and ACBs) are written to
 // KYTY_NATIVE_GPU_DUMP_DIR as <kind><n>.dcb.bin / .ib.bin, without slowing every frame like
@@ -1281,6 +1287,10 @@ public:
 	// Lock-free: Kyty's command processor asks for every draw and dispatch, while the pipeline's
 	// worker may hold m_mutex for a whole submission.
 	bool Active() const { return m_active.load(std::memory_order_acquire); }
+	// False once the native path has been set up (on the first DCB) and is not running: it could not start,
+	// turned itself off or was stopped. Before setup it is true, as the native path is still to come.
+	// Lock-free, for DirectPresentWanted.
+	bool NotGivenUp() const { return !m_started.load(std::memory_order_acquire) || Active(); }
 
 	// The draws and dispatches translated since the last call (KYTY_NATIVE_GPU_CTL), for the flip dump.
 	struct FrameDraw {
@@ -1346,6 +1356,7 @@ public:
 		if (!m_initialized) {
 			Init();
 			m_initialized = true;
+			m_started.store(true, std::memory_order_release);
 		}
 		if (!m_enabled || m_disabled || (acb && m_acb_mode == AcbMode::Off)) {
 			return false;
@@ -2007,6 +2018,12 @@ public:
 	// cannot see), so whatever is flipped is made resident; until then such writes land in the dummy.
 	void KeepResident(uint64_t addr, uint64_t size) {
 #if KYTY_GEM_BACKING_SUPPORTED
+		// A display buffer carved at registration (ShadowCarveDisplayBuffer) is resident and exported already:
+		// nothing to promote, and above all no idle wait under m_mutex. m_gem is set before Active(), which
+		// ShadowOnFlip checked.
+		if (m_gem != nullptr && m_gem->IsCarved(addr, size)) {
+			return;
+		}
 		std::unique_lock<std::mutex> lock(m_mutex);
 		if (m_gem == nullptr || !m_flipped.insert(addr).second) {
 			return;
@@ -2585,6 +2602,7 @@ public:
 		if (!m_initialized) {
 			Init();
 			m_initialized = true;
+			m_started.store(true, std::memory_order_release);
 		}
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (!m_enabled || m_disabled || m_submitter == nullptr || !m_submitter->Async()) {
@@ -5529,6 +5547,7 @@ private:
 	uint64_t                 m_acb_resolved   = 0;
 	uint64_t                 m_acb_unresolved = 0;
 	std::atomic<bool> m_active {false};
+	std::atomic<bool> m_started {false}; // Init has run (m_initialized, readable without m_mutex): NotGivenUp
 	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
 	double        m_busy_s      = 0.0;
@@ -7341,6 +7360,72 @@ bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+bool DirectPresentWanted() {
+	static const bool switches = [] {
+		const char* v = std::getenv("KYTY_DIRECT_PRESENT");
+		if (v == nullptr || v[0] != '1') {
+			return false;
+		}
+		const char* why = !KYTY_GEM_BACKING_SUPPORTED ? "no GEM backing on this platform"
+		                  : !EnvOn("KYTY_NATIVE_GPU_GEM") ? "KYTY_NATIVE_GPU_GEM is off"
+		                  : !EnvOn("KYTY_NATIVE_GPU_PRIMARY") ? "not in primary mode (KYTY_NATIVE_GPU_PRIMARY)"
+		                  : EnvOn("KYTY_NATIVE_GPU_NULL") ? "nothing renders (KYTY_NATIVE_GPU_NULL)"
+		                  : std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr ? "flips are dumped (KYTY_NATIVE_GPU_DUMP_FLIPS)"
+		                                                                         : nullptr;
+		if (why != nullptr) {
+			std::fprintf(stderr, "native shadow: KYTY_DIRECT_PRESENT=1 ignored: %s\n", why);
+		}
+		return why == nullptr;
+	}();
+	return switches && LibKernel::Memory::GetGemBacking() != nullptr && Shadow::Instance().NotGivenUp() &&
+	       DemandedDumps().load(std::memory_order_relaxed) == 0 && DumpsLeft().load(std::memory_order_relaxed) == 0;
+}
+
+bool ShadowCarveDisplayBuffer(uint64_t addr, uint64_t size, NativeDisplayBuffer* out) {
+#if KYTY_GEM_BACKING_SUPPORTED
+	if (out == nullptr || addr == 0 || size == 0 || !DirectPresentWanted()) {
+		return false;
+	}
+	// The GEM backing itself, not the native path's m_gem: that is set on the first DCB, and titles register
+	// their display buffers before it. GemBacking has its own lock; m_mutex is never taken.
+	GemBacking* gem = LibKernel::Memory::GetGemBacking();
+	if (gem == nullptr) {
+		return false;
+	}
+	GemBacking::CarveInfo info;
+	if (!gem->CarveGuestRange(addr, size, &info)) {
+		return false;
+	}
+	out->dmabuf_fd = info.dmabuf_fd;
+	out->bo_size   = info.bo_size;
+	out->bo_offset = info.bo_offset;
+	return true;
+#else
+	(void)addr;
+	(void)size;
+	(void)out;
+	return false;
+#endif
+}
+
+void ShadowReleaseDisplayBuffer(uint64_t addr, uint64_t size) {
+#if KYTY_GEM_BACKING_SUPPORTED
+	if (GemBacking* gem = LibKernel::Memory::GetGemBacking(); gem != nullptr && size != 0) {
+		gem->SetCarveRegistered(addr, size, false);
+	}
+#else
+	(void)addr;
+	(void)size;
+#endif
+}
+
+void ShadowOnDirectFlip() {
+	if (Shadow::Instance().Active()) {
+		Shadow::Instance().Ps5RegsOnFlip();
+	}
+	ShadowFlipStats(0.0);
+}
+
 void ShadowSetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint64_t offchip_granularity,
                                 uint64_t offchip_buffering) {
 	// VGT_HS_OFFCHIP_PARAM: OFFCHIP_BUFFERING [8:0], OFFCHIP_GRANULARITY [10:9].
@@ -7691,11 +7776,11 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	// KYTY_NATIVE_GPU_CTL=1: "dump N" on the control socket dumps the next N flips, render targets
 	// included (see ControlSocket).
 	static const bool on_demand   = EnvOn("KYTY_NATIVE_GPU_CTL");
-	static uint32_t   demand_left = 0;
+	std::atomic<uint32_t>& demand_left = DumpsLeft(); // read by DirectPresentWanted
 	if (on_demand && demand_left == 0) {
 		if (const uint32_t count = DemandedDumps().exchange(0); count != 0) {
 			demand_left = std::min(count, 120u);
-			std::fprintf(stderr, "native shadow: on-demand dump of %u flips from flip %llu\n", demand_left,
+			std::fprintf(stderr, "native shadow: on-demand dump of %u flips from flip %llu\n", demand_left.load(),
 			             static_cast<unsigned long long>(n));
 		}
 	}
