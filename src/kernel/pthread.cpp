@@ -4322,6 +4322,12 @@ int KYTY_SYSV_ABI pthread_cond_signal(LibKernel::PthreadCond* cond) {
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadCondSignal(cond));
 }
 
+int KYTY_SYSV_ABI pthread_cond_destroy(LibKernel::PthreadCond* cond) {
+	PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadCondDestroy(cond));
+}
+
 int KYTY_SYSV_ABI pthread_cond_init(LibKernel::PthreadCond*           cond,
                                     const LibKernel::PthreadCondattr* attr) {
 	PRINT_NAME();
@@ -4429,6 +4435,26 @@ int KYTY_SYSV_ABI pthread_rwlock_wrlock(LibKernel::PthreadRwlock* rwlock) {
 	// Hot path for some PS5 titles; per-call name logging can dominate runtime.
 
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadRwlockWrlock(rwlock));
+}
+
+int KYTY_SYSV_ABI pthread_rwlock_tryrdlock(LibKernel::PthreadRwlock* rwlock) {
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadRwlockTryrdlock(rwlock));
+}
+
+int KYTY_SYSV_ABI pthread_rwlock_trywrlock(LibKernel::PthreadRwlock* rwlock) {
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadRwlockTrywrlock(rwlock));
+}
+
+int KYTY_SYSV_ABI pthread_rwlockattr_init(LibKernel::PthreadRwlockattr* attr) {
+	PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadRwlockattrInit(attr));
+}
+
+int KYTY_SYSV_ABI pthread_rwlockattr_destroy(LibKernel::PthreadRwlockattr* attr) {
+	PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadRwlockattrDestroy(attr));
 }
 
 int KYTY_SYSV_ABI pthread_rwlock_destroy(LibKernel::PthreadRwlock* rwlock) {

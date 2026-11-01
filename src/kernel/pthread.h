@@ -284,6 +284,7 @@ int KYTY_SYSV_ABI pthread_attr_setstack(LibKernel::PthreadAttr* attr, void* addr
 int KYTY_SYSV_ABI pthread_attr_setstacksize(LibKernel::PthreadAttr* attr, size_t stack_size);
 int KYTY_SYSV_ABI pthread_cond_broadcast(LibKernel::PthreadCond* cond);
 int KYTY_SYSV_ABI pthread_cond_signal(LibKernel::PthreadCond* cond);
+int KYTY_SYSV_ABI pthread_cond_destroy(LibKernel::PthreadCond* cond);
 int KYTY_SYSV_ABI pthread_cond_init(LibKernel::PthreadCond*           cond,
                                     const LibKernel::PthreadCondattr* attr);
 int KYTY_SYSV_ABI pthread_condattr_init(LibKernel::PthreadCondattr* attr);
@@ -304,6 +305,10 @@ int KYTY_SYSV_ABI pthread_rwlock_rdlock(LibKernel::PthreadRwlock* rwlock);
 int KYTY_SYSV_ABI pthread_rwlock_unlock(LibKernel::PthreadRwlock* rwlock);
 int KYTY_SYSV_ABI pthread_rwlock_wrlock(LibKernel::PthreadRwlock* rwlock);
 int KYTY_SYSV_ABI pthread_rwlock_destroy(LibKernel::PthreadRwlock* rwlock);
+int KYTY_SYSV_ABI pthread_rwlock_tryrdlock(LibKernel::PthreadRwlock* rwlock);
+int KYTY_SYSV_ABI pthread_rwlock_trywrlock(LibKernel::PthreadRwlock* rwlock);
+int KYTY_SYSV_ABI pthread_rwlockattr_init(LibKernel::PthreadRwlockattr* attr);
+int KYTY_SYSV_ABI pthread_rwlockattr_destroy(LibKernel::PthreadRwlockattr* attr);
 int KYTY_SYSV_ABI pthread_rwlock_init(LibKernel::PthreadRwlock*           rwlock,
                                       const LibKernel::PthreadRwlockattr* attr);
 int KYTY_SYSV_ABI pthread_key_create(LibKernel::PthreadKey*                   key,
