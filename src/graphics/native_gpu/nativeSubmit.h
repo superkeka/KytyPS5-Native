@@ -60,6 +60,9 @@ public:
 	static constexpr uint64_t kCpShadowOffset  = kSlots * kSlotSize;
 	static constexpr uint64_t kCpShadowReserve = kCpShadowReserveBytes; // S, then the save area P of a pushed context
 	static_assert(kCpShadowOffset + kCpShadowReserve <= kIbSize - kScratchSize, "S fits between the slots and the scratch area");
+	// S in VRAM (CreateCpShadowVram): right after the IB buffer's VA.
+	static constexpr uint64_t kCpShadowVramVa   = kIbVa + kIbSize;
+	static constexpr uint64_t kCpShadowVramSize = (kCpShadowReserve + 0xffffull) & ~0xffffull;
 	// Extra DRM_IOCTL_AMDGPU_CS attempts spent waiting out a userptr revalidation (-EFAULT).
 	static constexpr int      kCsRetries = 64;
 
@@ -100,6 +103,7 @@ public:
 			delete self;
 			return nullptr;
 		}
+		self->CreateCpShadowVram();
 		self->QueryComputeRings();
 		// Opt-in: with the whole GDS, GWS and OA partitions in every submission (so amdgpu reprograms
 		// them for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even when
@@ -131,6 +135,24 @@ public:
 			c.handle = h;
 			Ioctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &c);
 		}
+		if (m_shadow_va != 0) {
+			struct drm_amdgpu_gem_va v;
+			std::memset(&v, 0, sizeof(v));
+			v.handle     = m_shadow_handle;
+			v.operation  = AMDGPU_VA_OP_UNMAP;
+			v.va_address = m_shadow_va;
+			v.map_size   = kCpShadowVramSize;
+			Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_VA, &v);
+		}
+		if (m_shadow_cpu != nullptr) {
+			::munmap(m_shadow_cpu, kCpShadowVramSize);
+		}
+		if (m_shadow_handle != 0) {
+			struct drm_gem_close c;
+			std::memset(&c, 0, sizeof(c));
+			c.handle = m_shadow_handle;
+			Ioctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &c);
+		}
 		if (m_ib_va != 0) {
 			VaOp(AMDGPU_VA_OP_UNMAP, m_ib_handle, m_ib_va);
 		}
@@ -155,9 +177,10 @@ public:
 	}
 
 	[[nodiscard]] uint64_t ScratchVa() const { return m_ib_va + kIbSize - kScratchSize; }
-	[[nodiscard]] uint64_t CpShadowVa() const { return m_ib_va + kCpShadowOffset; }
+	[[nodiscard]] uint64_t CpShadowVa() const { return m_shadow_va != 0 ? m_shadow_va : m_ib_va + kCpShadowOffset; }
 	[[nodiscard]] volatile uint32_t* CpShadowCpu() const {
-		return reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(m_ib_cpu) + kCpShadowOffset);
+		return reinterpret_cast<volatile uint32_t*>(m_shadow_cpu != nullptr ? static_cast<uint8_t*>(m_shadow_cpu)
+		                                                                      : static_cast<uint8_t*>(m_ib_cpu) + kCpShadowOffset);
 	}
 	// amdgpu preempts gfx IBs in the middle (mid command buffer preemption: amdgpu.mcbp=1, or SR-IOV): another
 	// process could then run inside one of our jobs, with our CP shadow enables on.
@@ -784,6 +807,60 @@ private:
 		}
 	}
 
+	// CP register shadowing's S in VRAM (KYTY_NATIVE_GPU_CP_SHADOW_VRAM=0: in the IB buffer). In the IB buffer S is
+	// system memory the GPU reads uncached, and the LOADs of each shadow preamble (~650 registers, about nine
+	// preambles a frame) read it through the fabric dword by dword: Demon's Souls in load mode took 4.8-6.7 ms a
+	// buffer instead of 3.0 without shadowing and missed 18-28% of its vsyncs instead of 3.6%, while record mode,
+	// which shadows every SET into S but LOADs nothing, cost nothing. The PS5's S, like all its GPU memory, is
+	// GDDR6 behind GL2. Always valid (no BO list entry), CPU-visible for the seed Kyty writes before the first job;
+	// the CPU's later reads of it (CpShadowCheck, dumps) may miss values still in GL2.
+	void CreateCpShadowVram() {
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW_VRAM"); v != nullptr && v[0] == '0') {
+			return;
+		}
+		union drm_amdgpu_gem_create c;
+		std::memset(&c, 0, sizeof(c));
+		c.in.bo_size      = kCpShadowVramSize;
+		c.in.alignment    = 64 * 1024;
+		c.in.domains      = AMDGPU_GEM_DOMAIN_VRAM;
+		c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: CP shadow VRAM buffer failed: %s; S stays in the IB buffer\n", std::strerror(errno));
+			return;
+		}
+		m_shadow_handle = c.out.handle;
+		union drm_amdgpu_gem_mmap m;
+		std::memset(&m, 0, sizeof(m));
+		m.in.handle = m_shadow_handle;
+		void* p     = MAP_FAILED;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_MMAP, &m) == 0) {
+			p = ::mmap(nullptr, kCpShadowVramSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_drm_fd, static_cast<off_t>(m.out.addr_ptr));
+		}
+		struct drm_amdgpu_gem_va v;
+		std::memset(&v, 0, sizeof(v));
+		v.handle     = m_shadow_handle;
+		v.operation  = AMDGPU_VA_OP_MAP;
+		v.flags      = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE;
+		v.va_address = kCpShadowVramVa;
+		v.map_size   = kCpShadowVramSize;
+		if (p == MAP_FAILED || Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_VA, &v) != 0) {
+			std::fprintf(stderr, "NativeSubmitter: CP shadow VRAM buffer map failed: %s; S stays in the IB buffer\n", std::strerror(errno));
+			if (p != MAP_FAILED) {
+				::munmap(p, kCpShadowVramSize);
+			}
+			struct drm_gem_close cl;
+			std::memset(&cl, 0, sizeof(cl));
+			cl.handle = m_shadow_handle;
+			Ioctl(m_drm_fd, DRM_IOCTL_GEM_CLOSE, &cl);
+			m_shadow_handle = 0;
+			return;
+		}
+		m_shadow_cpu = p;
+		m_shadow_va  = kCpShadowVramVa;
+		std::fprintf(stderr, "NativeSubmitter: CP shadow S in VRAM at 0x%llx (KYTY_NATIVE_GPU_CP_SHADOW_VRAM=0: in the IB buffer)\n",
+		             static_cast<unsigned long long>(m_shadow_va));
+	}
+
 	bool CreateIb() {
 		union drm_amdgpu_gem_create c;
 		std::memset(&c, 0, sizeof(c));
@@ -897,6 +974,9 @@ private:
 	uint32_t m_ib_handle = 0;
 	void*    m_ib_cpu    = nullptr;
 	uint64_t m_ib_va     = 0;
+	uint32_t m_shadow_handle = 0;       // CreateCpShadowVram
+	void*    m_shadow_cpu    = nullptr;
+	uint64_t m_shadow_va     = 0;
 	GemBacking* m_gem           = nullptr;
 	int         m_ib_dmabuf     = -1; // CreateKfdIb
 	uint64_t    m_ib_kfd_va     = 0;
