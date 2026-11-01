@@ -2974,20 +2974,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 
-	// A bound color target without FMASK must still point CB_COLORn_FMASK at its own base, as
-	// radeonsi and PAL always program it: with a CMASK fast clear the CB reads that address. ASTRO BOT
-	// binds such a target as MRT4 with FMASK 0, and the CB stalls forever on the gfx10 hardware here
-	// (CB/SC busy, no waves; the same surface with FMASK == BASE renders fine as MRT0). Rechecked 28.10:
-	// without this ASTRO BOT hung in 2 of 3 runs, once after an "Illegal register access", once after
-	// TCP reads of GPU address 0; CB_HW_CONTROL_3/4 already hold the PS5 kernel's values. Why the PS5
-	// takes FMASK 0 is open (something readable at address 0 there?).
+	// A bound color target without FMASK pointed at its own base (SetFmaskFix, KYTY_NATIVE_GPU_FMASK_FIX=1), as radeonsi
+	// and PAL program it. Up to 28.10 ASTRO BOT's MRT4 with FMASK 0 and a CMASK fast clear hung the gfx ring here
+	// without it ("Illegal register access" in 0x9F, TCP reads of address 0). Since AgcDcbResetQueue in Sony's form,
+	// 0x35 as written and direct memory resident at allocation it runs 524 s in load mode without the fix (1.11), so
+	// the title's FMASK 0 runs as written, as on the PS5.
 	auto fix_fmask = [&]() {
-		// KYTY_NATIVE_GPU_FMASK_FIX=0 leaves CB_COLORn_FMASK as the title wrote it (experiment).
-		static const bool fmask_fix = [] {
-			const char* v = std::getenv("KYTY_NATIVE_GPU_FMASK_FIX");
-			return v == nullptr || v[0] != '0';
-		}();
-		if (!fmask_fix) {
+		if (!m_fmask_fix) {
 			return;
 		}
 		const uint32_t mask = reg(cx, kCbTargetMask) & m_target_mask;

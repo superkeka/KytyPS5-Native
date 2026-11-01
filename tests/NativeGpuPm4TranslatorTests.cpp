@@ -651,6 +651,16 @@ void TestFmaskFix() {
 	Append(dcb, IT_SET_CONTEXT_REG, {0x318u + 4u * 0xFu, 0x5125700u}, false);
 	Append(dcb, IT_SET_CONTEXT_REG, {0x321u + 4u * 0xFu, 0x0u}, false);
 	Append(dcb, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
+	{
+		Pm4Translator off;
+		const auto    r0 = off.Translate(dcb);
+		bool       set_fmask = false;
+		for (const auto& p: Decode(r0.ib)) {
+			set_fmask |= p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x321u + 4u * 0xFu && p.body[1] != 0u;
+		}
+		Check(r0.ok && r0.stats.fmask_fixed == 0 && !set_fmask, "by default the title's FMASK 0 runs as written");
+	}
+	t.SetFmaskFix(true);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.fmask_fixed == 1, "one target without FMASK fixed");
 	uint32_t fmask4 = 0;
@@ -3771,6 +3781,7 @@ void TestCpShadowCbInserts() {
 	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Record, CpShadowMode::Off}) {
 		for (const bool late_fmask: {false, true}) {
 			Pm4Translator t;
+			t.SetFmaskFix(true);
 			if (mode != CpShadowMode::Off) {
 				t.SetCpShadow(kTestShadowVa, mode);
 			}
@@ -3814,6 +3825,7 @@ void TestCpShadowCbInserts() {
 	// A BASE_EXT S has no value for (no key: amdgpu's clear state, 0, on the GPU): the zero word is copied for it.
 	{
 		Pm4Translator t;
+		t.SetFmaskFix(true);
 		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
 		Start(t, {{kMask, 0xFu}, {kBase0, 0x1000u}, {kFmask0, 0u}}, {}, {});
 		ToyCp cp;
@@ -3837,6 +3849,7 @@ void TestCpShadowCbInserts() {
 	// last fix is the GPU's again. The CPU pop SETs the copy's BASE, and the fix follows it on the CPU.
 	for (const bool gpu: {true, false}) {
 		Pm4Translator t;
+		t.SetFmaskFix(true);
 		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
 		t.SetCpShadowPushPop(gpu);
 		Start(t, start, {}, {});
@@ -3868,6 +3881,7 @@ void TestCpShadowCbInserts() {
 	// the copy holds those values already; the pop in the next buffer gives back both, and the fix after it is the GPU's.
 	{
 		Pm4Translator t;
+		t.SetFmaskFix(true);
 		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
 		t.SetCpShadowPushPop(true);
 		Start(t, start, {}, {});

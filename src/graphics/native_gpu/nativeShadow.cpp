@@ -4688,9 +4688,13 @@ private:
 			m_translator.SetNoDcc(true);
 			std::fprintf(stderr, "native shadow: render targets without DCC (experiment)\n");
 		}
-		if (PrimaryFeature("KYTY_NATIVE_GPU_NO_CMASK_CLEAR")) {
-			// Only MRT4 by default: ASTRO BOT's CMASK-only fast clear there hangs the CB. Turning it off
-			// everywhere leaves other fast-cleared targets stale (8x8 squares around moving objects).
+		if (EnvOn("KYTY_NATIVE_GPU_FMASK_FIX")) {
+			m_translator.SetFmaskFix(true);
+			std::fprintf(stderr, "native shadow: CB_COLORn_FMASK = BASE on targets without FMASK (experiment)\n");
+		}
+		if (EnvOn("KYTY_NATIVE_GPU_NO_CMASK_CLEAR")) {
+			// Experiment, MRT4 by default: up to 28.10 ASTRO BOT's CMASK-only fast clear there hung the CB (no longer
+			// since 1.11, see fix_fmask). Turning it off everywhere leaves fast-cleared targets stale (8x8 squares).
 			const char*    v     = std::getenv("KYTY_NATIVE_GPU_NO_CMASK_CLEAR_SLOTS");
 			const uint32_t slots = v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0x10u;
 			m_translator.SetNoCmaskClear(true, slots);

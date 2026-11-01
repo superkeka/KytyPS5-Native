@@ -913,6 +913,10 @@ public:
 	// Context register overrides the PS5 kernel applies through the CP's RCIU CAM (see PatchContext).
 	void SetPs5RegOverrides(bool on) { m_ps5_reg_overrides = on; }
 
+	// Experiment, off by default: a bound target without FMASK gets CB_COLORn_FMASK = BASE before a draw, as radeonsi
+	// and PAL program it. The guest's FMASK 0 runs as written, as on the PS5.
+	void SetFmaskFix(bool on) { m_fmask_fix = on; }
+
 	// Experiment: targets without DCC lose CB_COLORn_INFO.FAST_CLEAR (no CMASK fast clear).
 	// CMASK fast clear off on targets without DCC in the MRT slots of `slots` (bit n = slot n).
 	void SetNoCmaskClear(bool on, uint32_t slots = 0xffu) {
@@ -1210,6 +1214,7 @@ private:
 	uint32_t                     m_saved_display_dcc_gpu = 0;     // m_display_dcc_gpu at the GPU push
 	std::array<uint32_t, 8>      m_display_dcc_info {};           // their guest CB_COLORn_INFO
 	bool                         m_ps5_reg_overrides = false;
+	bool                         m_fmask_fix = false;
 	uint32_t                     m_target_mask = 0xffffffffu;
 	bool                         m_no_cmask_clear = false;
 	uint32_t                     m_no_cmask_clear_slots = 0xffu;
