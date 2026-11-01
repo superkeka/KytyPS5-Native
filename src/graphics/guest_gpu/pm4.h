@@ -52,6 +52,7 @@ constexpr uint32_t IT_COPY_DATA                 = 0x40;
 constexpr uint32_t IT_CP_DMA                    = 0x41;
 constexpr uint32_t IT_PFP_SYNC_ME               = 0x42;
 constexpr uint32_t IT_SURFACE_SYNC              = 0x43;
+constexpr uint32_t IT_COND_WRITE                = 0x45;
 constexpr uint32_t IT_EVENT_WRITE               = 0x46;
 constexpr uint32_t IT_RELEASE_MEM               = 0x49;
 constexpr uint32_t IT_DMA_DATA                  = 0x50;

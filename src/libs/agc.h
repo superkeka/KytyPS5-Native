@@ -327,6 +327,38 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference)
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t* cmd, const volatile Label* address);
 int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data);
 
+uint32_t* KYTY_SYSV_ABI AgcDcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op);
+uint32_t* KYTY_SYSV_ABI AgcDcbAtomicMem(CommandBuffer* buf, uint8_t engine, uint8_t op,
+                                        uint8_t command, uint8_t cache_policy,
+                                        volatile void* address, uint64_t src, uint64_t cmp,
+                                        uint32_t loop_interval);
+uint32_t* KYTY_SYSV_ABI AgcAcbAtomicMem(CommandBuffer* buf, uint8_t op, uint8_t command,
+                                        volatile void* address, uint8_t cache_policy, uint64_t src,
+                                        uint64_t cmp, uint32_t loop_interval);
+uint32_t KYTY_SYSV_ABI  AgcDcbAtomicMemGetSize();
+uint32_t KYTY_SYSV_ABI  AgcAcbAtomicMemGetSize();
+uint32_t* KYTY_SYSV_ABI AgcCbCondWrite(CommandBuffer* buf, uint8_t function, uint8_t write_space,
+                                       volatile void* write_address, uint32_t write_data,
+                                       const volatile void* poll_address, uint32_t reference,
+                                       uint32_t mask);
+uint32_t KYTY_SYSV_ABI  AgcCbCondWriteGetSize();
+uint32_t KYTY_SYSV_ABI  AgcAcbRewindGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbDmaDataGetSize();
+uint32_t KYTY_SYSV_ABI  AgcAcbDmaDataGetSize();
+uint32_t KYTY_SYSV_ABI  AgcAcbDispatchIndirectGetSize();
+uint32_t KYTY_SYSV_ABI  AgcAcbEventWriteGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbSetIndexSizeGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbSetIndexBufferGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbSetIndexCountGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexIndirectGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndirectMultiGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbGetLodStatsGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbSetPredicationDisableGetSize();
+uint64_t KYTY_SYSV_ABI  AgcDcbBeginOcclusionQueryGetSize(uint32_t type);
+uint32_t KYTY_SYSV_ABI  AgcDcbEndOcclusionQueryGetSize();
+int KYTY_SYSV_ABI       AgcSetSemaphoreMemory(void* address, uint64_t size);
+int KYTY_SYSV_ABI       AgcGetSemaphoreLabel(uint32_t index, void** label);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
                                       int32_t display_buffer_index, uint32_t flip_mode,
                                       int64_t flip_arg);

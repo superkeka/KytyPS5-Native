@@ -3510,8 +3510,8 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
-                                           uint8_t mailbox, uint8_t signal_type, uint8_t op) {
+static uint32_t* agc_mem_semaphore(CommandBuffer* buf, const volatile void* address, uint8_t mailbox,
+                                   uint8_t signal_type, uint8_t op, bool acb) {
 	EXIT_NOT_IMPLEMENTED(op != 6u && op != 7u);
 
 	auto* cmd =
@@ -3522,8 +3522,8 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 
 	const auto address_value = reinterpret_cast<uint64_t>(address);
 	const bool signal        = (op == 6u);
-	// An ACB's markers: header bit 2 clear (libSceAgc sets it in DCBs only).
-	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 0u);
+	// The markers' header bit 2: set in a DCB, clear in an ACB, as libSceAgc writes them.
+	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, acb ? 0u : 1u);
 	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = (signal ? AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG : AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
@@ -3542,12 +3542,22 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 	               ((mailbox & 0x1u) << 16u);
 	if (!signal) {
 		const bool was_acb         = g_agc_internal_data_in_acb;
-		g_agc_internal_data_in_acb = true;
+		g_agc_internal_data_in_acb = acb;
 		write_agc_internal_data_packet(semaphore + 4, AGC_MEM_SEMAPHORE_END_TAG);
 		g_agc_internal_data_in_acb = was_acb;
 	}
 
 	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op) {
+	return agc_mem_semaphore(buf, address, mailbox, signal_type, op, true);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op) {
+	return agc_mem_semaphore(buf, address, mailbox, signal_type, op, false);
 }
 
 uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
@@ -4551,6 +4561,188 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 	return cmd;
 }
 
+// ATOMIC_MEM as libSceAgc writes it: the DCB form also takes the engine (bits 31:30), the loop
+// interval is in units of 64 clocks, at most 0xfff.
+static uint32_t* agc_atomic_mem(CommandBuffer* buf, uint32_t engine, uint8_t op, uint8_t command,
+                                uint8_t cache_policy, uint64_t address, uint64_t src,
+                                uint64_t cmp, uint32_t loop_interval) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(9);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	cmd[0] = KYTY_PM4(9, Pm4::IT_ATOMIC_MEM, 0u);
+	cmd[1] = (engine << 30u) | ((cache_policy & 0x3u) << 25u) | ((command & 0xfu) << 8u) |
+	         (op & 0x7fu);
+	cmd[2] = static_cast<uint32_t>(address);
+	cmd[3] = static_cast<uint32_t>(address >> 32u);
+	cmd[4] = static_cast<uint32_t>(src);
+	cmd[5] = static_cast<uint32_t>(src >> 32u);
+	cmd[6] = static_cast<uint32_t>(cmp);
+	cmd[7] = static_cast<uint32_t>(cmp >> 32u);
+	cmd[8] = std::min(loop_interval >> 6u, 0xfffu);
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbAtomicMem(CommandBuffer* buf, uint8_t engine, uint8_t op,
+                                        uint8_t command, uint8_t cache_policy,
+                                        volatile void* address, uint64_t src, uint64_t cmp,
+                                        uint32_t loop_interval) {
+	PRINT_NAME();
+
+	return agc_atomic_mem(buf, engine, op, command, cache_policy, reinterpret_cast<uint64_t>(address),
+	                      src, cmp, loop_interval);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbAtomicMem(CommandBuffer* buf, uint8_t op, uint8_t command,
+                                        volatile void* address, uint8_t cache_policy, uint64_t src,
+                                        uint64_t cmp, uint32_t loop_interval) {
+	PRINT_NAME();
+
+	return agc_atomic_mem(buf, 0, op, command, cache_policy, reinterpret_cast<uint64_t>(address),
+	                      src, cmp, loop_interval);
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbAtomicMemGetSize() {
+	return 9u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbAtomicMemGetSize() {
+	return 9u * 4u;
+}
+
+// COND_WRITE polling memory (POLL_SPACE 1): writes write_data where reference compares with the
+// masked poll value by function.
+uint32_t* KYTY_SYSV_ABI AgcCbCondWrite(CommandBuffer* buf, uint8_t function, uint8_t write_space,
+                                       volatile void* write_address, uint32_t write_data,
+                                       const volatile void* poll_address, uint32_t reference,
+                                       uint32_t mask) {
+	PRINT_NAME();
+
+	if (buf == nullptr) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(9);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	const auto poll  = reinterpret_cast<uint64_t>(poll_address);
+	const auto write = reinterpret_cast<uint64_t>(write_address);
+	cmd[0]           = KYTY_PM4(9, Pm4::IT_COND_WRITE, 0u);
+	cmd[1]           = ((write_space & 0x3u) << 8u) | 0x10u | (function & 0x7u);
+	cmd[2]           = static_cast<uint32_t>(poll);
+	cmd[3]           = static_cast<uint32_t>(poll >> 32u);
+	cmd[4]           = reference;
+	cmd[5]           = mask;
+	cmd[6]           = static_cast<uint32_t>(write);
+	cmd[7]           = static_cast<uint32_t>(write >> 32u);
+	cmd[8]           = write_data;
+	return cmd;
+}
+
+uint32_t KYTY_SYSV_ABI AgcCbCondWriteGetSize() {
+	return 9u * 4u;
+}
+
+// The sizes libSceAgc answers for builders whose GetSize the titles import.
+uint32_t KYTY_SYSV_ABI AgcAcbRewindGetSize() {
+	return 2u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbDmaDataGetSize() {
+	return 7u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbDmaDataGetSize() {
+	return 7u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbDispatchIndirectGetSize() {
+	return 4u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbEventWriteGetSize() {
+	return 2u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbSetIndexSizeGetSize() {
+	return 3u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbSetIndexBufferGetSize() {
+	return 3u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbSetIndexCountGetSize() {
+	return 2u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexIndirectGetSize() {
+	return 5u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbDrawIndirectMultiGetSize() {
+	return (2u * AGC_INTERNAL_DATA_PACKET_SIZE_DW + 10u) * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbGetLodStatsGetSize() {
+	return 5u * 4u;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbSetPredicationDisableGetSize() {
+	return 4u * 4u;
+}
+
+uint64_t KYTY_SYSV_ABI AgcDcbBeginOcclusionQueryGetSize(uint32_t type) {
+	return type == 1 ? 0x120u : (type == 0 ? 0x10u : 0u);
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbEndOcclusionQueryGetSize() {
+	return 4u * 4u;
+}
+
+// The semaphore memory a title gives the library once: 16 KiB aligned, at most 1 GiB, cleared;
+// GetSemaphoreLabel hands out its 32-byte slots.
+static std::mutex g_semaphore_memory_mutex;
+static uint64_t   g_semaphore_memory      = 0;
+static uint64_t   g_semaphore_memory_size = 0;
+
+int KYTY_SYSV_ABI AgcSetSemaphoreMemory(void* address, uint64_t size) {
+	PRINT_NAME();
+
+	const auto addr = reinterpret_cast<uint64_t>(address);
+	std::lock_guard lock(g_semaphore_memory_mutex);
+	if (g_semaphore_memory_size != 0) {
+		return static_cast<int>(0x8a6c0048u);
+	}
+	if ((size & 0x3fffu) != 0 || (addr & 0x3fffu) != 0) {
+		return static_cast<int>(0x8a6c0002u);
+	}
+	if (size > 0x40000000u) {
+		return static_cast<int>(0x8a6c000bu);
+	}
+	g_semaphore_memory      = addr;
+	g_semaphore_memory_size = size;
+	std::memset(address, 0, size);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcGetSemaphoreLabel(uint32_t index, void** label) {
+	PRINT_NAME();
+
+	std::lock_guard lock(g_semaphore_memory_mutex);
+	if (g_semaphore_memory_size == 0) {
+		return static_cast<int>(0x8a6c0049u);
+	}
+	const uint64_t offset = static_cast<uint64_t>(index) << 5u;
+	if (offset + 0x20u > g_semaphore_memory_size) {
+		return static_cast<int>(0x8a6c000bu);
+	}
+	*label = reinterpret_cast<void*>(g_semaphore_memory + offset);
+	return OK;
+}
 
 namespace AgcDiff {
 

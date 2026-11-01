@@ -178,6 +178,29 @@ LIB_DEFINE(InitAgcDriver_1) {
 	AGC_FUNC("ziVA3whp3p4", Gen5::AgcRewindPatchSetRewindState);
 	AGC_FUNC("eWaWyFegzgQ", Gen5::AgcRewindPatchSetRewindState);      // sceAgcAsyncRewindPatchSetRewindState
 	AGC_FUNC("YUeqkyT7mEQ", Gen5::AgcDcbSetFlip);
+	AGC_FUNC("G0jrLdvEqDw", Gen5::AgcDcbMemSemaphore);
+	AGC_FUNC("1-gUn1PI4Sw", Gen5::AgcDcbAtomicMem);
+	AGC_FUNC("XKKuA6VkSRc", Gen5::AgcAcbAtomicMem);
+	AGC_FUNC("oz6zQq1JwCE", Gen5::AgcDcbAtomicMemGetSize);
+	AGC_FUNC("da1Sm8-QDoU", Gen5::AgcAcbAtomicMemGetSize);
+	AGC_FUNC("7toV+elXqNM", Gen5::AgcCbCondWrite);
+	AGC_FUNC("FuVbkyKlf+s", Gen5::AgcCbCondWriteGetSize);
+	AGC_FUNC("0ZOG0jc9nRg", Gen5::AgcAcbRewindGetSize);
+	AGC_FUNC("2ccJz9LQI+w", Gen5::AgcDcbDmaDataGetSize);
+	AGC_FUNC("M0ttm8h7SKA", Gen5::AgcAcbDmaDataGetSize);
+	AGC_FUNC("PxKWV2fVAps", Gen5::AgcAcbDispatchIndirectGetSize);
+	AGC_FUNC("Y-5vneiBtzk", Gen5::AgcAcbEventWriteGetSize);
+	AGC_FUNC("ca4KPvp0qLQ", Gen5::AgcDcbSetIndexSizeGetSize);
+	AGC_FUNC("j4emHHndCPY", Gen5::AgcDcbSetIndexBufferGetSize);
+	AGC_FUNC("mljzuGDZRQ4", Gen5::AgcDcbSetIndexCountGetSize);
+	AGC_FUNC("mStuvI0zOtc", Gen5::AgcDcbDrawIndexIndirectGetSize);
+	AGC_FUNC("pYoKs3lPy88", Gen5::AgcDcbDrawIndirectMultiGetSize);
+	AGC_FUNC("rUuVjyR+Rd4", Gen5::AgcDcbGetLodStatsGetSize);
+	AGC_FUNC("vLrBL8DQiz8", Gen5::AgcDcbSetPredicationDisableGetSize);
+	AGC_FUNC("ms1xVoZ-Vwc", Gen5::AgcDcbBeginOcclusionQueryGetSize);
+	AGC_FUNC("P1CugZ99Uzc", Gen5::AgcDcbEndOcclusionQueryGetSize);
+	AGC_FUNC("v3G+IipShZs", Gen5::AgcSetSemaphoreMemory);
+	AGC_FUNC("hFQ9pUxoLQ4", Gen5::AgcGetSemaphoreLabel);
 }
 
 } // namespace LibGen5

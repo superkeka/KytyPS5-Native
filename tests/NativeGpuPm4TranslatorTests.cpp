@@ -2969,6 +2969,10 @@ void TestValidateBlacklist() {
 	Check(!ok({Pkt3(0x37u, 4, false), 0u, 0x2c00u, 0u, 1u}, NativeIbKind::Gfx) && !ok({Pkt3(0x40u, 5, false), 0u | (5u << 8u), 0x2c00u, 0u, 0x1000u, 0x2u}, NativeIbKind::Gfx) &&
 	          !ok({Pkt3(0x3Cu, 6, false), 3u, 0x2c00u, 0u, 1u, ~0u, 4u}, NativeIbKind::Gfx),
 	      "register writes, register reads and register waits");
+	Check(!ok({Pkt3(0x45u, 8, false), 0x10u, 0x1000u, 0x2u, 1u, ~0u, 0x2c00u, 0u, 1u}, NativeIbKind::Gfx) &&
+	          !ok({Pkt3(0x45u, 8, false), 0x100u, 0x2c00u, 0u, 1u, ~0u, 0x1000u, 0x2u, 1u}, NativeIbKind::Gfx) &&
+	          ok({Pkt3(0x45u, 8, false), 0x110u, 0x1000u, 0x2u, 1u, ~0u, 0x2000u, 0x2u, 1u}, NativeIbKind::Gfx),
+	      "COND_WRITE: a register write or poll refused, memory to memory (libSceAgc's form) passes");
 	Check(!ok({Pkt3(0x3Fu, 3, false), 0u, 0u, 8u | (1u << 23u)}, NativeIbKind::Gfx), "an IB at VA 0");
 	Check(!ok({Pkt3(0x28u, 2, false), 0x81018002u, 0x81018002u}, NativeIbKind::Gfx), "shadowing enables with no shadow buffer");
 	Check(ok({Pkt3(0x3Cu, 6, false), 3u | (1u << 4u), 0x1000u, 0x2u, 1u, ~0u, 4u}, NativeIbKind::Compute), "a title's wait on MEC as written");

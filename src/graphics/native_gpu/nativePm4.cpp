@@ -47,6 +47,7 @@ constexpr uint32_t IT_WAIT_REG_MEM_64          = 0x93;
 constexpr uint32_t IT_DMA_DATA                 = 0x50;
 constexpr uint32_t IT_WRITE_DATA               = 0x37;
 constexpr uint32_t IT_PFP_SYNC_ME              = 0x42;
+constexpr uint32_t IT_COND_WRITE               = 0x45;
 constexpr uint32_t IT_EVENT_WRITE              = 0x46;
 constexpr uint32_t IT_ACQUIRE_MEM             = 0x58;
 constexpr uint32_t IT_SET_SH_REG_INDIRECT      = 0x63;
@@ -1080,6 +1081,11 @@ bool ValidateNativeIbBlacklist(std::span<const uint32_t> ib, bool lod_stats, uin
 				break;
 			case IT_COPY_DATA:
 				if (n < 5 || ((b[0] & 0xfu) == 0u && b[0] != kClockCopyCntl) || ((b[0] >> 8u) & 0xfu) == 0u) {
+					return bad();
+				}
+				break;
+			case IT_COND_WRITE: // POLL_SPACE 0 or WRITE_SPACE 0: a register
+				if (n < 1 || (b[0] & (1u << 4u)) == 0u || ((b[0] >> 8u) & 0x3u) == 0u) {
 					return bad();
 				}
 				break;
