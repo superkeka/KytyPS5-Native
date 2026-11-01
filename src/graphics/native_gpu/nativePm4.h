@@ -209,6 +209,7 @@ struct Pm4TranslateStats {
 	// CP register shadowing (Pm4Translator::SetCpShadow): preambles that turn it on, the dwords of their
 	// LOAD_*_REG packets and the registers those load, and the classes that had no key to load (an anchor).
 	uint32_t cp_shadow_preambles = 0;
+	uint32_t cp_shadow_gated     = 0; // of those, with amdgpu's load enables (SetCpShadowGatedLoads)
 	uint32_t cp_shadow_load_dw   = 0;
 	uint32_t cp_shadow_load_regs = 0;
 	uint32_t cp_shadow_anchors   = 0;
@@ -618,12 +619,16 @@ std::vector<std::pair<size_t, size_t>> SplitIbAtPackets(std::span<const uint32_t
 // PFP_SYNC_ME on MEC is an illegal opcode).
 enum class NativeIbKind { Gfx, Compute };
 
-// The native-labels packet check: true when every packet of `ib` is one the translator has run on the
-// board before (in particular RELEASE_MEM and WAIT_REG_MEM only in the barrier's forms, NOPs only as
-// fillers, GET_LOD_STATS only with `lod_stats`), so an "Illegal opcode in command stream" cannot come
-// from a form never tried. On failure `bad_dw` is the offending packet.
+// The packet check before an IB goes to the GPU. By default a blacklist: the packets that take the board down here,
+// each from a probe or a run (anything on MEC it cannot run, a chain on MEC, CP shadowing's buffer or enables touched
+// outside the translator's forms, kernel and queue-management packets, register-space reads and writes, an IB at VA
+// 0); everything else runs as the title wrote it, as on the PS5. SetNativeIbValidation(true) (or
+// KYTY_NATIVE_GPU_VALIDATE_STRICT=1) checks the other way round: only packets in forms the translator has run on the
+// board before (RELEASE_MEM and WAIT_REG_MEM in the barrier's forms, NOPs as fillers, GET_LOD_STATS only with
+// `lod_stats`, ...). On failure `bad_dw` is the offending packet.
 bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw = nullptr,
                       NativeIbKind kind = NativeIbKind::Gfx);
+void SetNativeIbValidation(bool strict);
 
 // How a held guest wait may leave the CPU (KYTY_NATIVE_GPU_ACB_RINGS). The GPU is only given the
 // wait once a writer that satisfies it is guaranteed to run:
@@ -1042,6 +1047,11 @@ public:
 	void SetLodStats(bool on) { m_lod_stats = on; }
 	// DRAW_INDEX_OFFSET_2 (0x35) as the title wrote it, not as DRAW_INDEX_2 at the offset's address.
 	void SetDrawIndexOffsetVerbatim(bool on) { m_draw_offset_verbatim = on; }
+	// Load mode: the shadow preamble's LOADs load only when amdgpu turns the loads on, after another context's job on the
+	// ring (EmitShadowPreamble). ForceCpShadowLoad: the next preamble loads anyway (a job of ours on the same context
+	// left other state in the CP, as an AGR buffer on the gfx ring does).
+	void SetCpShadowGatedLoads(bool on) { m_cp_shadow_gated = on; }
+	void ForceCpShadowLoad() { m_cp_shadow_force_load = true; }
 	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
 	// scan every stage's user-data SGPRs (PS, VS, GS, ES, HS, LS) and USER_DATA_ADDR; dispatches
 	// scan COMPUTE_USER_DATA_0..15. Descriptor tables those pointers name are read two levels deep
@@ -1237,6 +1247,8 @@ private:
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
 	bool                         m_draw_offset_verbatim = false;
+	bool                         m_cp_shadow_gated      = false;
+	bool                         m_cp_shadow_force_load = false;
 	bool                         m_pfp_sync_indirect = false;
 	bool                         m_cp_dma_idle       = true;
 	bool                         m_waits_verbatim    = false;

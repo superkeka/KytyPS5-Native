@@ -592,6 +592,109 @@ bool IsWork(uint32_t op) {
 	}
 }
 
+// amdgpu's clear state for gfx10 (clearstate_gfx10.h, gfx10_cs_data, MIT): the context registers a CLEAR_STATE resets,
+// as [first, end) offsets from 0xa000, and the ones it sets to something other than 0. S holds these for every register
+// nothing has written, so LOADs of them give what a CLEAR_STATE and the LOADs give (EmitShadowPreamble).
+constexpr std::pair<uint32_t, uint32_t> kClearStateExtents[] = {{0x000u, 0x0d7u}, {0x0d8u, 0x1e8u}, {0x1f5u, 0x1f9u},
+                                                                {0x1ffu, 0x29du}, {0x2a0u, 0x2a2u}, {0x2a3u, 0x2a4u},
+                                                                {0x2a5u, 0x2e7u}, {0x2f5u, 0x3c0u}};
+constexpr std::pair<uint32_t, uint32_t> kClearStateValues[] = {
+    {0x00du, 0x40004000u}, // PA_SC_SCREEN_SCISSOR_BR
+    {0x01fu, 0x00150055u}, // DB_RMI_L2_CACHE_CONTROL
+    {0x081u, 0x80000000u}, // PA_SC_WINDOW_SCISSOR_TL
+    {0x082u, 0x40004000u}, // PA_SC_WINDOW_SCISSOR_BR
+    {0x083u, 0x0000ffffu}, // PA_SC_CLIPRECT_RULE
+    {0x085u, 0x40004000u}, // PA_SC_CLIPRECT_0_BR
+    {0x087u, 0x40004000u}, // PA_SC_CLIPRECT_1_BR
+    {0x089u, 0x40004000u}, // PA_SC_CLIPRECT_2_BR
+    {0x08bu, 0x40004000u}, // PA_SC_CLIPRECT_3_BR
+    {0x08cu, 0xaa99aaaau}, // PA_SC_EDGERULE
+    {0x08eu, 0xffffffffu}, // CB_TARGET_MASK
+    {0x08fu, 0xffffffffu}, // CB_SHADER_MASK
+    {0x090u, 0x80000000u}, // PA_SC_GENERIC_SCISSOR_TL
+    {0x091u, 0x40004000u}, // PA_SC_GENERIC_SCISSOR_BR
+    {0x094u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_0_TL
+    {0x095u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_0_BR
+    {0x096u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_1_TL
+    {0x097u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_1_BR
+    {0x098u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_2_TL
+    {0x099u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_2_BR
+    {0x09au, 0x80000000u}, // PA_SC_VPORT_SCISSOR_3_TL
+    {0x09bu, 0x40004000u}, // PA_SC_VPORT_SCISSOR_3_BR
+    {0x09cu, 0x80000000u}, // PA_SC_VPORT_SCISSOR_4_TL
+    {0x09du, 0x40004000u}, // PA_SC_VPORT_SCISSOR_4_BR
+    {0x09eu, 0x80000000u}, // PA_SC_VPORT_SCISSOR_5_TL
+    {0x09fu, 0x40004000u}, // PA_SC_VPORT_SCISSOR_5_BR
+    {0x0a0u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_6_TL
+    {0x0a1u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_6_BR
+    {0x0a2u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_7_TL
+    {0x0a3u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_7_BR
+    {0x0a4u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_8_TL
+    {0x0a5u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_8_BR
+    {0x0a6u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_9_TL
+    {0x0a7u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_9_BR
+    {0x0a8u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_10_TL
+    {0x0a9u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_10_BR
+    {0x0aau, 0x80000000u}, // PA_SC_VPORT_SCISSOR_11_TL
+    {0x0abu, 0x40004000u}, // PA_SC_VPORT_SCISSOR_11_BR
+    {0x0acu, 0x80000000u}, // PA_SC_VPORT_SCISSOR_12_TL
+    {0x0adu, 0x40004000u}, // PA_SC_VPORT_SCISSOR_12_BR
+    {0x0aeu, 0x80000000u}, // PA_SC_VPORT_SCISSOR_13_TL
+    {0x0afu, 0x40004000u}, // PA_SC_VPORT_SCISSOR_13_BR
+    {0x0b0u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_14_TL
+    {0x0b1u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_14_BR
+    {0x0b2u, 0x80000000u}, // PA_SC_VPORT_SCISSOR_15_TL
+    {0x0b3u, 0x40004000u}, // PA_SC_VPORT_SCISSOR_15_BR
+    {0x0b5u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_0
+    {0x0b7u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_1
+    {0x0b9u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_2
+    {0x0bbu, 0x3f800000u}, // PA_SC_VPORT_ZMAX_3
+    {0x0bdu, 0x3f800000u}, // PA_SC_VPORT_ZMAX_4
+    {0x0bfu, 0x3f800000u}, // PA_SC_VPORT_ZMAX_5
+    {0x0c1u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_6
+    {0x0c3u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_7
+    {0x0c5u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_8
+    {0x0c7u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_9
+    {0x0c9u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_10
+    {0x0cbu, 0x3f800000u}, // PA_SC_VPORT_ZMAX_11
+    {0x0cdu, 0x3f800000u}, // PA_SC_VPORT_ZMAX_12
+    {0x0cfu, 0x3f800000u}, // PA_SC_VPORT_ZMAX_13
+    {0x0d1u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_14
+    {0x0d3u, 0x3f800000u}, // PA_SC_VPORT_ZMAX_15
+    {0x100u, 0xffffffffu}, // VGT_MAX_VTX_INDX
+    {0x104u, 0x00550055u}, // CB_RMI_GL2_CACHE_CONTROL
+    {0x10cu, 0x01000000u}, // DB_STENCILREFMASK
+    {0x10du, 0x01000000u}, // DB_STENCILREFMASK_BF
+    {0x1b6u, 0x00000002u}, // SPI_PS_IN_CONTROL
+    {0x204u, 0x00090000u}, // PA_CL_CLIP_CNTL
+    {0x205u, 0x00000004u}, // PA_SU_SC_MODE_CNTL
+    {0x295u, 0x00000100u}, // VGT_GS_PER_ES
+    {0x296u, 0x00000080u}, // VGT_ES_PER_GS
+    {0x297u, 0x00000002u}, // VGT_GS_PER_VS
+    {0x2aau, 0x000000ffu}, // IA_MULTI_VGT_PARAM
+    {0x2f7u, 0x00001000u}, // PA_SC_LINE_CNTL
+    {0x2f9u, 0x00000005u}, // PA_SU_VTX_CNTL
+    {0x2fau, 0x3f800000u}, // PA_CL_GB_VERT_CLIP_ADJ
+    {0x2fbu, 0x3f800000u}, // PA_CL_GB_VERT_DISC_ADJ
+    {0x2fcu, 0x3f800000u}, // PA_CL_GB_HORZ_CLIP_ADJ
+    {0x2fdu, 0x3f800000u}, // PA_CL_GB_HORZ_DISC_ADJ
+    {0x30eu, 0xffffffffu}, // PA_SC_AA_MASK_X0Y0_X1Y0
+    {0x30fu, 0xffffffffu}, // PA_SC_AA_MASK_X0Y1_X1Y1
+    {0x311u, 0x00000003u}, // PA_SC_BINNER_CNTL_0
+    {0x313u, 0x00100000u}, // PA_SC_CONSERVATIVE_RASTERIZATION_CNTL
+    {0x316u, 0x0000001eu}, // VGT_VERTEX_REUSE_BLOCK_CNTL
+    {0x317u, 0x00000020u}, // VGT_OUT_DEALLOC_CNTL
+};
+
+bool InClearState(uint32_t off) {
+	return std::any_of(std::begin(kClearStateExtents), std::end(kClearStateExtents),
+	                   [&](const auto& e) { return off >= e.first && off < e.second; });
+}
+uint32_t ClearStateValue(uint32_t off) {
+	const auto* it = std::find_if(std::begin(kClearStateValues), std::end(kClearStateValues), [&](const auto& v) { return v.first == off; });
+	return it != std::end(kClearStateValues) ? it->second : 0u;
+}
+
 // What a shadow preamble restores with LOAD_*_REG (Pm4Translator::SetCpShadow); the rest of the copy is SET.
 // PA_SC_SHADER_CONTROL takes the PS5's RCIU CAM override, which may not apply to a LOAD's writes.
 bool CpShadowLoadsContext(uint32_t off) {
@@ -655,8 +758,9 @@ uint32_t FmaskFixSlots(uint32_t off) {
 // LOAD_*_REG from S's region at `base` of the keys of `regs` in [lo, hi) that `loads` takes, in runs. A class
 // with none LOADs `anchor` (value 0 unless the GPU wrote it): the CP takes a class's base only from a LOAD that
 // loads, and a shadowed write through a base this job never set goes near VA 0 (a VM fault).
+// `also`: registers loaded though the copy has no value for them (S holds one: the context's clear state).
 void EmitCpShadowLoad(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, uint32_t op, bool compute, uint64_t base, const RegFile& regs,
-                      uint32_t lo, uint32_t hi, bool (*loads)(uint32_t), uint32_t anchor) {
+                      uint32_t lo, uint32_t hi, bool (*loads)(uint32_t), uint32_t anchor, bool (*also)(uint32_t) = nullptr) {
 	const size_t at = ib.size();
 	ib.push_back(0u); // the header, once the length is known
 	ib.push_back(static_cast<uint32_t>(base));
@@ -670,9 +774,8 @@ void EmitCpShadowLoad(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, uint3
             run_len = 0;
         }
 	};
-	for (const auto& kv: regs) {
-		const uint32_t off = kv.first;
-		if (off < lo || off >= hi || !loads(off)) {
+	for (uint32_t off = lo; off < hi && off < RegFile::kDense; off++) {
+		if (!(regs.Find(off) != nullptr || (also != nullptr && also(off))) || !loads(off)) {
 			continue;
 		}
 		if (run_len != 0 && run_off + run_len == off) {
@@ -812,7 +915,211 @@ static bool MecGuestWaitOk(uint32_t control) {
 	return AcbWaitsVerbatim() && GuestWaitControlOk(control) && ((control >> 8u) & 0x3u) == 0u;
 }
 
+namespace {
+
+std::atomic<int> g_validate_strict {-1}; // -1: KYTY_NATIVE_GPU_VALIDATE_STRICT decides
+
+bool ValidateStrict() {
+	int v = g_validate_strict.load(std::memory_order_relaxed);
+	if (v < 0) {
+		const char* e = std::getenv("KYTY_NATIVE_GPU_VALIDATE_STRICT");
+		v             = e != nullptr && e[0] == '1' ? 1 : 0;
+		g_validate_strict.store(v, std::memory_order_relaxed);
+	}
+	return v == 1;
+}
+
+// Packets of the kernel and of queue management (KIQ), which a title never writes and which reprogram the CP, the VM
+// or the queues: ME_INITIALIZE, PREAMBLE_CNTL, INTERRUPT, GEN_PDEPTE, INDIRECT_BUFFER_PASID, PRIME_UTCL2,
+// LOAD_CONFIG_REG, SET_CONFIG_REG, SET_QUEUE_REG, INVALIDATE_TLBS, INDIRECT_BUFFER_PRIV, REG_RMW, and 0xA0-0xAF
+// (SET_RESOURCES, MAP_PROCESS, MAP_QUEUES, UNMAP_QUEUES, QUERY_STATUS, RUN_LIST ...).
+bool PrivilegedOp(uint32_t op) {
+	switch (op) {
+		case 0x21u:
+		case 0x32u:
+		case 0x44u:
+		case 0x4Au:
+		case 0x5Au:
+		case 0x5Bu:
+		case 0x5Cu:
+		case 0x5Du:
+		case 0x60u:
+		case 0x68u:
+		case 0x78u:
+		case 0x98u: return true;
+		default: return op >= 0xA0u && op <= 0xAFu;
+	}
+}
+
+// What a compute ring (MEC) cannot run: an illegal opcode there stops the ring.
+bool GraphicsOnlyOp(uint32_t op) {
+	switch (op) {
+		case IT_CLEAR_STATE:
+		case IT_SET_PREDICATION:
+		case IT_INDEX_BUFFER_SIZE:
+		case IT_DRAW_INDIRECT:
+		case IT_DRAW_INDEX_INDIRECT:
+		case IT_DRAW_INDIRECT_MULTI:
+		case IT_DRAW_INDEX_INDIRECT_MULTI:
+		case IT_INDEX_BASE:
+		case IT_DRAW_INDEX_2:
+		case IT_DRAW_INDEX_OFFSET_2:
+		case IT_DRAW_INDEX_AUTO:
+		case IT_NUM_INSTANCES:
+		case IT_PFP_SYNC_ME:
+		case IT_CONTEXT_CONTROL:
+		case IT_SET_CONTEXT_REG:
+		case IT_SET_CONTEXT_REG_INDIRECT:
+		case IT_GET_LOD_STATS:
+		case IT_LOAD_UCONFIG_REG:
+		case IT_LOAD_CONTEXT_REG:
+		case IT_LOAD_SH_REG:
+		case IT_INDIRECT_BUFFER: // a chain on MEC took the board down (probe condexec)
+			return true;
+		default: return false;
+	}
+}
+
+bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind);
+
+// The blacklist (ValidateNativeIb).
+bool ValidateNativeIbBlacklist(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind) {
+	const bool compute = kind == NativeIbKind::Compute;
+	const uint64_t s   = g_cp_shadow_va.load(std::memory_order_relaxed);
+	uint32_t dw = 0;
+	auto     bad = [&]() {
+		if (bad_dw != nullptr) {
+			*bad_dw = dw;
+		}
+		return false;
+	};
+	// The translator's own forms for the packets that touch CP shadowing (and any other packet of the IB at `at`, size
+	// `size`): what the strict check says of that one packet.
+	auto strict_one = [&](uint32_t at, uint32_t size) {
+		uint32_t unused = 0;
+		return ValidateNativeIbStrict(ib.subspan(at, size), lod_stats, &unused, kind);
+	};
+	auto in_s = [&](uint64_t a, uint64_t bytes) { return s != 0 && a < s + kCpShadowReserveBytes && a + bytes > s; };
+	while (dw < ib.size()) {
+		const uint32_t header = ib[dw];
+		if ((header >> 30u) != 3u) {
+			return bad();
+		}
+		const uint32_t size = PacketSizeDw(header);
+		if (dw + size > ib.size()) {
+			return bad();
+		}
+		const uint32_t  op = (header >> 8u) & 0xffu;
+		const uint32_t* b  = ib.data() + dw + 1;
+		const uint32_t  n  = size - 1u; // body dwords
+		if (PrivilegedOp(op) || (compute && GraphicsOnlyOp(op))) {
+			return bad();
+		}
+		// On MEC these need the shader-type bit unless MEC runs their plain form (KYTY_NATIVE_GPU_MEC_PLAIN_OPS); a title's
+		// waits go as written without it (ASTRO BOT plays so).
+		switch (op) {
+			case IT_SET_BASE:
+			case IT_DISPATCH_DIRECT:
+			case IT_DISPATCH_INDIRECT:
+			case IT_EVENT_WRITE:
+			case IT_ACQUIRE_MEM:
+			case IT_SET_SH_REG:
+			case IT_DMA_DATA:
+			case IT_WRITE_DATA:
+			case IT_RELEASE_MEM:
+				if (compute && (header & 2u) == 0 && !MecPlainOp(op)) {
+					return bad();
+				}
+				break;
+			default: break;
+		}
+		switch (op) {
+			// CP shadowing: only the translator's forms (the enables while S is registered, LOADs from S).
+			case IT_CONTEXT_CONTROL:
+			case IT_LOAD_UCONFIG_REG:
+			case IT_LOAD_CONTEXT_REG:
+			case IT_LOAD_SH_REG:
+				if (!strict_one(dw, size)) {
+					return bad();
+				}
+				break;
+			// The FMASK fix's COND_EXEC over S's tables is the translator's; any other skips no further than the IB.
+			case IT_COND_EXEC:
+				if (n < 4 || (s != 0 && in_s(b[0] | (static_cast<uint64_t>(b[1]) << 32u), 4) && !strict_one(dw, std::min<uint32_t>(10u, static_cast<uint32_t>(ib.size()) - dw)))) {
+					return bad();
+				}
+				break;
+			// S, P and the fix tables only through the translator's DMA_DATA and ATOMIC_MEM; no register space.
+			case IT_DMA_DATA: {
+				if (n < 6 || (b[5] & (3u << 26u)) != 0u) { // SAS / DAS: register addresses
+					return bad();
+				}
+				const uint32_t src_sel = (b[0] >> 29u) & 0x3u;
+				const uint32_t dst_sel = (b[0] >> 20u) & 0x3u;
+				const uint64_t bytes   = std::max<uint64_t>(b[5] & 0x3ffffffu, 1u);
+				const uint64_t src     = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
+				const uint64_t dst     = b[3] | (static_cast<uint64_t>(b[4]) << 32u);
+				if ((((src_sel == 0u || src_sel == 3u) && in_s(src, bytes)) || ((dst_sel == 0u || dst_sel == 3u) && in_s(dst, bytes))) &&
+				    !strict_one(dw, size)) {
+					return bad();
+				}
+				break;
+			}
+			case IT_ATOMIC_MEM:
+				if (n < 3 || (in_s(b[1] | (static_cast<uint64_t>(b[2]) << 32u), 8) && !strict_one(dw, size))) {
+					return bad();
+				}
+				break;
+			// Register space: a write is a privileged register as likely as not, and a read of a context or UCONFIG
+			// register stopped the ring (probe); the translator's GPU clock copy is the one read.
+			case IT_WRITE_DATA:
+				// libSceAgc's debug-marker strings go to SQ_THREAD_TRACE_USERDATA_2/3, the one register write passed on.
+				if (n < 3 || (((b[0] >> 8u) & 0xfu) == 0u && !(!compute && TraceUserDataWrite(b[0], b[1], b[2])))) {
+					return bad();
+				}
+				break;
+			case IT_COPY_DATA:
+				if (n < 5 || ((b[0] & 0xfu) == 0u && b[0] != kClockCopyCntl) || ((b[0] >> 8u) & 0xfu) == 0u) {
+					return bad();
+				}
+				break;
+			case IT_WAIT_REG_MEM:
+			case IT_WAIT_REG_MEM_64:
+				if (n < 1 || (b[0] & (1u << 4u)) == 0u) { // MEM_SPACE 0: a register
+					return bad();
+				}
+				break;
+			// An IB at VA 0 or of no length.
+			case IT_INDIRECT_BUFFER:
+				if (n < 3 || ((b[0] & ~3u) == 0u && (b[1] & 0xffffu) == 0u) || (b[2] & 0xfffffu) == 0u) {
+					return bad();
+				}
+				break;
+			case IT_GET_LOD_STATS:
+				if (!lod_stats) {
+					return bad();
+				}
+				break;
+			default: break;
+		}
+		dw += size;
+	}
+	return true;
+}
+
+} // namespace
+
+void SetNativeIbValidation(bool strict) {
+	g_validate_strict.store(strict ? 1 : 0, std::memory_order_relaxed);
+}
+
 bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind) {
+	return ValidateStrict() ? ValidateNativeIbStrict(ib, lod_stats, bad_dw, kind) : ValidateNativeIbBlacklist(ib, lod_stats, bad_dw, kind);
+}
+
+namespace {
+
+bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32_t* bad_dw, NativeIbKind kind) {
 	const bool compute = kind == NativeIbKind::Compute;
 	uint32_t dw = 0;
 	auto     bad = [&]() {
@@ -1014,7 +1321,8 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 			// job's end), and CP shadowing's enables while a shadow buffer is registered. The title's is dropped.
 			case IT_CONTEXT_CONTROL: {
 				const bool off    = b[0] == 0x80000000u && b[1] == 0x80000000u;
-				const bool shadow = g_cp_shadow_va.load(std::memory_order_relaxed) != 0 && b[0] == kCpShadowEnables &&
+				// The shadow preamble's enables, with every load on or (gated) the load control left as amdgpu set it.
+				const bool shadow = g_cp_shadow_va.load(std::memory_order_relaxed) != 0 && (b[0] == kCpShadowEnables || b[0] == 0u) &&
 				                    b[1] == kCpShadowEnables;
 				if (compute || header != Pkt3(IT_CONTEXT_CONTROL, 2, false) || (!off && !shadow)) {
 					return bad();
@@ -1076,6 +1384,8 @@ bool ValidateNativeIb(std::span<const uint32_t> ib, bool lod_stats, uint32_t* ba
 	}
 	return true;
 }
+
+} // namespace
 
 RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bool same_ring, bool writer_submitted,
                              bool label_in_memory, bool native_wait, bool gfx_writer, bool shared_ring) {
@@ -1514,23 +1824,41 @@ void Pm4Translator::EmitShadowPreamble(std::vector<uint32_t>& ib, Pm4TranslateSt
 	// context back to amdgpu's clear state. Then, as Mesa's shadowing preamble (ac_create_shadowing_ib_preamble):
 	// PFP_SYNC_ME so the shadow writes before it have landed when the LOADs read S, the enables, and the LOADs of
 	// all four classes back to back before any SET, so every class has its base in this job.
-	ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
-	ib.push_back(0x80000000u);
-	ib.push_back(0x80000000u);
-	ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
-	ib.push_back(0u);
-	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
-	ib.push_back(0u);
-	ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
-	ib.push_back(kCpShadowEnables);
-	ib.push_back(kCpShadowEnables);
+	//
+	// Gated (SetCpShadowGatedLoads, load mode): as the PS5 reloads a queue's registers only when the CP switches to it from
+	// another one, the LOADs load only after another client's job ran on the ring. amdgpu's CONTEXT_CONTROL in front of
+	// every job turns the loads on after another context's job and leaves them off after our own
+	// (gfx_v10_0_ring_emit_cntxcntl, AMDGPU_HAVE_CTX_SWITCH), when the CP still holds our state, S's. So no CLEAR_STATE,
+	// the load control stays amdgpu's (bit 31 clear: not updated) and only shadowing goes on; S holds the clear state of
+	// every register a CLEAR_STATE resets, and the LOADs take all of those, which gives what the clear and the LOADs gave.
+	// Before 20 such preambles a frame (Demon's Souls) took a third of its frame rate.
+	const bool gated = m_cp_shadow_mode == CpShadowMode::Load && m_cp_shadow_gated && !m_cp_shadow_force_load;
+	if (gated) {
+		ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
+		ib.push_back(0u);
+		ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
+		ib.push_back(0u);
+		ib.push_back(kCpShadowEnables);
+		stats.cp_shadow_gated++;
+	} else {
+		ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
+		ib.push_back(0x80000000u);
+		ib.push_back(0x80000000u);
+		ib.push_back(Pkt3(IT_CLEAR_STATE, 1, false));
+		ib.push_back(0u);
+		ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
+		ib.push_back(0u);
+		ib.push_back(Pkt3(IT_CONTEXT_CONTROL, 2, false));
+		ib.push_back(kCpShadowEnables);
+		ib.push_back(kCpShadowEnables);
+	}
 	const uint64_t s = m_cp_shadow_va;
 	// The probe's order: UCONFIG, context, graphics SH, compute SH (the compute header, into the SH region).
 	// Anchors: GE_INDX_OFFSET, PA_SC_WINDOW_OFFSET, SPI_SHADER_USER_DATA_PS_0, COMPUTE_USER_DATA_0.
 	EmitCpShadowLoad(ib, stats, IT_LOAD_UCONFIG_REG, false, s + 4ull * kCpShadowUconfigDw, uc, 0, RegFile::kDense, CpShadowLoadsUconfig,
 	                 0x24Au);
 	EmitCpShadowLoad(ib, stats, IT_LOAD_CONTEXT_REG, false, s + 4ull * kCpShadowContextDw, cx, 0, RegFile::kDense, CpShadowLoadsContext,
-	                 0x080u);
+	                 0x080u, gated ? InClearState : nullptr);
 	EmitCpShadowLoad(ib, stats, IT_LOAD_SH_REG, false, s + 4ull * kCpShadowShDw, sh, 0, kShComputeBase, CpShadowLoadsSh, 0x00Cu);
 	EmitCpShadowLoad(ib, stats, IT_LOAD_SH_REG, true, s + 4ull * kCpShadowShDw, sh, kShComputeBase, RegFile::kDense, CpShadowLoadsSh,
 	                 0x240u);
@@ -1785,6 +2113,16 @@ void Pm4Translator::WriteCpShadowImage(std::span<uint32_t> s, std::span<uint32_t
 	if (s.size() < kCpShadowDwords) {
 		return;
 	}
+	// amdgpu's clear state under the copy, for the registers a preamble LOADs that nothing has written.
+	for (const auto& [first, end]: kClearStateExtents) {
+		for (uint32_t offset = first; offset < end; offset++) {
+			s[kCpShadowContextDw + offset] = 0u;
+			m_cp_valid_cx.set(offset);
+		}
+	}
+	for (const auto& [offset, value]: kClearStateValues) {
+		s[kCpShadowContextDw + offset] = value;
+	}
 	for (const auto& [offset, value]: m_cx) {
 		if (offset < RegFile::kDense) {
 			s[kCpShadowContextDw + offset] = PatchContext(offset, value);
@@ -1869,7 +2207,8 @@ Pm4Translator::CpShadowCheck Pm4Translator::CompareCpShadow(std::span<const uint
 	auto outside = [&](const char* cls, uint32_t region, const RegFile& regs) {
 		for (uint32_t off = 0; off < RegFile::kDense; off++) {
 			const uint32_t got = s[region + off];
-			if (got == 0 || regs.count(off) != 0) {
+			// The seed's clear state of a context register nothing wrote is expected too.
+			if (got == 0 || regs.count(off) != 0 || (region == kCpShadowContextDw && InClearState(off) && got == ClearStateValue(off))) {
 				continue;
 			}
 			const bool expected = ours(region, off);
@@ -4737,6 +5076,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_cp                          = cp;
 	if (cp_shadow && !head_from_start) {
 		EmitShadowPreamble(cp_head, head_stats, m_cx, m_sh, m_uc, cp_start);
+	}
+	if (cp_shadow) {
+		m_cp_shadow_force_load = false;
 	}
 	r.cp_shadow = cp_shadow;
 

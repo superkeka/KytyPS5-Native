@@ -1357,6 +1357,11 @@ public:
 			m_trace_last_dcb.store(NowSecShadow(), std::memory_order_relaxed); // FlipTrace
 		}
 		Pm4Translator&     tr    = acb ? m_acb_translator : agr && m_agr_translator != nullptr ? *m_agr_translator : m_translator;
+		// An AGR buffer on the gfx ring's own context leaves its state in the CP, which amdgpu does not count as another
+		// context: the next DCB's shadow preamble loads anyway.
+		if (agr && m_agr_translator != nullptr && !SecondGfxRing()) {
+			m_translator.ForceCpShadowLoad();
+		}
 		if (!acb) {
 			LoadAgcStartState();
 			ActivateCpShadowLocked();
@@ -4831,6 +4836,11 @@ private:
 			m_translator.SetPfpSyncIndirect(true);
 			m_acb_translator.SetPfpSyncIndirect(true);
 			std::fprintf(stderr, "native shadow: PFP_SYNC_ME before indirect draws and dispatches\n");
+		}
+		// Load mode reloads registers from the shadow only after another client's job, as the PS5 only on a queue switch;
+		// KYTY_NATIVE_GPU_CP_SHADOW_GATED=0 reloads before every job (CLEAR_STATE and every load on).
+		if (!EnvIs("KYTY_NATIVE_GPU_CP_SHADOW_GATED", "0")) {
+			m_translator.SetCpShadowGatedLoads(true);
 		}
 		// DRAW_INDEX_OFFSET_2 runs as the title wrote it; KYTY_NATIVE_GPU_DRAW_OFFSET_VERBATIM=0 makes it DRAW_INDEX_2.
 		if (!EnvIs("KYTY_NATIVE_GPU_DRAW_OFFSET_VERBATIM", "0")) {

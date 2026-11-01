@@ -807,23 +807,34 @@ private:
 		}
 	}
 
-	// CP register shadowing's S in VRAM (KYTY_NATIVE_GPU_CP_SHADOW_VRAM=0: in the IB buffer). In the IB buffer S is
+	static bool EnvIsZero(const char* name) {
+		const char* v = std::getenv(name);
+		return v != nullptr && v[0] == '0';
+	}
+	// CP register shadowing's S in a buffer of its own (KYTY_NATIVE_GPU_CP_SHADOW_MEM). In the IB buffer S is
 	// system memory the GPU reads uncached, and the LOADs of each shadow preamble (~650 registers, about nine
 	// preambles a frame) read it through the fabric dword by dword: Demon's Souls in load mode took 4.8-6.7 ms a
 	// buffer instead of 3.0 without shadowing and missed 18-28% of its vsyncs instead of 3.6%, while record mode,
 	// which shadows every SET into S but LOADs nothing, cost nothing. The PS5's S, like all its GPU memory, is
 	// GDDR6 behind GL2. Always valid (no BO list entry), CPU-visible for the seed Kyty writes before the first job;
 	// the CPU's later reads of it (CpShadowCheck, dumps) may miss values still in GL2.
+	//
+	// KYTY_NATIVE_GPU_CP_SHADOW_MEM: gtt (default) a CPU-cached GTT buffer the GPU reaches through GL2, like the title's
+	// memory; vram; ib (S in the IB buffer, uncached). With the title's memory all resident Demon's Souls costs the same
+	// with each (GPU busy 13.2 ms a frame against 9.4 without shadowing): what shadowing costs now lies elsewhere. GTT
+	// because the BC-250's 512 MiB of VRAM fill up and TTM may move a VRAM buffer out; nothing moves a GTT one.
 	void CreateCpShadowVram() {
-		if (const char* v = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW_VRAM"); v != nullptr && v[0] == '0') {
+		const char* mem  = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW_MEM");
+		const bool  vram = mem != nullptr && std::strcmp(mem, "vram") == 0;
+		if ((mem != nullptr && std::strcmp(mem, "ib") == 0) || EnvIsZero("KYTY_NATIVE_GPU_CP_SHADOW_VRAM")) {
 			return;
 		}
 		union drm_amdgpu_gem_create c;
 		std::memset(&c, 0, sizeof(c));
 		c.in.bo_size      = kCpShadowVramSize;
 		c.in.alignment    = 64 * 1024;
-		c.in.domains      = AMDGPU_GEM_DOMAIN_VRAM;
-		c.in.domain_flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED | AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
+		c.in.domains      = vram ? AMDGPU_GEM_DOMAIN_VRAM : AMDGPU_GEM_DOMAIN_GTT;
+		c.in.domain_flags = (vram ? AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED : 0u) | AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
 		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &c) != 0) {
 			std::fprintf(stderr, "NativeSubmitter: CP shadow VRAM buffer failed: %s; S stays in the IB buffer\n", std::strerror(errno));
 			return;
@@ -857,7 +868,7 @@ private:
 		}
 		m_shadow_cpu = p;
 		m_shadow_va  = kCpShadowVramVa;
-		std::fprintf(stderr, "NativeSubmitter: CP shadow S in VRAM at 0x%llx (KYTY_NATIVE_GPU_CP_SHADOW_VRAM=0: in the IB buffer)\n",
+		std::fprintf(stderr, "NativeSubmitter: CP shadow S in %s at 0x%llx (KYTY_NATIVE_GPU_CP_SHADOW_MEM=gtt|vram|ib)\n", vram ? "VRAM" : "cached GTT",
 		             static_cast<unsigned long long>(m_shadow_va));
 	}
 

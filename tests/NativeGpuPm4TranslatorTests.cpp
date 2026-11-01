@@ -2950,6 +2950,65 @@ void TestCpShadowExits() {
 
 // The shadow preamble: its packets in order, the LOAD runs from the copy's keys, what is SET instead, the anchors,
 // and the packet check.
+// Gated load mode: no CLEAR_STATE, the load control left as amdgpu set it for the job (bit 31 clear) and shadowing on,
+// then the LOADs, the context's taking every register a CLEAR_STATE resets; a forced preamble (after an AGR buffer) is
+// the full one once.
+// The default packet check, a blacklist: the board's known killers refused, anything else as the title wrote it.
+void TestValidateBlacklist() {
+	using Libs::Graphics::NativeGpu::SetNativeIbValidation;
+	SetNativeIbValidation(false);
+	auto ok = [](std::vector<uint32_t> ib, NativeIbKind kind) { return ValidateNativeIb(ib, false, nullptr, kind); };
+	Check(ok({Pkt3(0x35u, 4, false), 1u, 0u, 3u, 0u}, NativeIbKind::Gfx) && ok({0xc0032200u, 0x1000u, 0x2u, 0u, 4u}, NativeIbKind::Gfx) &&
+	          ok({Pkt3(0x2Au, 1, false), 0u}, NativeIbKind::Gfx),
+	      "a draw, a title's COND_EXEC and a packet the strict check never saw pass");
+	Check(!ok({Pkt3(0x2Du, 2, false), 3u, 0u}, NativeIbKind::Compute) && !ok({Pkt3(0x3Fu, 3, true), 0x1000u, 0x2u, 8u | (1u << 20u) | (1u << 23u)}, NativeIbKind::Compute),
+	      "a draw or an IB on MEC");
+	Check(!ok({Pkt3(0x98u, 1, false), 0u}, NativeIbKind::Gfx) && !ok({Pkt3(0xA2u, 1, false), 0u}, NativeIbKind::Gfx) &&
+	          !ok({Pkt3(0x68u, 2, false), 0x10u, 0u}, NativeIbKind::Gfx),
+	      "kernel and queue-management packets");
+	Check(!ok({Pkt3(0x37u, 4, false), 0u, 0x2c00u, 0u, 1u}, NativeIbKind::Gfx) && !ok({Pkt3(0x40u, 5, false), 0u | (5u << 8u), 0x2c00u, 0u, 0x1000u, 0x2u}, NativeIbKind::Gfx) &&
+	          !ok({Pkt3(0x3Cu, 6, false), 3u, 0x2c00u, 0u, 1u, ~0u, 4u}, NativeIbKind::Gfx),
+	      "register writes, register reads and register waits");
+	Check(!ok({Pkt3(0x3Fu, 3, false), 0u, 0u, 8u | (1u << 23u)}, NativeIbKind::Gfx), "an IB at VA 0");
+	Check(!ok({Pkt3(0x28u, 2, false), 0x81018002u, 0x81018002u}, NativeIbKind::Gfx), "shadowing enables with no shadow buffer");
+	Check(ok({Pkt3(0x3Cu, 6, false), 3u | (1u << 4u), 0x1000u, 0x2u, 1u, ~0u, 4u}, NativeIbKind::Compute), "a title's wait on MEC as written");
+	SetNativeIbValidation(true);
+}
+
+void TestCpShadowGatedPreamble() {
+	Pm4Translator t;
+	t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+	t.SetCpShadowGatedLoads(true);
+	std::vector<uint32_t> draw;
+	Append(draw, IT_DRAW_INDEX_AUTO, {3u, 0u}, false);
+	auto       r    = t.Translate(draw);
+	const auto pkts = Decode(r.ib);
+	Check(r.ok && r.stats.cp_shadow_gated == 1 && pkts.size() >= 6 && pkts[0].op == IT_PFP_SYNC_ME && pkts[1].op == IT_CONTEXT_CONTROL &&
+	          pkts[1].body == std::vector<uint32_t>({0u, 0x81018002u}) && Count(pkts, IT_CLEAR_STATE) == 0 && pkts[2].op == IT_LOAD_UC &&
+	          pkts[3].op == IT_LOAD_CX,
+	      "gated: PFP_SYNC_ME, shadowing on with amdgpu's load control, no CLEAR_STATE, then the LOADs");
+	SetCpShadowValidation(kTestShadowVa);
+	Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "the gated preamble passes the gfx packet check");
+	SetCpShadowValidation(0);
+	using Ranges = std::vector<std::pair<uint32_t, uint32_t>>;
+	const Ranges cx = LoadRanges(pkts, IT_LOAD_CX, false);
+	uint32_t     n  = 0;
+	for (const auto& [first, count]: cx) {
+		n += count;
+	}
+	Check(!cx.empty() && cx.front() == std::make_pair(0u, 0xd7u) && n > 0x300u, "the context LOAD takes amdgpu's clear-state registers");
+	std::vector<uint32_t> s(kCpShadowDwords, 0xdeadbeefu), save(Libs::Graphics::NativeGpu::kCpShadowSaveBytes / 4u, 0u);
+	t.WriteCpShadowImage(s, save);
+	Check(s[kCpShadowContextDw + 0x08eu] == 0xffffffffu && s[kCpShadowContextDw + 0x000u] == 0u && s[kCpShadowContextDw + 0x0b5u] == 0x3f800000u,
+	      "S starts from amdgpu's clear state (CB_TARGET_MASK, DB_RENDER_CONTROL, a viewport's ZMAX)");
+	t.ForceCpShadowLoad();
+	const auto pf = Decode(t.Translate(draw).ib);
+	Check(Count(pf, IT_CLEAR_STATE) == 1 && pf[0].op == IT_CONTEXT_CONTROL && pf[0].body == std::vector<uint32_t>({0x80000000u, 0x80000000u}),
+	      "forced: the full preamble once");
+	const auto pn = Decode(t.Translate(draw).ib);
+	Check(Count(pn, IT_CLEAR_STATE) == 0, "then gated again");
+}
+
 void TestCpShadowPreamble() {
 	using Libs::Graphics::NativeGpu::ValidateNativeIb;
 	Pm4Translator t;
@@ -3041,11 +3100,15 @@ void TestCpShadowImage() {
 	Check(s[kCpShadowContextDw + 0x358u] == 0x40u && s[kCpShadowContextDw + 0x10u] == 3u, "context at S + 0x1000, PatchContext applied");
 	Check(s[kCpShadowShDw + 0x00Cu] == 5u && s[kCpShadowShDw + 0x241u] == 6u && s[kCpShadowUconfigDw + 0x24Au] == 7u,
 	      "SH at S + 0, compute SH in the same region, UCONFIG at S + 0x9000");
-	uint32_t nonzero = 0;
-	for (uint32_t v: s) {
-		nonzero += v != 0 ? 1u : 0u;
+	// Besides the keys, the context region holds amdgpu's clear state: 85 registers it sets to other than 0, none of
+	// them a key here.
+	uint32_t nonzero = 0, context = 0;
+	for (uint32_t i = 0; i < s.size(); i++) {
+		const bool cx = i >= kCpShadowContextDw && i < kCpShadowContextDw + 0x400u;
+		nonzero += s[i] != 0 && !cx ? 1u : 0u;
+		context += s[i] != 0 && cx ? 1u : 0u;
 	}
-	Check(nonzero == 5, "nothing else, offsets of 0x400 and up included");
+	Check(nonzero == 3 && context == 2 + 85, "nothing else, offsets of 0x400 and up included");
 }
 
 // The Demon's Souls mechanism: a verbatim table the title fills after the buffer was translated. The CP runs
@@ -4184,6 +4247,8 @@ int main() {
 	// The cases count the packets a DCB turns into; the preamble's start values (PIXEL_PIPE_STAT_CONTROL,
 	// the CP draw state) are board settings with their own switches, left out here.
 	setenv("KYTY_NATIVE_GPU_PIXEL_PIPE_STAT", "0", 0);
+	// The cases check the translator's forms with the strict packet check; TestValidateBlacklist the default one.
+	Libs::Graphics::NativeGpu::SetNativeIbValidation(true);
 	setenv("KYTY_NATIVE_GPU_CP_STATE", "0", 0);
 	TestNopsOnly();
 	TestContextShadowAcrossDcbs();
@@ -4250,6 +4315,8 @@ int main() {
 	TestLodBankSources();
 	TestCpShadowExits();
 	TestCpShadowPreamble();
+	TestCpShadowGatedPreamble();
+	TestValidateBlacklist();
 	TestCpShadowImage();
 	TestCpShadowLateTable();
 	TestAgrQueueSharesRing0();
