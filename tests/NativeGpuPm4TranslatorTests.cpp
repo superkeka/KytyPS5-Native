@@ -683,6 +683,14 @@ void TestComputeQueueDispatchIndirect() {
 	      "SET_BASE(1) points at the argument address");
 	Check(disp != nullptr && disp->body.size() == 2 && disp->body[0] == 0u && disp->body[1] == 0x41u,
 	      "DISPATCH_INDIRECT at offset 0 keeps the initiator");
+	Check(r.stats.pfp_syncs_emitted == 1 && Count(pkts, 0x42u) == 1 && FindFirst(pkts, 0x42u) < base,
+	      "PFP_SYNC_ME first: the PS5 runs the buffer on MEC, where no prefetch parser reads the arguments early");
+	Pm4Translator         d;
+	std::vector<uint32_t> dcb;
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x10000000u, 0x2u}, false);
+	Append(dcb, 0x16u, {0x40u, 0x41u}, false);
+	auto rd = d.Translate(dcb);
+	Check(rd.ok && rd.stats.pfp_syncs_emitted == 0, "a DCB's indirect dispatch runs as written");
 }
 
 void TestIndirectDraws() {
@@ -952,6 +960,64 @@ bool IsLabelEvent(uint32_t event) {
 bool IsTrackerPacket(const std::vector<uint32_t>& ib, uint32_t dw) {
 	return dw >= 5 && dw + 2 < ib.size() && ib[dw - 5] == 0xc0064900u && ib[dw - 4] == kTrackerEvent && ib[dw - 3] == (1u << 29u) &&
 	       ib[dw - 2] == static_cast<uint32_t>(kTrackerVa) && ib[dw - 1] == static_cast<uint32_t>(kTrackerVa >> 32u);
+}
+
+// A DMA_DATA without CP_SYNC gets a zero-byte DMA_DATA with CP_SYNC before the job ends (the IB's end, or with native
+// labels before the segment's tracker release); one with CP_SYNC, none, and KYTY_NATIVE_GPU_CP_DMA_IDLE=0 none.
+void TestCpDmaIdle() {
+	constexpr uint32_t kIdleControl = (1u << 31u) | (3u << 20u) | (3u << 29u);
+	auto is_idle = [&](const Packet& p) { return p.op == 0x50u && p.body == std::vector<uint32_t>({kIdleControl, 0u, 0u, 0u, 0u, 0u}); };
+	auto idles   = [&](const std::vector<Packet>& pkts) { return static_cast<uint32_t>(std::count_if(pkts.begin(), pkts.end(), is_idle)); };
+	std::vector<uint32_t> plain;
+	Append(plain, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
+	Append(plain, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	std::vector<uint32_t> synced;
+	Append(synced, 0x50u, {1u << 31u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
+	{
+		Pm4Translator t;
+		auto          r    = t.Translate(plain);
+		const auto    pkts = Decode(r.ib);
+		Check(r.ok && r.stats.cp_dma_idle == 1 && idles(pkts) == 1,
+		      "a DMA without CP_SYNC: the IB ends with the CP DMA idle wait");
+		size_t at = 0;
+		for (size_t i = 0; i < pkts.size(); i++) {
+			at = is_idle(pkts[i]) ? i : at;
+		}
+		Check(FindFirst(pkts, IT_DISPATCH_DIRECT) < &pkts[at], "after the rest of the job");
+		Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "it passes the gfx packet check");
+		auto rs = t.Translate(synced);
+		Check(rs.ok && rs.stats.cp_dma_idle == 0 && idles(Decode(rs.ib)) == 0, "a DMA with CP_SYNC needs none");
+	}
+	{
+		Pm4Translator t;
+		t.SetCpDmaIdle(false);
+		auto r = t.Translate(plain);
+		Check(r.ok && r.stats.cp_dma_idle == 0 && idles(Decode(r.ib)) == 0, "off: none");
+	}
+	{
+		Pm4Translator t;
+		t.SetComputeRing(true);
+		std::vector<uint32_t> acb;
+		Append(acb, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, true);
+		auto r = t.Translate(acb);
+		Check(r.ok && r.stats.cp_dma_idle == 1 && ValidateNativeIb(r.ib, true, nullptr, NativeIbKind::Compute), "on a compute ring with the shader-type bit");
+	}
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		auto r = t.Translate(plain);
+		Check(r.ok && r.segments.size() == 1 && r.stats.cp_dma_idle == 1, "native labels: one idle wait");
+		const auto& s       = r.segments[0];
+		uint32_t    idle_dw = 0;
+		for (uint32_t dw = 0; dw + 7 <= r.ib.size(); dw++) {
+			if (r.ib[dw] == Pkt3(0x50u, 6, false) && r.ib[dw + 1] == kIdleControl) {
+				idle_dw = dw;
+			}
+		}
+		Check(!s.points.empty() && idle_dw != 0 && idle_dw < s.points.back().dw && IsTrackerPacket(r.ib, s.points.back().dw),
+		      "before the segment's tracker release");
+	}
 }
 
 // A label release writing `value` at `addr`.
@@ -4091,6 +4157,7 @@ int main() {
 	TestDrawIndexOffset();
 	TestFmaskFix();
 	TestComputeQueueDispatchIndirect();
+	TestCpDmaIdle();
 	TestIndirectDraws();
 	TestIndirectMultiDraws();
 	TestContextStatePushPop();

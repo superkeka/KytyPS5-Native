@@ -196,6 +196,7 @@ struct Pm4TranslateStats {
 	uint32_t label_wb_stripped = 0; // label releases whose added write-backs a wait of the same buffer took off
 	uint32_t waits_split       = 0; // native labels: guest waits the IB is cut at (no known writer yet)
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
+	uint32_t cp_dma_idle       = 0; // zero-byte DMA_DATA with CP_SYNC before a job end after a DMA without one
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
 	uint32_t pfp_syncs_emitted = 0; // PFP_SYNC_ME emitted in place of dropped PFP waits
@@ -1059,6 +1060,8 @@ public:
 	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
+	// A zero-byte DMA_DATA with CP_SYNC before a job ends after a DMA_DATA without CP_SYNC (on by default).
+	void SetCpDmaIdle(bool on) { m_cp_dma_idle = on; }
 	// Guest WAIT_REG_MEM / WAIT_REG_MEM_64 on the gfx ring as written: the BC-250's CP runs both, 64-bit
 	// compares, PFP waits and any compare function (probe waitforms). Off: our form (EQUAL on ME, a 64-bit
 	// wait as 32-bit ones, a PFP wait as ME and PFP_SYNC_ME, other functions held on the CPU). Off by
@@ -1228,6 +1231,7 @@ private:
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
 	bool                         m_pfp_sync_indirect = false;
+	bool                         m_cp_dma_idle       = true;
 	bool                         m_waits_verbatim    = false;
 	bool                         m_gds_dma_sync      = false;
 	bool                         m_acquire_full      = false;

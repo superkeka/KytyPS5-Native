@@ -2901,14 +2901,32 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// WRITE_DATA), and on the gfx ring the PFP can fetch them ahead of the ME. libSceAgc's indirect draws
 	// carry no sync of their own, and without one ASTRO BOT, My First GT and Dead Cells draw right: the
 	// title orders its writes itself. KYTY_NATIVE_GPU_PFP_SYNC_INDIRECT=1 puts the RADV-style sync back.
+	// A compute queue's buffer always gets it on the gfx ring: the PS5 runs it on MEC, which has no
+	// prefetch parser, so the title's stream has nothing to order the PFP with (BC5 F91).
 	auto pfp_sync_me = [&]() {
 		// A compute ring has one engine; the PFP race this closes exists only on the gfx ring, and
 		// PFP_SYNC_ME is illegal on MEC.
-		if (m_pfp_sync_indirect && !m_compute_ring) {
+		if ((m_pfp_sync_indirect || m_compute_queue) && !m_compute_ring) {
 			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
 			body.push_back(0);
 			stats.pfp_syncs_emitted++;
 		}
+	};
+
+	// CP DMA runs beside the CP and outlives the IB it was issued in: a DMA_DATA without CP_SYNC may still be
+	// copying when the job's end-of-pipe fence or a tracker release says the job is done (BC5 F41: the next IB
+	// hung). The PS5's contract is that a finished job's writes have landed, so a job end after such a DMA waits
+	// for it with a zero-byte DMA_DATA with CP_SYNC, Mesa's si_cp_dma_wait_for_idle: the DMA engine finds no
+	// work and holds the ME until the copies before it are done. KYTY_NATIVE_GPU_CP_DMA_IDLE=0 leaves it out.
+	bool cp_dma_busy = false;
+	auto cp_dma_idle = [&]() {
+		if (!cp_dma_busy || !m_cp_dma_idle) {
+			return;
+		}
+		// CP_SYNC, DST_SEL 3 and SRC_SEL 3 (TC_L2) on the micro engine; no addresses, BYTE_COUNT 0.
+		body.insert(body.end(), {Pkt3(IT_DMA_DATA, 6, m_compute_ring), (1u << 31u) | (3u << 20u) | (3u << 29u), 0u, 0u, 0u, 0u, 0u});
+		cp_dma_busy = false;
+		stats.cp_dma_idle++;
 	};
 
 	// A guest wait turned into a full barrier on our fence: an end-of-pipe RELEASE_MEM that flushes and
@@ -3054,6 +3072,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// next segment's preamble holds its register writes).
 	auto close_segment = [&](bool last) {
 		if (seg_effects || last || segs.size() > 1 || !queued_points.empty()) {
+			cp_dma_idle();
 			TrackerPoint end;
 			end.kind = TrackerPoint::Kind::End;
 			queued_points.push_back(std::move(end));
@@ -4013,6 +4032,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						body[body.size() - size + 1] |= 1u << 31u; // CP_SYNC
 						stats.gds_dma_synced++;
 					}
+					cp_dma_busy = (body[body.size() - size + 1] & (1u << 31u)) == 0;
 				}
 				stats.dma_data++;
 				{
@@ -4637,6 +4657,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	end_cut_run();
 	if (direct) {
 		end_direct();
+	}
+	if (!labels) {
+		cp_dma_idle(); // with native labels the last segment's close puts it before the tracker's release
 	}
 	if (!r.unknown_ops.empty()) {
 		const uint32_t first_op = r.unknown_op;

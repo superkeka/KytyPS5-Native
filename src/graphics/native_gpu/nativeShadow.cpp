@@ -3643,8 +3643,9 @@ private:
 	//             may reload the queue from its MQD on any remap
 	//   golden    the helper's local golden table (/etc/kyty/ps5-golden.conf)
 	// "all" (or 1) is gfx_pipe,accum,kfd_gds. The game's VMIDs are this VM's gfx VMID (by PASID,
-	// followed per flip) and, with KFD queues, 8-15. Unset, primary mode writes hqd,kfd_gds, the compute
-	// queues as the PS5 kernel sets them up (with the OA and GWS their GDS resource state asks for); 0
+	// followed per flip) and, with KFD queues, 8-15. Unset, primary mode writes hqd,kfd_gds,shmem: the compute
+	// queues as the PS5 kernel sets them up (with the OA and GWS their GDS resource state asks for) and its
+	// aperture bases, which FLAT accesses with the PS5's aperture addresses in literals need (BC5 F249); 0
 	// writes nothing. The helper puts every register back when the connection closes (exit or crash).
 	static constexpr uint32_t kPs5GfxPipe = 1u, kPs5Accum = 2u, kPs5KfdGds = 4u, kPs5ShMem = 8u, kPs5Hqd = 16u, kPs5Golden = 32u;
 	// Absolute dword offsets (GC segment 0 is 0x1260).
@@ -3659,7 +3660,7 @@ private:
 #if KYTY_GEM_BACKING_SUPPORTED
 		const char* v = std::getenv("KYTY_NATIVE_GPU_PS5_REGS");
 		if ((v == nullptr || v[0] == '\0') && EnvOn("KYTY_NATIVE_GPU_PRIMARY")) {
-			v = "hqd,kfd_gds";
+			v = "hqd,kfd_gds,shmem";
 		}
 		if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0) {
 			return;
@@ -4831,6 +4832,11 @@ private:
 			m_acb_translator.SetPfpSyncIndirect(true);
 			std::fprintf(stderr, "native shadow: PFP_SYNC_ME before indirect draws and dispatches\n");
 		}
+		if (EnvIs("KYTY_NATIVE_GPU_CP_DMA_IDLE", "0")) {
+			m_translator.SetCpDmaIdle(false);
+			m_acb_translator.SetCpDmaIdle(false);
+			std::fprintf(stderr, "native shadow: no CP DMA idle wait at job ends (KYTY_NATIVE_GPU_CP_DMA_IDLE=0)\n");
+		}
 		// KYTY_NATIVE_GPU_WRITE_DATA_NATIVE=1|2: WRITE_DATA also runs in the native IB (see SetWriteDataNative).
 		if (const char* v = std::getenv("KYTY_NATIVE_GPU_WRITE_DATA_NATIVE"); v != nullptr && v[0] != '0') {
 			m_translator.SetWriteDataNative(static_cast<uint32_t>(std::strtoul(v, nullptr, 0)));
@@ -5035,6 +5041,10 @@ private:
 	// DCBs of guest queue 0, 1 ACBs, 2 the AGR queue's DCBs).
 	void AuditTranslatedLocked(int k, uint64_t frame, const Pm4TranslateResult& result, const std::string& flat_why) {
 		m_audit_buffers[k][result.ok ? 0 : 1]++;
+		if (result.ok) {
+			m_audit_cp_dma_idle[k] += result.stats.cp_dma_idle;
+			m_audit_pfp_syncs[k] += result.stats.pfp_syncs_emitted;
+		}
 		m_audit_sync[k][result.ok ? 0 : 1].Add(result.sync);
 		for (const Pm4Refusal& f: result.refusals) {
 			// An INDIRECT_BUFFER or REWIND left in the buffer: FlattenIndirectBuffers says why.
@@ -5184,6 +5194,9 @@ private:
 		             "packet check and GDS shaders refuse after it, those count as translated\n",
 		             n(m_audit_buffers[0][0]), n(m_audit_buffers[0][1]), n(m_audit_buffers[1][0]), n(m_audit_buffers[1][1]),
 		             n(m_audit_buffers[2][0]), n(m_audit_buffers[2][1]));
+		std::fprintf(stderr, "native audit: added syncs (dcb/acb/agr): CP DMA idle waits at job ends %llu/%llu/%llu, PFP_SYNC_ME %llu/%llu/%llu\n",
+		             n(m_audit_cp_dma_idle[0]), n(m_audit_cp_dma_idle[1]), n(m_audit_cp_dma_idle[2]), n(m_audit_pfp_syncs[0]),
+		             n(m_audit_pfp_syncs[1]), n(m_audit_pfp_syncs[2]));
 		for (int k = 0; k < 3; k++) {
 			for (int r = 0; r < 2; r++) {
 				const SyncAuditT<uint64_t>& s  = m_audit_sync[k][r];
@@ -5578,6 +5591,8 @@ private:
 	uint32_t                                                   m_audit_reports = 0;   // flip reports so far
 	SyncAuditT<uint64_t>                                       m_audit_sync[3][2] {}; // [kind][translated, refused]
 	uint64_t                                                   m_audit_buffers[3][2] {};
+	uint64_t                                                   m_audit_cp_dma_idle[3] {}; // translated buffers' Pm4TranslateStats sums
+	uint64_t                                                   m_audit_pfp_syncs[3] {};
 	std::map<std::tuple<int, uint8_t, uint32_t>, AuditRefusal> m_audit_refusals;
 	uint64_t                                                   m_audit_refusals_more = 0;
 	std::array<std::array<uint64_t, 2>, 64>                    m_audit_getreg {}; // by hwreg id: instructions, shaders
