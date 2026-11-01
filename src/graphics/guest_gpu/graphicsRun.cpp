@@ -172,9 +172,34 @@ void GuestGpu::SubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_
 	submission.eop_flip_arg = flip_arg;
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
-	m_queues[0].push_front(std::move(submission));
+	InsertAfterEopFlips(m_queues[0], std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
+}
+
+bool GuestGpu::SubmitEopFlipRequest(uint64_t request_id) {
+	EXIT_IF(request_id == 0);
+	// Ahead of everything queued, as SubmitEopFlip.
+	Submission submission;
+	submission.type            = SubmissionType::EopFlip;
+	submission.queue_id        = 0;
+	submission.flip_request_id = request_id;
+	Common::LockGuard lock(m_queue_mutex);
+	if (m_drained) {
+		// A release that ran after the GPU thread stopped: the flip is never shown. One that runs while the
+		// thread still drains what was queued is shown, so a WaitUntilSafeForRendering behind it can end.
+		return false;
+	}
+	InsertAfterEopFlips(m_queues[0], std::move(submission));
+	m_submission_count++;
+	m_work_available.Signal();
+	return true;
+}
+
+void GuestGpu::InsertAfterEopFlips(std::deque<Submission>& queue, Submission&& submission) {
+	const auto position = std::find_if(queue.begin(), queue.end(),
+	                                   [](const Submission& s) { return s.type != SubmissionType::EopFlip; });
+	queue.insert(position, std::move(submission));
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
@@ -474,7 +499,8 @@ void GuestGpu::ThreadRun(void* data) {
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
 				gpu->m_idle.SignalAll();
-				should_stop = true;
+				gpu->m_drained = true;
+				should_stop    = true;
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
@@ -571,7 +597,9 @@ void GuestGpu::ThreadRun(void* data) {
 				std::fprintf(stderr, " (%zu dwords left)\n", at.size());
 			}
 			submission.blocked = true;
-			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+			// Behind the end-of-pipe flips queued while it ran: the wait that stopped it
+			// (WaitUntilSafeForRendering) may end only once such a flip is prepared and shown.
+			InsertAfterEopFlips(gpu->m_queues[submission.queue_id], std::move(submission));
 			gpu->m_submission_count++;
 		} else {
 			for (auto& queue: gpu->m_queues) {
@@ -629,8 +657,12 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::EopFlip: {
-			cp.EopFlip(submission.eop_flip[0], submission.eop_flip[1], submission.eop_flip[2],
-			           submission.eop_flip_arg);
+			if (submission.flip_request_id != 0) {
+				cp.EopFlipRequest(submission.flip_request_id);
+			} else {
+				cp.EopFlip(submission.eop_flip[0], submission.eop_flip[1], submission.eop_flip[2],
+				           submission.eop_flip_arg);
+			}
 			break;
 		}
 		case SubmissionType::SuspendPoint:
@@ -1161,8 +1193,10 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	}
 
 	// Natively there is no work left to wait for: signal now instead of after a round trip through
-	// the Vulkan queue.
-	if (interrupt && native) {
+	// the Vulkan queue. A kernel context (bit 27, an EOP flip's) also goes now: the flip takes its place
+	// in VideoOut's order of flip releases where this release is in GPU order, as a later
+	// WaitUntilSafeForRendering expects; the flip's copy is still recorded after this work.
+	if (interrupt && (native || (interrupt_context_id & 0x08000000u) != 0)) {
 		m_renderer.TriggerInterrupt(m_interrupt_event_id, interrupt_context_id);
 		return;
 	}
@@ -1285,6 +1319,24 @@ void CommandProcessor::EopFlip(int handle, int index, int flip_mode, int64_t fli
 	};
 	ProcessorScope processor_scope(*this);
 	Flip(handle, index, flip_mode, flip_arg);
+}
+
+void CommandProcessor::EopFlipRequest(uint64_t request_id) {
+	if (g_current_processor != nullptr) {
+		EXIT("invalid graphics-thread end-of-pipe flip\n");
+	}
+	struct ProcessorScope {
+		explicit ProcessorScope(CommandProcessor& processor) { g_current_processor = &processor; }
+		~ProcessorScope() { g_current_processor = nullptr; }
+	};
+	ProcessorScope processor_scope(*this);
+	m_renderer.GetOcclusionQueries().Publish();
+
+	auto& command = CurrentBuffer();
+	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	GetScheduler().DeferPriorityOperation(
+	    [&renderer = m_renderer, request_id] { renderer.GetVideoOut().CompleteFlip(request_id); });
+	GetScheduler().Flush();
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {

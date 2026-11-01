@@ -43,6 +43,10 @@ public:
 	// A DCB's flip the GPU has just passed (native labels, from the tracker): prepared on the GPU
 	// thread ahead of queued submissions, as the PS5 kernel queues it from the end-of-pipe interrupt.
 	void SubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_arg);
+	// The same for a flip reserved by VideoOutDriver::SubmitEopFlip, whose end-of-pipe interrupt
+	// (VideoOutDriver::EopFlip) has just arrived. False when the GPU is shutting down: the flip is
+	// dropped (never shown).
+	bool SubmitEopFlipRequest(uint64_t request_id);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
@@ -67,7 +71,7 @@ private:
 		Pm4Execution              execution;
 		bool                      started          = false;
 		bool                      blocked          = false;
-		uint64_t                  flip_request_id  = 0;
+		uint64_t                  flip_request_id  = 0;           // FlipPreparation; EopFlip if reserved
 		int                       eop_flip[3]      = {};          // EopFlip: handle, index, mode
 		int64_t                   eop_flip_arg     = 0;
 		uint64_t                  flip_watermark   = UINT64_MAX;  // NextFlipRequestId() at submission
@@ -76,6 +80,10 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	// Front of a queue, behind the end-of-pipe flips already there (in arrival order): a flip whose
+	// interrupt came first is prepared first, and a submission that is put back unfinished does not
+	// go in front of a flip it may wait for. Caller holds m_queue_mutex.
+	static void       InsertAfterEopFlips(std::deque<Submission>& queue, Submission&& submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -93,6 +101,7 @@ private:
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
+	bool                                           m_drained           = false; // the thread ran everything and stopped
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
 	bool                                           m_shutdown_complete = false;

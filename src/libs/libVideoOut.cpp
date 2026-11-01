@@ -30,6 +30,8 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("oNOQn3knW6s", VideoOut::VideoOutDeleteVblankEvent);
 	LIB_FUNC("elWQ9vERF-Q", VideoOut::VideoOutDeletePreVblankStartEvent);
 	LIB_FUNC("U46NwOiJpys", VideoOut::VideoOutSubmitFlip);
+	LIB_FUNC("j8xl+92A0q4", VideoOut::VideoOutSubmitEopFlip);
+	LIB_FUNC("OcQybQejHEY", VideoOut::VideoOutGetBufferLabelAddress);
 	LIB_FUNC("SbU3dwp80lQ", VideoOut::VideoOutGetFlipStatus);
 	LIB_FUNC("zgXifHT9ErY", VideoOut::VideoOutIsFlipPending);
 	LIB_FUNC("1FZBKy8HeNU", VideoOut::VideoOutGetVblankStatus);

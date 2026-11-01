@@ -62,6 +62,9 @@ namespace Gen5Driver {
 static constexpr uint64_t DriverDmemBase = 0x0fe0000000ull;
 static constexpr uint32_t DriverDmemSize = 0x200000;
 static constexpr uint32_t AgcDmemOffset  = 0x40000;
+// The active-workload masks, one u64 per workload stream (32): libSceAgcDriver's sub-region 2 of
+// this region (offset 0x3a000, 0x200 bytes, in the 2 MiB layout), zeroed with the region.
+static constexpr uint32_t WorkloadDmemOffset = 0x3a000;
 
 struct DriverDmem {
 	std::mutex mutex;
@@ -99,6 +102,9 @@ void Initialize() {
 	NativeGpu::ShadowSetFlipHost([](int handle, int index, int flip_mode, int64_t flip_arg) {
 		g_renderer->GetGpu().SubmitEopFlip(handle, index, flip_mode, flip_arg);
 	});
+	// The GPU order of the flip releases so far, for the WaitUntilSafeForRendering pads of a native
+	// command buffer's CPU tail (the flips whose release ran before the wait hold its buffer).
+	NativeGpu::ShadowSetEopFlipOrderHost([] { return g_renderer->GetVideoOut().EopFlipOrder(); });
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(Gen5Driver::Initialize() != OK);
 	ShaderInit();
@@ -1808,6 +1814,23 @@ static std::mutex g_workload_stream_mutex;
 static uint32_t   g_workload_stream_mask = 0;
 static uint8_t    g_workload_streams[WORKLOAD_STREAM_MAX_ID + 1][WORKLOAD_STREAM_RECORD_SIZE] {};
 
+// The active-workload mask of each stream in driver DMEM, which SetWorkloadsActive and
+// SetWorkloadComplete update with ATOMIC_MEM.
+static uint64_t workload_mask_address(uint32_t stream_id) {
+	return Gen5Driver::DriverDmemBase + Gen5Driver::WorkloadDmemOffset + 8ull * stream_id;
+}
+
+// Driver start: stream 0 ("System") is registered, as libSceAgcDriver does at init.
+static void workload_streams_init() {
+	static constexpr char system_name[] = "System";
+	static_assert(sizeof(system_name) <= WORKLOAD_STREAM_RECORD_SIZE);
+
+	std::lock_guard lock(g_workload_stream_mutex);
+	std::memset(g_workload_streams[0], 0, WORKLOAD_STREAM_RECORD_SIZE);
+	std::memcpy(g_workload_streams[0], system_name, sizeof(system_name));
+	g_workload_stream_mask |= 1u;
+}
+
 uint32_t KYTY_SYSV_ABI AgcDriverGetDefaultOwner() {
 	PRINT_NAME();
 
@@ -1888,6 +1911,59 @@ int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void
 	std::memset(g_workload_streams[stream_id], 0, WORKLOAD_STREAM_RECORD_SIZE);
 	std::memcpy(g_workload_streams[stream_id], stream, WORKLOAD_STREAM_RECORD_SIZE);
 	g_workload_stream_mask |= stream_bit;
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcDriverUnregisterWorkloadStream(uint32_t stream_id) {
+	PRINT_NAME();
+
+	LOGF("\t stream_id = %" PRIu32 "\n", stream_id);
+
+	if (stream_id < WORKLOAD_STREAM_MIN_ID || stream_id > WORKLOAD_STREAM_MAX_ID) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+	}
+
+	std::lock_guard lock(g_workload_stream_mutex);
+
+	const uint32_t stream_bit = 1u << stream_id;
+	if ((g_workload_stream_mask & stream_bit) == 0) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+	}
+
+	g_workload_stream_mask &= ~stream_bit;
+	std::memset(g_workload_streams[stream_id], 0, WORKLOAD_STREAM_RECORD_SIZE);
+
+	return OK;
+}
+
+// The stream's record (up to 32 bytes) and its active-workload mask from driver DMEM.
+int KYTY_SYSV_ABI AgcDriverGetWorkloadStreamInfo(uint32_t stream_id, void* info, size_t info_size,
+                                                 uint64_t* active_mask) {
+	PRINT_NAME();
+
+	LOGF("\t stream_id = %" PRIu32 "\n"
+	     "\t info      = 0x%016" PRIx64 "\n"
+	     "\t info_size = %" PRIu64 "\n",
+	     stream_id, reinterpret_cast<uint64_t>(info), static_cast<uint64_t>(info_size));
+
+	if (stream_id > WORKLOAD_STREAM_MAX_ID) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+	}
+
+	std::lock_guard lock(g_workload_stream_mutex);
+
+	if ((g_workload_stream_mask & (1u << stream_id)) == 0) {
+		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
+	}
+
+	if (info != nullptr) {
+		std::memcpy(info, g_workload_streams[stream_id],
+		            std::min(info_size, static_cast<size_t>(WORKLOAD_STREAM_RECORD_SIZE)));
+	}
+	if (active_mask != nullptr) {
+		*active_mask = *reinterpret_cast<const volatile uint64_t*>(workload_mask_address(stream_id));
+	}
 
 	return OK;
 }
@@ -2447,122 +2523,6 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 	return first;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
-                                                        uint32_t       video_out_handle,
-                                                        uint32_t       display_buffer_index) {
-	PRINT_NAME();
-
-	LOGF("\t video_out_handle     = %" PRIu32 "\n"
-	     "\t display_buffer_index = %" PRIu32 "\n",
-	     video_out_handle, display_buffer_index);
-
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	auto* cmd = buf->AllocateDW(7);
-
-	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
-
-	cmd[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE);
-	cmd[1] = video_out_handle;
-	cmd[2] = display_buffer_index;
-	cmd[3] = 0;
-	cmd[4] = 0;
-	cmd[5] = 0;
-	cmd[6] = 0;
-
-	return cmd;
-}
-
-uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
-                                                 const uint32_t* workload_ids,
-                                                 uint32_t        workload_count) {
-	PRINT_NAME();
-
-	LOGF("\t stream_id      = %" PRIu32 "\n"
-	     "\t workload_ids   = 0x%016" PRIx64 "\n"
-	     "\t workload_count = %" PRIu32 "\n",
-	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
-
-	if (buf == nullptr || workload_ids == nullptr || workload_count == 0 ||
-	    workload_count > WORKLOAD_ACTIVE_COUNT_MAX || stream_id < WORKLOAD_STREAM_MIN_ID ||
-	    stream_id > WORKLOAD_STREAM_MAX_ID) {
-		return nullptr;
-	}
-
-	uint64_t workload_mask = 0;
-	for (uint32_t i = 0; i < workload_count; i++) {
-		const auto workload_id = workload_ids[i];
-		if (workload_id > WORKLOAD_ID_MAX) {
-			return nullptr;
-		}
-
-		const uint64_t workload_bit = 1ull << workload_id;
-		if ((workload_mask & workload_bit) != 0) {
-			return nullptr;
-		}
-		workload_mask |= workload_bit;
-	}
-
-	{
-		std::lock_guard lock(g_workload_stream_mutex);
-		if ((g_workload_stream_mask & (1u << stream_id)) == 0) {
-			return nullptr;
-		}
-	}
-
-	auto* cmd = buf->AllocateDW(WORKLOAD_ACTIVE_PACKET_SIZE_DW);
-	if (cmd == nullptr) {
-		return nullptr;
-	}
-
-	cmd[0] = KYTY_PM4(WORKLOAD_ACTIVE_PACKET_SIZE_DW, Pm4::IT_NOP, Pm4::R_ZERO);
-	std::memset(cmd + 1, 0,
-	            static_cast<size_t>(WORKLOAD_ACTIVE_PACKET_SIZE_DW - 1) * sizeof(uint32_t));
-	cmd[1] = stream_id;
-	cmd[2] = static_cast<uint32_t>(workload_mask & 0xffffffffu);
-	cmd[3] = static_cast<uint32_t>((workload_mask >> 32u) & 0xffffffffu);
-
-	return cmd;
-}
-
-uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
-                                                  uint32_t workload_id) {
-	PRINT_NAME();
-
-	LOGF("\t stream_id   = %" PRIu32 "\n"
-	     "\t workload_id = %" PRIu32 "\n",
-	     stream_id, workload_id);
-
-	if (buf == nullptr || stream_id < WORKLOAD_STREAM_MIN_ID ||
-	    stream_id > WORKLOAD_STREAM_MAX_ID || workload_id > WORKLOAD_ID_MAX) {
-		return nullptr;
-	}
-
-	{
-		std::lock_guard lock(g_workload_stream_mutex);
-		if ((g_workload_stream_mask & (1u << stream_id)) == 0) {
-			return nullptr;
-		}
-	}
-
-	auto* cmd = buf->AllocateDW(WORKLOAD_COMPLETE_PACKET_SIZE_DW);
-	if (cmd == nullptr) {
-		return nullptr;
-	}
-
-	const uint64_t workload_clear_mask = ~(1ull << workload_id);
-
-	cmd[0] = KYTY_PM4(WORKLOAD_COMPLETE_PACKET_SIZE_DW, Pm4::IT_NOP, Pm4::R_ZERO);
-	std::memset(cmd + 1, 0,
-	            static_cast<size_t>(WORKLOAD_COMPLETE_PACKET_SIZE_DW - 1) * sizeof(uint32_t));
-	cmd[1] = stream_id;
-	cmd[2] = workload_id;
-	cmd[3] = static_cast<uint32_t>(workload_clear_mask & 0xffffffffu);
-	cmd[4] = static_cast<uint32_t>((workload_clear_mask >> 32u) & 0xffffffffu);
-
-	return cmd;
-}
-
 uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
 	PRINT_NAME();
 
@@ -2850,6 +2810,12 @@ static constexpr uint32_t AGC_WAIT_USER_DATA_END_TAG            = 0xc8000000u;
 static constexpr uint32_t AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG    = 0xc9010000u;
 static constexpr uint32_t AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG      = 0xc9020000u;
 static constexpr uint32_t AGC_MEM_SEMAPHORE_END_TAG             = 0xc9000000u;
+// libSceAgcDriver's markers (agc_write_marker), tag in the top byte: SetFlip (with a payload),
+// WaitUntilSafeForRendering (begin and end), SetWorkloadsActive (with a payload), SetWorkloadComplete.
+static constexpr uint32_t AGC_FLIP_TAG                          = 0xc7000000u;
+static constexpr uint32_t AGC_WAIT_UNTIL_SAFE_TAG               = 0xcb000000u;
+static constexpr uint32_t AGC_WORKLOADS_ACTIVE_TAG              = 0xcc000000u;
+static constexpr uint32_t AGC_WORKLOAD_COMPLETE_TAG             = 0xcd000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_DW           = 4u;
 static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
 
@@ -2861,6 +2827,43 @@ static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
 	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, g_agc_internal_data_in_acb ? 0u : 1u);
 	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = tag;
+}
+
+// The register libSceAgcDriver's markers write their payload to: SQ_THREAD_TRACE_USERDATA_3.
+static constexpr uint32_t AGC_INTERNAL_DATA_PAYLOAD_REGISTER = 0x343u;
+
+// The dwords agc_write_marker writes for a payload of payload_dw dwords.
+static constexpr uint32_t agc_marker_payload_size_dw(uint32_t payload_dw) {
+	return payload_dw == 0 ? AGC_INTERNAL_DATA_PACKET_SIZE_DW : payload_dw == 1 ? 4u : payload_dw + 7u;
+}
+
+// libSceAgcDriver's marker: one SET_UCONFIG_REG of SQ_THREAD_TRACE_USERDATA_2 (0x342) with the value;
+// with a payload the same packet also sets SQ_THREAD_TRACE_USERDATA_3 (0x343) to its first dword, and
+// the rest goes to 0x343 through a WRITE_DATA to the register (DST_SEL 0, WR_CONFIRM). The headers'
+// bit 2 is set in a DCB and clear in an ACB. Returns the dwords written.
+static uint32_t agc_write_marker(uint32_t* p, bool acb, uint32_t value, const uint32_t* payload, uint32_t dwords) {
+	const uint32_t r = acb ? 0u : 1u;
+	if (payload == nullptr || dwords == 0) {
+		p[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, r);
+		p[1] = AGC_INTERNAL_DATA_REGISTER;
+		p[2] = value;
+		return AGC_INTERNAL_DATA_PACKET_SIZE_DW;
+	}
+	p[0] = KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, r);
+	p[1] = AGC_INTERNAL_DATA_REGISTER;
+	p[2] = value;
+	p[3] = payload[0];
+	if (dwords == 1) {
+		return 4;
+	}
+	const uint32_t rest  = dwords - 1u;
+	auto*          write = p + 4;
+	write[0]             = KYTY_PM4(rest + 4u, Pm4::IT_WRITE_DATA, r);
+	write[1]             = 0x06010000u;
+	write[2]             = 0xc000u | AGC_INTERNAL_DATA_PAYLOAD_REGISTER;
+	write[3]             = 0;
+	std::memcpy(write + 4, payload + 1, static_cast<size_t>(rest) * sizeof(uint32_t));
+	return 8u + rest;
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
@@ -4323,6 +4326,15 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	    (tag == AGC_MARKER_SET_TAG || tag == AGC_MARKER_PUSH_TAG || tag == AGC_MARKER_POP_TAG) && KYTY_PM4_LEN(cmd_id) <= 4u) {
 		return true;
 	}
+	// libSceAgcDriver's flip, WaitUntilSafeForRendering and workload markers (agc_write_marker), in
+	// DCBs and ACBs: the 3-dword form, or the 4-dword one whose second register (0x343) holds the
+	// payload's first dword.
+	if (const uint32_t tag = payload[1] & 0xff000000u;
+	    (tag == AGC_FLIP_TAG || tag == AGC_WAIT_UNTIL_SAFE_TAG || tag == AGC_WORKLOADS_ACTIVE_TAG ||
+	     tag == AGC_WORKLOAD_COMPLETE_TAG) &&
+	    (KYTY_PM4_LEN(cmd_id) == AGC_INTERNAL_DATA_PACKET_SIZE_DW || KYTY_PM4_LEN(cmd_id) == 4u)) {
+		return true;
+	}
 	if (KYTY_PM4_R(cmd_id) != 1u) {
 		return false;
 	}
@@ -4534,6 +4546,97 @@ uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
 	return agc_pop_marker(buf, true);
 }
 
+static constexpr uint32_t AGC_SET_FLIP_PACKET_SIZE_DW            = 64;
+static constexpr uint32_t AGC_WAIT_UNTIL_SAFE_PACKET_SIZE_DW     = 32;
+static constexpr int32_t  AGC_DISPLAY_BUFFER_INDEX_MIN           = -2;
+static constexpr int32_t  AGC_DISPLAY_BUFFER_INDEX_MAX           = 15;
+
+// The display buffer's VideoOut label (u64, 1 while the buffer is or will be on screen), 0 for the
+// special indices. False when VideoOut has no labels for the handle.
+static bool agc_display_buffer_label(int handle, int32_t display_buffer_index, uint64_t* label) {
+	*label = 0;
+	if (display_buffer_index < 0) {
+		return true;
+	}
+	uint64_t* labels = nullptr;
+	if (g_renderer->GetVideoOut().GetBufferLabelAddress(handle, &labels) < 0 || labels == nullptr) {
+		return false;
+	}
+	*label = reinterpret_cast<uint64_t>(labels + display_buffer_index);
+	return true;
+}
+
+// sceAgcDriverSetFlip, which libSceAgc's DcbSetFlip and AcbSetFlip call (64 dwords). libSceAgcDriver
+// answers 0x8029000a for an index outside [-2, 15] and the VideoOut error when the flip cannot be
+// submitted; libSceAgc then returns nullptr. The flip is reserved now, while the buffer is recorded
+// (sceVideoOutSubmitEopFlip); the RELEASE_MEM writes 1 into the buffer's label and raises the
+// interrupt with the flip's kernel context, on which the kernel performs the flip.
+static uint32_t* agc_set_flip(CommandBuffer* buf, bool acb, uint32_t video_out_handle, int32_t display_buffer_index,
+                              uint32_t flip_mode, int64_t flip_arg) {
+	if (buf == nullptr || display_buffer_index < AGC_DISPLAY_BUFFER_INDEX_MIN ||
+	    display_buffer_index > AGC_DISPLAY_BUFFER_INDEX_MAX || !buf->ReserveDW(AGC_SET_FLIP_PACKET_SIZE_DW)) {
+		return nullptr;
+	}
+
+	const auto handle = static_cast<int>(video_out_handle);
+	uint64_t   label  = 0;
+	if (!agc_display_buffer_label(handle, display_buffer_index, &label)) {
+		return nullptr;
+	}
+	uint32_t ctx = 0;
+	if (g_renderer->GetVideoOut().SubmitEopFlip(handle, display_buffer_index, static_cast<int>(flip_mode), flip_arg,
+	                                            &ctx, true) < 0) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(AGC_SET_FLIP_PACKET_SIZE_DW);
+	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+
+	const bool     has_label = display_buffer_index >= 0;
+	const auto     index     = static_cast<uint32_t>(display_buffer_index);
+	const auto     arg       = static_cast<uint64_t>(flip_arg);
+	// Two fields libSceAgcDriver derives from the interrupt context (their meaning is unknown); Kyty's
+	// flip contexts (0x08000000 | request) give p = 0 and t = 0.
+	const bool     kernel    = (ctx & 0x0bffc000u) == 0x08000000u;
+	const bool     plain     = ((ctx >> 12u) & 0x3u) == 0 && (ctx & 0xf00u) <= 0x600u;
+	const uint32_t p         = kernel && plain ? (ctx >> 8u) & 0x7u : 7u;
+	const uint32_t t         = kernel && !plain ? (ctx >> 12u) & 0x3u : 0u;
+	const uint32_t value     = AGC_FLIP_TAG | 0x00010000u | (t << 12u) | ((flip_mode & 0xfu) << 8u) | ((index & 0x1fu) << 3u) | p;
+	// The first payload dword comes from a libSceVideoOut call whose meaning is unknown (7VSZJxxcTL8);
+	// nothing reads it back.
+	const uint32_t payload[3] = {0u, static_cast<uint32_t>(arg), static_cast<uint32_t>(arg >> 32u)};
+	uint32_t       n          = agc_write_marker(cmd, acb, value, payload, 3);
+
+	// RELEASE_MEM: CACHE_FLUSH_TS at end of pipe in a DCB, CS_DONE at end of shader in an ACB, GL2
+	// write-back; DST_SEL TC_L2, INT_SEL 2 (after write confirm), DATA_SEL 2 (64-bit 1 into the label)
+	// for a buffer index.
+	auto* release = cmd + n;
+	release[0]    = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u);
+	release[1]    = acb ? 0x0620062fu : 0x06200504u;
+	release[2]    = 0x02010000u | (has_label ? 1u << 30u : 0u);
+	release[3]    = static_cast<uint32_t>(label) & ~0x3u;
+	release[4]    = static_cast<uint32_t>(label >> 32u);
+	release[5]    = has_label ? 1u : 0u;
+	release[6]    = 0;
+	release[7]    = ctx & 0x0fffffffu;
+	n += 8;
+
+	// The PS5 pads to 64 dwords with a NOP and writes only its header; Kyty's bookkeeping goes into the
+	// body (Pm4::KYTY_FLIP_PAD_MAGIC).
+	auto* pad = cmd + n;
+	pad[0]    = KYTY_PM4(AGC_SET_FLIP_PACKET_SIZE_DW - n, Pm4::IT_NOP, Pm4::R_ZERO);
+	std::memset(pad + 1, 0, static_cast<size_t>(AGC_SET_FLIP_PACKET_SIZE_DW - n - 1u) * sizeof(uint32_t));
+	pad[1] = Pm4::KYTY_FLIP_PAD_MAGIC;
+	pad[2] = video_out_handle;
+	pad[3] = index;
+	pad[4] = flip_mode;
+	pad[5] = static_cast<uint32_t>(arg);
+	pad[6] = static_cast<uint32_t>(arg >> 32u);
+	pad[7] = ctx;
+
+	return cmd;
+}
+
 uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
                                       int32_t display_buffer_index, uint32_t flip_mode,
                                       int64_t flip_arg) {
@@ -4545,20 +4648,238 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 	     "\t flip_arg             = %" PRId64 "\n",
 	     video_out_handle, display_buffer_index, flip_mode, flip_arg);
 
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+	return agc_set_flip(buf, false, video_out_handle, display_buffer_index, flip_mode, flip_arg);
+}
 
-	auto* cmd = buf->AllocateDW(6);
+uint32_t* KYTY_SYSV_ABI AgcAcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
+                                      int32_t display_buffer_index, uint32_t flip_mode,
+                                      int64_t flip_arg) {
+	PRINT_NAME();
 
+	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
+	     "\t display_buffer_index = %" PRId32 "\n"
+	     "\t flip_mode            = %" PRIu32 "\n"
+	     "\t flip_arg             = %" PRId64 "\n",
+	     video_out_handle, display_buffer_index, flip_mode, flip_arg);
+
+	return agc_set_flip(buf, true, video_out_handle, display_buffer_index, flip_mode, flip_arg);
+}
+
+// sceAgcDriverWaitUntilSafeForRendering (32 dwords): between two markers, a WAIT_REG_MEM_64 on the
+// PFP until the buffer's label is 0 (the buffer is no longer shown and no flip to it is pending).
+// Errors as agc_set_flip's.
+static uint32_t* agc_wait_until_safe_for_rendering(CommandBuffer* buf, bool acb, uint32_t video_out_handle,
+                                                   int32_t display_buffer_index) {
+	if (buf == nullptr || display_buffer_index < AGC_DISPLAY_BUFFER_INDEX_MIN ||
+	    display_buffer_index > AGC_DISPLAY_BUFFER_INDEX_MAX || !buf->ReserveDW(AGC_WAIT_UNTIL_SAFE_PACKET_SIZE_DW)) {
+		return nullptr;
+	}
+
+	const auto handle = static_cast<int>(video_out_handle);
+	uint64_t   label  = 0;
+	if (!agc_display_buffer_label(handle, display_buffer_index, &label)) {
+		return nullptr;
+	}
+	// Flip requests reserved from here on (the frame's own flip) are not waited for.
+	const uint64_t watermark = g_renderer->GetVideoOut().NextFlipRequestId();
+
+	auto* cmd = buf->AllocateDW(AGC_WAIT_UNTIL_SAFE_PACKET_SIZE_DW);
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	cmd[0] = KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP);
-	cmd[1] = video_out_handle;
-	cmd[2] = display_buffer_index;
-	cmd[3] = flip_mode;
-	cmd[4] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg) & 0xffffffffu);
-	cmd[5] = static_cast<uint32_t>((static_cast<uint64_t>(flip_arg) >> 32u) & 0xffffffffu);
+	const auto index = static_cast<uint32_t>(display_buffer_index);
+	uint32_t   n     = agc_write_marker(cmd, acb, AGC_WAIT_UNTIL_SAFE_TAG | (index & 0x1fu), nullptr, 0);
+
+	auto* wait = cmd + n;
+	if (display_buffer_index >= 0) {
+		// EQUAL, memory, PFP: the 64-bit label against 0 under a full mask.
+		wait[0] = KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0u);
+		wait[1] = 0x06000113u;
+		wait[2] = static_cast<uint32_t>(label) & ~0x7u;
+		wait[3] = static_cast<uint32_t>(label >> 32u) & 0x3ffffu;
+		wait[4] = 0;
+		wait[5] = 0;
+		wait[6] = 0xffffffffu;
+		wait[7] = 0xffffffffu;
+		wait[8] = 0x40u;
+	} else {
+		wait[0] = KYTY_PM4(9, Pm4::IT_NOP, Pm4::R_ZERO);
+		std::memset(wait + 1, 0, 8u * sizeof(uint32_t));
+	}
+	n += 9;
+	n += agc_write_marker(cmd + n, acb, AGC_WAIT_UNTIL_SAFE_TAG | 0x20u | (index & 0x1fu), nullptr, 0);
+
+	// The PS5 pads to 32 dwords with a NOP and writes only its header; for a buffer index Kyty's
+	// bookkeeping goes into the body (Pm4::KYTY_WAIT_FLIP_PAD_MAGIC), where its command processor waits
+	// instead of polling the label. Body: magic, handle, index, watermark lo/hi, then the GPU-order
+	// mark lo/hi, all ones (not set yet): the command processor stores VideoOutDriver::EopFlipOrder()
+	// there when it reaches the wait, so only flips whose release ran before the wait hold the buffer,
+	// as on the PS5.
+	auto* pad = cmd + n;
+	pad[0]    = KYTY_PM4(AGC_WAIT_UNTIL_SAFE_PACKET_SIZE_DW - n, Pm4::IT_NOP, Pm4::R_ZERO);
+	std::memset(pad + 1, 0, static_cast<size_t>(AGC_WAIT_UNTIL_SAFE_PACKET_SIZE_DW - n - 1u) * sizeof(uint32_t));
+	if (display_buffer_index >= 0) {
+		pad[1] = Pm4::KYTY_WAIT_FLIP_PAD_MAGIC;
+		pad[2] = video_out_handle;
+		pad[3] = index;
+		pad[4] = static_cast<uint32_t>(watermark);
+		pad[5] = static_cast<uint32_t>(watermark >> 32u);
+		pad[6] = 0xffffffffu;
+		pad[7] = 0xffffffffu;
+	}
 
 	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf, uint32_t video_out_handle,
+                                                        int32_t display_buffer_index) {
+	PRINT_NAME();
+
+	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
+	     "\t display_buffer_index = %" PRId32 "\n",
+	     video_out_handle, display_buffer_index);
+
+	return agc_wait_until_safe_for_rendering(buf, false, video_out_handle, display_buffer_index);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbWaitUntilSafeForRendering(CommandBuffer* buf, uint32_t video_out_handle,
+                                                        int32_t display_buffer_index) {
+	PRINT_NAME();
+
+	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
+	     "\t display_buffer_index = %" PRId32 "\n",
+	     video_out_handle, display_buffer_index);
+
+	return agc_wait_until_safe_for_rendering(buf, true, video_out_handle, display_buffer_index);
+}
+
+// The workload packets' ATOMIC_MEM on the stream's mask in driver DMEM: TC_OP 0x67 (64-bit swap) or
+// 0x75 (64-bit AND), command 2; the DCB form sets engine bit 30.
+static void agc_write_workload_atomic(uint32_t* cmd, bool acb, uint32_t op, uint32_t stream_id, uint64_t src) {
+	const uint64_t address = workload_mask_address(stream_id);
+
+	cmd[0] = KYTY_PM4(9, Pm4::IT_ATOMIC_MEM, 0u);
+	cmd[1] = (acb ? 0u : 1u << 30u) | 0x200u | op;
+	cmd[2] = static_cast<uint32_t>(address);
+	cmd[3] = static_cast<uint32_t>(address >> 32u);
+	cmd[4] = static_cast<uint32_t>(src);
+	cmd[5] = static_cast<uint32_t>(src >> 32u);
+	cmd[6] = 0;
+	cmd[7] = 0;
+	cmd[8] = 0;
+}
+
+static bool workload_stream_registered(uint32_t stream_id) {
+	std::lock_guard lock(g_workload_stream_mutex);
+	return (g_workload_stream_mask & (1u << stream_id)) != 0;
+}
+
+// sceAgcDriverSetWorkloadsActive (18 dwords): the marker with the mask as payload, then the mask
+// swapped into the stream's slot.
+static uint32_t* agc_set_workloads_active(CommandBuffer* buf, bool acb, uint32_t stream_id,
+                                          const uint32_t* workload_ids, uint32_t workload_count) {
+	if (buf == nullptr || workload_ids == nullptr || workload_count == 0 ||
+	    workload_count > WORKLOAD_ACTIVE_COUNT_MAX || stream_id < WORKLOAD_STREAM_MIN_ID ||
+	    stream_id > WORKLOAD_STREAM_MAX_ID) {
+		return nullptr;
+	}
+
+	uint64_t workload_mask = 0;
+	for (uint32_t i = 0; i < workload_count; i++) {
+		const auto workload_id = workload_ids[i];
+		if (workload_id > WORKLOAD_ID_MAX) {
+			return nullptr;
+		}
+
+		const uint64_t workload_bit = 1ull << workload_id;
+		if ((workload_mask & workload_bit) != 0) {
+			return nullptr;
+		}
+		workload_mask |= workload_bit;
+	}
+
+	if (!workload_stream_registered(stream_id)) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(WORKLOAD_ACTIVE_PACKET_SIZE_DW);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	const uint32_t mask[2] = {static_cast<uint32_t>(workload_mask), static_cast<uint32_t>(workload_mask >> 32u)};
+	const uint32_t n       = agc_write_marker(cmd, acb, AGC_WORKLOADS_ACTIVE_TAG | stream_id, mask, 2);
+	agc_write_workload_atomic(cmd + n, acb, 0x67u, stream_id, workload_mask);
+	static_assert(agc_marker_payload_size_dw(2) + 9u == WORKLOAD_ACTIVE_PACKET_SIZE_DW);
+
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
+                                                 const uint32_t* workload_ids,
+                                                 uint32_t        workload_count) {
+	PRINT_NAME();
+
+	LOGF("\t stream_id      = %" PRIu32 "\n"
+	     "\t workload_ids   = 0x%016" PRIx64 "\n"
+	     "\t workload_count = %" PRIu32 "\n",
+	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
+
+	return agc_set_workloads_active(buf, false, stream_id, workload_ids, workload_count);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
+                                                 const uint32_t* workload_ids,
+                                                 uint32_t        workload_count) {
+	PRINT_NAME();
+
+	LOGF("\t stream_id      = %" PRIu32 "\n"
+	     "\t workload_ids   = 0x%016" PRIx64 "\n"
+	     "\t workload_count = %" PRIu32 "\n",
+	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
+
+	return agc_set_workloads_active(buf, true, stream_id, workload_ids, workload_count);
+}
+
+// sceAgcDriverSetWorkloadComplete (12 dwords): the marker, then the workload's bit cleared in the
+// stream's slot.
+static uint32_t* agc_set_workload_complete(CommandBuffer* buf, bool acb, uint32_t stream_id, uint32_t workload_id) {
+	if (buf == nullptr || stream_id < WORKLOAD_STREAM_MIN_ID || stream_id > WORKLOAD_STREAM_MAX_ID ||
+	    workload_id > WORKLOAD_ID_MAX || !workload_stream_registered(stream_id)) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(WORKLOAD_COMPLETE_PACKET_SIZE_DW);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	const uint32_t n = agc_write_marker(cmd, acb, AGC_WORKLOAD_COMPLETE_TAG | (workload_id << 5u) | stream_id, nullptr, 0);
+	agc_write_workload_atomic(cmd + n, acb, 0x75u, stream_id, ~(1ull << workload_id));
+	static_assert(agc_marker_payload_size_dw(0) + 9u == WORKLOAD_COMPLETE_PACKET_SIZE_DW);
+
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
+                                                  uint32_t workload_id) {
+	PRINT_NAME();
+
+	LOGF("\t stream_id   = %" PRIu32 "\n"
+	     "\t workload_id = %" PRIu32 "\n",
+	     stream_id, workload_id);
+
+	return agc_set_workload_complete(buf, false, stream_id, workload_id);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
+                                                  uint32_t workload_id) {
+	PRINT_NAME();
+
+	LOGF("\t stream_id   = %" PRIu32 "\n"
+	     "\t workload_id = %" PRIu32 "\n",
+	     stream_id, workload_id);
+
+	return agc_set_workload_complete(buf, true, stream_id, workload_id);
 }
 
 // ATOMIC_MEM as libSceAgc writes it: the DCB form also takes the engine (bits 31:30), the loop
@@ -5438,6 +5759,8 @@ int Initialize() {
 	std::memcpy(reinterpret_cast<void*>(function_table), functions.data(), sizeof(functions));
 	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
 	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
+	// The active-workload masks (WorkloadDmemOffset) start zeroed with the region.
+	Gen5::workload_streams_init();
 	g_driver_dmem.physical_offset = physical_offset;
 	return OK;
 }

@@ -30,6 +30,13 @@ using Libs::Graphics::NativeGpu::PlanRingWait;
 using Libs::Graphics::NativeGpu::Pm4Translator;
 using Libs::Graphics::NativeGpu::RingWaitRelease;
 using Libs::Graphics::NativeGpu::WriteLodUsageReport;
+using Libs::Graphics::NativeGpu::kFlipPadMagic;
+using Libs::Graphics::NativeGpu::kWaitFlipPadMagic;
+using Libs::Graphics::NativeGpu::kWaitFlipPadEopMark;
+using Libs::Graphics::NativeGpu::kWaitFlipPadToken;
+using Libs::Graphics::NativeGpu::WaitFlipGroupDw;
+using Libs::Graphics::NativeGpu::SetWaitFlipMarks;
+using Libs::Graphics::NativeGpu::AppendKernelReleases;
 
 namespace {
 
@@ -1618,6 +1625,376 @@ void TestLabelsCpuTail() {
 	const auto& pts  = re.segments[0].points;
 	const auto  flip = std::find_if(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Flip; });
 	Check(flip != pts.end() && flip->data == std::vector<uint32_t>({0u, 1u, 2u, 3u, 4u}), "and is a flip point with its five dwords");
+}
+
+// Kyty's bookkeeping in the padding of libSceAgc's SetFlip and WaitUntilSafeForRendering (pm4.h): kFlipPadMagic,
+// kWaitFlipPadMagic and the padding's layout come from nativePm4.h.
+
+// libSceAgc's marker (agc.cpp): SET_UCONFIG 0x342 with the value, a payload's first dword in 0x343 and the rest in a
+// WRITE_DATA to SQ_THREAD_TRACE_USERDATA_3 (0xc343). Header bit 2 is set in a DCB, clear in an ACB.
+void AppendAgcMarker(std::vector<uint32_t>& cb, bool acb, uint32_t value, const std::vector<uint32_t>& payload) {
+	const uint32_t r = acb ? 0u : 4u;
+	if (payload.empty()) {
+		cb.insert(cb.end(), {0xc0017900u | r, 0x342u, value});
+		return;
+	}
+	cb.insert(cb.end(), {0xc0027900u | r, 0x342u, value, payload[0]});
+	if (payload.size() > 1) {
+		const auto rem = static_cast<uint32_t>(payload.size() - 1);
+		cb.insert(cb.end(), {0xc0003700u | ((rem + 2u) << 16u) | r, 0x06010000u, 0x0000c343u, 0u});
+		cb.insert(cb.end(), payload.begin() + 1, payload.end());
+	}
+}
+
+// AgcDcbSetFlip / AgcAcbSetFlip in libSceAgc's form, 64 dwords: the marker with its 12-byte payload, the RELEASE_MEM
+// that writes 1 into the display buffer's label (none for a negative index) and raises the interrupt with the context id
+// sceVideoOutSubmitEopFlip gave, and the padding NOP with Kyty's bookkeeping.
+void AppendSonyFlip(std::vector<uint32_t>& cb, bool acb, uint32_t handle, int idx, uint32_t mode, uint64_t arg, uint64_t label,
+                    uint32_t ctx) {
+	const size_t   start = cb.size();
+	const auto     index = static_cast<uint32_t>(idx);
+	const bool     has   = idx >= 0;
+	const uint64_t l     = has ? label : 0u;
+	// The context's bits 8..13 are 0 (Kyty's VideoOut), so libSceAgc's p and t are 0.
+	AppendAgcMarker(cb, acb, 0xc7010000u | ((mode & 0xfu) << 8u) | ((index & 0x1fu) << 3u),
+	                {0u, static_cast<uint32_t>(arg), static_cast<uint32_t>(arg >> 32u)});
+	cb.insert(cb.end(), {0xc0064900u, acb ? 0x0620062fu : 0x06200504u, 0x02010000u | (has ? 1u << 30u : 0u), static_cast<uint32_t>(l) & ~3u,
+	                     static_cast<uint32_t>(l >> 32u), has ? 1u : 0u, 0u, ctx & 0x0fffffffu});
+	cb.push_back(0xc02c1000u);
+	std::vector<uint32_t> pad(45, 0u);
+	const std::vector<uint32_t> kyty = {kFlipPadMagic, handle, index, mode, static_cast<uint32_t>(arg), static_cast<uint32_t>(arg >> 32u), ctx};
+	std::copy(kyty.begin(), kyty.end(), pad.begin());
+	cb.insert(cb.end(), pad.begin(), pad.end());
+	Check(cb.size() - start == 64, "test SetFlip is 64 dwords");
+}
+
+// AgcDcbWaitUntilSafeForRendering / AgcAcbWaitUntilSafeForRendering in libSceAgc's form, 32 dwords: the begin marker, the
+// WAIT_REG_MEM_64 until the label is 0 (a 9-dword NOP for a negative index), the end marker and the padding NOP with
+// Kyty's bookkeeping (the EOP flip order not set yet: 0xffffffff twice).
+void AppendSonyWaitUntilSafe(std::vector<uint32_t>& cb, bool acb, uint32_t handle, int idx, uint64_t label, uint64_t watermark) {
+	const size_t start = cb.size();
+	const auto   index = static_cast<uint32_t>(idx);
+	AppendAgcMarker(cb, acb, 0xcb000000u | (index & 0x1fu), {});
+	if (idx >= 0) {
+		cb.insert(cb.end(), {0xc0079300u, 0x06000113u, static_cast<uint32_t>(label) & ~7u, static_cast<uint32_t>(label >> 32u) & 0x3ffffu, 0u, 0u,
+		                     0xffffffffu, 0xffffffffu, 0x40u});
+	} else {
+		cb.push_back(0xc0071000u);
+		cb.resize(cb.size() + 8u, 0u);
+	}
+	AppendAgcMarker(cb, acb, 0xcb000020u | (index & 0x1fu), {});
+	cb.push_back(0xc00f1000u);
+	std::vector<uint32_t> pad(16, 0u);
+	const std::vector<uint32_t> kyty = {kWaitFlipPadMagic, handle, index, static_cast<uint32_t>(watermark), static_cast<uint32_t>(watermark >> 32u),
+	                                    0xffffffffu, 0xffffffffu};
+	std::copy(kyty.begin(), kyty.end(), pad.begin());
+	cb.insert(cb.end(), pad.begin(), pad.end());
+	Check(cb.size() - start == 32, "test WaitUntilSafeForRendering is 32 dwords");
+}
+
+// SetWorkloadsActive (18 dwords) and SetWorkloadComplete (12 dwords) in libSceAgc's form: the marker, then the ATOMIC_MEM
+// on the stream's 64-bit word (a swap with the mask, an AND with all but the workload's bit; engine PFP in a DCB).
+void AppendSonyWorkloads(std::vector<uint32_t>& cb, bool acb, uint32_t stream, uint64_t mask, uint32_t id, uint64_t word) {
+	const uint32_t engine = acb ? 0u : 1u << 30u;
+	AppendAgcMarker(cb, acb, 0xcc000000u | stream, {static_cast<uint32_t>(mask), static_cast<uint32_t>(mask >> 32u)});
+	cb.insert(cb.end(), {0xc0071e00u, engine | 0x267u, static_cast<uint32_t>(word), static_cast<uint32_t>(word >> 32u), static_cast<uint32_t>(mask),
+	                     static_cast<uint32_t>(mask >> 32u), 0u, 0u, 0u});
+	const uint64_t keep = ~(1ull << id);
+	AppendAgcMarker(cb, acb, 0xcd000000u | (id << 5u) | stream, {});
+	cb.insert(cb.end(), {0xc0071e00u, engine | 0x275u, static_cast<uint32_t>(word), static_cast<uint32_t>(word >> 32u), static_cast<uint32_t>(keep),
+	                     static_cast<uint32_t>(keep >> 32u), 0u, 0u, 0u});
+}
+
+bool PassesBothChecks(const std::vector<uint32_t>& ib, NativeIbKind kind) {
+	using Libs::Graphics::NativeGpu::SetNativeIbValidation;
+	using Libs::Graphics::NativeGpu::ValidateNativeIb;
+	SetNativeIbValidation(false);
+	const bool blacklist = ValidateNativeIb(ib, false, nullptr, kind);
+	SetNativeIbValidation(true);
+	const bool strict = ValidateNativeIb(ib, false, nullptr, kind);
+	return blacklist && strict;
+}
+
+// SetFlip in libSceAgc's form on either ring: its markers pass, the label the GPU cannot write is the tracker's write
+// of 1, and the interrupt that follows it keeps the kernel context id (bit 27) for the host's dispatch.
+void TestSonyFlip() {
+	static uint64_t labels[16] = {};
+	const uint64_t  label      = reinterpret_cast<uint64_t>(&labels[5]);
+	constexpr uint32_t kCtx    = 0x08000005u;
+	auto label_then_irq = [&](const Pm4TranslateResult& r) {
+		Check(r.segments.size() == 1, "one segment");
+		const auto& pts   = r.segments[0].points;
+		const auto  write = std::find_if(pts.begin(), pts.end(), [&](const TrackerPoint& p) {
+			return p.kind == TrackerPoint::Kind::CpuWrite && p.addr == label && p.data == std::vector<uint32_t>({1u, 0u});
+		});
+		const auto  irq   = std::find_if(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Interrupt; });
+		return write != pts.end() && irq != pts.end() && write < irq && irq->ctx == kCtx &&
+		       std::none_of(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Flip; });
+	};
+	for (const bool eop_flips: {false, true}) {
+		Pm4Translator t;
+		TestOracle    o;
+		o.unwritable = label;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFlipsAtEop(eop_flips);
+		std::vector<uint32_t> dcb;
+		AppendSonyFlip(dcb, false, 1u, 5, 1u, 0x1122334455667788ull, label, kCtx);
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.unknown_ops.empty() && r.stats.interrupts == 1 && r.stats.labels_cpu == 1 && r.cpu_tail.empty(),
+		      "a DCB's SetFlip translates: the label on the tracker, the interrupt on the tracker, nothing for Kyty's CP");
+		Check(label_then_irq(r), "the label's write of 1, then the interrupt with all 28 bits of the context id");
+		const auto pkts = Decode(r.ib);
+		bool       tag = false, user_data = false;
+		for (const auto& p: pkts) {
+			tag       = tag || (p.op == IT_SET_UCONFIG_REG && p.body.size() == 3 && p.body[0] == 0x342u && (p.body[1] >> 24u) == 0xc7u);
+			user_data = user_data || (p.op == IT_WRITE_DATA && p.body.size() == 5 && p.body[0] == 0x06010000u && p.body[1] == 0xc343u &&
+			                          p.body[3] == 0x55667788u && p.body[4] == 0x11223344u);
+		}
+		Check(tag && user_data, "the marker and its payload go to the gfx CP as written");
+		Check(!HasLabelRelease(pkts, label, 1u), "no GPU release on a label the GPU cannot write");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the IB passes both packet checks");
+	}
+	// A label the GPU may write: the GPU's release (two halves), then the interrupt.
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		std::vector<uint32_t> dcb;
+		AppendSonyFlip(dcb, false, 1u, 5, 1u, 0, label, kCtx);
+		auto       r    = t.Translate(dcb);
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && HasLabelRelease(pkts, label, 1u) && HasLabelRelease(pkts, label + 4u, 0u), "the GPU writes a label it can reach");
+		const auto& pts = r.segments[0].points;
+		Check(std::count_if(pts.begin(), pts.end(), [&](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Interrupt && p.ctx == kCtx; }) == 1,
+		      "and the interrupt keeps bit 27");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the IB passes both packet checks");
+	}
+	// A negative index: no label, the interrupt alone.
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		std::vector<uint32_t> dcb;
+		AppendSonyFlip(dcb, false, 1u, -1, 0u, 0, 0, 0x08000007u);
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.interrupts == 1 && r.stats.labels_cpu == 0 && r.stats.labels_native == 0, "SetFlip of index -1: the interrupt alone");
+		const auto& pts = r.segments[0].points;
+		Check(std::any_of(pts.begin(), pts.end(), [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Interrupt && p.ctx == 0x08000007u; }),
+		      "with its kernel context id");
+	}
+	// An ACB's SetFlip (CS_DONE, end of shader) on a compute ring: the markers are dropped, label and interrupt as on gfx.
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		o.unwritable = label;
+		t.SetComputeQueue(true);
+		t.SetComputeRing(true);
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		std::vector<uint32_t> acb;
+		AppendSonyFlip(acb, true, 1u, 5, 1u, 0x1122334455667788ull, label, kCtx);
+		auto       r    = t.Translate(acb);
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && r.unknown_ops.empty() && label_then_irq(r), "an ACB's SetFlip on a compute ring: label, then interrupt");
+		Check(FindFirst(pkts, IT_SET_UCONFIG_REG) == nullptr && FindFirst(pkts, IT_WRITE_DATA) == nullptr, "its markers stay off MEC");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "the IB passes both compute packet checks");
+	}
+}
+
+// WaitUntilSafeForRendering in libSceAgc's form: the GPU does not wait on the label (the flip is a Vulkan copy on the
+// same gfx pipe); its padding goes to Kyty's command processor, which waits there.
+void TestSonyWaitUntilSafe() {
+	static uint64_t labels[16] = {};
+	const uint64_t  label      = reinterpret_cast<uint64_t>(&labels[3]);
+	labels[3]                  = 1; // on screen: a GPU wait here would block
+	for (const bool acb: {false, true}) {
+		Pm4Translator t;
+		TestOracle    o;
+		if (acb) {
+			t.SetComputeQueue(true);
+			t.SetComputeRing(true);
+		}
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		std::vector<uint32_t> cb;
+		AppendSonyWaitUntilSafe(cb, acb, 1u, 3, label, 0x0000000700000042ull);
+		Append(cb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, acb);
+		auto       r    = t.Translate(cb);
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && r.unknown_ops.empty() && r.segments.size() == 1 && o.asked == 0 && r.stats.waits_flip == 1 && r.stats.marker_wait_flip == 1,
+		      acb ? "an ACB's WaitUntilSafeForRendering: no held segment, the oracle not asked"
+		          : "a DCB's WaitUntilSafeForRendering: no held segment, the oracle not asked");
+		Check(Count(pkts, 0x93u) == 0 && Count(pkts, 0x3Cu) == 0, "no GPU wait on the label");
+		Check(r.cpu_tail.size() == 17 && r.cpu_tail[0] == 0xc00f1000u && r.cpu_tail[1] == kWaitFlipPadMagic && r.cpu_tail[2] == 1u &&
+		          r.cpu_tail[3] == 3u && r.cpu_tail[4] == 0x42u && r.cpu_tail[5] == 7u,
+		      "the padding NOP, with handle, index and watermark, is Kyty's CP's");
+		Check(PassesBothChecks(r.ib, acb ? NativeIbKind::Compute : NativeIbKind::Gfx), "the IB passes both packet checks");
+		// Where the GPU reaches the padding, a FlipMark point notes which EOP flips have released; its token in the
+		// tail's copy lets the tracker put that order into the padding before Kyty's CP runs it.
+		const uint32_t token = r.cpu_tail[1u + kWaitFlipPadToken];
+		const auto&    pts   = r.segments[0].points;
+		Check(token != 0 && std::count_if(pts.begin(), pts.end(), [&](const TrackerPoint& p) {
+			      return p.kind == TrackerPoint::Kind::FlipMark && p.ctx == token;
+		      }) == 1,
+		      "one FlipMark point, its token in the tail's padding");
+		Check(r.cpu_tail[1u + kWaitFlipPadEopMark] == 0xffffffffu && r.cpu_tail[2u + kWaitFlipPadEopMark] == 0xffffffffu,
+		      "the order is not set by the translator");
+		uint32_t asked = 0;
+		Check(SetWaitFlipMarks(r.cpu_tail, [&](uint32_t t) {
+			      asked = t;
+			      return 0x0000000900000011ull;
+		      }) == 1 &&
+		          asked == token && r.cpu_tail[1u + kWaitFlipPadEopMark] == 0x11u && r.cpu_tail[2u + kWaitFlipPadEopMark] == 9u,
+		      "SetWaitFlipMarks puts the order for the padding's token into it");
+		Check(SetWaitFlipMarks(r.cpu_tail, [](uint32_t) { return 0ull; }) == 0 && r.cpu_tail[1u + kWaitFlipPadEopMark] == 0x11u,
+		      "and leaves a padding whose order is set");
+	}
+	// A negative index has no wait; the padding still goes to Kyty's CP, which decides on the index.
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		std::vector<uint32_t> dcb;
+		AppendSonyWaitUntilSafe(dcb, false, 1u, -1, 0, 0x42u);
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.waits_flip == 0 && r.cpu_tail.size() == 17 && r.cpu_tail[1] == kWaitFlipPadMagic, "index -1: no wait, the padding");
+	}
+	// A WAIT_REG_MEM_64 on its own is a guest wait as before.
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		dcb.insert(dcb.end(), {0xc0079300u, 0x06000113u, static_cast<uint32_t>(label) & ~7u, static_cast<uint32_t>(label >> 32u) & 0x3ffffu, 0u, 0u,
+		                       0xffffffffu, 0xffffffffu, 0x40u});
+		Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.waits_flip == 0 && o.asked == 1 && r.segments.size() == 2 && r.segments[1].held, "a plain 64-bit wait is held");
+	}
+	// Without native labels (shadow mode, Kyty's CP runs the whole buffer) the wait is still left out.
+	{
+		Pm4Translator         t;
+		std::vector<uint32_t> dcb;
+		AppendSonyWaitUntilSafe(dcb, false, 1u, 3, label, 0x42u);
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.waits_flip == 1 && r.cpu_tail.empty() && Count(Decode(r.ib), 0x93u) == 0, "shadow mode: no wait, no tail");
+	}
+}
+
+// A WaitUntilSafeForRendering's wait, end marker and padding are one group a chunk must not cut (WaitFlipGroupDw); the
+// releases of SetFlip in a part of a buffer that does not run still go to Kyty's CP (AppendKernelReleases).
+void TestWaitFlipGroupAndKernelReleases() {
+	static uint64_t labels[16] = {};
+	const uint64_t  label      = reinterpret_cast<uint64_t>(&labels[2]);
+	{
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		const size_t start = dcb.size();
+		AppendSonyWaitUntilSafe(dcb, false, 1u, 2, label, 0x42u);
+		Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		const size_t wait = start + 3u;
+		Check(WaitFlipGroupDw(dcb, wait) == 9u + 3u + 17u, "the wait, the end marker and the padding are one group");
+		Check(WaitFlipGroupDw(dcb, 0) == 0 && WaitFlipGroupDw(dcb, start) == 0 && WaitFlipGroupDw(dcb, wait + 9u) == 0,
+		      "other packets start none");
+		Check(WaitFlipGroupDw(std::span<const uint32_t>(dcb).first(wait + 12u), wait) == 0, "nor a wait whose padding is cut off");
+		std::vector<uint32_t> neg;
+		AppendSonyWaitUntilSafe(neg, false, 1u, -1, 0, 0x42u);
+		Check(WaitFlipGroupDw(neg, 3u) == 0, "index -1 has no wait");
+		std::vector<uint32_t> acb;
+		AppendSonyWaitUntilSafe(acb, true, 1u, 2, label, 0x42u);
+		Check(WaitFlipGroupDw(acb, 3u) == 29u, "nor does an ACB's form differ");
+	}
+	{
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		const size_t first = dcb.size();
+		AppendSonyFlip(dcb, false, 1u, 2, 1u, 0x1122334455667788ull, label, 0x08000005u);
+		// A title's own end-of-pipe interrupt (no kernel context) stays dropped with its part.
+		const std::vector<uint32_t> title = {0xc0064900u, 0x06200504u, 0x02010000u, 0u, 0u, 0u, 0u, 0x5u};
+		dcb.insert(dcb.end(), title.begin(), title.end());
+		const size_t second = dcb.size();
+		AppendSonyFlip(dcb, true, 1u, -1, 0u, 0, 0, 0x08000007u);
+		std::vector<uint32_t> out = {0xdeadbeefu};
+		Check(AppendKernelReleases(dcb, &out) == 2 && out.size() == 17u && out[0] == 0xdeadbeefu, "both SetFlip releases, after what was there");
+		Check(std::equal(out.begin() + 1, out.begin() + 9, dcb.begin() + static_cast<std::ptrdiff_t>(first + 10u)) &&
+		          std::equal(out.begin() + 9, out.end(), dcb.begin() + static_cast<std::ptrdiff_t>(second + 10u)),
+		      "as written");
+		std::vector<uint32_t> none;
+		Check(AppendKernelReleases(title, &none) == 0 && none.empty(), "a title's release is not a kernel one");
+	}
+}
+
+// SetWorkloadsActive and SetWorkloadComplete in libSceAgc's form: on the gfx ring the ATOMIC_MEMs run as written where the
+// GPU may write the word; otherwise, and on a compute ring, the tracker performs them.
+void TestSonyWorkloads() {
+	static uint64_t words[32] = {};
+	const uint64_t  word      = reinterpret_cast<uint64_t>(&words[4]);
+	const uint64_t  mask      = (1ull << 3u) | (1ull << 40u);
+	auto atomics = [&](const Pm4TranslateResult& r) {
+		std::vector<std::vector<uint32_t>> out;
+		for (const auto& s: r.segments) {
+			for (const auto& p: s.points) {
+				if (p.kind == TrackerPoint::Kind::Atomic && p.addr == word) {
+					out.push_back(p.data);
+				}
+			}
+		}
+		return out;
+	};
+	const std::vector<uint32_t> swap  = {(1u << 30u) | 0x267u, static_cast<uint32_t>(mask), static_cast<uint32_t>(mask >> 32u)};
+	const std::vector<uint32_t> clear = {(1u << 30u) | 0x275u, ~(1u << 3u), 0xffffffffu};
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		std::vector<uint32_t> dcb;
+		AppendSonyWorkloads(dcb, false, 4u, mask, 3u, word);
+		auto       r    = t.Translate(dcb);
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && r.unknown_ops.empty() && Count(pkts, 0x1Eu) == 2 && r.stats.atomics_cpu == 0 && atomics(r).empty(),
+		      "a DCB's workload swap and AND run on the gfx ring as written");
+		Check(HasRef(r.refs, word, 8, false), "the workload word is made resident");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the IB passes both packet checks");
+	}
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		o.unwritable = word;
+		t.SetNativeLabels(&o, kTrackerVa);
+		std::vector<uint32_t> dcb;
+		AppendSonyWorkloads(dcb, false, 4u, mask, 3u, word);
+		auto r = t.Translate(dcb);
+		Check(r.ok && Count(Decode(r.ib), 0x1Eu) == 0 && r.stats.atomics_cpu == 2 && atomics(r) == std::vector<std::vector<uint32_t>>({swap, clear}),
+		      "on a word the GPU cannot write the tracker performs both, in order");
+	}
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetComputeQueue(true);
+		t.SetComputeRing(true);
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		std::vector<uint32_t> acb;
+		AppendSonyWorkloads(acb, true, 4u, mask, 3u, word);
+		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+		auto r          = t.Translate(acb);
+		const auto pkts = Decode(r.ib);
+		const std::vector<uint32_t> acb_swap  = {0x267u, swap[1], swap[2]};
+		const std::vector<uint32_t> acb_clear = {0x275u, clear[1], clear[2]};
+		Check(r.ok && r.unknown_ops.empty() && Count(pkts, 0x1Eu) == 0 && atomics(r) == std::vector<std::vector<uint32_t>>({acb_swap, acb_clear}),
+		      "an ACB's on a compute ring: the tracker performs them");
+		Check(FindFirst(pkts, IT_SET_UCONFIG_REG) == nullptr && FindFirst(pkts, IT_WRITE_DATA) == nullptr, "its markers stay off MEC");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "the IB passes both compute packet checks");
+	}
+	{
+		Pm4Translator         t;
+		std::vector<uint32_t> dcb;
+		AppendSonyWorkloads(dcb, false, 4u, mask, 3u, word);
+		auto r = t.Translate(dcb);
+		Check(r.ok && Count(Decode(r.ib), 0x1Eu) == 2, "without native labels as written on the gfx ring, as before");
+	}
 }
 
 void TestLabelWriteCovers() {
@@ -4312,6 +4689,10 @@ int main() {
 	TestLabelsLocalWait();
 	TestLabelsSplit();
 	TestLabelsCpuTail();
+	TestSonyFlip();
+	TestSonyWaitUntilSafe();
+	TestWaitFlipGroupAndKernelReleases();
+	TestSonyWorkloads();
 	TestLabelWriteCovers();
 	TestLabelsWait64();
 	TestValidateNativeIb();

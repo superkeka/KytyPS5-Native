@@ -32,17 +32,18 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 }
 
 void RenderContext::ShutdownGpu() {
+	// The GPU object outlives the drain: a late EOP flip interrupt run there finds it no longer accepting work.
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
-		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.Finish();
 		}
 		m_command_scheduler.DrainPriorityOperations();
-		m_video_out = nullptr;
 	}
+	m_gpu.reset();
+	m_video_out = nullptr;
 }
 
 GuestGpu& RenderContext::GetGpu() const {
@@ -191,7 +192,18 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 	m_interrupt_eqs.erase(it);
 }
 
+// Every guest end-of-pipe interrupt, from Kyty's command processor or the native tracker, passes the
+// PS5 kernel's dispatch here first. A context with bit 27 set belongs to the kernel: an EOP flip's
+// (sceVideoOutSubmitEopFlip) submits that flip, and any other kernel-internal one is not the title's
+// either. Only the rest reach the title's event queues.
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+	if ((context_id & 0x08000000u) != 0) {
+		if (m_video_out != nullptr && m_gpu != nullptr) {
+			(void)m_video_out->EopFlip(context_id);
+		}
+		return;
+	}
+
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);

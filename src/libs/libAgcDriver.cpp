@@ -67,6 +67,8 @@ LIB_DEFINE(InitAgcDriver_1) {
 	AGC_FUNC("ZLJk9r2+2Aw", Gen5::AgcDriverUnregisterOwnerAndResources);
 	AGC_FUNC("pWLG7WOpVcw", Gen5::AgcDriverUnregisterResource);
 	AGC_FUNC("3AyTaWcF-H8", Gen5::AgcDriverRegisterWorkloadStream);
+	AGC_FUNC("n5ElQVYsU1A", Gen5::AgcDriverUnregisterWorkloadStream);
+	AGC_FUNC("t8PLXbBCiRA", Gen5::AgcDriverGetWorkloadStreamInfo);
 
 	AGC_FUNC("LtTouSCZjHM", Gen5::AgcCbNop);
 	AGC_FUNC("t7PlZ9nt5Lc", Gen5::AgcCbNopGetSize);
@@ -102,6 +104,10 @@ LIB_DEFINE(InitAgcDriver_1) {
 	AGC_FUNC("xAeBOa0A3kk", Gen5::AgcAcbSetMarker);
 	AGC_FUNC("cpCILPya5Zk", Gen5::AgcAcbPushMarker);
 	AGC_FUNC("6mFxkVqdmbQ", Gen5::AgcAcbPopMarker);
+	AGC_FUNC("ebixW91gpPw", Gen5::AgcAcbSetFlip);
+	AGC_FUNC("GPbUp9jXQa8", Gen5::AgcAcbWaitUntilSafeForRendering);
+	AGC_FUNC("rVOmPz2RBlg", Gen5::AgcAcbSetWorkloadsActive);
+	AGC_FUNC("opR1JeJZCBU", Gen5::AgcAcbSetWorkloadComplete);
 	AGC_FUNC("TRO721eVt4g", Gen5::AgcDcbResetQueue);
 	AGC_FUNC("MWiElSNE8j8", Gen5::AgcDcbWaitUntilSafeForRendering);
 	AGC_FUNC("LFSPFmGc9Hg", Gen5::AgcDcbSetWorkloadsActive);

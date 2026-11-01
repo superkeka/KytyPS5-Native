@@ -98,10 +98,21 @@ public:
 	void PrepareCpuFlip(uint64_t request_id);
 	// GuestGpu::SubmitEopFlip on the GPU thread: the flip request and its recording, as Flip() does.
 	void EopFlip(int handle, int index, int flip_mode, int64_t flip_arg);
+	// GuestGpu::SubmitEopFlipRequest on the GPU thread: the recording of a flip reserved earlier.
+	void EopFlipRequest(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	// libSceAgc's WaitUntilSafeForRendering (Pm4::KYTY_WAIT_FLIP_PAD_MAGIC): only flip requests older
+	// than `watermark` (NextFlipRequestId() when the wait was recorded) hold the buffer, and of the GPU
+	// (SetFlip) flips only those whose release ran before the wait: VideoOut's EopFlipOrder() <= `eop_mark`
+	// (UINT64_MAX: every released one). See VideoOutDriver::IsSafeForRendering.
+	bool WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index, uint64_t watermark, uint64_t eop_mark);
+	// VideoOutDriver::EopFlipOrder(): how many flip releases have run, the mark of a WaitUntilSafe pad.
+	[[nodiscard]] uint64_t VideoOutEopFlipOrder() const;
+	// Whether `address` is a VideoOut display buffer label (its WAIT_REG_MEM_64 is WaitFlipDone's).
+	[[nodiscard]] bool IsVideoOutBufferLabel(uint64_t address) const;
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void WaitForRewind(bool valid);

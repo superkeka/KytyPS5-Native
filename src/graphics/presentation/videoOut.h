@@ -37,11 +37,33 @@ public:
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
-	void WaitForSubmitSlot(int handle);
+	// `on_gpu_thread`: the GPU thread waits (PrepareVideoOutFlip), where a port full of CPU flips
+	// that only it can prepare is a deadlock; another thread just waits.
+	void WaitForSubmitSlot(int handle, bool on_gpu_thread = true);
 	// `before`: only flip requests older than this id count (NextFlipRequestId() when the command
-	// buffer that waits was submitted).
-	[[nodiscard]] bool     IsSafeForRendering(int handle, int index, uint64_t before = UINT64_MAX);
+	// buffer that waits was submitted). `eop_mark`: an EOP flip reserved by SubmitEopFlip counts only
+	// when its end-of-pipe release ran by then (EopFlipOrder() when the wait was reached; never
+	// while its release has not run), as the PS5's wait on the buffer label sees it.
+	[[nodiscard]] bool     IsSafeForRendering(int handle, int index, uint64_t before = UINT64_MAX,
+	                                          uint64_t eop_mark = UINT64_MAX);
 	[[nodiscard]] uint64_t NextFlipRequestId();
+	// How many end-of-pipe releases of flips reserved by SubmitEopFlip have run (arrived at EopFlip).
+	[[nodiscard]] uint64_t EopFlipOrder();
+
+	// sceVideoOutSubmitEopFlip: reserves a flip that the GPU's end-of-pipe interrupt with context
+	// `*ctx` will submit (EopFlip). With `wait_for_slot`, a full queue waits for a slot instead of
+	// returning VIDEO_OUT_ERROR_FLIP_QUEUE_FULL.
+	int SubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_arg, uint32_t* ctx,
+	                  bool wait_for_slot);
+	// sceVideoOutGetBufferLabelAddress: the port's 16 display buffer labels (1 while the buffer is
+	// or will be on screen, 0 once it left it), stable while the port is open.
+	int GetBufferLabelAddress(int handle, uint64_t** labels);
+	// The PS5 kernel's handling of an end-of-pipe interrupt: true when `ctx` is the context of a
+	// reserved EOP flip, whose preparation is then queued on the GPU thread (false too when the GPU
+	// is shutting down and drops it).
+	bool EopFlip(uint32_t ctx);
+	// Whether `addr` lies in some port's buffer labels, and which.
+	bool IsBufferLabel(uint64_t addr, int* handle, int* index);
 
 	[[nodiscard]] Impl& State() noexcept;
 
@@ -85,6 +107,9 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
                                                        void*                           option);
 KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index);
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg);
+KYTY_SYSV_ABI int VideoOutSubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_arg,
+                                        uint32_t* ctx);
+KYTY_SYSV_ABI int VideoOutGetBufferLabelAddress(int handle, void** address);
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status);
 KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle);
 KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status);

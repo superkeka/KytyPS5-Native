@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -198,6 +199,8 @@ struct Pm4TranslateStats {
 	uint32_t dma_data          = 0; // IT_DMA_DATA memory/immediate -> memory passed through
 	uint32_t cp_dma_idle       = 0; // zero-byte DMA_DATA with CP_SYNC before a job end after a DMA without one
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
+	uint32_t waits_flip        = 0; // WaitUntilSafeForRendering's WAIT_REG_MEM_64, left to Kyty's CP (its padding NOP)
+	uint32_t atomics_cpu       = 0; // native labels: ATOMIC_MEM the tracker performs on the CPU (TrackerPoint::Kind::Atomic)
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
 	uint32_t pfp_syncs_emitted = 0; // PFP_SYNC_ME emitted in place of dropped PFP waits
 	uint32_t clear_state       = 0; // IT_CLEAR_STATE
@@ -557,6 +560,11 @@ struct TrackerPoint {
 		LodStats,  // fill `size` bytes at `addr` like Kyty's GET_LOD_STATS
 		Wake,      // the GPU has written the label at `addr`: wake a guest sleeping on it, store nothing
 		Flip,      // AgcDcbSetFlip: request the flip `data` holds (handle, index, mode, arg low, arg high)
+		Atomic,    // ATOMIC_MEM at `addr` on the CPU: `data` holds its control dword (TC_OP), source low and high
+		           // (libSceAgc's workload swap 0x67 and AND 0x75, where the GPU may not run it)
+		FlipMark,  // WaitUntilSafeForRendering's padding, whose wait Kyty's CP does from the CPU tail: note which EOP
+		           // flips have released by the time the GPU gets here, for the padding copy whose token is `ctx`
+		           // (SetWaitFlipMarks)
 	};
 	Kind                  kind     = Kind::End;
 	uint32_t              dw       = 0; // the point's 32-bit sequence value in the IB (patched before submission)
@@ -606,6 +614,32 @@ struct Pm4Segment {
 	};
 	std::vector<AuditWait>    audit_waits;
 };
+
+// Kyty's bookkeeping in body[0] of the padding NOPs (R_ZERO) that end libSceAgc's SetFlip and
+// WaitUntilSafeForRendering, whose bodies the PS5 leaves unwritten (Pm4::KYTY_FLIP_PAD_MAGIC and
+// Pm4::KYTY_WAIT_FLIP_PAD_MAGIC in pm4.h).
+constexpr uint32_t kFlipPadMagic     = 0x4b46504bu; // "KPFK": the flip's padding, informational only
+constexpr uint32_t kWaitFlipPadMagic = 0x4b46574bu; // "KWFK": handle, index, flip watermark for Kyty's CP
+// WaitUntilSafeForRendering's padding body (after the header): [0] kWaitFlipPadMagic, [1] handle, [2] index, [3..4]
+// the flip watermark when it was recorded, [5..6] the EOP flip order its wait sees (VideoOutDriver::EopFlipOrder;
+// both 0xffffffff until set), and in the copy the translator puts in the CPU tail [7] the token of its FlipMark point.
+constexpr uint32_t kWaitFlipPadEopMark = 5;
+constexpr uint32_t kWaitFlipPadToken   = 7;
+
+// WaitUntilSafeForRendering as libSceAgc writes it: when the packet at `at` is a WAIT_REG_MEM_64 followed by
+// libSceAgc's end marker and the padding NOP with kWaitFlipPadMagic, the dwords from `at` to the end of that padding
+// (a cut between them would leave the wait without its padding); else 0.
+uint32_t WaitFlipGroupDw(std::span<const uint32_t> dcb, size_t at);
+
+// Sets the EOP flip order (body[kWaitFlipPadEopMark..+1]) of every WaitUntilSafeForRendering padding in `tail` that has
+// none yet, to `mark(token)` (token: body[kWaitFlipPadToken], 0 when the padding is shorter). Returns how many.
+uint32_t SetWaitFlipMarks(std::span<uint32_t> tail, const std::function<uint64_t(uint32_t token)>& mark);
+
+// Appends to `out` every RELEASE_MEM in `dcb` that raises an interrupt with a kernel context id (bit 27: SetFlip's,
+// from sceVideoOutSubmitEopFlip), as written. For a part of a buffer that does not run: Kyty's command processor
+// still writes the flip's label and raises its interrupt, so the flip reserved when SetFlip was recorded is shown.
+// Returns how many.
+uint32_t AppendKernelReleases(std::span<const uint32_t> dcb, std::vector<uint32_t>* out);
 
 // Rewrites `len` dwords at `ib[dw]` as one-dword filler NOPs.
 void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len);

@@ -1260,6 +1260,7 @@ struct Host {
 	std::function<void(int, uint32_t)>           interrupt;
 	std::function<uint64_t()>                    reference_clock;
 	std::function<void(int, int, int, int64_t)> flip; // ShadowSetFlipHost
+	std::function<uint64_t()>                    eop_flip_order; // ShadowSetEopFlipOrderHost
 };
 Host& HostCallbacks() {
 	static Host host;
@@ -6295,6 +6296,12 @@ private:
 			if ((header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x22u && size >= 5) { // COND_EXEC: EXEC_COUNT dwords follow
 				cond_until = std::max(cond_until, dw + size + (whole[dw + 4] & 0x3fffu));
 			}
+			// WaitUntilSafeForRendering: its label wait, libSceAgc's end marker and the padding stay in one chunk. The
+			// translator leaves the wait to Kyty's command processor only when it sees the padding follow; cut off from
+			// it, the wait would hold the GPU on a label the frame's own flip, reserved when it was recorded, keeps at 1.
+			if (const uint32_t group = WaitFlipGroupDw(whole, dw); group != 0) {
+				cond_until = std::max(cond_until, dw + group);
+			}
 			dw += size;
 			while (next_mark < marks.size() && marks[next_mark] < dw) {
 				next_mark++;
@@ -6397,6 +6404,10 @@ private:
 					g_audit_chunk_dropped.fetch_add(1, std::memory_order_relaxed);
 					g_audit_chunk_dropped_dw.fetch_add(whole.size() - cb, std::memory_order_relaxed);
 				}
+				// A SetFlip in the dropped part reserved its flip when it was recorded, and only its release's
+				// interrupt lets the flip go: Kyty's command processor runs those releases (the label, then the
+				// interrupt), so the flip shows what the chunks before rendered instead of holding every later one.
+				AppendKernelReleases(whole.subspan(cb), &done->tail);
 				queue.push_back(Piece {{}, {}, std::move(done)});
 				return true;
 			}
@@ -7064,6 +7075,42 @@ private:
 				break;
 			}
 			case TrackerPoint::Kind::Wake: WakeAddress(p.addr); break;
+			case TrackerPoint::Kind::FlipMark:
+				// The GPU has reached a WaitUntilSafeForRendering: the EOP flips released so far are the ones its wait
+				// sees (Finish puts this into the padding's copy in the CPU tail).
+				if (HostCallbacks().eop_flip_order) {
+					m_flip_marks[p.ctx] = HostCallbacks().eop_flip_order();
+					while (m_flip_marks.size() > 4096) { // a mark whose tail never ran (its buffer refused late)
+						m_flip_marks.erase(m_flip_marks.begin());
+					}
+				}
+				break;
+			case TrackerPoint::Kind::Atomic: {
+				// libSceAgc's ATOMIC_MEM where the GPU does not run it (a compute ring, or memory the GPU cannot write):
+				// its TC_OP on the CPU, atomically, 64-bit with bit 5 set. A swap (7) stores the source, an AND (0x15)
+				// masks the word with it (SetWorkloadsActive, SetWorkloadComplete).
+				if (p.data.size() < 3 || p.addr == 0) {
+					break;
+				}
+				const uint32_t tc_op = p.data[0] & 0x1fu;
+				const uint64_t src   = p.data[1] | (static_cast<uint64_t>(p.data[2]) << 32u);
+				if ((p.data[0] & 0x20u) != 0) {
+					auto* dst = reinterpret_cast<uint64_t*>(p.addr);
+					if (tc_op == 0x07u) {
+						__atomic_store_n(dst, src, __ATOMIC_SEQ_CST);
+					} else if (tc_op == 0x15u) {
+						__atomic_fetch_and(dst, src, __ATOMIC_SEQ_CST);
+					}
+				} else {
+					auto* dst = reinterpret_cast<uint32_t*>(p.addr);
+					if (tc_op == 0x07u) {
+						__atomic_store_n(dst, static_cast<uint32_t>(src), __ATOMIC_SEQ_CST);
+					} else if (tc_op == 0x15u) {
+						__atomic_fetch_and(dst, static_cast<uint32_t>(src), __ATOMIC_SEQ_CST);
+					}
+				}
+				break;
+			}
 			case TrackerPoint::Kind::Timestamp: {
 				const uint64_t clock = HostCallbacks().reference_clock ? HostCallbacks().reference_clock() : 0;
 				std::memcpy(reinterpret_cast<void*>(p.addr), &clock, std::min<uint32_t>(p.size, 8));
@@ -7133,8 +7180,31 @@ private:
 		}
 		const double start = NowSecShadow();
 		if (done.whole) {
+			// A buffer Kyty's command processor runs whole: its WaitUntilSafeForRendering paddings take the EOP flips
+			// released before it in GPU order (now), not those the tracker runs while it waits for the processor; the
+			// processor sets them back to all ones once the wait has passed. Only the buffer's own dwords are marked: a
+			// padding in a buffer it calls (shared with other submissions) takes its mark when the processor reaches it.
+			if (const auto& order = HostCallbacks().eop_flip_order; order && done.buffer != nullptr && done.size_dw != 0) {
+				const uint64_t now = order();
+				SetWaitFlipMarks(std::span<uint32_t>(const_cast<uint32_t*>(done.buffer), done.size_dw),
+				                 [now](uint32_t /*token*/) { return now; });
+			}
 			done.then(std::span<const uint32_t>(done.buffer, done.size_dw));
 		} else if (!done.tail.empty()) {
+			// WaitUntilSafeForRendering's paddings: the EOP flips released when the GPU reached each (its FlipMark
+			// point, run before this in tracker order), so Kyty's command processor waits as the PS5's GPU would and
+			// does not count a flip recorded before the wait but released after it, such as the frame's own. A padding
+			// without its mark takes the order now: every release before the end of this buffer has run, none after.
+			if (const auto& order = HostCallbacks().eop_flip_order; order) {
+				SetWaitFlipMarks(done.tail, [&](uint32_t token) {
+					if (const auto it = m_flip_marks.find(token); token != 0 && it != m_flip_marks.end()) {
+						const uint64_t mark = it->second;
+						m_flip_marks.erase(it);
+						return mark;
+					}
+					return order();
+				});
+			}
 			// Kyty keeps a span to the packets until its command processor has run them: keep the last
 			// tails alive, far more than it ever has queued.
 			m_tails.push_back(std::move(done.tail));
@@ -7211,6 +7281,7 @@ private:
 	std::deque<Entry>                       m_entries;
 	bool                                    m_drain = false;
 	std::deque<std::vector<uint32_t>>       m_tails;
+	std::map<uint32_t, uint64_t>            m_flip_marks; // FlipMark token -> the EOP flip order when the GPU reached it
 	double                                     m_audit_scan_prev = 0.0; // KYTY_NATIVE_GPU_AUDIT: the previous scan began
 	std::vector<std::pair<uint32_t, uint64_t>> m_audit_reached;         // and what this one found reached
 };
@@ -7224,6 +7295,10 @@ bool ShadowNativeLabels() {
 
 void ShadowSetFlipHost(std::function<void(int, int, int, int64_t)> flip) {
 	HostCallbacks().flip = std::move(flip);
+}
+
+void ShadowSetEopFlipOrderHost(std::function<uint64_t()> order) {
+	HostCallbacks().eop_flip_order = std::move(order);
 }
 
 void ShadowSetHost(std::function<void(int, uint32_t)> interrupt, std::function<uint64_t()> reference_clock) {

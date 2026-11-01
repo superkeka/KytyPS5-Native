@@ -86,6 +86,16 @@ constexpr uint32_t R_CONTEXT_STATE  = 0x1A;
 
 constexpr uint32_t R_NUM = 0x3F + 1;
 
+// Kyty's bookkeeping in the bodies of the padding NOPs (IT_NOP, R_ZERO) that end libSceAgc's SetFlip
+// and WaitUntilSafeForRendering packets. The PS5 writes only those NOPs' headers, so the bodies are
+// free. SetFlip: magic, handle, index, flip mode, flip argument low and high, interrupt context
+// (informational: the flip RELEASE_MEM's interrupt drives the flip).
+constexpr uint32_t KYTY_FLIP_PAD_MAGIC = 0x4b46504bu; // "KPFK"
+// WaitUntilSafeForRendering (display buffer index >= 0 only): magic, handle, index, watermark low and
+// high, where the watermark is VideoOutDriver::NextFlipRequestId() when the wait was recorded: flip
+// requests reserved before it count, the frame's own flip (recorded after it) does not.
+constexpr uint32_t KYTY_WAIT_FLIP_PAD_MAGIC = 0x4b46574bu; // "KWFK"
+
 /* Context registers */
 
 constexpr uint32_t DB_RENDER_CONTROL                                = 0x0;

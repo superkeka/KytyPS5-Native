@@ -203,10 +203,19 @@ struct VideoOutConfig {
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
 	uint64_t                            current_flip_id = 0; // the request that put flip_status.currentBuffer on screen
+	// That request's source and, for an EOP flip reserved by SubmitEopFlip, the order in which its
+	// end-of-pipe release ran (FlipQueue::TakeEopFlip; 0: not such a flip). See IsSafeForRendering.
+	FlipRequestSource                   current_flip_source    = FlipRequestSource::Cpu;
+	uint64_t                            current_flip_eop_order = 0;
 	VideoOutVblankStatus                pre_vblank_status;
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
+	// sceVideoOutGetBufferLabelAddress: one 64-bit label per display buffer. The GPU's flip release
+	// (AgcDcbSetFlip) writes 1, and FlipQueue::Flip writes 0 once another buffer is on screen; a
+	// WaitUntilSafeForRendering waits for 0. Plain host memory the guest shares, zeroed at Open. It
+	// lives as long as the driver, so a release still in flight after Close never writes freed memory.
+	alignas(64) std::array<uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> labels {};
 };
 
 class FlipQueue {
@@ -222,13 +231,24 @@ public:
 	void Cancel(VideoOutConfig& cfg);
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
-	void WaitForSubmitSlot(VideoOutConfig& cfg);
+	// `on_gpu_thread`: the caller is the GPU thread, which alone moves CPU flips into m_requests, so
+	// a port full of CPU flips with nothing in m_requests can never drain there.
+	void WaitForSubmitSlot(VideoOutConfig& cfg, bool on_gpu_thread);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	bool     IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t before);
+	bool     IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t before, uint64_t eop_mark);
+	// The reserved, not yet submitted EOP flip whose interrupt context is `ctx`; it then gets the
+	// next end-of-pipe order, so a repeated interrupt does not prepare it twice.
+	bool TakeEopFlip(uint32_t ctx, uint64_t& request_id);
+	void DropEopOrder(uint64_t request_id);
 	uint64_t NextRequestId() {
 		Common::LockGuard lock(m_mutex);
 		return m_next_request_id;
+	}
+	// How many EOP flip releases have run so far (the last order TakeEopFlip gave).
+	uint64_t EopOrder() {
+		Common::LockGuard lock(m_mutex);
+		return m_eop_order;
 	}
 
 private:
@@ -247,8 +267,15 @@ private:
 		RequestState                state;
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
+		// EOP flip reserved by SubmitEopFlip: the order in which its end-of-pipe release ran (its
+		// interrupt arrived and queued the preparation); 0 while it has not run.
+		uint64_t eop_order;
 	};
 	void SignalDoneLocked();
+	// Whether a pending request of the buffer holds it (IsSafeForRendering).
+	static bool HoldsBuffer(const Request& r, uint64_t before, uint64_t eop_mark);
+	// Whether a request of r's port older than r and outside r's group is still pending.
+	bool OlderPendingOnPort(const Request& r) const;
 
 	Graphics::Presenter& m_presenter;
 	Common::Mutex        m_mutex;
@@ -261,6 +288,7 @@ private:
 	bool                 m_processing      = false;
 	bool                 m_gpu_waiting     = false;
 	uint64_t             m_next_request_id = 1;
+	uint64_t             m_eop_order       = 0;
 };
 
 struct VideoOutDriver::Impl {
@@ -285,6 +313,8 @@ public:
 	VideoOutConfig* Get(int handle, uint64_t& generation);
 	bool            IsOpened(int handle);
 	int             SetFlipMaster(int slave_handle, int master_handle);
+	// The labels are members of the fixed port array, so finding one needs no lock.
+	bool FindLabel(uint64_t addr, int& handle, int& index) const;
 
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
@@ -541,6 +571,17 @@ static bool IsValidFlipMode(int mode) {
 	       mode == VIDEO_OUT_FLIP_MODE_SLAVE || mode == VIDEO_OUT_FLIP_MODE_MASTER;
 }
 
+// The end-of-pipe interrupt context of an EOP flip request (sceVideoOutSubmitEopFlip). Bit 27 marks a
+// kernel context as the PS5 kernel's do, so the interrupt goes to VideoOut and not to the title's
+// event queues (RenderContext::TriggerInterrupt). Bits 8..13 stay 0, so libSceAgc's flip marker
+// decodes it with p = 0. At most 16 requests per port are pending, so the low byte of the request id
+// tells them apart.
+constexpr uint32_t VIDEO_OUT_EOP_FLIP_CONTEXT = 0x08000000u;
+
+static uint32_t EopFlipContext(uint64_t request_id) {
+	return VIDEO_OUT_EOP_FLIP_CONTEXT | static_cast<uint32_t>(request_id & 0xffu);
+}
+
 // Set once the headset port shows eye images. The window then shows them instead of the main port,
 // so the picture is visible without a headset.
 static std::atomic<bool> g_headset_mirror {false};
@@ -717,6 +758,9 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.count         = 0;
 	config.pre_vblank_status         = VideoOutVblankStatus();
 	config.vblank_status             = VideoOutVblankStatus();
+	for (auto& label: config.labels) {
+		std::atomic_ref<uint64_t>(label).store(0, std::memory_order_release);
+	}
 
 	return handle;
 }
@@ -815,6 +859,18 @@ bool VideoOutDriver::Impl::IsOpened(int handle) {
 	Common::LockGuard lock(m_mutex);
 
 	return handle > 0 && handle < VIDEO_OUT_NUM_MAX && m_video_out_ctx[handle].opened;
+}
+
+bool VideoOutDriver::Impl::FindLabel(uint64_t addr, int& handle, int& index) const {
+	for (int h = 1; h < VIDEO_OUT_NUM_MAX; h++) {
+		const auto base = reinterpret_cast<uint64_t>(m_video_out_ctx[h].labels.data());
+		if (addr >= base && addr < base + sizeof(m_video_out_ctx[h].labels)) {
+			handle = h;
+			index  = static_cast<int>((addr - base) / sizeof(uint64_t));
+			return true;
+		}
+	}
+	return false;
 }
 
 int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
@@ -1109,6 +1165,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	int             index      = 0;
 	{
 		Common::LockGuard lock(m_mutex);
+		// A GPU request is already in m_requests: reserved just before by SubmitFlipFromGpu, or by
+		// SubmitEopFlip when the command buffer was written and taken by its interrupt (TakeEopFlip).
+		// A CPU request moves there now.
 		auto request = std::find_if(m_requests.begin(), m_requests.end(),
 		                            [request_id](const auto& r) { return r.id == request_id; });
 		if (request == m_requests.end()) {
@@ -1125,7 +1184,11 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 				cancelled->state = RequestState::Recording;
 				return;
 			}
-			request = m_requests.insert(m_requests.end(), *pending);
+			// In request order: an EOP flip reserved when its command buffer was written may already
+			// wait there, and a flip submitted before it must not be shown after it.
+			const auto position = std::find_if(m_requests.begin(), m_requests.end(),
+			                                   [request_id](const auto& r) { return r.id > request_id; });
+			request = m_requests.insert(position, *pending);
 			m_cpu_requests.erase(pending);
 		}
 		if (request->state != RequestState::Reserved) {
@@ -1272,13 +1335,15 @@ void FlipQueue::Complete(uint64_t request_id) {
 	}
 }
 
-void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
+void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg, bool on_gpu_thread) {
 	Common::LockGuard lock(m_mutex);
 	auto belongs_to_port = [&cfg](const auto& request) { return request.cfg == &cfg; };
 	while (std::count_if(m_requests.begin(), m_requests.end(), belongs_to_port) +
 	           std::count_if(m_cpu_requests.begin(), m_cpu_requests.end(), belongs_to_port) >=
 	       VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
-		if (m_requests.empty()) {
+		// Another thread (the title's, recording a SetFlip) waits while the GPU thread prepares and
+		// the video out shows the CPU flips.
+		if (on_gpu_thread && m_requests.empty()) {
 			EXIT("video-out queue is saturated by CPU flips queued behind the current EOP\n");
 		}
 		m_submit_slot_cond_var.Wait(&m_mutex);
@@ -1301,36 +1366,115 @@ void FlipQueue::SignalDoneLocked() {
 // holds for the buffer on screen too: when a later flip has already shown it (the check ran late,
 // after the frame's own flip), the PS5's GPU passed the wait before that flip existed. Holding it
 // until the next vblank instead made each frame miss one, and My First GT stayed at 30 fps.
-bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t before) {
+//
+// An EOP flip reserved when its command buffer was written (SubmitEopFlip, libSceAgc's SetFlip)
+// counts by the GPU order of its release instead: on the PS5 the wait reads the buffer's label at its
+// own place in the GPU's work, where only flips whose release ran before it have written 1. So such a
+// flip holds the buffer when its release ran by the wait's `eop_mark` (EopFlipOrder() when the
+// command processor reached the wait), and never while its release has not run.
+bool FlipQueue::HoldsBuffer(const Request& r, uint64_t before, uint64_t eop_mark) {
+	if (r.source == FlipRequestSource::GpuEop && r.eop_order != 0) {
+		return r.eop_order <= eop_mark;
+	}
+	if (r.source == FlipRequestSource::GpuEop && r.state == RequestState::Reserved) {
+		return false;
+	}
+	// A CPU flip, or a GPU flip reserved at its end of pipe and prepared at once (the R_FLIP path).
+	return r.id < before;
+}
+
+bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index, uint64_t before, uint64_t eop_mark) {
 	Common::LockGuard lock(m_mutex);
-	auto matches = [&cfg, index, before](const auto& r) { return r.cfg == &cfg && r.index == index && r.id < before; };
-	const bool safe = (cfg.flip_status.currentBuffer != index || cfg.current_flip_id >= before) &&
-	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
+	auto matches = [&cfg, index, before, eop_mark](const auto& r) {
+		return r.cfg == &cfg && r.index == index && HoldsBuffer(r, before, eop_mark);
+	};
+	const bool shown_holds =
+	    cfg.flip_status.currentBuffer == index &&
+	    (cfg.current_flip_source == FlipRequestSource::GpuEop && cfg.current_flip_eop_order != 0
+	         ? cfg.current_flip_eop_order <= eop_mark
+	         : cfg.current_flip_id < before);
+	const bool safe = !shown_holds && std::none_of(m_requests.begin(), m_requests.end(), matches) &&
 	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	m_gpu_waiting = !safe;
 	if (LogFlips()) {
 		// The first check that holds a buffer, and the one that lets it go.
-		static int      last_index  = -1;
-		static uint64_t last_before = 0;
-		static bool     last_safe   = true;
-		if (safe != last_safe || index != last_index || before != last_before) {
-			last_index  = index;
-			last_before = before;
-			last_safe   = safe;
-			std::fprintf(stderr, "flip [%.2f]: buffer %d %s for rendering (current %d from flip %" PRIu64 ", flips before %" PRIu64 ")\n",
-			             FlipLogMs(), index, safe ? "safe" : "not safe", cfg.flip_status.currentBuffer, cfg.current_flip_id, before);
+		static int      last_index    = -1;
+		static uint64_t last_before   = 0;
+		static uint64_t last_eop_mark = 0;
+		static bool     last_safe     = true;
+		if (safe != last_safe || index != last_index || before != last_before || eop_mark != last_eop_mark) {
+			last_index    = index;
+			last_before   = before;
+			last_eop_mark = eop_mark;
+			last_safe     = safe;
+			std::fprintf(stderr,
+			             "flip [%.2f]: buffer %d %s for rendering (current %d from flip %" PRIu64 " eop %" PRIu64
+			             ", flips before %" PRIu64 ", releases up to %" PRIu64 ")\n",
+			             FlipLogMs(), index, safe ? "safe" : "not safe", cfg.flip_status.currentBuffer, cfg.current_flip_id,
+			             cfg.current_flip_eop_order, before, eop_mark);
 			for (const auto* queue: {&m_requests, &m_cpu_requests}) {
 				for (const auto& r: *queue) {
 					if (safe) {
 						break;
 					}
-					std::fprintf(stderr, "\t %s request %" PRIu64 ": buffer %d, state %d\n", queue == &m_requests ? "GPU-side" : "CPU", r.id,
-					             r.index, static_cast<int>(r.state));
+					std::fprintf(stderr, "\t %s request %" PRIu64 ": buffer %d, state %d, eop %" PRIu64 "\n",
+					             queue == &m_requests ? "GPU-side" : "CPU", r.id, r.index, static_cast<int>(r.state), r.eop_order);
 				}
 			}
 		}
 	}
 	return safe;
+}
+
+// A flip whose preparation was refused (the GPU thread is gone) no longer holds its buffer.
+void FlipQueue::DropEopOrder(uint64_t request_id) {
+	Common::LockGuard lock(m_mutex);
+	for (auto* queue: {&m_requests, &m_cancelled_requests}) {
+		for (auto& r: *queue) {
+			if (r.id == request_id && r.state == RequestState::Reserved) {
+				r.eop_order = 0;
+			}
+		}
+	}
+}
+
+bool FlipQueue::TakeEopFlip(uint32_t ctx, uint64_t& request_id) {
+	if ((ctx & 0x0fffff00u) != VIDEO_OUT_EOP_FLIP_CONTEXT) {
+		return false;
+	}
+	Common::LockGuard lock(m_mutex);
+	// A port closed (or a slave request replaced) before the interrupt left the request cancelled;
+	// it is still prepared, which retires it.
+	for (auto* queue: {&m_requests, &m_cancelled_requests}) {
+		const auto request = std::find_if(queue->begin(), queue->end(), [ctx](const auto& r) {
+			return r.source == FlipRequestSource::GpuEop && r.state == RequestState::Reserved &&
+			       r.eop_order == 0 && EopFlipContext(r.id) == (ctx & 0x0fffffffu);
+		});
+		if (request != queue->end()) {
+			request->eop_order = ++m_eop_order;
+			request_id         = request->id;
+			// The release wrote 1 into the label before its interrupt; a Flip that took the buffer off the screen in
+			// between saw no EOP order yet and cleared it. With the order given, Flip leaves the label alone.
+			if (queue == &m_requests && request->index >= 0 && request->index < VIDEO_OUT_BUFFER_NUM_MAX) {
+				std::atomic_ref<uint64_t>(request->cfg->labels[request->index]).store(1, std::memory_order_release);
+			}
+			if (LogFlips()) {
+				std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": end-of-pipe interrupt 0x%08" PRIx32 "\n", FlipLogMs(),
+				             request_id, ctx);
+			}
+			return true;
+		}
+	}
+	if (LogFlips()) {
+		std::fprintf(stderr, "flip [%.2f]: end-of-pipe interrupt 0x%08" PRIx32 " matches no reserved flip\n", FlipLogMs(), ctx);
+	}
+	return false;
+}
+
+bool FlipQueue::OlderPendingOnPort(const Request& r) const {
+	auto older = [&r](const Request& o) { return o.cfg == r.cfg && o.id < r.id && o.group != r.group; };
+	return std::any_of(m_requests.begin(), m_requests.end(), older) ||
+	       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), older);
 }
 
 bool FlipQueue::Flip(uint32_t micros) {
@@ -1341,18 +1485,28 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_submit_cond_var.WaitFor(&m_mutex, micros);
 	}
 	EXIT_IF(m_processing);
-	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
-	                               [](const auto& r) { return r.group == r.id; });
-	if (owner == m_requests.end()) {
-		m_mutex.Unlock();
-		return false;
+	// The first group that can be shown: every request of it is ready (none still on the CPU side),
+	// and no older flip of any of its ports is pending outside it, so each port shows its flips in
+	// request order. A group that is not ready holds back only its own ports: an EOP flip reserved
+	// when its command buffer was written (SubmitEopFlip) stays Reserved for the frame's whole GPU
+	// time, and the other ports' flips do not wait for it.
+	uint64_t group = 0;
+	for (const auto& owner: m_requests) {
+		if (owner.group != owner.id) {
+			continue;
+		}
+		const uint64_t candidate = owner.id;
+		if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
+		                [candidate](const auto& r) { return r.group == candidate; }) ||
+		    std::any_of(m_requests.begin(), m_requests.end(), [this, candidate](const auto& r) {
+			    return r.group == candidate && (r.state != RequestState::Ready || OlderPendingOnPort(r));
+		    })) {
+			continue;
+		}
+		group = candidate;
+		break;
 	}
-	const uint64_t group = owner->id;
-	if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
-	                [group](const auto& r) { return r.group == group; }) ||
-	    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
-		    return r.group == group && r.state != RequestState::Ready;
-	    })) {
+	if (group == 0) {
 		m_mutex.Unlock();
 		return false;
 	}
@@ -1414,6 +1568,20 @@ bool FlipQueue::Flip(uint32_t micros) {
 			continue;
 		}
 		auto& r = *it;
+		// The buffer this flip takes off the screen is safe for rendering again: its label goes to 0,
+		// unless a flip still pending shows it again and its release may already have written 1 (one recorded
+		// whose release has not run, Reserved without an EOP order, has written nothing).
+		const int previous = r.cfg->flip_status.currentBuffer;
+		if (previous >= 0 && previous < VIDEO_OUT_BUFFER_NUM_MAX && previous != r.index) {
+			auto shows_previous = [&r, previous](const auto& o) {
+				return o.cfg == r.cfg && o.index == previous && o.id != r.id &&
+				       !(o.source == FlipRequestSource::GpuEop && o.state == RequestState::Reserved && o.eop_order == 0);
+			};
+			if (std::none_of(m_requests.begin(), m_requests.end(), shows_previous) &&
+			    std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), shows_previous)) {
+				std::atomic_ref<uint64_t>(r.cfg->labels[previous]).store(0, std::memory_order_release);
+			}
+		}
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1421,6 +1589,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 		r.cfg->flip_status.flipArg                  = r.flip_arg;
 		r.cfg->flip_status.currentBuffer            = r.index;
 		r.cfg->current_flip_id                      = r.id;
+		r.cfg->current_flip_source                  = r.source;
+		r.cfg->current_flip_eop_order               = r.eop_order;
 		if (LogFlips()) {
 			std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": buffer %d displayed\n", FlipLogMs(), r.id, r.index);
 		}
@@ -1784,6 +1954,33 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	return OK;
 }
 
+KYTY_SYSV_ABI int VideoOutSubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_arg,
+                                        uint32_t* ctx) {
+	PRINT_NAME();
+	EXIT_IF(g_video_out_driver == nullptr);
+
+	const int result = g_video_out_driver->SubmitEopFlip(handle, index, flip_mode, flip_arg, ctx, false);
+	if (result == VIDEO_OUT_ERROR_INVALID_FLIP_MODE) {
+		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
+	}
+	return result;
+}
+
+KYTY_SYSV_ABI int VideoOutGetBufferLabelAddress(int handle, void** address) {
+	PRINT_NAME();
+
+	if (address == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+	EXIT_IF(g_video_out_driver == nullptr);
+	uint64_t* labels = nullptr;
+	const int result = g_video_out_driver->GetBufferLabelAddress(handle, &labels);
+	if (result == OK) {
+		*address = labels;
+	}
+	return result;
+}
+
 int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index,
                                       int flip_mode, int64_t flip_arg, uint64_t& request_id) {
 	EXIT_IF(buffer.IsInvalid());
@@ -1810,22 +2007,94 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	m_impl->GetFlipQueue().Complete(request_id);
 }
 
-void VideoOutDriver::WaitForSubmitSlot(int handle) {
+void VideoOutDriver::WaitForSubmitSlot(int handle, bool on_gpu_thread) {
 	auto* cfg = m_impl->Get(handle);
 	EXIT_IF(cfg == nullptr);
-	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
+	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg, on_gpu_thread);
 }
 
 uint64_t VideoOutDriver::NextFlipRequestId() {
 	return m_impl->GetFlipQueue().NextRequestId();
 }
 
-bool VideoOutDriver::IsSafeForRendering(int handle, int index, uint64_t before) {
+uint64_t VideoOutDriver::EopFlipOrder() {
+	return m_impl->GetFlipQueue().EopOrder();
+}
+
+bool VideoOutDriver::IsSafeForRendering(int handle, int index, uint64_t before, uint64_t eop_mark) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, index, before);
+	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, index, before, eop_mark);
+}
+
+// The flip is reserved now, when the command buffer is written, as the PS5 does; the GPU's
+// end-of-pipe interrupt with `*ctx` submits it later (EopFlip). Until then it holds its place in the
+// queue, so flips submitted after it are shown after it.
+int VideoOutDriver::SubmitEopFlip(int handle, int index, int flip_mode, int64_t flip_arg,
+                                  uint32_t* ctx, bool wait_for_slot) {
+	if (ctx == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+	for (;;) {
+		uint64_t  request_id = 0;
+		const int result     = ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,
+		                                          FlipRequestSource::GpuEop, request_id);
+		if (result == OK) {
+			EXIT_IF(request_id == 0);
+			*ctx = EopFlipContext(request_id);
+			return OK;
+		}
+		if (result != VIDEO_OUT_ERROR_FLIP_QUEUE_FULL || !wait_for_slot) {
+			return result;
+		}
+		// The title's thread, while it writes a command buffer: the GPU thread drains the queue.
+		WaitForSubmitSlot(handle, false);
+	}
+}
+
+int VideoOutDriver::GetBufferLabelAddress(int handle, uint64_t** labels) {
+	if (labels == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+	auto* ctx = m_impl->Get(handle);
+	if (ctx == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	*labels = ctx->labels.data();
+	return OK;
+}
+
+// On the PS5 the kernel takes the flip's end-of-pipe interrupt and submits the flip; the title never
+// sees it. Here the flip is prepared on the GPU thread ahead of queued submissions, as the R_FLIP
+// tracker point's flip is (GuestGpu::SubmitEopFlip). An interrupt that arrives while the GPU shuts
+// down is dropped: the request goes back to holding nothing (no EOP order), and VideoOutShutdown discards it.
+bool VideoOutDriver::EopFlip(uint32_t ctx) {
+	uint64_t request_id = 0;
+	if (!m_impl->GetFlipQueue().TakeEopFlip(ctx, request_id)) {
+		return false;
+	}
+	if (!m_impl->Renderer().GetGpu().SubmitEopFlipRequest(request_id)) {
+		m_impl->GetFlipQueue().DropEopOrder(request_id);
+		return false;
+	}
+	return true;
+}
+
+bool VideoOutDriver::IsBufferLabel(uint64_t addr, int* handle, int* index) {
+	int h = 0;
+	int i = 0;
+	if (!m_impl->FindLabel(addr, h, i)) {
+		return false;
+	}
+	if (handle != nullptr) {
+		*handle = h;
+	}
+	if (index != nullptr) {
+		*index = i;
+	}
+	return true;
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {

@@ -1788,17 +1788,45 @@ KYTY_CP_OP_PARSER(CpOpContextControl) {
 	return 2;
 }
 
-// ATOMIC_MEM as libSceAgc writes it around a context push or pop: atomic 0x67 (a 64-bit swap, nothing
-// returned) of the source data into its flags.
+// ATOMIC_MEM as libSceAgc writes it: around a context push or pop, atomic 0x67 (a 64-bit swap, nothing
+// returned) of the source data into its flags; the workload packets (SetWorkloadsActive and
+// SetWorkloadComplete), 0x67 and 0x75 (a 64-bit AND) on the stream's mask in driver memory. TC_OP is the
+// operation in bits 0..4 (0x07 swap, 0x15 AND), bit 5 the 64-bit form and bit 6 "nothing returned": the
+// 32-bit forms are 0x47 and 0x55, and 0x27/0x35 (0x07/0x15) are the same operations returning the old
+// value, which goes to CP registers nothing here reads. Memory is changed the same way by all of them.
 KYTY_CP_OP_PARSER(CpOpAtomicMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 9u);
-	EXIT_NOT_IMPLEMENTED((buffer[0] & 0x7fu) != 0x67u);
 
-	auto* addr = reinterpret_cast<volatile uint64_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-	EXIT_NOT_IMPLEMENTED(addr == nullptr);
-	*addr = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+	const uint32_t op      = buffer[0] & 0x7fu;
+	const uint32_t atomic  = op & 0x1fu;
+	const bool     wide    = (op & 0x20u) != 0;
+	const uint64_t address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
+	const uint64_t src     = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+	EXIT_NOT_IMPLEMENTED(address == 0);
+
+	if (atomic == 0x07u || atomic == 0x15u) {
+		EXIT_NOT_IMPLEMENTED((address & (wide ? 0x7u : 0x3u)) != 0);
+	}
+
+	switch (atomic) {
+		case 0x07u: // swap: the old value is only returned, so a store
+			if (wide) {
+				std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(address)).store(src);
+			} else {
+				std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(address)).store(static_cast<uint32_t>(src));
+			}
+			break;
+		case 0x15u: // AND
+			if (wide) {
+				std::atomic_ref<uint64_t>(*reinterpret_cast<uint64_t*>(address)).fetch_and(src);
+			} else {
+				std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(address)).fetch_and(static_cast<uint32_t>(src));
+			}
+			break;
+		default: EXIT("unsupported ATOMIC_MEM op 0x%02" PRIx32 "\n", op);
+	}
 
 	return 8;
 }
@@ -2139,7 +2167,37 @@ KYTY_CP_OP_PARSER(CpOpNop) {
 	auto r = KYTY_PM4_R(cmd_id);
 
 	if (r == Pm4::R_ZERO) {
-		return KYTY_PM4_LEN(cmd_id) - 1;
+		const auto body_dw = KYTY_PM4_LEN(cmd_id) - 1u;
+		// The padding of libSceAgc's WaitUntilSafeForRendering: the wait for the display buffer, in
+		// place of the WAIT_REG_MEM_64 on its label (CpOpWaitRegMem64). SetFlip's padding
+		// (Pm4::KYTY_FLIP_PAD_MAGIC) is only padding: its RELEASE_MEM's interrupt flips.
+		if (body_dw >= 5u && body_dw < dw && buffer[0] == Pm4::KYTY_WAIT_FLIP_PAD_MAGIC &&
+		    static_cast<int32_t>(buffer[2]) >= 0) {
+			const uint64_t watermark = buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u);
+			uint64_t       eop_mark  = UINT64_MAX;
+			if (body_dw >= 7u) {
+				// On the PS5 the wait reads the label at its place in GPU order: only flips whose
+				// RELEASE_MEM ran before it have written 1. body[5..6] is that place in VideoOut's order
+				// of flip releases (EopFlipOrder()); all ones = not yet taken. The first time this
+				// command processor reaches the pad it takes it and stores it into the pad (Sony leaves
+				// the padding unwritten), so a re-run after SuspendPm4 checks against the same mark.
+				eop_mark = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
+				if (eop_mark == UINT64_MAX) {
+					eop_mark   = cp.VideoOutEopFlipOrder();
+					auto* body = const_cast<uint32_t*>(buffer);
+					body[5]    = static_cast<uint32_t>(eop_mark);
+					body[6]    = static_cast<uint32_t>(eop_mark >> 32u);
+				}
+			}
+			// Once the wait has passed the mark goes back to all ones: a later run of the same command buffer
+			// takes its own place in GPU order.
+			if (cp.WaitFlipDone(buffer[1], buffer[2], watermark, eop_mark) && body_dw >= 7u) {
+				auto* body = const_cast<uint32_t*>(buffer);
+				body[5]    = 0xffffffffu;
+				body[6]    = 0xffffffffu;
+			}
+		}
+		return body_dw;
 	}
 
 	auto cp_op = g_cp_op_custom_func[r];
@@ -2197,14 +2255,14 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	// The header's low bits are the shader type and predicate (libSceAgc's ACB form sets the former).
 	EXIT_NOT_IMPLEMENTED((cmd_id & 0xfffffffcu) != 0xc0064900);
 
-	uint32_t interrupt_selector = (buffer[1] >> 24u) & 0x7u;
-	// A context id with bit 27 set is libSceAgc's own (its context push/pop checks), not the title's:
-	// no interrupt reaches the title for it.
-	if ((buffer[6] & 0x08000000u) != 0) {
-		if (interrupt_selector == 4 || (interrupt_selector == 1 && !cp.IsAsyncComputeQueue())) {
-			return 7;
-		}
-		interrupt_selector = interrupt_selector == 2 ? 3 : 0;
+	const uint32_t interrupt_selector = (buffer[1] >> 24u) & 0x7u;
+	// A context id with bit 27 set is a kernel context, not the title's. libSceAgc's context push/pop
+	// checks (no label) do nothing here. The others, such as libSceAgcDriver's SetFlip release (label,
+	// then the interrupt with the flip's context), keep all 28 bits: RenderContext::TriggerInterrupt
+	// hands them to the kernel side (VideoOut's EOP flips) and never to the title.
+	if ((buffer[6] & 0x08000000u) != 0 &&
+	    (interrupt_selector == 4 || (interrupt_selector == 1 && !cp.IsAsyncComputeQueue()))) {
+		return 7;
 	}
 
 	// The event type, cache actions and destination cache only order GPU work, which the renderer's
@@ -2212,7 +2270,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	cp.ReleaseMem(
 	    (buffer[1] >> 29u) & 0x7u, interrupt_selector,
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
-	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu);
+	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x0fffffffu);
 
 	return 7;
 }
@@ -2391,6 +2449,27 @@ KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
 	return 6;
 }
 
+bool CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index, uint64_t watermark,
+                                    uint64_t eop_mark) {
+	// Stall only this command processor, as WaitFlipDone(handle, index) does.
+	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
+	                                                 static_cast<int>(display_buffer_index), watermark, eop_mark)) {
+		SuspendPm4();
+		return false;
+	}
+	return true;
+}
+
+uint64_t CommandProcessor::VideoOutEopFlipOrder() const {
+	return m_renderer.GetVideoOut().EopFlipOrder();
+}
+
+bool CommandProcessor::IsVideoOutBufferLabel(uint64_t address) const {
+	int handle = 0;
+	int index  = 0;
+	return m_renderer.GetVideoOut().IsBufferLabel(address, &handle, &index);
+}
+
 template <typename T>
 static T CpOpWaitRegMemReadValue(const uint32_t* buffer) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
@@ -2413,8 +2492,21 @@ static uint32_t CpOpWaitRegMemWaitOp(uint32_t control) {
 	}
 }
 
+// libSceAgc's WaitUntilSafeForRendering after its WAIT_REG_MEM_64 (`next` = the first dword after the
+// packet, `dw` dwords left there): the 3-dword end marker (SET_UCONFIG 0x342, 0xcb000020 | index, DCB or
+// ACB header), then the padding NOP with Kyty's Pm4::KYTY_WAIT_FLIP_PAD_MAGIC. The same rule as the native
+// translator's WaitFlipPadFollows.
+static bool CpOpWaitFlipPadFollows(const uint32_t* next, uint32_t dw) {
+	if (dw < 5u || (next[0] & ~4u) != 0xc0017900u || next[1] != 0x342u || (next[2] & ~0x1fu) != 0xcb000020u) {
+		return false;
+	}
+	const uint32_t nop = next[3];
+	return (nop >> 30u) == 3u && ((nop >> 8u) & 0xffu) == Pm4::IT_NOP && KYTY_PM4_R(nop) == Pm4::R_ZERO &&
+	       KYTY_PM4_LEN(nop) >= 2u && KYTY_PM4_LEN(nop) <= dw - 3u && next[4] == Pm4::KYTY_WAIT_FLIP_PAD_MAGIC;
+}
+
 template <typename T>
-static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer) {
+static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer, [[maybe_unused]] uint32_t dw) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	constexpr auto value_dw = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
@@ -2436,6 +2528,18 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
 
+	// libSceAgc's WaitUntilSafeForRendering waits for a display buffer's label to be 0; Kyty waits in
+	// its padding NOP that follows (Pm4::KYTY_WAIT_FLIP_PAD_MAGIC) and does not poll the label. Any other
+	// 64-bit wait, on a label too (a title's own sceAgcDcbWaitRegMem), polls as written: the labels are
+	// real (the flip release writes 1, VideoOut 0 when the buffer leaves the screen).
+	if constexpr (sizeof(T) == sizeof(uint64_t)) {
+		EXIT_IF(dw < packet_dw);
+		if (CpOpWaitFlipPadFollows(buffer + payload_dw, dw - packet_dw) &&
+		    cp.IsVideoOutBufferLabel(reinterpret_cast<uint64_t>(addr))) {
+			return payload_dw;
+		}
+	}
+
 	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, poll, CpOpWaitRegMemWaitOp<T>(ctrl));
 
 	return payload_dw;
@@ -2444,13 +2548,13 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 KYTY_CP_OP_PARSER(CpOpWaitRegMem32) {
 	KYTY_PROFILER_FUNCTION();
 
-	return CpOpWaitRegMemSized<uint32_t>(cp, cmd_id, buffer);
+	return CpOpWaitRegMemSized<uint32_t>(cp, cmd_id, buffer, dw);
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
 	KYTY_PROFILER_FUNCTION();
 
-	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer);
+	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer, dw);
 }
 
 KYTY_CP_OP_PARSER(CpOpWriteData) {

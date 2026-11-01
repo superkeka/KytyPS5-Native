@@ -65,7 +65,8 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			     "\n",
 			     result, handle, index, flip_mode, flip_arg);
 		}
-		video_out.WaitForSubmitSlot(handle);
+		// On the GPU thread, which alone prepares CPU flips: a port full of them cannot drain here.
+		video_out.WaitForSubmitSlot(handle, true);
 	}
 }
 

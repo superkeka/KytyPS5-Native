@@ -73,6 +73,9 @@ constexpr uint32_t R_DISPATCH_RESET = 0x09;
 constexpr uint32_t R_PUSH_MARKER    = 0x0B;
 constexpr uint32_t R_POP_MARKER     = 0x0C;
 
+// kFlipPadMagic and kWaitFlipPadMagic (the padding NOPs of libSceAgc's SetFlip and WaitUntilSafeForRendering) are in
+// nativePm4.h.
+
 // High bits of a register offset select an indexed SET variant; the register itself is the rest.
 constexpr uint32_t kRegisterSelectorMask = 0x70000000u;
 
@@ -571,6 +574,35 @@ bool IsFlipMarker(uint32_t tag) {
 	return tag == 0x68750777u || tag == 0x68750778u || tag == 0x68750781u;
 }
 
+// WaitUntilSafeForRendering as libSceAgc writes it (agc.cpp): its WAIT_REG_MEM_64 on the display buffer's label is
+// followed by libSceAgc's end marker (SET_UCONFIG 0x342, tag 0xCB000020 | index; header bit 2 set in a DCB, clear in
+// an ACB) and the padding NOP that carries Kyty's kWaitFlipPadMagic. `at` is the first dword after the wait.
+bool WaitFlipPadFollows(std::span<const uint32_t> dcb, size_t at) {
+	if (at + 5u > dcb.size() || (dcb[at] & ~4u) != 0xc0017900u || dcb[at + 1] != 0x342u || (dcb[at + 2] & ~0x1fu) != 0xcb000020u) {
+		return false;
+	}
+	const uint32_t nop = dcb[at + 3];
+	return (nop >> 30u) == 3u && ((nop >> 8u) & 0xffu) == IT_NOP && ((nop >> 2u) & 0x3fu) == R_ZERO && PacketSizeDw(nop) >= 2u &&
+	       at + 3u + PacketSizeDw(nop) <= dcb.size() && dcb[at + 4] == kWaitFlipPadMagic;
+}
+
+// Ties a WaitUntilSafeForRendering padding the translator copies into a CPU tail to its FlipMark point (never 0).
+std::atomic<uint32_t> g_wait_flip_token {0};
+uint32_t NextWaitFlipToken() {
+	for (;;) {
+		const uint32_t token = g_wait_flip_token.fetch_add(1, std::memory_order_relaxed) + 1u;
+		if (token != 0) {
+			return token;
+		}
+	}
+}
+
+// ATOMIC_MEM in the forms libSceAgc writes: the flag swap around a context push or pop and SetWorkloadsActive's
+// 64-bit swap (TC_OP 0x67), SetWorkloadComplete's 64-bit AND (0x75).
+bool AgcAtomicOp(uint32_t control) {
+	return (control & 0x7fu) == 0x67u || (control & 0x7fu) == 0x75u;
+}
+
 // Packets that make the GPU do something (as opposed to setting state), for dropping an empty first
 // segment. Labels, waits and LOD statistics say so themselves.
 bool IsWork(uint32_t op) {
@@ -870,6 +902,68 @@ void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
 	for (uint32_t i = 0; i < len; i++) {
 		ib[dw + i] = kFiller;
 	}
+}
+
+uint32_t WaitFlipGroupDw(std::span<const uint32_t> dcb, size_t at) {
+	if (at >= dcb.size()) {
+		return 0;
+	}
+	const uint32_t header = dcb[at];
+	if ((header >> 30u) != 3u || ((header >> 8u) & 0xffu) != IT_WAIT_REG_MEM_64) {
+		return 0;
+	}
+	const size_t wait = PacketSizeDw(header);
+	if (!WaitFlipPadFollows(dcb, at + wait)) {
+		return 0;
+	}
+	return static_cast<uint32_t>(wait + 3u + PacketSizeDw(dcb[at + wait + 3u]));
+}
+
+uint32_t SetWaitFlipMarks(std::span<uint32_t> tail, const std::function<uint64_t(uint32_t token)>& mark) {
+	uint32_t set = 0;
+	for (size_t dw = 0; dw < tail.size();) {
+		const uint32_t header = tail[dw];
+		const size_t   size   = (header >> 30u) == 3u ? PacketSizeDw(header) : 1u;
+		if (dw + size > tail.size()) {
+			break;
+		}
+		const size_t body_count = size - 1u;
+		uint32_t*    body       = tail.data() + dw + 1;
+		if ((header >> 30u) == 3u && ((header >> 8u) & 0xffu) == IT_NOP && ((header >> 2u) & 0x3fu) == R_ZERO &&
+		    body_count > kWaitFlipPadEopMark + 1u && body[0] == kWaitFlipPadMagic && body[kWaitFlipPadEopMark] == 0xffffffffu &&
+		    body[kWaitFlipPadEopMark + 1u] == 0xffffffffu) {
+			const uint64_t value           = mark(body_count > kWaitFlipPadToken ? body[kWaitFlipPadToken] : 0u);
+			body[kWaitFlipPadEopMark]      = static_cast<uint32_t>(value);
+			body[kWaitFlipPadEopMark + 1u] = static_cast<uint32_t>(value >> 32u);
+			set++;
+		}
+		dw += size;
+	}
+	return set;
+}
+
+uint32_t AppendKernelReleases(std::span<const uint32_t> dcb, std::vector<uint32_t>* out) {
+	uint32_t n = 0;
+	for (size_t dw = 0; dw < dcb.size();) {
+		const uint32_t header = dcb[dw];
+		const size_t   size   = (header >> 30u) == 3u ? PacketSizeDw(header) : 1u;
+		if (dw + size > dcb.size()) {
+			break;
+		}
+		const uint32_t op = (header >> 8u) & 0xffu;
+		// libSceAgc's RELEASE_MEM, or Kyty's NOP marker with the same body: [1] DATA_SEL / INT_SEL, [6] the context id.
+		const bool release = (header >> 30u) == 3u && (op == IT_RELEASE_MEM || (op == IT_NOP && ((header >> 2u) & 0x3fu) == R_RELEASE_MEM));
+		if (release && size >= 8u) {
+			const uint32_t* bptr    = dcb.data() + dw + 1;
+			const uint32_t  int_sel = (bptr[1] >> 24u) & 0x7u;
+			if (int_sel != 0 && (bptr[6] & 0x08000000u) != 0) {
+				out->insert(out->end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				n++;
+			}
+		}
+		dw += size;
+	}
+	return n;
 }
 
 // Opcodes an ACB passes to MEC with the header as the title wrote it, without the shader-type bit the
@@ -1297,7 +1391,8 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					return bad();
 				}
 				break;
-			// libSceAgc's flag swap around a context push or pop (AgcDcbContextStateOp), on the gfx ring.
+			// libSceAgc's flag swap around a context push or pop (AgcDcbContextStateOp) and its workload swap and AND
+			// (SetWorkloadsActive, SetWorkloadComplete), on the gfx ring.
 			case IT_ATOMIC_MEM:
 				if (compute || size != 9) {
 					return bad();
@@ -1312,7 +1407,7 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					}
 					return bad();
 				}
-				if ((b[0] & 0x7fu) != 0x67u) { // libSceAgc's flag swap around a context push or pop
+				if (!AgcAtomicOp(b[0])) { // libSceAgc's flag swap, workload swap or workload AND
 					return bad();
 				}
 				break;
@@ -3735,6 +3830,30 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						note_write({static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bptr[3], true,
 						            false, false});
 					}
+				} else if (marker == R_ZERO && body_count >= 1 && bptr[0] == kWaitFlipPadMagic) {
+					// WaitUntilSafeForRendering's padding: Kyty's command processor waits there for the display buffer, as
+					// for R_WAIT_FLIP_DONE, with the flip watermark the padding carries. Its WAIT_REG_MEM_64 stays out of
+					// the IB (the IT_WAIT_REG_MEM_64 case).
+					stats.marker_wait_flip++;
+					if (labels) {
+						const size_t at = r.cpu_tail.size();
+						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						// On the PS5 the wait reads the label where it stands in the GPU's order: only the flips whose
+						// release ran before it have written 1. A FlipMark point here notes which have; its token in
+						// the copy lets the tracker put that into the padding (SetWaitFlipMarks) before Kyty runs it.
+						if (body_count > kWaitFlipPadToken) {
+							TrackerPoint mark;
+							mark.kind = TrackerPoint::Kind::FlipMark;
+							mark.ctx  = NextWaitFlipToken();
+							r.cpu_tail[at + 1u + kWaitFlipPadToken] = mark.ctx;
+							// The copy's mark is this run's: whatever the guest dwords still hold is not.
+							r.cpu_tail[at + 1u + kWaitFlipPadEopMark]      = 0xffffffffu;
+							r.cpu_tail[at + 1u + kWaitFlipPadEopMark + 1u] = 0xffffffffu;
+							tracker_point(std::move(mark));
+						}
+					}
+				} else if (marker == R_ZERO && body_count >= 1 && bptr[0] == kFlipPadMagic) {
+					// SetFlip's padding is only padding: its RELEASE_MEM's interrupt (a kernel context id) does the flip.
 				} else if (marker == R_RELEASE_MEM && labels) {
 					stats.marker_release++;
 					if (body_count < 7) {
@@ -3891,9 +4010,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						stats.interrupts_gpu++;
 						NoteOnce(21, "RELEASE_MEM interrupt raised by the GPU (EOP log)");
 					} else if (interrupt) {
+						// All 28 bits of the context id, as the PS5's CP hands them to the kernel: bit 27 marks a kernel
+						// context (SetFlip's, from sceVideoOutSubmitEopFlip), which the host's interrupt dispatch takes
+						// for itself instead of the title's event queues.
 						TrackerPoint irq;
 						irq.kind = TrackerPoint::Kind::Interrupt;
-						irq.ctx  = bptr[6] & 0x07ffffffu;
+						irq.ctx  = bptr[6] & 0x0fffffffu;
 						tracker_point(irq);
 						irq_pending = m_irq_at_release;
 						stats.interrupts++;
@@ -4231,6 +4353,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// primary (non-shadow) native path will have to honour.
 				const bool     wide     = op == IT_WAIT_REG_MEM_64;
 				const uint32_t need     = wide ? 8u : 6u;
+				// WaitUntilSafeForRendering: the PS5's GPU waits here until the display buffer's label is 0 (off
+				// screen). Kyty's flip is a Vulkan copy on this same gfx pipe, so a GPU wait could hold up the very flip
+				// that frees the buffer. Kyty's command processor waits instead, at the padding NOP that follows (the
+				// IT_NOP case puts it in the CPU tail), as for R_WAIT_FLIP_DONE; the wait stays out of the IB.
+				if (wide && WaitFlipPadFollows(dcb, static_cast<size_t>(dw) + size)) {
+					stats.waits_flip++;
+					NoteOnce(23, "WaitUntilSafeForRendering's label wait left to Kyty's command processor (CPU tail)");
+					break;
+				}
 				if (m_audit && body_count >= 1) {
 					AuditWait(r.sync, wide, bptr[0]);
 				}
@@ -4898,22 +5029,41 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				dw += 8u; // the RELEASE_MEM
 				break;
 			}
-			case IT_ATOMIC_MEM:
-				// libSceAgc's flag swap around a context push or pop: as written on the gfx ring.
-				if (m_compute_ring || body_count != 8 || (bptr[0] & 0x7fu) != 0x67u) {
+			case IT_ATOMIC_MEM: {
+				// libSceAgc's flag swap around a context push or pop, and the workload swap and AND of SetWorkloadsActive and
+				// SetWorkloadComplete (into the driver's workload words): as written on the gfx ring, where the GPU may
+				// write the address. MEC has not run an ATOMIC_MEM on this board, and memory the GPU cannot write must not
+				// get one: with native labels the tracker performs it on the CPU when the GPU gets there. Without native
+				// labels Kyty's command processor runs the whole buffer and performs it, so a compute ring leaves it out.
+				if (body_count != 8 || !AgcAtomicOp(bptr[0])) {
 					return fail(op, dw, RefuseWhy::AtomicForm);
+				}
+				const uint64_t addr = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+				if (labels && (m_compute_ring || !label_gpu(addr, 8))) {
+					TrackerPoint cpu_atomic;
+					cpu_atomic.kind = TrackerPoint::Kind::Atomic;
+					cpu_atomic.addr = addr;
+					cpu_atomic.data = {bptr[0], bptr[3], bptr[4]};
+					tracker_point(std::move(cpu_atomic));
+					note_write({addr, 0, false, false, true});
+					stats.atomics_cpu++;
+					NoteOnce(24, "ATOMIC_MEM performed by the tracker (compute ring, or memory the GPU cannot write)");
+					break;
+				}
+				if (m_compute_ring) {
+					break;
 				}
 				if (direct) {
 					in_place = true;
 				} else {
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				}
-				{
-					const uint64_t addr = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
-					add_ref(addr, 8, false);
-					note_gpu_written(addr, addr + 8);
+				if (!labels) {
+					add_ref(addr, 8, false); // label_gpu has added it otherwise
 				}
+				note_gpu_written(addr, addr + 8);
 				break;
+			}
 			case IT_CLEAR_STATE:
 				// CMD 1-3 (libSceAgc's AgcDcbContextStateOp): PUSH_STATE, POP_STATE, push then clear, which the
 				// PS5's CP does with register shadowing the kernel sets up. The shadow does them here.
