@@ -263,7 +263,8 @@ constexpr uint32_t kReleasePolicy   = 0x3u << 25u;    // CACHE_POLICY
 bool LabelEventOk(uint32_t event) {
 	const uint32_t type  = event & 0x3fu;
 	const uint32_t index = (event >> 8u) & 0xfu;
-	const bool     known = type == 0x14u || type == 0x28u || type == 0x2bu || type == 0x2du || type == 0x2fu || type == 0x30u;
+	// 0x04 CACHE_FLUSH_TS: libSceAgc's SetFlip release.
+	const bool known = type == 0x04u || type == 0x14u || type == 0x28u || type == 0x2bu || type == 0x2du || type == 0x2fu || type == 0x30u;
 	return known && (index == 5u || index == 6u) && (event & ~(0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) == 0u;
 }
 // The label itself goes to memory past the caches (DST_SEL 0) either way, and GPU waits read it
@@ -296,15 +297,47 @@ uint32_t StrippableWriteBack(uint32_t guest_event, uint32_t event) {
 	}
 	return strip;
 }
+// Releases as the title wrote them (1.11): whether the CPU sees a label while the GPU job still runs is up to the
+// release's CACHE_POLICY, not its DST_SEL. With STREAM, NOA or BYPASS the label written to L2 (DST_SEL 1, as
+// libSceAgc writes them) reaches the CPU within ~30 us, 32- or 64-bit, on the gfx ring and on compute; with LRU it
+// stays in GL2 until a write-back (probe labelvis with the job kept running: LABELVIS_GO_UC). The PS5 is no
+// different: the labels its CPU reads carry BYPASS, the LRU ones are GPU-to-GPU syncs, which see each other in
+// GL2. The old belief that a DST_SEL 1 label never reaches the CPU came from probes whose job ended right after
+// the label (the end-of-job fence writes GL2 back) and from runs mixing LRU labels with Kyty's CPU-side reads.
+// KYTY_NATIVE_GPU_RELEASES_AS_WRITTEN=0 goes back to rewriting labels (DST_SEL 0, write-backs added, 64-bit
+// data as two halves).
+bool ReleasesAsWritten() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_RELEASES_AS_WRITTEN");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+// KYTY_NATIVE_GPU_RELEASE_GLM_WB=1: a release with GL2_WB or GLM_INV but no GLM_WB gets GLM_WB added. On 27.10 such
+// releases as written gave black frames, but those runs also had LRU labels the CPU did not see; as written with
+// labels as written (1.11) ASTRO BOT draws right, so they go as the title wrote them.
+bool ReleaseGlmWriteBack() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_RELEASE_GLM_WB");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+bool AcbReleasesAsWritten() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_ACB_RELEASES_AS_WRITTEN");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
 // KYTY_NATIVE_GPU_LABELS_VERBATIM: which label releases go as the title wrote them, by DATA_SEL: 1
 // 32-bit data, 2 64-bit, 4 the GPU clock, 8 none (cache actions alone); 0 rewrites every one (data to
-// memory, write-backs added, 64-bit data as two halves). 64-bit labels are left out by default: as
-// written, My First Gran Turismo drew black frames (a probe's 64-bit release in its event, 0x2d, also
-// stopped the gfx ring once, without --awake).
+// memory, write-backs added, 64-bit data as two halves). All by default; with the old rewriting
+// (KYTY_NATIVE_GPU_RELEASES_AS_WRITTEN=0) 64-bit labels are left out, as before.
 bool LabelsVerbatim(uint32_t data_sel) {
 	static const uint32_t mask = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_LABELS_VERBATIM");
-		return v == nullptr ? 0xdu : static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : (ReleasesAsWritten() ? 0xfu : 0xdu);
 	}();
 	return data_sel <= 3 && (mask & (data_sel == 0 ? 8u : 1u << (data_sel - 1u))) != 0;
 }
@@ -976,7 +1009,10 @@ static bool MecPlainOp(uint32_t op) {
 		std::array<bool, 256> a {};
 		const char*           v = std::getenv("KYTY_NATIVE_GPU_ACB_PLAIN");
 		if (v == nullptr) {
-			for (uint32_t o: {IT_SET_SH_REG, IT_DISPATCH_DIRECT, IT_DISPATCH_INDIRECT, IT_ACQUIRE_MEM, IT_DMA_DATA, IT_EVENT_WRITE}) {
+			// RELEASE_MEM: amdgpu's own compute-ring fences are plain RELEASE_MEMs, and libSceAgc writes its ACB ones
+			// plain too.
+			for (uint32_t o: {IT_SET_SH_REG, IT_DISPATCH_DIRECT, IT_DISPATCH_INDIRECT, IT_ACQUIRE_MEM, IT_DMA_DATA, IT_EVENT_WRITE,
+			                  IT_RELEASE_MEM}) {
 				a[o] = true;
 			}
 		}
@@ -1262,6 +1298,11 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				}
 				if (!compute && LabelEventOk(b[0]) && (b[1] & ~(0x3u << 16u)) == (1u << 24u)) {
 					break; // a title's interrupt alone, as written
+				}
+				if (LabelEventOk(b[0]) && ((b[1] >> 24u) & 0x7u) == 0u && ((b[1] >> 16u) & 0x3u) <= 1u &&
+				    (b[1] & ~((0x7u << 29u) | (0x3u << 16u))) == 0u &&
+				    (((b[1] >> 29u) & 0x7u) <= 2u || (((b[1] >> 29u) & 0x7u) == 3u && b[4] == 0u && b[5] == 0u && (b[2] & 7u) == 0u))) {
+					break; // the title's label, GPU-clock timestamp or cache actions as written (ReleasesAsWritten)
 				}
 				if ((b[0] == kFlushEventCntl || (b[0] == kClockEopCntl && !compute)) && b[1] == kDataTimestampCntl &&
 				    b[4] == 0u && b[5] == 0u && (b[2] & 7u) == 0u) {
@@ -3885,23 +3926,60 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.unknown_detail = {bptr[0], bptr[1]};
 						return fail(op, dw, RefuseWhy::ReleaseDataSel);
 					}
-					// The guest's packet as written: a DCB release without an interrupt, in an end-of-pipe
-					// event the ring runs (LabelEventOk), with no data (cache actions alone) or data to memory
-					// (DST_SEL 0). libSceAgc sends labels to L2 (DST_SEL 1), which this board's CP firmware
-					// leaves there, where the CPU never sees them, whatever the page's MTYPE (ASTRO BOT drew
-					// black frames with them as written, also with its shared memory mapped C_RW_S as the PS5
-					// kernel maps it); writing them to memory in agc.cpp instead cost My First Gran Turismo
-					// its 60 fps in places. They keep the rewritten form. A data label goes as written only
-					// where the GPU may write it (label_gpu below).
+					// The guest's packet as written: a DCB release in an end-of-pipe event the ring runs
+					// (LabelEventOk). A data label goes as written only where the GPU may write it (label_gpu
+					// below). With KYTY_NATIVE_GPU_RELEASES_AS_WRITTEN=0 (the form before 1.11) only one without
+					// an interrupt whose data goes to memory (DST_SEL 0): libSceAgc's labels to L2 (DST_SEL 1) were
+					// thought to stay there for good, which ReleasesAsWritten's probe disproves.
 					// On this board GL2_WB does not write back the metadata cache, and GLM_INV without GLM_WB
 					// drops it: ASTRO BOT's frames stayed black with its end-of-pipe GL2 write-backs and full
 					// invalidates as written. Mesa never invalidates GLM without writing it back. Such a
 					// release takes the rewritten form, which adds GLM_WB.
+					//
+					// With ReleasesAsWritten (the default) the DCB's release goes as the title wrote it, DST_SEL 1 and
+					// 64-bit data included, with one change: the interrupt is cleared from it, raised by the tracker
+					// instead (stock amdgpu
+					// takes no guest interrupt from the gfx ring), which also keeps a kernel context (bit 27) away
+					// from amdgpu. A release that writes no data (INT_SEL 1 or 4: the CP writes none then, probe
+					// labelvis LABELVIS_INTSEL; or no address) goes without its DATA_SEL too: its event and cache
+					// actions as written (libSceAgc's CACHE_FLUSH_AND_INV_TS interrupts flush the CB and DB).
 					const uint32_t dst_sel    = (bptr[1] >> 16u) & 0x3u;
 					const bool     glm_ok     = (bptr[0] & (kGcrGl2Wb | kGcrGlmInv)) == 0u || (bptr[0] & kGcrGlmWb) != 0u;
-					const bool     as_written = LabelsVerbatim(data_sel) && op == IT_RELEASE_MEM && !m_compute_queue && int_sel == 0 &&
-					                        glm_ok && LabelEventOk(bptr[0]) && (data_sel == 0 || (dst != 0 && dst_sel == 0));
-					auto write_as_written = [&] { body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size); };
+					const bool     interrupt  = int_sel == 1 || int_sel == 2 || int_sel == 4;
+					const bool     whole      = ReleasesAsWritten();
+					const uint32_t event_run  = whole && !glm_ok && ReleaseGlmWriteBack() ? bptr[0] | kGcrGlmWb : bptr[0];
+					// An ACB's release goes as written too (KYTY_NATIVE_GPU_ACB_RELEASES_AS_WRITTEN=0: rewritten as before),
+					// its header too on MEC (an ACB on the gfx ring loses the compute shader-type bit): MEC runs the events
+					// libSceAgc uses there, and
+					// DST_SEL 1 with BYPASS reaches the CPU from compute as from gfx (probe labelvis on compute).
+					const bool     as_written = LabelsVerbatim(data_sel) && op == IT_RELEASE_MEM && size == 8u &&
+					                        (whole ? (!m_compute_queue || AcbReleasesAsWritten()) && dst_sel <= 1u &&
+					                                     (!interrupt || !m_guest_irq) && LabelEventOk(event_run)
+					                               : !m_compute_queue && int_sel == 0 && glm_ok && LabelEventOk(bptr[0]) &&
+					                                     (data_sel == 0 || (dst != 0 && dst_sel == 0)));
+					// `with_interrupt`: the GPU raises the title's interrupt itself (the EOP log), as written.
+					const bool data_kept = sel == data_sel;
+					auto write_as_written = [&](bool with_interrupt = false) {
+						const size_t at = body.size();
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						if (!m_compute_ring) {
+							body[at] = Pkt3(IT_RELEASE_MEM, 7, false); // an ACB on the gfx ring: no compute shader-type bit
+						} else if (!MecPlainOp(IT_RELEASE_MEM)) {
+							body[at] |= 2u; // KYTY_NATIVE_GPU_ACB_PLAIN without 0x49: the compute shader-type bit
+						}
+						if (data_kept && data_sel == 3) {
+							body[at + 5] = 0u; // the GPU clock replaces the data dwords
+							body[at + 6] = 0u;
+						}
+						body[at + 1] = event_run;
+						if (!data_kept) {
+							body[at + 2] &= ~(0x7u << 29u); // no data, as the CP writes none
+						}
+						if (!with_interrupt) {
+							body[at + 2] &= ~(0x7u << 24u); // the interrupt is the tracker's (as_written holds none otherwise)
+							body[at + 7] = 0u;              // and so is its context id
+						}
+					};
 					TrackerPoint cpu;
 					bool         cpu_point = false;
 					if (sel == 3) {
@@ -3946,9 +4024,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// always ran it. A release that only
 					// flushes caches becomes a flush into our scratch dword, unless a tracker point (also a
 					// flush) follows anyway.
-					const bool interrupt = int_sel == 1 || int_sel == 2 || int_sel == 4;
 					if ((sel == 1 || sel == 2) && as_written) {
 						write_as_written();
+						// The PS5 maps the memory its CPU shares with the GPU coherent (type 12, C_RW_S); stock amdgpu
+						// maps it NC here, where the GPU's results stay in GL2. So a label the CPU may read gets the
+						// write-backs LabelEventCntl adds, and they come off again where a wait of the same buffer
+						// shows it is a GPU sync (StrippableWriteBack): Gran Turismo 7 froze without them.
+						if (whole) {
+							const size_t   ev    = body.size() - size + 1u;
+							const uint32_t event = body[ev] | (LabelWriteBack() ? kGcrGlmWb | kGcrGl2Wb : 0u);
+							body[ev]             = event;
+							if (const uint32_t strip = StrippableWriteBack(bptr[0], event); strip != 0u) {
+								label_releases.push_back({local_writes.size(), ev, strip});
+							}
+						}
 						mirror_store(dst, std::span<const uint32_t>(bptr + 4, sel), false);
 						NoteOnce(12, "RELEASE_MEM label as the title wrote it");
 					} else if (sel == 1) {
@@ -3969,8 +4058,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						for (uint32_t i = 2; i < 7; i++) {
 							body.push_back(i == 6 ? 0u : bptr[i]);
 						}
-					} else if (!interrupt && !cpu_point && data_sel == 0 && as_written) {
-						write_as_written(); // cache actions and the event alone
+					} else if (!cpu_point && (data_sel == 0 || !data_kept) && sel != 5 && as_written) {
+						write_as_written(); // cache actions and the event alone (an interrupt is the tracker's)
 					} else if (!interrupt && !cpu_point && ((bptr[0] >> 12u) & 0x1fffu) != 0) {
 						EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring, LabelEventCntl(bptr[0]));
 					}
@@ -4000,8 +4089,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const bool     irq_on_gpu = interrupt && m_guest_irq && op == IT_RELEASE_MEM && !cpu_point &&
 					                        (guest_ctx != 0 || m_guest_irq_ctx0) && guest_ctx < (1u << 27u);
 					if (irq_on_gpu) {
-						if (!m_compute_queue && int_sel == 1 && data_sel == 0 && glm_ok && LabelEventOk(bptr[0])) {
-							write_as_written();
+						if (!m_compute_queue && size == 8u && int_sel == 1 && data_sel == 0 && glm_ok && LabelEventOk(bptr[0])) {
+							write_as_written(true);
 						} else {
 							EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring, LabelEventCntl(bptr[0]));
 							body[body.size() - 6] |= kIntSel2;

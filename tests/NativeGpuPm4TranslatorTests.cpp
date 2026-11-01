@@ -1360,28 +1360,57 @@ void TestLabelsAsWritten() {
 	AppendGuestRelease(dcb, 3, 0, 0x202000310ull, 0);
 	AppendGuestRelease(dcb, 0, 0, 0, 0);
 	auto r = t.Translate(dcb);
-	Check(r.ok && r.stats.changed_ops[0x49] == 1 && r.stats.ops[0x49] == 4,
-	      "labels without an interrupt go as the title wrote them (32-bit, clock, cache only), 64-bit ones not by default");
+	Check(r.ok && r.stats.changed_ops[0x49] == 2 && r.stats.ops[0x49] == 4,
+	      "labels without an interrupt go as the title wrote them (32-bit, 64-bit, clock, cache only), the data labels with "
+	      "GLM and GL2 write-back added");
 	const auto pkts = Decode(r.ib);
-	Check(HasLabelRelease(pkts, 0x20200030cull, 9u) && HasLabelRelease(pkts, 0x202000308ull, 8u), "the 64-bit label as two halves");
+	Check(!HasLabelRelease(pkts, 0x20200030cull, 9u), "the 64-bit label is not split into halves");
+	{
+		namespace ng = Libs::Graphics::NativeGpu;
+		ng::SetNativeIbValidation(false);
+		const bool blacklist = ng::ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx);
+		ng::SetNativeIbValidation(true);
+		Check(blacklist && ng::ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "both packet checks take the title's forms");
+	}
 
-	// Data to L2 (libSceAgc's labels) never reaches the CPU on this board: written to memory with write-backs.
+	// Data to L2 (libSceAgc's labels): the CPU sees them as long as the release's cache policy is not LRU, as on
+	// the PS5, so they go as written too.
 	std::vector<uint32_t> l2;
 	AppendGuestRelease(l2, 1, 0, 0x202000300ull, 5, 1);
 	auto rl = t.Translate(l2);
-	Check(rl.stats.changed_ops[0x49] == 1 && HasLabelRelease(Decode(rl.ib), 0x202000300ull, 5u), "a label sent to L2 is rewritten");
+	const auto  pls = Decode(rl.ib);
+	const auto* pl = FindFirst(pls, 0x49u);
+	Check(pl != nullptr && ((pl->body[1] >> 16u) & 3u) == 1u && pl->body[0] == (0x06000514u | (1u << 12u) | (1u << 21u)),
+	      "a label sent to L2 goes as written, write-backs added (the PS5's shared memory is coherent, NC here is not)");
 
-	// GL2_WB without GLM_WB: rewritten with GLM_WB added.
+	// GL2_WB without GLM_WB: as written too (KYTY_NATIVE_GPU_RELEASE_GLM_WB=1 adds GLM_WB).
 	std::vector<uint32_t> wb;
 	AppendGuestRelease(wb, 0, 0, 0, 0, 0, 0x00200528u);
-	auto rw = t.Translate(wb);
-	Check(rw.stats.changed_ops[0x49] == 1, "a GL2 write-back without GLM_WB is not passed as written");
+	auto        rw = t.Translate(wb);
+	const auto  pws = Decode(rw.ib);
+	const auto* pw = FindFirst(pws, 0x49u);
+	Check(rw.stats.changed_ops[0x49] == 0 && pw != nullptr && pw->body[0] == 0x00200528u, "a GL2 write-back without GLM_WB as written");
 
-	// An interrupt stays the tracker's.
+	// An interrupt stays the tracker's; the label goes as written without it.
 	std::vector<uint32_t> irq;
-	AppendGuestRelease(irq, 1, 2, 0x202000300ull, 5);
-	auto ri = t.Translate(irq);
-	Check(ri.stats.changed_ops[0x49] == 1 && ri.stats.interrupts == 1, "a release with an interrupt is not passed as written");
+	AppendGuestRelease(irq, 1, 2, 0x202000300ull, 5, 1);
+	auto        ri = t.Translate(irq);
+	const auto  pis = Decode(ri.ib);
+	const auto* pi = FindFirst(pis, 0x49u);
+	Check(ri.stats.changed_ops[0x49] == 1 && ri.stats.interrupts == 1 && pi != nullptr && ((pi->body[1] >> 24u) & 7u) == 0u &&
+	          ((pi->body[1] >> 16u) & 3u) == 1u && pi->body[4] == 5u,
+	      "a release with an interrupt: the label as written, the interrupt the tracker's");
+
+	// INT_SEL 1 ("interrupt only"): the CP writes no data with it, so the title's CACHE_FLUSH_AND_INV_TS goes as written
+	// without data or interrupt, and the tracker raises the interrupt.
+	std::vector<uint32_t> only;
+	AppendGuestRelease(only, 1, 1, 0x202000300ull, 5, 1, 0x06000514u, 0x77u);
+	auto        ro  = t.Translate(only);
+	const auto  pos = Decode(ro.ib);
+	const auto* po  = FindFirst(pos, 0x49u);
+	Check(ro.ok && ro.stats.interrupts == 1 && po != nullptr && po->body[0] == 0x06000514u && po->body[1] == (1u << 16u) &&
+	          po->body[6] == 0u,
+	      "an interrupt-only release: its event as written, no data, the interrupt the tracker's");
 }
 
 // With the EOP log, the GPU raises a title's interrupts that carry a context id where they run.
@@ -1426,7 +1455,8 @@ void TestGuestInterruptsOnGpu() {
 	Check(r0.ok && r0.stats.interrupts_gpu == 3 && r0.stats.interrupts == 0, "context id 0 on the GPU as well");
 	Check(ValidateNativeIb(r0.ib, false, nullptr, NativeIbKind::Gfx), "the packet check takes it");
 
-	// A compute queue with a KFD queue of its own: the interrupt alone goes in our form, compute bit set.
+	// A compute queue with a KFD queue of its own: the interrupt alone goes in our form, with the title's plain header
+	// (MEC runs a plain RELEASE_MEM, as amdgpu's compute fences).
 	Pm4Translator acb;
 	acb.SetNativeLabels(&o, kTrackerVa);
 	acb.SetComputeQueue(true);
@@ -1437,7 +1467,7 @@ void TestGuestInterruptsOnGpu() {
 	auto       ra   = acb.Translate(acb_buf);
 	const auto apkt = Decode(ra.ib);
 	const auto air  = std::find_if(apkt.begin(), apkt.end(), [](const Packet& p) { return p.op == 0x49u && p.body[6] == 0xau; });
-	Check(ra.ok && ra.stats.interrupts_gpu == 1 && ra.stats.interrupts == 0 && air != apkt.end() && air->compute &&
+	Check(ra.ok && ra.stats.interrupts_gpu == 1 && ra.stats.interrupts == 0 && air != apkt.end() && !air->compute &&
 	          ((air->body[1] >> 24u) & 7u) == 2u,
 	      "an ACB's interrupt is raised by the GPU in our form");
 	Check(ValidateNativeIb(ra.ib, false, nullptr, NativeIbKind::Compute), "which the compute packet check takes");
@@ -1754,7 +1784,8 @@ void TestSonyFlip() {
 		Check(!HasLabelRelease(pkts, label, 1u), "no GPU release on a label the GPU cannot write");
 		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the IB passes both packet checks");
 	}
-	// A label the GPU may write: the GPU's release (two halves), then the interrupt.
+	// A label the GPU may write: libSceAgc's release as written (64-bit 1 to L2), the interrupt taken off it and
+	// raised by the tracker.
 	{
 		Pm4Translator t;
 		TestOracle    o;
@@ -1763,7 +1794,12 @@ void TestSonyFlip() {
 		AppendSonyFlip(dcb, false, 1u, 5, 1u, 0, label, kCtx);
 		auto       r    = t.Translate(dcb);
 		const auto pkts = Decode(r.ib);
-		Check(r.ok && HasLabelRelease(pkts, label, 1u) && HasLabelRelease(pkts, label + 4u, 0u), "the GPU writes a label it can reach");
+		bool       written = false;
+		for (const auto& p: pkts) {
+			written = written || (p.op == 0x49u && p.body[0] == (0x06200504u | (1u << 12u)) && p.body[1] == ((2u << 29u) | (1u << 16u)) &&
+			                      p.body[2] == static_cast<uint32_t>(label) && p.body[4] == 1u && p.body[5] == 0u);
+		}
+		Check(r.ok && written, "the GPU writes a label it can reach, as libSceAgc wrote it");
 		const auto& pts = r.segments[0].points;
 		Check(std::count_if(pts.begin(), pts.end(), [&](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Interrupt && p.ctx == kCtx; }) == 1,
 		      "and the interrupt keeps bit 27");
@@ -2112,7 +2148,12 @@ void TestValidateNativeIb() {
 	rejects({0xc0033700u, 0x200u, 0x1000u, 0u, 1u}, "WRITE_DATA without write confirm rejected");
 	rejects({0xc0033700u, 0x100000u, 0x1000u, 0u, 1u}, "WRITE_DATA to a register rejected");
 	rejects({0xc0064902u, kFlushEvent, 1u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "RELEASE_MEM with the compute bit rejected");
-	rejects({0xc0064900u, 0x528u, 2u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "a guest-form RELEASE_MEM rejected");
+	rejects({0xc0064900u, 0x52au, 2u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM in an event not known to run rejected");
+	rejects({0xc0064900u, 0x528u, 4u << 29u, 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM with an unknown DATA_SEL rejected");
+	{
+		std::vector<uint32_t> ib = {0xc0064900u, 0x06000528u, (2u << 29u) | (1u << 16u), 0x1000u, 0u, 1u, 0u, 0u};
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "the title's 64-bit L2 label passes on gfx");
+	}
 	rejects({0xc0064900u, kFlushEvent, (1u << 29u) | (1u << 24u), 0x1000u, 0u, 1u, 0u, 0u}, "a RELEASE_MEM interrupt alone rejected");
 	rejects({0xc0064900u, kFlushEvent, 1u << 29u, 0x1000u, 0u, 1u, 0u, 5u}, "a context id without an interrupt rejected");
 	{
@@ -4493,8 +4534,9 @@ void TestAuditPolicyLost() {
 	const auto rv = t.Translate(dcb);
 	Check(rv.ok && rv.stats.waits_native == 1 && rv.sync.policy_lost[Form(AuditSync::Wait)] == 0, "as written it keeps it");
 
-	// Releases in the guest's event keep it (CACHE_POLICY 3, libSceAgc's), the barrier's event (EVENT_INDEX 0, which
-	// LabelEventCntl does not keep) and an interrupt the tracker raises do not.
+	// Releases in the guest's event keep it (CACHE_POLICY 3, libSceAgc's), also one whose interrupt the tracker raises
+	// (it goes as written without the interrupt); the barrier's event (EVENT_INDEX 0, which LabelEventCntl does not
+	// keep) does not.
 	std::vector<uint32_t> rel;
 	AppendGuestRelease(rel, 1, 0, 0x202000300ull, 5, 1);
 	AppendGuestRelease(rel, 1, 0, 0x202000304ull, 5, 0, 0x06000014u);
@@ -4502,8 +4544,8 @@ void TestAuditPolicyLost() {
 	AppendGuestRelease(rel, 1, 0, 0x202000308ull, 5);
 	const auto rr = t.Translate(rel);
 	Check(rr.ok && rr.sync.packets[Form(AuditSync::Release)] == 4 && rr.sync.policy[Form(AuditSync::Release)][3] == 4 &&
-	          rr.sync.policy_lost[Form(AuditSync::Release)] == 2,
-	      "two of four releases lose their policy");
+	          rr.sync.policy_lost[Form(AuditSync::Release)] == 1,
+	      "one of four releases loses its policy");
 }
 
 // audit_waits: each wait a segment runs as a GPU wait or a barrier, with the first point after it.

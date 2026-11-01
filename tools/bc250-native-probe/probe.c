@@ -2566,10 +2566,27 @@ static bool DangerLabelVis(Device* d, Common* c) {
 			BoDestroy(d, &mem);
 			continue;
 		}
+		// LABELVIS_GO_UC=1: the CPU's go word in a UC buffer of its own, so the job keeps running after the label
+		// (no end-of-job cache flush) and the wait still sees the CPU's write whatever the label's mapping.
+		const bool go_uc = getenv("LABELVIS_GO_UC") != NULL;
+		Bo         go_bo = {0};
+		if (go_uc) {
+			r = MemCreate(d, &go_bo, MEM_GTT, 64 * KiB, NULL);
+			if (r == 0) {
+				r = BoBind(d, &go_bo, 0x0710000000ull + k * 0x100000ull, AMDGPU_VM_MTYPE_UC);
+			}
+			if (r != 0) {
+				printf("  %-7s: go buffer setup failed: %s\n", kinds[k].name, ErrStr(r));
+				BoDestroy(d, &mem);
+				continue;
+			}
+		}
 		volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
-		Bo*                bos[] = {&mem};
+		volatile uint32_t* go    = go_uc ? (volatile uint32_t*)go_bo.cpu : m + 16;
+		const uint64_t     go_va = go_uc ? go_bo.va : mem.va + 64;
+		Bo*                bos[] = {&mem, &go_bo};
 		m[0] = 0;          // the label
-		m[16] = 0;         // the CPU's go
+		*go  = 0;          // the CPU's go
 		__sync_synchronize();
 		Ib ib = {.n = 0};
 		// LABELVIS_EVENT: the event dword (default BOTTOM_OF_PIPE_TS, no GCR actions); LABELVIS_DST=1:
@@ -2580,22 +2597,28 @@ static bool DangerLabelVis(Device* d, Common* c) {
 		IbPush(&ib, ev != NULL ? (uint32_t)strtoul(ev, NULL, 0) : 0x28u | (5u << 8));
 		// LABELVIS_WIDE=1: a 64-bit label (DATA_SEL 2), its high dword 0x5eed0000 + kind.
 		const bool wide = getenv("LABELVIS_WIDE") != NULL;
-		IbPush(&ib, ((wide ? 2u : 1u) << 29) | ((dst != NULL ? (uint32_t)strtoul(dst, NULL, 0) & 3u : 0u) << 16)); // no interrupt
+		// LABELVIS_INTSEL: the release's INT_SEL (default 0, no interrupt): does the CP still write the data with it?
+		const char* intsel = getenv("LABELVIS_INTSEL");
+		IbPush(&ib, ((wide ? 2u : 1u) << 29) | ((dst != NULL ? (uint32_t)strtoul(dst, NULL, 0) & 3u : 0u) << 16) |
+		                ((intsel != NULL ? (uint32_t)strtoul(intsel, NULL, 0) & 7u : 0u) << 24));
 		IbPush(&ib, (uint32_t)mem.va);
 		IbPush(&ib, (uint32_t)(mem.va >> 32));
 		IbPush(&ib, 0x1abe1000u + (uint32_t)k);
 		IbPush(&ib, wide ? 0x5eed0000u + (uint32_t)k : 0u);
 		IbPush(&ib, 0);
-		IbPush(&ib, cs ? Pkt3(0x3cu, 6) : Pkt3Gfx(0x3cu, 6)); // WAIT_REG_MEM: memory, equal, ME
-		IbPush(&ib, 3u | (1u << 4) | wait_pol);
-		IbPush(&ib, (uint32_t)(mem.va + 64));
-		IbPush(&ib, (uint32_t)((mem.va + 64) >> 32));
-		IbPush(&ib, 1u);
-		IbPush(&ib, 0xffffffffu);
-		IbPush(&ib, 4u);
+		// LABELVIS_NOWAIT=1: only the label, no wait for the CPU's go (an NC poll never sees it and stops the ring).
+		if (getenv("LABELVIS_NOWAIT") == NULL) {
+			IbPush(&ib, cs ? Pkt3(0x3cu, 6) : Pkt3Gfx(0x3cu, 6)); // WAIT_REG_MEM: memory, equal, ME
+			IbPush(&ib, 3u | (1u << 4) | wait_pol);
+			IbPush(&ib, (uint32_t)go_va);
+			IbPush(&ib, (uint32_t)(go_va >> 32));
+			IbPush(&ib, 1u);
+			IbPush(&ib, 0xffffffffu);
+			IbPush(&ib, 4u);
+		}
 		IbPad(&ib);
 		uint64_t seq = 0;
-		r            = SubmitOn(d, ip, 0, &c->ib, &ib, bos, 1, &seq);
+		r            = SubmitOn(d, ip, 0, &c->ib, &ib, bos, go_uc ? 2 : 1, &seq);
 		if (r != 0) {
 			printf("  %-7s: submit failed: %s\n", kinds[k].name, ErrStr(r));
 			BoDestroy(d, &mem);
@@ -2614,7 +2637,7 @@ static bool DangerLabelVis(Device* d, Common* c) {
 				break;
 			}
 		}
-		m[16] = 1;
+		*go = 1;
 		__sync_synchronize();
 		const double t_go = NowSec();
 		int          w    = WaitOn(d, ip, 0, seq, 1.0);
@@ -2632,6 +2655,9 @@ static bool DangerLabelVis(Device* d, Common* c) {
 			_exit(3); // freeing buffers would wait on the stopped ring
 		}
 		BoDestroy(d, &mem);
+		if (go_uc) {
+			BoDestroy(d, &go_bo);
+		}
 	}
 	return true;
 }
