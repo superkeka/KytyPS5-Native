@@ -150,8 +150,49 @@ public:
 		return on;
 	}
 
+	// Direct memory is resident from its allocation, as on the PS5, where an allocation is physical memory the GPU
+	// reaches at once: sceKernelAllocateDirectMemory makes every block of it a buffer (PromoteBackingAtAlloc), with no
+	// MapReserve budget, so a mapping only binds views of buffers and nothing waits for a promotion, the dummy or a
+	// move (ASTRO BOT allocates 12406 MiB, Demon's Souls 12288, GT7 10562: all resident with Steam unloaded, the
+	// system's own pages in swap). A block that cannot be made resident (out of RAM) ends that: the log says the game
+	// runs in a non-PS5 mode, and the rest goes the map-time way. KYTY_NATIVE_GPU_RESIDENCY=map starts at map time,
+	// =partial on reference only.
+	static bool ResidencyAtAlloc() {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_RESIDENCY");
+			return v == nullptr || v[0] == '\0' || std::strcmp(v, "alloc") == 0;
+		}();
+		return on;
+	}
+
 	// True while every block with GPU access was made resident at map time.
 	[[nodiscard]] bool MapComplete() const { return ResidencyAtMap() && !m_map_overflow.load(std::memory_order_acquire); }
+
+	// Allocation-time residency (ResidencyAtAlloc) for backing bytes [offset, offset + size). Returns false once a block
+	// could not be made resident.
+	bool PromoteBackingAtAlloc(uint64_t offset, uint64_t size) {
+		if (size == 0 || !EnsureRange(offset, size) || m_alloc_failed.load(std::memory_order_acquire)) {
+			return false;
+		}
+		std::lock_guard<std::mutex> lock(m_lock);
+		VaSync                      va_sync(*this);
+		for (uint64_t index = offset / BlockSize(); index <= (offset + size - 1) / BlockSize(); index++) {
+			Block& block = m_blocks[index];
+			if (block.resident || block.code) {
+				continue;
+			}
+			if (!PromoteBlockUnlocked(index)) {
+				m_alloc_failed.store(true, std::memory_order_release);
+				m_map_overflow.store(true, std::memory_order_release);
+				std::fprintf(stderr,
+				             "GemBacking: NOT PS5 MODE: direct memory could not be made resident past %llu MiB (out of RAM); the "
+				             "rest becomes resident at map time or on reference\n",
+				             static_cast<unsigned long long>(m_resident_bytes >> 20u));
+				return false;
+			}
+		}
+		return true;
+	}
 
 	// Map-time residency for backing bytes [offset, offset + size) before their new view is bound: BindView then maps
 	// the view straight onto the blocks' buffers. Bound first, the view would map the dummy and PromoteAtMap would
@@ -2100,6 +2141,7 @@ private:
 	std::map<uint64_t, External>  m_external; // guest VA -> userptr buffer for non-direct ranges
 	std::array<std::pair<uint64_t, uint64_t>, 3> m_prt {}; // PRT apertures (start, size), SetPrtAperture
 	std::atomic<bool>             m_map_overflow {false}; // a block with GPU access stayed out of map-time residency
+	std::atomic<bool>             m_alloc_failed {false}; // PromoteBackingAtAlloc ran out of RAM: not the PS5 mode
 	mutable std::mutex            m_lock;     // guards blocks, views, m_external and the dummy
 };
 

@@ -2575,6 +2575,10 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 #if KYTY_GEM_BACKING_SUPPORTED
 	if (auto* gem = GetGemBacking(); gem != nullptr) {
 		gem->SetMemoryType(addr, len, memory_type);
+		// PS5 residency: direct memory is the GPU's from its allocation (KYTY_NATIVE_GPU_RESIDENCY=alloc).
+		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc()) {
+			gem->PromoteBackingAtAlloc(addr, len);
+		}
 	}
 #endif
 
