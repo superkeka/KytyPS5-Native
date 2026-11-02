@@ -50,6 +50,12 @@
 //      kernel: 0 adds a request to keep GFX powered, 1 drops it), as a PS5 title's GPU never powers its
 //      graphics block down between submissions; GFXOFF cost ASTRO BOT five times the late frames. The
 //      helper holds one request while any client asks and drops it when the last one disconnects.
+//   op 17 | vmid << 8, size = pasid: every wave of gfx-hub VMID `vmid` (1-7) killed, as the PS5 kernel ends a hung
+//      title's waves and as amdgpu's soft recovery does on gfx9 (gfx_v9_0_ring_soft_recovery; gfx10 has none): SQ_CMD
+//      = CMD 3 (KILL) | MODE 1 (broadcast) | CHECK_VMID | vmid << 28. Only when IH_VMID_n_LUT says that VMID serves
+//      `pasid` and the client process holds a DRM fd with that PASID (its /proc fdinfo): a client kills its own waves
+//      and no one else's. KFD's VMIDs (8-15) are refused, since KFD ends its own queues' waves, unless the helper is
+//      built with -DKYTY_LODHW_SQKILL_KFD (probing only). value = the SQ_CMD word written.
 // Build: cc -O2 -pthread -o kyty-lodhw kyty-lodhw.c. Run as root: kyty-lodhw [socket path] [socket group gid]
 
 #define _GNU_SOURCE
@@ -77,6 +83,7 @@ enum {
 	kIhVmidLut  = 0x10A0, // IH_VMID_0_LUT (OSSSYS seg0 0x10A0): the PASID each gfx-hub VMID serves
 	kInvReq     = 0x28b3, // GCVM_INVALIDATE_ENG16_REQ: amdgpu gives its rings 0-13 and keeps 17
 	kInvAck     = 0x28c5, // GCVM_INVALIDATE_ENG16_ACK
+	kSqCmd      = 0x1260 + 0x111b, // SQ_CMD (GC segment 0)
 	kReport     = 1u << 19,
 	kCachePol   = 1u << 28,
 	kEnable     = 1u << 29, // always set by the PS5 kernel
@@ -352,6 +359,65 @@ static void RestoreSaved(const struct Saved* e) {
 	fprintf(stderr, "kyty-lodhw: %s [sel 0x%03x] 0x%08x (set 0x%08x) restored to 0x%08x\n", name, e->sel, cur, e->set, e->old);
 }
 
+// Whether process `pid` holds a DRM fd whose fdinfo has "pasid:\t<pasid>" (amdgpu's line for the fd's VM).
+static int PidHasPasid(pid_t pid, uint32_t pasid) {
+	char pattern[64];
+	snprintf(pattern, sizeof(pattern), "/proc/%d/fdinfo/*", (int)pid);
+	glob_t g;
+	if (glob(pattern, 0, NULL, &g) != 0) {
+		return 0;
+	}
+	int found = 0;
+	for (size_t i = 0; i < g.gl_pathc && !found; i++) {
+		FILE* f = fopen(g.gl_pathv[i], "re");
+		if (f == NULL) {
+			continue;
+		}
+		char line[128];
+		while (fgets(line, sizeof(line), f) != NULL) {
+			unsigned v = 0;
+			if (sscanf(line, "pasid: %u", &v) == 1) {
+				found = v == pasid;
+				break;
+			}
+		}
+		fclose(f);
+	}
+	globfree(&g);
+	return found;
+}
+
+// Op 17: SQ_CMD KILL for every wave of `vmid`, if `pasid` owns it and is the client's. 0 or -errno.
+static int SqKill(int c, uint32_t vmid, uint32_t pasid, uint32_t* word) {
+#ifdef KYTY_LODHW_SQKILL_KFD
+	const uint32_t last = 15;
+#else
+	const uint32_t last = 7;
+#endif
+	if (vmid == 0 || vmid > last || pasid == 0) {
+		return -EINVAL;
+	}
+	struct ucred cr;
+	socklen_t    len = sizeof(cr);
+	if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &len) != 0 || !PidHasPasid(cr.pid, pasid)) {
+		return -EPERM;
+	}
+	if (Rd(kIhVmidLut + vmid) != pasid) {
+		return -ESRCH;
+	}
+	// With GFXOFF the SQ is powered down and the write is lost; a client that hangs keeps GFX busy anyway, but
+	// hold a request for the write as op 16 does.
+	const int gfxoff = g_gfxoff_holders == 0 && GfxoffRequest(0) == 0;
+	*word = 3u | 1u << 4 | 1u << 7 | vmid << 28;
+	const int r = Wr(kSqCmd, *word);
+	if (gfxoff) {
+		GfxoffRequest(1);
+	}
+	fprintf(stderr, "kyty-lodhw: SQ_CMD 0x%08x: waves of VMID %u (pasid %u, pid %d) killed%s\n", *word, vmid, pasid, (int)cr.pid,
+	        r == 0 ? "" : " (write failed)");
+	return r;
+}
+
 // One connected client. Only a client that issued reports leaves the reporter to be reset.
 static void* Client(void* arg) {
 	const int     c       = (int)(intptr_t)arg;
@@ -551,6 +617,8 @@ static void* Client(void* arg) {
 				}
 			}
 			rep.value = g_gfxoff_holders;
+		} else if ((q.op & 0xffu) == 17) {
+			rep.status = SqKill(c, q.op >> 8, q.size, &rep.value);
 		} else {
 			rep.status = -EINVAL;
 		}

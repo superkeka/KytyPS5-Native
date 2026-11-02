@@ -4814,6 +4814,40 @@ void TestInjectWait() {
 		          ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Compute),
 		      "on a compute ring: the compute wait, registered");
 	}
+	// SetInjectShader (fault, spin): one dispatch of Kyty's shader before the guest's, once, in either shadow mode.
+	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Off}) {
+		constexpr uint64_t kCode = 0x400001010000ull;
+		Pm4Translator      t;
+		TestOracle         o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		t.SetExitGuard(kAbort, kRun, kStub);
+		t.SetCpShadow(mode == CpShadowMode::Off ? 0u : kTestShadowVa, mode);
+		t.SetInjectShader(kCode);
+		auto dispatches = [](const std::vector<uint32_t>& ib, uint32_t* first_pgm) {
+			uint32_t n = 0, pgm = 0;
+			for (const auto& p: Decode(ib)) {
+				if (p.op == IT_SET_SH_REG && p.body.size() >= 2 && p.body[0] == 0x20Cu) {
+					pgm = p.body[1];
+				}
+				if (p.op == IT_DISPATCH_DIRECT) {
+					if (n++ == 0) {
+						*first_pgm = pgm;
+					}
+				}
+			}
+			return n;
+		};
+		const auto r   = t.Translate(dcb);
+		uint32_t   pgm = 0;
+		Check(r.ok && r.injected && dispatches(r.ib, &pgm) == 2 && pgm == static_cast<uint32_t>(kCode >> 8u),
+		      "the injected dispatch runs Kyty's shader before the guest's");
+		SetCpShadowValidation(mode == CpShadowMode::Load ? kTestShadowVa : 0u);
+		Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "the packet check takes the injected dispatch");
+		SetCpShadowValidation(0);
+		const auto r2 = t.Translate(dcb);
+		Check(r2.ok && !r2.injected && dispatches(r2.ib, &pgm) == 1, "the next buffer has only the guest's");
+	}
 }
 
 // KYTY_NATIVE_GPU_AUDIT (SetAudit): the guest's sync packets field by field, from its own dwords.

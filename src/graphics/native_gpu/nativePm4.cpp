@@ -4021,6 +4021,24 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			seg_effects = true;
 		}
 	}
+	// SetInjectShader: the dispatch goes where the injected wait would, with the compute state it needs; the guest's
+	// compute registers it overwrites do not matter, since the title is stopped once the wave is found.
+	if (m_inject_shader_va != 0 && labels) {
+		auto set_sh = [&](uint32_t reg, std::initializer_list<uint32_t> v) {
+			body.push_back(Pkt3(IT_SET_SH_REG, 1u + static_cast<uint32_t>(v.size()), true));
+			body.push_back(reg);
+			body.insert(body.end(), v.begin(), v.end());
+		};
+		set_sh(0x20c, {static_cast<uint32_t>(m_inject_shader_va >> 8u), static_cast<uint32_t>(m_inject_shader_va >> 40u)}); // PGM_LO/HI
+		set_sh(0x212, {1u | 0xc0u << 12u | 1u << 21u | 1u << 30u, 0u}); // RSRC1: 8 VGPRs, denorms, DX10_CLAMP, MEM_ORDERED; RSRC2
+		set_sh(0x228, {0u});                                            // RSRC3
+		set_sh(0x204, {0u, 0u, 0u, 64u, 1u, 1u});                       // START_X..Z, NUM_THREAD_X..Z
+		set_sh(0x215, {0u, 0xffffffffu, 0xffffffffu, 0u, 0xffffffffu, 0xffffffffu}); // RESOURCE_LIMITS, SE0/1, TMPRING, SE2/3
+		body.push_back(Pkt3(IT_DISPATCH_DIRECT, 4, true));
+		body.insert(body.end(), {1u, 1u, 1u, 1u | 1u << 2u | 1u << 6u}); // COMPUTE_SHADER_EN, FORCE_START_AT_0, ORDER_MODE
+		r.injected  = true;
+		seg_effects = true;
+	}
 	while (dw < dcb.size()) {
 		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
@@ -5821,7 +5839,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	}
 	r.cp_shadow = cp_shadow;
 	if (r.injected) {
-		m_inject_wait_va = 0; // once: a refused buffer leaves it armed for the next one
+		m_inject_wait_va   = 0; // once: a refused buffer leaves it armed for the next one
+		m_inject_shader_va = 0;
 	}
 
 	// Copies body[from, to) to the IB, each direct run in it as IB2s into the guest's buffer. Returns,

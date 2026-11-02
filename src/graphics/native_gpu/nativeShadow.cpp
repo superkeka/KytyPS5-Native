@@ -1446,7 +1446,7 @@ public:
 		const double       t_core      = NowSecShadow();
 		Pm4TranslateResult result      = tr.Translate(dcb);
 		if (result.injected) {
-			std::fprintf(stderr, "native inject: %s at dcb %llu (%s %llu carries the wait on scratch + %u)\n", InjectName(),
+			std::fprintf(stderr, "native inject: %s at dcb %llu (%s %llu carries it on scratch + %u)\n", InjectName(),
 			             static_cast<unsigned long long>(m_frames), kind, static_cast<unsigned long long>(frame), kInjectOffset);
 			std::fflush(stderr);
 		}
@@ -4018,7 +4018,8 @@ public:
 	// wait-nowatch (the same with the watchdog off: amdgpu's reset meets the wrap), wait-bare (unguarded, unwrapped and
 	// unregistered, refused unless CP shadowing is off: the L3 and post-reset paths), stream (the worker publishes a
 	// chunk 3.5 s late: T1s), kfd-wait (the wait at the start of the next ACB, on a KFD queue: nothing stops it unless gfx
-	// waits on it).
+	// waits on it), fault (one wave of Kyty's own at a DCB's start halts on a GPU page fault: T2, then L2), spin (one
+	// such wave that never ends: T1, then L2).
 	// Hang survival's switches, read once at Init (after the submitter's mode is known):
 	//   KYTY_NATIVE_GPU_ON_HANG           exit (default) | disable: a GPU failure on the submit side ends the title
 	//                                     (OnGpuFailureLocked) or turns the native path off as before
@@ -4029,7 +4030,7 @@ public:
 	//   KYTY_NATIVE_GPU_WATCH_MARGIN_MS   1000: the stop has to be done this long before amdgpu's timer
 	//   KYTY_NATIVE_GPU_WATCH_L1_MS       300: L1's time before L2
 	//   KYTY_NATIVE_GPU_WATCH_FAULT       exit (default) | log
-	//   KYTY_NATIVE_GPU_WATCH_SQKILL      0 (default) | 1: L2 through the helper's op 17, if it has it
+	//   KYTY_NATIVE_GPU_WATCH_SQKILL      1 (default) | 0: L2 through the helper's op 17, if it has it
 	//   KYTY_NATIVE_GPU_WATCH_HOOK        0 | 1: KYTY_NATIVE_GPU_HANG_HOOK in the watchdog's path (it eats the deadline)
 	//   KYTY_NATIVE_GPU_WATCH_EXIT_CODE   70 (EX_SOFTWARE)
 	//   KYTY_NATIVE_GPU_STREAM_MAX_MS     amdgpu's gfx timeout less 2 s (half of one of 4 s or less; 0: no bound)
@@ -4057,7 +4058,7 @@ public:
 		m_watch_poll_ms       = std::max(1.0, ms("KYTY_NATIVE_GPU_WATCH_POLL_MS", 20.0));
 		m_watch_l1_ms         = ms("KYTY_NATIVE_GPU_WATCH_L1_MS", 300.0);
 		m_watch_fault_exit    = !EnvIs("KYTY_NATIVE_GPU_WATCH_FAULT", "log");
-		m_watch_sqkill        = EnvIs("KYTY_NATIVE_GPU_WATCH_SQKILL", "1");
+		m_watch_sqkill        = !EnvIs("KYTY_NATIVE_GPU_WATCH_SQKILL", "0");
 		m_watch_hook          = EnvIs("KYTY_NATIVE_GPU_WATCH_HOOK", "1");
 		m_watch_exit_code     = static_cast<int>(ms("KYTY_NATIVE_GPU_WATCH_EXIT_CODE", 70.0));
 		m_stream_max_s        = ms("KYTY_NATIVE_GPU_STREAM_MAX_MS", WatchConfig::DefaultStreamMaxMs(m_watch_cfg.t_gfx_ms)) * 1e-3;
@@ -4093,7 +4094,7 @@ public:
 #endif
 	}
 
-	enum class InjectKind { None, Wait, WaitNoWatch, WaitBare, Stream, KfdWait };
+	enum class InjectKind { None, Wait, WaitNoWatch, WaitBare, Stream, KfdWait, Fault, Spin };
 	const char* InjectName() const {
 		switch (m_inject) {
 			case InjectKind::Wait: return "wait";
@@ -4101,6 +4102,8 @@ public:
 			case InjectKind::WaitBare: return "wait-bare";
 			case InjectKind::Stream: return "stream";
 			case InjectKind::KfdWait: return "kfd-wait";
+			case InjectKind::Fault: return "fault";
+			case InjectKind::Spin: return "spin";
 			default: return "none";
 		}
 	}
@@ -4119,9 +4122,11 @@ public:
 		           : kind == "wait-bare"    ? InjectKind::WaitBare
 		           : kind == "stream"       ? InjectKind::Stream
 		           : kind == "kfd-wait"     ? InjectKind::KfdWait
+		           : kind == "fault"        ? InjectKind::Fault
+		           : kind == "spin"         ? InjectKind::Spin
 		                                    : InjectKind::None;
 		if (m_inject == InjectKind::None) {
-			std::fprintf(stderr, "native inject: KYTY_NATIVE_GPU_INJECT_HANG=%s is not one of wait, wait-nowatch, wait-bare, stream, kfd-wait\n", v);
+			std::fprintf(stderr, "native inject: KYTY_NATIVE_GPU_INJECT_HANG=%s is not one of wait, wait-nowatch, wait-bare, stream, kfd-wait, fault, spin\n", v);
 			return;
 		}
 		std::fprintf(stderr, "native inject: %s from dcb %llu on (hang test)\n", InjectName(), static_cast<unsigned long long>(m_inject_dcb));
@@ -4149,6 +4154,24 @@ public:
 						return;
 					}
 					m_translator.SetInjectWait(va, true);
+					m_inject_armed = true;
+				}
+				break;
+			case InjectKind::Fault:
+			case InjectKind::Spin:
+				if (!acb) {
+					// One wave64 of our own: a load from VA 0, which nothing maps, halting the wave on a GPU page fault
+					// (global_load_dword v6, v[4:5]), or s_sleep in a loop forever.
+					static constexpr uint32_t kFault[] = {0x7e080280u, 0x7e0a0280u, 0xdc308000u, 0x067d0004u, 0xbf8c3f70u, 0xbf810000u};
+					static constexpr uint32_t kSpin[]  = {0xbf8e007fu, 0xbf82fffeu, 0xbf810000u};
+					auto* code = reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + kInjectCodeOffset);
+					const uint32_t* src = m_inject == InjectKind::Fault ? kFault : kSpin;
+					const size_t    n   = m_inject == InjectKind::Fault ? std::size(kFault) : std::size(kSpin);
+					for (size_t i = 0; i < n; i++) {
+						code[i] = src[i];
+					}
+					std::atomic_thread_fence(std::memory_order_seq_cst);
+					m_translator.SetInjectShader(m_submitter->ScratchVa() + kInjectCodeOffset);
 					m_inject_armed = true;
 				}
 				break;
@@ -6268,6 +6291,8 @@ private:
 	// KYTY_NATIVE_GPU_INJECT_HANG's wait word (Pm4Translator::SetInjectWait), between the run word and the trampolines:
 	// 0 from Init on, written by nobody but a stop's release of the injected wait.
 	static constexpr uint32_t kInjectOffset = 2064;
+	// KYTY_NATIVE_GPU_INJECT_HANG=fault|spin's shader, past the GPU clock pairs (4096 + 2048 x 16), 256-byte aligned.
+	static constexpr uint32_t kInjectCodeOffset = 65536;
 	// The guest waits each emitted segment gives the GPU, until the GPU has passed the segment's end
 	// point (StopGpu releases those of the segments it has not).
 	struct ExitWaits {

@@ -880,7 +880,7 @@ struct Pm4TranslateResult {
 	// segment does not carry on from the piece before it in the same job.
 	bool                    cp_shadow = false;
 	std::vector<uint32_t>   cp_shadow_resume;
-	// SetInjectWait: this buffer carries the injected wait (once per arming).
+	// SetInjectWait / SetInjectShader: this buffer carries the injected wait or shader (once per arming).
 	bool                    injected = false;
 	// SetAudit: the guest's sync packets field by field, and what refused the buffer (each opcode and reason once, at
 	// most 8), up to where the walk stopped.
@@ -1162,6 +1162,10 @@ public:
 		m_inject_wait_bare = bare;
 	}
 	[[nodiscard]] bool InjectWaitArmed() const { return m_inject_wait_va != 0; }
+	// KYTY_NATIVE_GPU_INJECT_HANG=fault|spin: the next buffer translated with native labels starts its body with one
+	// wave64 of the shader at `code_va` (256-byte aligned, 8 VGPRs, no user data), as a title's own broken shader would
+	// run: nothing but the wave kill (the watchdog's L2) ends it. Cleared once a buffer carries it, as the wait.
+	void SetInjectShader(uint64_t code_va) { m_inject_shader_va = code_va; }
 	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
 	// scan every stage's user-data SGPRs (PS, VS, GS, ES, HS, LS) and USER_DATA_ADDR; dispatches
 	// scan COMPUTE_USER_DATA_0..15. Descriptor tables those pointers name are read two levels deep
@@ -1370,6 +1374,7 @@ private:
 	bool                         m_cp_shadow_wait_record = false;
 	uint64_t                     m_inject_wait_va        = 0;     // SetInjectWait
 	bool                         m_inject_wait_bare      = false;
+	uint64_t                     m_inject_shader_va      = 0;     // SetInjectShader
 	bool                         m_pfp_sync_indirect = false;
 	bool                         m_cp_dma_idle       = true;
 	bool                         m_waits_verbatim    = false;

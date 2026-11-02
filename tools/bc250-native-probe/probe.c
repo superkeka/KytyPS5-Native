@@ -15,6 +15,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1306,6 +1308,188 @@ static bool DangerVmFaultRead(Device* d, Common* c) {
 	printf("  follow-up store on the same context: %s\n", ok ? "ok" : "FAILED");
 	BoDestroy(d, &dst);
 	return ok;
+}
+
+// One request to the kyty-lodhw helper (tools/bc250-lodhw): {op, size, va} in, {status, value} out. 0 or -errno.
+static int LodhwCall(uint32_t op, uint32_t size, uint64_t va, uint32_t* value) {
+	const char* path = getenv("KYTY_LODHW_SOCK") != NULL ? getenv("KYTY_LODHW_SOCK") : "/run/kyty-lodhw.sock";
+	const int   s    = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+	if (s < 0) {
+		return -errno;
+	}
+	struct sockaddr_un a;
+	memset(&a, 0, sizeof(a));
+	a.sun_family = AF_UNIX;
+	snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+	struct {
+		uint32_t op, size;
+		uint64_t va;
+	} q = {op, size, va};
+	struct {
+		int32_t  status;
+		uint32_t value;
+	} rep = {-EIO, 0};
+	int r = connect(s, (struct sockaddr*)&a, sizeof(a)) != 0 ? -errno : 0;
+	if (r == 0 && (send(s, &q, sizeof(q), 0) != (ssize_t)sizeof(q) || recv(s, &rep, sizeof(rep), 0) != (ssize_t)sizeof(rep))) {
+		r = -EIO;
+	}
+	close(s);
+	if (value != NULL) {
+		*value = rep.value;
+	}
+	return r != 0 ? r : rep.status;
+}
+
+// The PASID of this process's VM: the "pasid:" line of the DRM fd's fdinfo. 0 if none.
+static uint32_t OwnPasid(Device* d) {
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", d->fd);
+	FILE* f = fopen(path, "re");
+	if (f == NULL) {
+		return 0;
+	}
+	char     line[128];
+	unsigned pasid = 0;
+	while (fgets(line, sizeof(line), f) != NULL && sscanf(line, "pasid: %u", &pasid) != 1) {
+	}
+	fclose(f);
+	return pasid;
+}
+
+// The watchdog's L2 (KYTY_NATIVE_GPU_WATCH_SQKILL): a wave that never ends on its own, killed with SQ_CMD through
+// the helper's op 17, as the PS5 kernel ends a hung title's waves (gfx10's amdgpu has no soft recovery). The job's
+// fence must then signal without an amdgpu reset. SQKILL_RING compute (default) | gfx; SQKILL_SHADER long (a valid
+// wave spinning 30 s) | readfault (a wave halted by a GPU page fault at VA 0, killed as soon as the fault shows up);
+// SQKILL_AFTER_MS (1000) for long. On gfx a failed kill leaves a wave amdgpu's queue reset cannot end: the board may
+// need a power cycle.
+static bool DangerSqKill(Device* d, Common* c) {
+	const char*    ring_env = getenv("SQKILL_RING");
+	const char*    sh_env   = getenv("SQKILL_SHADER");
+	const char*    after    = getenv("SQKILL_AFTER_MS");
+	const bool     gfx      = ring_env != NULL && strcmp(ring_env, "gfx") == 0;
+	const bool     fault    = sh_env != NULL && strcmp(sh_env, "readfault") == 0;
+	const double   kill_at  = (after != NULL ? atof(after) : 1000.0) * 1e-3;
+	const uint32_t ip       = gfx ? AMDGPU_HW_IP_GFX : AMDGPU_HW_IP_COMPUTE;
+	const uint32_t tick_khz = d->info.gpu_counter_freq;
+	printf("== danger sqkill: %s wave on the %s ring, killed through kyty-lodhw op 17\n", fault ? "faulting" : "spinning",
+	       gfx ? "gfx" : "compute");
+
+	const uint32_t pasid = OwnPasid(d);
+	uint32_t       vmid  = 0;
+	int            r     = LodhwCall(4, 0x1260 + 0x0e27, 0, NULL); // CP_CPF_STATUS: is the helper there at all
+	if (pasid == 0 || r != 0) {
+		printf("  no PASID (%u) or no helper (%s)\n", pasid, ErrStr(r));
+		return false;
+	}
+	struct drm_amdgpu_info_gpuvm_fault f0;
+	memset(&f0, 0, sizeof(f0));
+	QueryInfo(d, AMDGPU_INFO_GPUVM_FAULT, &f0, sizeof(f0), 0);
+	PrintGpuvmFault(d, "before");
+
+	Bo prog;
+	r = MemCreate(d, &prog, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &prog, 0x0700000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &prog);
+		return false;
+	}
+	volatile uint32_t* pv = (volatile uint32_t*)prog.cpu;
+	memset(prog.cpu, 0, 4096);
+	uint32_t ud[3] = {(uint32_t)prog.va, (uint32_t)(prog.va >> 32), (uint32_t)(30.0 * tick_khz * 1000.0)};
+	if (fault) {
+		LoadCode(c, k_readfault_w64, sizeof(k_readfault_w64));
+	} else {
+		LoadCode(c, k_long_w64, sizeof(k_long_w64));
+	}
+	Dispatch p     = {c->code.va, 64, fault ? 16u : 8u, fault ? 2u : 3u, false, 64, 1, ud};
+	Ib       ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo*      bos[] = {&prog, &c->code};
+	uint64_t seq   = 0;
+	const double t0 = NowSec();
+	r               = SubmitOn(d, ip, 0, &c->ib, &ib, bos, 2, &seq);
+	if (r != 0) {
+		printf("  submit failed: %s\n", ErrStr(r));
+		BoDestroy(d, &prog);
+		return false;
+	}
+
+	// Wait for the trigger: the time, or a new fault (polled every 5 ms, as the watchdog does).
+	int    w      = 1;
+	double t_trig = 0.0;
+	while (w == 1 && t_trig == 0.0) {
+		w                = WaitOn(d, ip, 0, seq, 0.005);
+		const double now = NowSec() - t0;
+		if (fault) {
+			struct drm_amdgpu_info_gpuvm_fault f;
+			memset(&f, 0, sizeof(f));
+			if (QueryInfo(d, AMDGPU_INFO_GPUVM_FAULT, &f, sizeof(f), 0) == 0 && f.status != 0 &&
+			    (f.addr != f0.addr || f.status != f0.status)) {
+				printf("  fault at %.1f ms: addr 0x%" PRIx64 " status 0x%x (VMID %u, CID 0x%x, %s)\n", now * 1e3, (uint64_t)f.addr,
+				       f.status, (f.status >> 20) & 0xfu, (f.status >> 9) & 0x1ffu, ((f.status >> 18) & 1u) ? "write" : "read");
+				t_trig = now;
+			}
+		} else if (now >= kill_at) {
+			t_trig = now;
+		}
+		if (now > 4.0) {
+			printf("  no trigger within 4 s\n");
+			break;
+		}
+	}
+	if (w != 1) {
+		printf("  job ended before the kill: %s after %.1f ms\n", w == 0 ? "signaled" : ErrStr(w), (NowSec() - t0) * 1e3);
+	}
+
+	uint32_t kills = 0;
+	double   t_end = 0.0;
+	if (w == 1 && t_trig != 0.0) {
+		r = LodhwCall(13u | pasid << 8, 0, 0, &vmid);
+		printf("  pasid %u -> gfx VMID %u (%s)\n", pasid, vmid, ErrStr(r));
+		for (kills = 0; kills < 2 && r == 0 && w == 1; kills++) {
+			uint32_t  word = 0;
+			const int k    = LodhwCall(17u | vmid << 8, pasid, 0, &word);
+			printf("  kill %u at %.1f ms: SQ_CMD 0x%08x, %s\n", kills + 1, (NowSec() - t0) * 1e3, word, ErrStr(k));
+			if (k != 0) {
+				break;
+			}
+			w = WaitOn(d, ip, 0, seq, 0.150);
+		}
+		t_end = NowSec() - t0;
+		printf("  after the kill: job %s at %.1f ms (%.1f ms after the trigger)\n",
+		       w == 0 ? "signaled" : (w == 1 ? "still running" : ErrStr(w)), t_end * 1e3, (t_end - t_trig) * 1e3);
+	}
+	if (w == 1) {
+		// Not killed: amdgpu's timeout and reset decide (compute 10 s, gfx 5 s on this board's lockup_timeout).
+		w = WaitOn(d, ip, 0, seq, 15.0);
+		printf("  then: %s at %.1f ms\n", w == 0 ? "signaled" : (w == 1 ? "TIMEOUT" : ErrStr(w)), (NowSec() - t0) * 1e3);
+	}
+	const int64_t state = ContextState(d);
+	const uint64_t elapsed = (uint64_t)pv[0] | ((uint64_t)pv[1] << 32);
+	if (!fault) {
+		printf("  wave ran %.2f s, finished on its own: %s\n", (double)elapsed / (tick_khz * 1000.0), pv[2] == 1 ? "yes" : "no");
+	}
+	printf("  context state 0x%" PRIx64 "\n", (uint64_t)state);
+	PrintGpuvmFault(d, "after");
+	BoDestroy(d, &prog);
+	if (state != 0) {
+		return false;
+	}
+
+	LoadCode(c, k_store_w64, sizeof(k_store_w64));
+	Bo dst;
+	r = MemCreate(d, &dst, MEM_GTT, 2 * MiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &dst, 0x0200000000ull, 0);
+	}
+	bool ok = r == 0 && StoreAndCheck(d, c, &dst, &c->code, 64, 64);
+	printf("  follow-up store on the same context: %s\n", ok ? "ok" : "FAILED");
+	BoDestroy(d, &dst);
+	return ok && kills > 0 && w == 0 && t_end - t_trig < 0.5;
 }
 
 static bool DangerDot2c(Device* d, Common* c) {
@@ -4841,7 +5025,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order condib condexec exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
+	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order condib condexec exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
 	printf("PRT cases, in risk order: prt-map prt-split prt-read-compute prt-write-compute prt-kfd-tlb prt-replace-race prt-cp-compute prt-gfx-{copy,dma,write,wait,dispatch}\n");
 }
 
@@ -4905,6 +5089,8 @@ int main(int argc, char** argv) {
 			ok = DangerVmFaultRead(&d, &c);
 		} else if (strcmp(danger, "long") == 0) {
 			ok = DangerLong(&d, &c);
+		} else if (strcmp(danger, "sqkill") == 0) {
+			ok = DangerSqKill(&d, &c);
 		} else if (strcmp(danger, "dot2c") == 0) {
 			ok = DangerDot2c(&d, &c);
 		} else if (strcmp(danger, "dot2x") == 0) {

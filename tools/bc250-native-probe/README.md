@@ -97,6 +97,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `vmfault` | one wave64 stores 256 bytes to the unmapped VA `0x900000000`, then a normal store checks the GPU |
 | `vmfault-read` | one wave64 loads a dword at the unmapped VA `0` (a null descriptor's base) and stores it, then a normal store checks the GPU |
 | `long` | one valid wave64 spins 12 s, publishing elapsed GPU time |
+| `sqkill` | a wave that never ends on its own (`SQKILL_SHADER=long`, spinning 30 s, killed after `SQKILL_AFTER_MS`; or `readfault`, halted by a page fault at VA `0`, killed as soon as the fault query shows it), killed through the kyty-lodhw helper's op 17 (SQ_CMD KILL for the probe's own VMID) on `SQKILL_RING=compute` or `gfx`; passes when the job's fence signals within 0.5 s with no amdgpu reset |
 | `dot2c` | `v_dot2c_f32_f16` (gfx10.3 encoding) with known inputs |
 | `dot2x` | same opcode as raw words with several accumulators/inputs, plus a control store |
 | `gds` | GDS/GWS/OA allocation, then 64 lanes of GDS `ds_add_rtn_u32` |
@@ -247,6 +248,16 @@ devcoredump are the debugging path.
 - So `noretry` does not change what a fault costs: the faulting wave halts either way. On the gfx ring
   it is the whole board: Demon's Souls froze it right after this same fault (a TCP read of VA 0 from a
   gfx VMID). Every address a guest shader can reach has to be mapped.
+
+### `sqkill` result (2026-11-02)
+
+- Op 17 ends the probe's waves at once on both rings, with no queue reset and a clean context afterwards:
+  spinning wave on compute 1.4 ms, on gfx 1.5 ms after the kill; a wave halted by a page fault at VA 0 on
+  compute 0.7 ms, on gfx 1.2 ms after the fault query showed it (the fault itself is seen 4-5 ms after the
+  submit). The follow-up store on the same context passed each time.
+- So the halted wave above is not the end of the board: SQ_CMD KILL for the VMID retires it, the draw or
+  dispatch behind it finishes and the job ends. gfx10's amdgpu has no soft recovery (gfx9's
+  `gfx_v9_0_ring_soft_recovery` is this write), so nothing but the helper does it on the BC-250.
 
 ### `long` result
 
