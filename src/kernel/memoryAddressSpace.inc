@@ -110,6 +110,11 @@ public:
 			m_gem = Libs::Graphics::NativeGpu::GemBacking::Create(m_size);
 			if (m_gem != nullptr) {
 				m_backing_base = m_gem->AliasBase();
+				// KYTY_NATIVE_GPU_PRT_NET: the guest's GPU windows read zeros where nothing is mapped. The low window
+				// ends where GuestRange::Valid's does (Graphics::LOWER_ADDRESS_SIZE, 1 TiB); GEM_VA starts at 64 KiB.
+				constexpr uint64_t kGpuLowWindowEnd = 1ull << 40u;
+				m_gem->InstallPrtNet({{{0x10000ull, kGpuLowWindowEnd - 0x10000ull},
+				                       {kExtendedMemoryBase, kExtendedMemorySize}}});
 				return;
 			}
 			LOGF_COLOR(Log::Color::Red,

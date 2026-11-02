@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/kfd_ioctl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3757,11 +3758,1091 @@ static bool RunBlob(Device* d, Common* c, const char* path, uint32_t vgprs) {
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// PRT mappings (GEM_VA with AMDGPU_VM_PAGE_PRT and no buffer): what Kyty's PRT net (KYTY_NATIVE_GPU_PRT_NET,
+// GemBacking::InstallPrtNet) relies on. On gfx10 a PRT page-table entry has VALID clear and PRT set; a client that
+// honours it reads zeros and drops writes, one that does not faults as at an unmapped address. Danger cases, in
+// risk order (run each alone, `dmesg` and a ping after each): prt-map and prt-split (no GPU work), prt-read-compute,
+// prt-write-compute, prt-kfd-tlb, prt-replace-race, prt-cp-compute, then prt-gfx-{copy,write,dma,wait,dispatch} (the
+// gfx ring: a client that faults there takes the board down). Never on the gfx ring: an INDIRECT_BUFFER or a shader
+// fetched from PRT (zeros run as packets or instructions, a hang with no fault), and VA [0, 64 KiB) (GEM_VA refuses it).
+
+#ifndef AMDGPU_VM_EXPLICIT_SYNC
+#define AMDGPU_VM_EXPLICIT_SYNC (1u << 10)
+#endif
+
+// Generated with llvm-mc (gfx1013, wave64) from the sources in the comments.
+// prt_global: s[0:1] = destination, s[2:3] = source. Lane i loads source + 4i (global_load_dword) and stores it at
+// destination + 4i.
+//   v_lshlrev_b32 v1, 2, v0 / global_load_dword v2, v1, s[2:3] / s_waitcnt vmcnt(0) / global_store_dword v1, v2, s[0:1]
+static const uint32_t k_prt_global_w64[] = {
+	0x34020082u, 0xdc308000u, 0x02020001u, 0xbf8c3f70u, 0xdc708000u, 0x00000201u,
+	0xbf810000u,
+};
+// prt_flat: the same through flat_load_dword (v_add_co_u32 v2, vcc, s2, v1 / v_mov_b32 v3, s3 /
+// v_add_co_ci_u32 v3, vcc, 0, v3, vcc / flat_load_dword v4, v[2:3] / s_waitcnt vmcnt(0) lgkmcnt(0)).
+static const uint32_t k_prt_flat_w64[] = {
+	0x34020082u, 0xd70f6a02u, 0x00020202u, 0x7e060203u, 0x50060680u, 0xdc300000u,
+	0x047d0002u, 0xbf8c0070u, 0xdc708000u, 0x00000401u, 0xbf810000u,
+};
+// prt_scalar: s_load_dwordx4 s[4:7], s[2:3], 0 (SQC), every lane stores s4 | s5 | s6 | s7 at destination + 4i.
+static const uint32_t k_prt_scalar_w64[] = {
+	0xf4080101u, 0xfa000000u, 0xbf8cc07fu, 0x88040504u, 0x88040604u, 0x88040704u,
+	0x34020082u, 0x7e040204u, 0xdc708000u, 0x00000201u, 0xbf810000u,
+};
+// prt_buffer: buffer_load_dword v2, v1, s[4:7], 0 offen through a raw V# built from s[2:3] (stride 0, 4 KiB,
+// DST_SEL XYZW, FORMAT 32_FLOAT, RESOURCE_LEVEL 1, OOB_SELECT raw: 0x31016fac).
+static const uint32_t k_prt_buffer_w64[] = {
+	0xbe840302u, 0x8705ff03u, 0x0000ffffu, 0xbe8603ffu, 0x00001000u, 0xbe8703ffu,
+	0x31016facu, 0x34020082u, 0xe0301000u, 0x80010201u, 0xbf8c3f70u, 0xdc708000u,
+	0x00000201u, 0xbf810000u,
+};
+// prt_image: image_load v2, v0, s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_1D unorm through a T# built from s[2:3]: base
+// s[2:3] >> 8, FORMAT 32_UINT (20), width 64, TYPE 1D (8), linear (SW_MODE 0), DST_SEL XYZW, RESOURCE_LEVEL 1.
+static const uint32_t k_prt_image_w64[] = {
+	0x90088802u, 0x8f099803u, 0x88080908u, 0x90098803u, 0x8709ff09u, 0x000000ffu,
+	0x8809ff09u, 0xc1400000u, 0xbe8a03ffu, 0x8000000fu, 0xbe8b03ffu, 0x80000facu,
+	0xbe8c0380u, 0xbe8d03ffu, 0x00400000u, 0xbe8e0380u, 0xbe8f0380u, 0xf0001100u,
+	0x00020200u, 0xbf8c3f70u, 0x34020082u, 0xdc708000u, 0x00000201u, 0xbf810000u,
+};
+// prt_write: s[0:1] = destination, s[2:3] = target. Lane i: global_store_dword of 0x5a5a0000 + i at target + 4i,
+// buffer_store_dword of the same at target + 0x100 + 4i (raw V#), global_atomic_add (glc, returns) of 1 at
+// target + 0x200 + 4i, s_waitcnt_vscnt null, 0, then global_load_dword (glc dlc) of target + 4i; stores (atomic
+// return, load) at destination + 8i.
+static const uint32_t k_prt_write_w64[] = {
+	0x34020082u, 0x4a0400ffu, 0x5a5a0000u, 0xdc708000u, 0x00020201u, 0xbe840302u,
+	0x8705ff03u, 0x0000ffffu, 0xbe8603ffu, 0x00001000u, 0xbe8703ffu, 0x31016facu,
+	0x4a0602ffu, 0x00000100u, 0xe0701000u, 0x80010203u, 0x4a0802ffu, 0x00000200u,
+	0x7e0a0281u, 0xdcc98000u, 0x06020504u, 0xbf8c3f70u, 0xbbfd0000u, 0xdc319000u,
+	0x07020001u, 0xbf8c3f70u, 0x34100083u, 0xdc748000u, 0x00000608u, 0xbf810000u,
+};
+// prt_race: s[0:1] = destination, s[2:3] = source (64 KiB), s[4:5] = stop word, s6 = most rounds. Each round lane i
+// loads (glc dlc) source + 4i + 256k for k = 0..255, the whole 64 KiB, ORing what it read; then reads the stop word
+// and ends when it is not 0. Stores (OR, rounds) at destination + 8i.
+static const uint32_t k_prt_race_w64[] = {
+	0x34020082u, 0x7e060280u, 0x7e0a0280u, 0xbe870380u, 0xbe880380u, 0x4a040208u,
+	0xdc319000u, 0x04020002u, 0xbf8c3f70u, 0x38060903u, 0x8008ff08u, 0x00000100u,
+	0xbf0aff08u, 0x00010000u, 0xbf85fff6u, 0x80078107u, 0xdc319000u, 0x06040005u,
+	0xbf8c3f70u, 0x7e120506u, 0xbf078009u, 0xbf850002u, 0xbf0a0607u, 0xbf85ffecu,
+	0x340e0083u, 0x7e100303u, 0x7e120207u, 0xdc748000u, 0x00000807u, 0xbf810000u,
+};
+// prt_kfdtlb: s[0:1] = log, s[2:3] = X, s[4:5] = control (+0 stop, +4 epoch), s6 = most entries. Lane 0 only
+// (s_mov_b64 exec, 1) loops: loads X and the epoch (glc dlc), s_memrealtime, and writes the entry {value, epoch,
+// time lo, time hi} at log + 16n, until the stop word is set or n = s6; then writes n at control + 8.
+static const uint32_t k_prt_kfdtlb_w64[] = {
+	0xbefe0481u, 0x7e020280u, 0xbe870380u, 0xdc319000u, 0x02020001u, 0xdc319004u,
+	0x03040001u, 0xf4940200u, 0x00000000u, 0xbf8c0070u, 0x7e080208u, 0x7e0a0209u,
+	0x8f0a8407u, 0x7e0c020au, 0xdc798000u, 0x00000206u, 0xdc319000u, 0x07040001u,
+	0xbf8c3f70u, 0x7e160507u, 0x80078107u, 0xbf07800bu, 0xbf850002u, 0xbf0a0607u,
+	0xbf85ffeau, 0x7e100207u, 0xdc718008u, 0x00040801u, 0xbf810000u,
+};
+
+// drm_amdgpu_gem_va with the timeline fields of kernels from 6.16 on (GemBacking::GemVaTimeline): the page-table
+// update's fence lands on a syncobj, so a case can wait for the update as Kyty's mapping calls do (VaSync).
+typedef struct {
+	uint32_t handle;
+	uint32_t pad;
+	uint32_t operation;
+	uint32_t flags;
+	uint64_t va_address;
+	uint64_t offset_in_bo;
+	uint64_t map_size;
+	uint64_t vm_timeline_point;
+	uint32_t vm_timeline_syncobj_out;
+	uint32_t num_syncobj_handles;
+	uint64_t input_fence_syncobj_handles;
+} PrtGemVa;
+
+typedef struct {
+	Device*  d;
+	uint32_t syncobj;
+	uint64_t point;
+} PrtVm;
+
+static void PrtVmInit(PrtVm* v, Device* d) {
+	memset(v, 0, sizeof(*v));
+	v->d = d;
+	struct drm_syncobj_create c;
+	memset(&c, 0, sizeof(c));
+	if (Ioctl(d->fd, DRM_IOCTL_SYNCOBJ_CREATE, &c) == 0) {
+		v->syncobj = c.handle;
+	}
+}
+
+// One GEM_VA with explicit sync, as Kyty issues them: a buffer (RWX) or, with handle 0, AMDGPU_VM_PAGE_PRT.
+static int PrtVa(PrtVm* v, uint32_t op, uint32_t handle, uint64_t va, uint64_t size, uint32_t flags) {
+	PrtGemVa a;
+	memset(&a, 0, sizeof(a));
+	a.handle     = handle;
+	a.operation  = op;
+	a.flags      = flags | AMDGPU_VM_EXPLICIT_SYNC;
+	a.va_address = va;
+	a.map_size   = size;
+	if (v->syncobj != 0) {
+		a.vm_timeline_syncobj_out = v->syncobj;
+		a.vm_timeline_point       = ++v->point;
+	}
+	int r = Ioctl(v->d->fd, v->syncobj != 0 ? DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA, PrtGemVa) : DRM_IOCTL_AMDGPU_GEM_VA, &a);
+	if (r != 0) {
+		printf("    GEM_VA op %u%s at 0x%" PRIx64 " +0x%" PRIx64 ": %s\n", op, handle == 0 ? " PRT" : "", va, size, ErrStr(r));
+	}
+	return r;
+}
+
+static int PrtMap(PrtVm* v, uint64_t va, uint64_t size) {
+	return PrtVa(v, AMDGPU_VA_OP_REPLACE, 0, va, size, AMDGPU_VM_PAGE_PRT);
+}
+
+static int PrtBind(PrtVm* v, const Bo* bo, uint64_t va, uint64_t size) {
+	return PrtVa(v, AMDGPU_VA_OP_REPLACE, bo->handle, va, size, VA_RWX);
+}
+
+// Waits for the page-table updates of every GEM_VA so far. Milliseconds waited, -1 on a timeout or an error.
+static double PrtVmWait(PrtVm* v, int timeout_ms) {
+	if (v->syncobj == 0 || v->point == 0) {
+		return 0;
+	}
+	const double    t0 = NowSec();
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	uint32_t                         handle = v->syncobj;
+	uint64_t                         point  = v->point;
+	struct drm_syncobj_timeline_wait w;
+	memset(&w, 0, sizeof(w));
+	w.handles       = (uintptr_t)&handle;
+	w.points        = (uintptr_t)&point;
+	w.count_handles = 1;
+	w.timeout_nsec  = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec + (int64_t)timeout_ms * 1000000;
+	w.flags         = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+	int r           = Ioctl(v->d->fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &w);
+	return r == 0 ? (NowSec() - t0) * 1e3 : -1.0;
+}
+
+// An always-valid GTT buffer (as Kyty's blocks are: a KFD queue reaches it, a CS need not list it) filled with `fill`.
+static int PrtBuffer(Device* d, Bo* bo, uint64_t size, uint32_t fill) {
+	int r = BoCreate(d, bo, size, AMDGPU_GEM_DOMAIN_GTT, AMDGPU_GEM_CREATE_VM_ALWAYS_VALID);
+	if (r == 0) {
+		r = BoMap(d, bo, NULL);
+	}
+	if (r == 0) {
+		uint32_t* p = (uint32_t*)bo->cpu;
+		for (uint64_t i = 0; i < size / 4; i++) {
+			p[i] = fill;
+		}
+		__sync_synchronize();
+	}
+	return r;
+}
+
+static long long PrtVramUsedKiB(void) {
+	long long v = -1;
+	FILE*     f = fopen("/sys/class/drm/renderD128/device/mem_info_vram_used", "re");
+	if (f != NULL) {
+		if (fscanf(f, "%lld", &v) != 1) {
+			v = -1;
+		}
+		fclose(f);
+	}
+	return v < 0 ? -1 : v / 1024;
+}
+
+// The DRM file's memory and identity lines (/proc/self/fdinfo): page tables count as this client's VRAM.
+static void PrtFdinfo(Device* d, const char* when) {
+	char path[64], line[160];
+	snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", d->fd);
+	FILE* f = fopen(path, "re");
+	printf("  fdinfo (%s), VRAM used on the device %lld KiB:", when, PrtVramUsedKiB());
+	while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+		if (strncmp(line, "drm-memory-", 11) == 0 || strncmp(line, "drm-total-", 10) == 0 ||
+		    strncmp(line, "drm-resident-", 13) == 0 || strncmp(line, "pasid", 5) == 0 || strncmp(line, "drm-client-id", 13) == 0) {
+			line[strcspn(line, "\n")] = '\0';
+			printf(" [%s]", line);
+		}
+	}
+	printf("\n");
+	if (f != NULL) {
+		fclose(f);
+	}
+}
+
+// PRT_HOLD_SEC (default `def`): keeps the VM alive for umr (`umr --vm-decode`, see the README), with its pasid.
+static void PrtHold(Device* d, int def) {
+	const char* v    = getenv("PRT_HOLD_SEC");
+	const int   hold = v != NULL ? atoi(v) : def;
+	if (hold <= 0) {
+		return;
+	}
+	PrtFdinfo(d, "held");
+	printf("  holding the VM %d s (pid %d); no CS has run in it, so it has no VMID: decode through its page directory\n", hold,
+	       (int)getpid());
+	fflush(stdout);
+	sleep((unsigned)hold);
+}
+
+// P-0. The PRT net's windows in a fresh VM (its own render-node file), no GPU work: what the two REPLACEs cost and how
+// many page tables they take, against 4 KiB-granular PRT, then 2000 always-valid buffer binds of 16-64 KiB into the
+// low window and back to PRT, without and with Kyty's pre-split (a PRT REPLACE of the piece first).
+static bool DangerPrtMap(const char* path) {
+	printf("== danger prt-map: PRT net windows in a fresh GPU VM, no GPU work\n");
+	Device v;
+	if (DeviceOpen(&v, path) != 0) {
+		return false;
+	}
+	PrtVm vm;
+	PrtVmInit(&vm, &v);
+	printf("  GEM_VA timeline: %s\n", vm.syncobj != 0 ? "yes" : "no (page-table update times not measured)");
+	PrtFdinfo(&v, "fresh VM");
+	bool ok = true;
+
+	// 4 KiB-granular PRT: every other 4 KiB page of 64 MiB at 16 TiB (outside the windows), 8192 mappings.
+	const uint64_t g4    = 1ull << 44;
+	const long long k0   = PrtVramUsedKiB();
+	double         t0    = NowSec();
+	int            fails = 0;
+	for (uint32_t i = 0; i < 8192; i++) {
+		fails += PrtMap(&vm, g4 + (uint64_t)i * 8192, 4096) != 0;
+	}
+	double ioctl_ms = (NowSec() - t0) * 1e3;
+	double wait_ms  = PrtVmWait(&vm, 2000);
+	printf("  4 KiB granular: 8192 PRT pages over 64 MiB: %d failed, ioctls %.1f ms, updates %.1f ms after, device VRAM %+lld KiB\n",
+	       fails, ioctl_ms, wait_ms, PrtVramUsedKiB() - k0);
+	ok = ok && fails == 0;
+
+	// The windows of KYTY_NATIVE_GPU_PRT_NET=all: [64 KiB, 1 TiB) and the extended window [8 TiB, +512 GiB).
+	const struct {
+		uint64_t    va, size;
+		const char* name;
+	} win[2] = {{0x10000ull, (1ull << 40) - 0x10000ull, "low [64 KiB, 1 TiB)"}, {0x80000000000ull, 512 * GiB, "extended [8 TiB, +512 GiB)"}};
+	for (int i = 0; i < 2; i++) {
+		const long long k = PrtVramUsedKiB();
+		t0                = NowSec();
+		const int r       = PrtMap(&vm, win[i].va, win[i].size);
+		ioctl_ms          = (NowSec() - t0) * 1e3;
+		wait_ms           = PrtVmWait(&vm, 2000);
+		printf("  %s: REPLACE PRT %s, ioctl %.2f ms, update %.2f ms after, device VRAM %+lld KiB\n", win[i].name, ErrStr(r), ioctl_ms,
+		       wait_ms, PrtVramUsedKiB() - k);
+		ok = ok && r == 0 && wait_ms >= 0;
+	}
+	PrtFdinfo(&v, "with the net");
+
+	Bo  bo;
+	int r = PrtBuffer(&v, &bo, 64 * KiB, 0x0b0b0b0bu);
+	if (r != 0) {
+		printf("  always-valid buffer: %s\n", ErrStr(r));
+		close(v.fd);
+		return false;
+	}
+	uint32_t seed = 0x2545f491u;
+	for (int split = 0; split < 2; split++) {
+		const long long k      = PrtVramUsedKiB();
+		double          waited = 0, worst = 0;
+		fails                  = 0;
+		t0                     = NowSec();
+		for (int i = 0; i < 2000; i++) {
+			seed                = seed * 1664525u + 1013904223u;
+			const uint64_t va   = 0x100000ull + (uint64_t)(seed % ((1u << 26) - 64)) * 16 * KiB;
+			const uint64_t size = 16 * KiB * (1 + ((seed >> 28) & 3u));
+			if (split != 0) {
+				fails += PrtMap(&vm, va, size) != 0;
+			}
+			fails += PrtBind(&vm, &bo, va, size) != 0;
+			const double w = PrtVmWait(&vm, 200); // a mapping call waits for its update (VaSync), an unmap does not
+			fails += w < 0;
+			waited += w > 0 ? w : 0;
+			worst = w > worst ? w : worst;
+			fails += PrtMap(&vm, va, size) != 0;
+		}
+		const double total_ms = (NowSec() - t0) * 1e3;
+		printf("  2000 binds into the low window and back to PRT, %s: %d failed, %.1f ms (%.1f us a bind and unbind), "
+		       "updates waited %.1f ms (worst %.2f ms), device VRAM %+lld KiB\n",
+		       split != 0 ? "with pre-split" : "no pre-split", fails, total_ms, total_ms * 1e3 / 2000, waited, worst,
+		       PrtVramUsedKiB() - k);
+		ok = ok && fails == 0;
+	}
+	PrtVmWait(&vm, 2000);
+	PrtFdinfo(&v, "after the binds");
+	printf("  addresses for umr: 0x10000 and 0x200000 (low window head), 0x40000000 (a 1 GiB entry), 0x80000000000 (extended)\n");
+	PrtHold(&v, 0);
+	BoDestroy(&v, &bo);
+	close(v.fd);
+	printf("  %s\n", ok ? "every mapping went through" : "a mapping FAILED");
+	return ok;
+}
+
+// P-6a. The pre-split hazard on the page tables, no GPU work and no CS (a CS ioctl rewrites the PRT remainders): a
+// 64 KiB buffer bound in the middle of a 1 GiB PRT mapping without a pre-split, and the same with one. Decode the
+// printed addresses with umr while the case holds the VM (PRT_HOLD_SEC, default 120).
+static bool DangerPrtSplit(const char* path) {
+	printf("== danger prt-split: a buffer bound inside a 1 GiB PRT mapping, without and with a PRT pre-split, for umr\n");
+	Device v;
+	if (DeviceOpen(&v, path) != 0) {
+		return false;
+	}
+	PrtVm vm;
+	PrtVmInit(&vm, &v);
+	Bo  bo;
+	int r = PrtBuffer(&v, &bo, 64 * KiB, 0x0b0b0b0bu);
+	if (r != 0) {
+		printf("  always-valid buffer: %s\n", ErrStr(r));
+		close(v.fd);
+		return false;
+	}
+	const uint64_t base[2] = {0x4000000000ull, 0x4040000000ull};
+	const uint64_t mid     = 512 * MiB;
+	bool           ok      = PrtMap(&vm, base[0], GiB) == 0 && PrtMap(&vm, base[1], GiB) == 0;
+	ok                     = ok && PrtVmWait(&vm, 2000) >= 0;
+	ok                     = ok && PrtBind(&vm, &bo, base[0] + mid, 64 * KiB) == 0 && PrtVmWait(&vm, 2000) >= 0;
+	ok                     = ok && PrtMap(&vm, base[1] + mid, 64 * KiB) == 0;
+	ok                     = ok && PrtBind(&vm, &bo, base[1] + mid, 64 * KiB) == 0 && PrtVmWait(&vm, 2000) >= 0;
+	printf("  mappings: %s\n", ok ? "ok" : "FAILED");
+	for (int i = 0; i < 2; i++) {
+		printf("  %s pre-split, 1 GiB PRT at 0x%" PRIx64 ":\n", i == 0 ? "without" : "with", base[i]);
+		printf("    0x%" PRIx64 "  the GiB's start: PRT\n", base[i] + 0x1000);
+		printf("    0x%" PRIx64 "  the buffer: valid, system\n", base[i] + mid);
+		printf("    0x%" PRIx64 "  rest of the same 2 MiB: PRT expected; 0 means the hazard (rewritten only by the next CS)\n",
+		       base[i] + mid + 64 * KiB);
+		printf("    0x%" PRIx64 "  rest of the same GiB: PRT expected; 0 means the hazard\n", base[i] + mid + 2 * MiB);
+	}
+	PrtHold(&v, 120);
+	BoDestroy(&v, &bo);
+	close(v.fd);
+	return ok;
+}
+
+// Runs one 64-lane wave64 group of `code` with user SGPRs `ud` (`num_ud`; s[0:1] is the destination `dst`) on the
+// compute ring and copies `out_dw` dwords of the destination out. Prints the job's end; false on a fault or a timeout.
+static bool PrtRun(Device* d, Common* c, Bo* dst, const uint32_t* code, size_t size, const uint32_t* ud, uint32_t num_ud,
+                   uint32_t groups, uint32_t* out, uint32_t out_dw) {
+	memset(dst->cpu, 0xee, out_dw * 4u);
+	__sync_synchronize();
+	LoadCode(c, (const uint8_t*)code, size);
+	Dispatch p  = {c->code.va, 64, 16, num_ud, false, 64, groups, ud};
+	Ib       ib = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo*      bos[] = {dst, &c->code};
+	uint64_t seq   = 0;
+	double   t0    = NowSec();
+	int      r     = Submit(d, &c->ib, &ib, bos, 2, &seq);
+	if (r == 0) {
+		r = Wait(d, seq, 15.0); // past amdgpu's lockup timeout: a hang shows as a reset
+	}
+	int64_t state = ContextState(d);
+	if (r != 0 || state != 0) {
+		printf("    job: %s after %.1f ms, context state 0x%" PRIx64 "\n", r == 1 ? "TIMEOUT" : ErrStr(r), (NowSec() - t0) * 1e3,
+		       (uint64_t)state);
+		return false;
+	}
+	memcpy(out, dst->cpu, out_dw * 4u);
+	return true;
+}
+
+static bool PrtFollowUp(Device* d, Common* c) {
+	LoadCode(c, k_store_w64, sizeof(k_store_w64));
+	Bo  dst;
+	int r = MemCreate(d, &dst, MEM_GTT, 2 * MiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &dst, 0x0200000000ull, 0);
+	}
+	bool ok = r == 0 && StoreAndCheck(d, c, &dst, &c->code, 64, 64);
+	printf("  follow-up store on the same context: %s\n", ok ? "ok" : "FAILED");
+	BoDestroy(d, &dst);
+	return ok;
+}
+
+static Bo* PrtDst(Device* d, Bo* dst, uint64_t va, bool uc) {
+	int r = MemCreate(d, dst, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, dst, va, uc ? AMDGPU_VM_MTYPE_UC : 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, dst);
+		return NULL;
+	}
+	return dst;
+}
+
+static const struct {
+	const char*     name;
+	const uint32_t* code;
+	size_t          size;
+} k_prt_loads[] = {
+    {"global", k_prt_global_w64, sizeof(k_prt_global_w64)}, {"flat", k_prt_flat_w64, sizeof(k_prt_flat_w64)},
+    {"scalar", k_prt_scalar_w64, sizeof(k_prt_scalar_w64)}, {"buffer", k_prt_buffer_w64, sizeof(k_prt_buffer_w64)},
+    {"image", k_prt_image_w64, sizeof(k_prt_image_w64)},
+};
+
+// P-1. Compute-ring reads of PRT: global, flat, scalar (SQC), buffer (V#) and image (linear 1D T#) loads of a page in a
+// 1 GiB PRT entry, a 2 MiB one, a single 4 KiB one, and the rest of a 1 GiB PRT mapping a buffer was bound into (with
+// Kyty's pre-split unless PRT_PRESPLIT=0), plus the buffer itself. Every PRT read must give 0 with no fault; the first
+// job that does not finish stops the case. PRT_LOADS (e.g. "global,scalar") picks the loads.
+static bool DangerPrtReadCompute(Device* d, Common* c) {
+	printf("== danger prt-read-compute: shader loads of PRT pages on the compute ring\n");
+	PrintGpuvmFault(d, "before");
+	PrtVm vm;
+	PrtVmInit(&vm, d);
+	Bo  dst, buf;
+	int r = PrtBuffer(d, &buf, 64 * KiB, 0x0b0b0b0bu);
+	if (r != 0 || PrtDst(d, &dst, 0x0201000000ull, false) == NULL) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	const bool     presplit = getenv("PRT_PRESPLIT") == NULL || getenv("PRT_PRESPLIT")[0] != '0';
+	const uint64_t split    = 0x40c0000000ull;
+	const uint64_t mid      = split + 512 * MiB;
+	bool           ok       = PrtMap(&vm, 0x4000000000ull, GiB) == 0 && PrtMap(&vm, 0x4040000000ull, 2 * MiB) == 0 &&
+	           PrtMap(&vm, 0x4080001000ull, 4 * KiB) == 0 && PrtMap(&vm, split, GiB) == 0;
+	ok = ok && (!presplit || PrtMap(&vm, mid, 64 * KiB) == 0) && PrtBind(&vm, &buf, mid, 64 * KiB) == 0;
+	ok = ok && PrtVmWait(&vm, 2000) >= 0;
+	if (!ok) {
+		printf("  PRT mappings FAILED\n");
+		return false;
+	}
+	const struct {
+		uint64_t    va;
+		uint32_t    want;
+		const char* name;
+	} targets[] = {
+	    {0x4000000000ull + 0x12345000ull, 0, "in a 1 GiB PRT entry"},
+	    {0x4040000000ull + 0x3000ull, 0, "in a 2 MiB PRT entry"},
+	    {0x4080001000ull, 0, "a single 4 KiB PRT page"},
+	    {mid + 64 * KiB, 0, presplit ? "rest of a pre-split 2 MiB" : "rest of a 2 MiB, no pre-split"},
+	    {mid + 2 * MiB, 0, presplit ? "rest of a pre-split GiB" : "rest of a GiB, no pre-split"},
+	    {mid, 0x0b0b0b0bu, "the buffer bound inside (control)"},
+	};
+	const char* only = getenv("PRT_LOADS");
+	// Load by load, the image load (the T# built in the shader is the least checked) last, so a fault names its client.
+	for (size_t k = 0; k < ARRAY_SIZE(k_prt_loads) && ok; k++) {
+		if (only != NULL && strstr(only, k_prt_loads[k].name) == NULL) {
+			continue;
+		}
+		printf("  %s load:\n", k_prt_loads[k].name);
+		for (size_t t = 0; t < ARRAY_SIZE(targets) && ok; t++) {
+			uint32_t out[64];
+			uint32_t ud[4] = {(uint32_t)dst.va, (uint32_t)(dst.va >> 32), (uint32_t)targets[t].va, (uint32_t)(targets[t].va >> 32)};
+			if (!PrtRun(d, c, &dst, k_prt_loads[k].code, k_prt_loads[k].size, ud, 4, 1, out, 64)) {
+				printf("    %s load of 0x%" PRIx64 " did not finish\n", k_prt_loads[k].name, targets[t].va);
+				PrintGpuvmFault(d, "after");
+				_exit(3); // freeing buffers would wait on the stopped ring
+			}
+			uint32_t good = 0;
+			for (uint32_t i = 0; i < 64; i++) {
+				good += out[i] == targets[t].want ? 1u : 0u;
+			}
+			printf("    0x%" PRIx64 " %s: %s", targets[t].va, targets[t].name, good == 64 ? "ok" : "WRONG");
+			if (good != 64) {
+				printf(" (lane 0 0x%08x, %u of 64 right)", out[0], good);
+				ok = false;
+			}
+			printf("\n");
+		}
+	}
+	PrintGpuvmFault(d, "after");
+	BoDestroy(d, &dst);
+	BoDestroy(d, &buf);
+	return PrtFollowUp(d, c) && ok;
+}
+
+// P-2. Compute-ring writes into PRT: global_store, buffer_store and global_atomic_add with return into a 2 MiB PRT
+// mapping, then a load of what was stored: all 0, no fault. Then a buffer full of a pattern replaces the PRT there and
+// the same loads must find the pattern intact (the writes were dropped, not parked in a cache or sent elsewhere).
+static bool DangerPrtWriteCompute(Device* d, Common* c) {
+	printf("== danger prt-write-compute: shader stores and atomics into PRT on the compute ring\n");
+	PrintGpuvmFault(d, "before");
+	PrtVm vm;
+	PrtVmInit(&vm, d);
+	Bo             dst, buf;
+	const uint32_t pattern = 0xc0dec0deu;
+	int            r       = PrtBuffer(d, &buf, 64 * KiB, pattern);
+	if (r != 0 || PrtDst(d, &dst, 0x0201000000ull, false) == NULL) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	const uint64_t t  = 0x4100000000ull;
+	bool           ok = PrtMap(&vm, t, 2 * MiB) == 0 && PrtVmWait(&vm, 2000) >= 0;
+	uint32_t       out[128];
+	uint32_t       ud[4] = {(uint32_t)dst.va, (uint32_t)(dst.va >> 32), (uint32_t)t, (uint32_t)(t >> 32)};
+	if (!ok || !PrtRun(d, c, &dst, k_prt_write_w64, sizeof(k_prt_write_w64), ud, 4, 1, out, 128)) {
+		printf("  the store job did not finish\n");
+		PrintGpuvmFault(d, "after");
+		_exit(3);
+	}
+	uint32_t zeros = 0;
+	for (uint32_t i = 0; i < 128; i++) {
+		zeros += out[i] == 0 ? 1u : 0u;
+	}
+	printf("  stores, buffer stores and atomics into PRT: done; atomic returns and loads back %s (lane 0: atomic 0x%08x, load 0x%08x)\n",
+	       zeros == 128 ? "all 0" : "NOT all 0", out[0], out[1]);
+	ok = zeros == 128;
+
+	ok = ok && PrtBind(&vm, &buf, t, 64 * KiB) == 0 && PrtVmWait(&vm, 2000) >= 0;
+	for (uint32_t off = 0; ok && off < 0x300; off += 0x100) {
+		uint32_t in[64];
+		ud[2] = (uint32_t)(t + off);
+		ud[3] = (uint32_t)((t + off) >> 32);
+		if (!PrtRun(d, c, &dst, k_prt_global_w64, sizeof(k_prt_global_w64), ud, 4, 1, in, 64)) {
+			_exit(3);
+		}
+		uint32_t good = 0;
+		for (uint32_t i = 0; i < 64; i++) {
+			good += in[i] == pattern ? 1u : 0u;
+		}
+		printf("  after a buffer replaced the PRT, +0x%03x reads the pattern in %u of 64 lanes (lane 0 0x%08x)\n", off, good, in[0]);
+		ok = good == 64;
+	}
+	const uint32_t* cpu  = (const uint32_t*)buf.cpu;
+	uint32_t        kept = 0;
+	for (uint32_t i = 0; i < 0x300 / 4; i++) {
+		kept += cpu[i] == pattern ? 1u : 0u;
+	}
+	printf("  the buffer's first 0x300 bytes on the CPU: %u of %u dwords still the pattern\n", kept, 0x300u / 4);
+	ok = ok && kept == 0x300u / 4;
+	PrtMap(&vm, t, 64 * KiB);
+	PrtVmWait(&vm, 2000);
+	PrintGpuvmFault(d, "after");
+	BoDestroy(d, &dst);
+	BoDestroy(d, &buf);
+	return PrtFollowUp(d, c) && ok;
+}
+
+// A KFD user-mode compute queue in the render node's VM (as Kyty's ACBs run), for prt-kfd-tlb.
+typedef struct {
+	uint64_t va, size, handle;
+	void*    cpu;
+} PrtKfdMem;
+
+typedef struct {
+	int                fd;
+	uint32_t           gpu;
+	PrtKfdMem          ring, ptrs, eop, ctx;
+	uint32_t           queue;
+	volatile uint64_t* wptr;
+	volatile uint64_t* doorbell;
+	uint64_t           w;
+} PrtKfd;
+
+static int PrtKfdAlloc(PrtKfd* q, Device* d, PrtKfdMem* m, uint64_t va, uint64_t size, uint32_t flags) {
+	struct kfd_ioctl_alloc_memory_of_gpu_args a;
+	memset(&a, 0, sizeof(a));
+	a.va_addr = va;
+	a.size    = size;
+	a.gpu_id  = q->gpu;
+	a.flags   = flags;
+	int r     = Ioctl(q->fd, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &a);
+	if (r != 0) {
+		printf("  KFD allocation at 0x%" PRIx64 " (0x%" PRIx64 "): %s\n", va, size, ErrStr(r));
+		return r;
+	}
+	m->va     = va;
+	m->size   = size;
+	m->handle = a.handle;
+	m->cpu    = NULL;
+	struct kfd_ioctl_map_memory_to_gpu_args mp;
+	memset(&mp, 0, sizeof(mp));
+	mp.handle               = a.handle;
+	mp.device_ids_array_ptr = (uintptr_t)&q->gpu;
+	mp.n_devices            = 1;
+	if ((r = Ioctl(q->fd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &mp)) != 0) {
+		printf("  KFD map: %s\n", ErrStr(r));
+		return r;
+	}
+	if ((flags & KFD_IOC_ALLOC_MEM_FLAGS_GTT) != 0) {
+		void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, d->fd, (off_t)a.mmap_offset);
+		if (p == MAP_FAILED) {
+			printf("  mmap of KFD memory: %s\n", strerror(errno));
+			return -errno;
+		}
+		m->cpu = p;
+		memset(p, 0, size);
+	}
+	return 0;
+}
+
+// KFD in `d`'s VM (ACQUIRE_VM, the memory policy GemBacking sets) and one PM4 compute queue at KFD VAs from
+// 0x500000000000 (clear of guest memory, Kyty's IB at 0x400000000000 and GemBacking's KFD VAs from 0x600000000000).
+static bool PrtKfdOpen(PrtKfd* q, Device* d) {
+	memset(q, 0, sizeof(*q));
+	q->fd = -1;
+	char path[96];
+	for (int n = 0; n < 8 && q->gpu == 0; n++) {
+		snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/gpu_id", n);
+		FILE* f = fopen(path, "re");
+		if (f != NULL) {
+			unsigned v = 0;
+			if (fscanf(f, "%u", &v) == 1 && v != 0) {
+				q->gpu = v;
+			}
+			fclose(f);
+		}
+	}
+	q->fd = open("/dev/kfd", O_RDWR | O_CLOEXEC);
+	if (q->fd < 0 || q->gpu == 0) {
+		printf("  no KFD (%s, gpu id %u)\n", strerror(errno), q->gpu);
+		return false;
+	}
+	struct kfd_ioctl_acquire_vm_args acq;
+	memset(&acq, 0, sizeof(acq));
+	acq.drm_fd = (uint32_t)d->fd;
+	acq.gpu_id = q->gpu;
+	int r      = Ioctl(q->fd, AMDKFD_IOC_ACQUIRE_VM, &acq);
+	if (r != 0) {
+		printf("  ACQUIRE_VM: %s\n", ErrStr(r));
+		return false;
+	}
+	struct kfd_ioctl_set_memory_policy_args policy;
+	memset(&policy, 0, sizeof(policy));
+	policy.gpu_id           = q->gpu;
+	policy.default_policy   = KFD_IOC_CACHE_POLICY_COHERENT;
+	policy.alternate_policy = KFD_IOC_CACHE_POLICY_COHERENT;
+	Ioctl(q->fd, AMDKFD_IOC_SET_MEMORY_POLICY, &policy);
+	const uint64_t va  = 0x500000000000ull;
+	const uint32_t gtt = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
+	                     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+	if (PrtKfdAlloc(q, d, &q->ring, va, 64 * KiB, gtt) != 0 || PrtKfdAlloc(q, d, &q->ptrs, va + 0x100000, 4096, gtt) != 0 ||
+	    PrtKfdAlloc(q, d, &q->eop, va + 0x200000, 4096,
+	                KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE) != 0) {
+		return false;
+	}
+	struct kfd_ioctl_create_queue_args cq;
+	memset(&cq, 0, sizeof(cq));
+	cq.ring_base_address     = q->ring.va;
+	cq.write_pointer_address = q->ptrs.va;
+	cq.read_pointer_address  = q->ptrs.va + 64;
+	cq.ring_size             = (uint32_t)q->ring.size;
+	cq.gpu_id                = q->gpu;
+	cq.queue_type            = KFD_IOC_QUEUE_TYPE_COMPUTE;
+	cq.queue_percentage      = 100;
+	cq.queue_priority        = 7;
+	cq.eop_buffer_address    = q->eop.va;
+	cq.eop_buffer_size       = q->eop.size;
+	cq.ctx_save_restore_size = 8368128;
+	cq.ctl_stack_size        = 12288;
+	// The context save area must be exactly the CWSR size plus the debugger area (32 bytes a wave), page aligned; the
+	// wave count is the kernel's (kfd_probe.c).
+	static const uint32_t kWaves[] = {768, 960, 480, 1536};
+	r                              = -EINVAL;
+	for (uint32_t i = 0; i < ARRAY_SIZE(kWaves) && r != 0; i++) {
+		const uint64_t debug = ((uint64_t)kWaves[i] * 32 + 63) & ~63ull;
+		const uint64_t total = (8368128 + debug + 4095) & ~4095ull;
+		if (PrtKfdAlloc(q, d, &q->ctx, va + 0x1000000 + (uint64_t)i * 0x1000000, total, gtt) != 0) {
+			continue;
+		}
+		cq.ctx_save_restore_address = q->ctx.va;
+		r                           = Ioctl(q->fd, AMDKFD_IOC_CREATE_QUEUE, &cq);
+	}
+	if (r != 0) {
+		printf("  CREATE_QUEUE: %s\n", ErrStr(r));
+		return false;
+	}
+	q->queue              = cq.queue_id;
+	const uint64_t slice  = 8192;
+	uint8_t*       db     = mmap(NULL, slice, PROT_READ | PROT_WRITE, MAP_SHARED, q->fd, (off_t)(cq.doorbell_offset & ~(slice - 1)));
+	if (db == MAP_FAILED) {
+		printf("  doorbell mmap: %s\n", strerror(errno));
+		return false;
+	}
+	q->doorbell = (volatile uint64_t*)(db + (cq.doorbell_offset & (slice - 1)));
+	q->wptr     = (volatile uint64_t*)q->ptrs.cpu;
+	return true;
+}
+
+static void PrtKfdSubmit(PrtKfd* q, const Ib* ib) {
+	uint32_t*      rb   = (uint32_t*)q->ring.cpu;
+	const uint64_t mask = q->ring.size / 4 - 1;
+	for (uint32_t i = 0; i < ib->n; i++) {
+		rb[(q->w++) & mask] = ib->dw[i];
+	}
+	__sync_synchronize();
+	*q->wptr = q->w;
+	__sync_synchronize();
+	*q->doorbell = q->w;
+}
+
+// A KFD map ioctl of an already-mapped buffer: the stock kernel then flushes the process's VMID (GemBacking::FlushKfdTlb).
+static bool PrtKfdMapFlush(PrtKfd* q, const PrtKfdMem* m) {
+	struct kfd_ioctl_map_memory_to_gpu_args mp;
+	memset(&mp, 0, sizeof(mp));
+	mp.handle               = m->handle;
+	mp.device_ids_array_ptr = (uintptr_t)&q->gpu;
+	mp.n_devices            = 1;
+	return Ioctl(q->fd, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &mp) == 0;
+}
+
+// P-5. Does a KFD queue cache PRT translations? A wave on a KFD queue (lane 0) reads X in a loop and logs (value,
+// epoch, GPU time). The render node rebinds X while it runs, waits for the page-table update and only then bumps the
+// epoch: 1 a buffer (pattern) over PRT, no flush; 2 PRT over the buffer, no flush; 3 the buffer again, then a KFD map
+// ioctl (FlushKfdTlb's flush); 4 PRT again, then PRT_TLB_FLUSH_CMD (e.g. the kyty-lodhw op-14 helper; without it the
+// KFD map flush). Reads of the old value after the epoch changed are stale translations; the case prints how many and
+// for how long. Both states are valid PTEs, so no fault is expected.
+static bool DangerPrtKfdTlb(Device* d, Common* c) {
+	(void)c;
+	printf("== danger prt-kfd-tlb: KFD queue reads of a VA the render node switches between PRT and a buffer\n");
+	PrintGpuvmFault(d, "before");
+	PrtKfd q;
+	if (!PrtKfdOpen(&q, d)) {
+		return false;
+	}
+	PrtVm vm;
+	PrtVmInit(&vm, d);
+	const uint32_t pattern = 0xa1a1a1a1u;
+	Bo             buf;
+	if (PrtBuffer(d, &buf, 64 * KiB, pattern) != 0) {
+		printf("  always-valid buffer failed\n");
+		return false;
+	}
+	const uint64_t x   = 0x4200000000ull;
+	const uint32_t gtt = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE |
+	                     KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+	PrtKfdMem      code, log, ctl;
+	const uint32_t max_entries = 262144; // 4 MiB of 16-byte entries
+	if (PrtKfdAlloc(&q, d, &code, 0x500006000000ull, 64 * KiB, gtt) != 0 ||
+	    PrtKfdAlloc(&q, d, &log, 0x500008000000ull, (uint64_t)max_entries * 16, gtt) != 0 ||
+	    PrtKfdAlloc(&q, d, &ctl, 0x50000c000000ull, 4096, gtt | KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED) != 0) {
+		return false;
+	}
+	if (PrtMap(&vm, x, 2 * MiB) != 0 || PrtVmWait(&vm, 2000) < 0) {
+		return false;
+	}
+	memcpy(code.cpu, k_prt_kfdtlb_w64, sizeof(k_prt_kfdtlb_w64));
+	FlushCpu(code.cpu, sizeof(k_prt_kfdtlb_w64));
+	volatile uint32_t* cw = (volatile uint32_t*)ctl.cpu; // [0] stop, [1] epoch, [2] entries written
+	cw[0] = cw[1] = cw[2] = 0;
+	__sync_synchronize();
+	uint32_t ud[7] = {(uint32_t)log.va,           (uint32_t)(log.va >> 32), (uint32_t)x, (uint32_t)(x >> 32),
+	                  (uint32_t)ctl.va,           (uint32_t)(ctl.va >> 32), max_entries};
+	Dispatch p     = {code.va, 64, 16, 7, false, 64, 1, ud};
+	Ib       ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	PrtKfdSubmit(&q, &ib);
+	volatile uint32_t* lg = (volatile uint32_t*)log.cpu;
+	double             t0 = NowSec();
+	while (lg[3] == 0 && lg[2] == 0 && NowSec() - t0 < 2.0) {
+	}
+	if (lg[3] == 0 && lg[2] == 0) {
+		printf("  the KFD wave did not start\n");
+		_exit(3);
+	}
+	const char* cmd = getenv("PRT_TLB_FLUSH_CMD");
+	for (uint32_t epoch = 1; epoch <= 4; epoch++) {
+		const bool to_buffer = (epoch & 1u) != 0;
+		int        r         = to_buffer ? PrtBind(&vm, &buf, x, 64 * KiB) : PrtMap(&vm, x, 64 * KiB);
+		const double w       = PrtVmWait(&vm, 2000);
+		const char*  flush   = "none";
+		if (epoch == 3 || (epoch == 4 && cmd == NULL)) {
+			flush = PrtKfdMapFlush(&q, &ctl) ? "KFD map ioctl" : "KFD map ioctl FAILED";
+		} else if (epoch == 4) {
+			flush = system(cmd) == 0 ? cmd : "PRT_TLB_FLUSH_CMD FAILED";
+		}
+		__sync_synchronize();
+		cw[1] = epoch;
+		__sync_synchronize();
+		printf("  epoch %u: X -> %s (%s, update %.2f ms), flush: %s\n", epoch, to_buffer ? "buffer" : "PRT", ErrStr(r), w, flush);
+		usleep(150000);
+	}
+	cw[0] = 1;
+	__sync_synchronize();
+	t0 = NowSec();
+	while (cw[2] == 0 && NowSec() - t0 < 2.0) {
+	}
+	const uint32_t n = cw[2];
+	if (n == 0) {
+		printf("  the KFD wave did not finish (stopped?)\n");
+		PrintGpuvmFault(d, "after");
+		_exit(3);
+	}
+	const double tick_us = 1000.0 / (double)d->info.gpu_counter_freq;
+	bool         ok      = true;
+	uint32_t     before  = 0;
+	for (uint32_t i = 0; i < n && lg[i * 4 + 1] == 0; i++) {
+		before += lg[i * 4] == 0 ? 1u : 0u;
+	}
+	printf("  %u entries; before epoch 1 X read 0 in %u reads\n", n, before);
+	for (uint32_t epoch = 1; epoch <= 4; epoch++) {
+		const uint32_t want  = (epoch & 1u) != 0 ? pattern : 0u;
+		uint32_t       first = n, seen = n, last = n, stale = 0, wrong = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			if (lg[i * 4 + 1] != epoch) {
+				continue;
+			}
+			first = first == n ? i : first;
+			last  = i;
+			if (lg[i * 4] == want) {
+				seen = seen == n ? i : seen;
+			} else if (seen == n) {
+				stale++;
+			} else {
+				wrong++;
+			}
+		}
+		if (first == n) {
+			printf("  epoch %u: no reads\n", epoch);
+			ok = false;
+			continue;
+		}
+		const uint64_t t_first = (uint64_t)lg[first * 4 + 2] | ((uint64_t)lg[first * 4 + 3] << 32);
+		const uint64_t t_seen  = seen == n ? (uint64_t)lg[last * 4 + 2] | ((uint64_t)lg[last * 4 + 3] << 32)
+		                                   : (uint64_t)lg[seen * 4 + 2] | ((uint64_t)lg[seen * 4 + 3] << 32);
+		printf("  epoch %u (X -> %s): %u reads; %s after %u stale reads, %.1f us; %u reads of the old value later\n", epoch,
+		       want != 0 ? "buffer" : "PRT", last - first + 1, seen == n ? "the new value NEVER seen" : "the new value seen", stale,
+		       (double)(t_seen - t_first) * tick_us, wrong);
+		ok = ok && seen != n && wrong == 0;
+	}
+	struct kfd_ioctl_destroy_queue_args dq;
+	memset(&dq, 0, sizeof(dq));
+	dq.queue_id = q.queue;
+	Ioctl(q.fd, AMDKFD_IOC_DESTROY_QUEUE, &dq);
+	PrintGpuvmFault(d, "after");
+	printf("  %s\n", ok ? "every switch was seen by the KFD queue" : "a switch was NOT seen, or went back");
+	return ok;
+}
+
+// P-7. The REPLACE window: a page-table REPLACE first writes 0 over the piece it frees and then the new entries, in two
+// updates, so a range rebound under a running wave is invalid for a few microseconds (Kyty's promotions and unbinds do
+// this today). Waves on the compute ring read a 64 KiB range (glc dlc) round after round while the CPU switches it
+// between an always-valid buffer and PRT PRT_RACE_SWITCHES times (default 10000, at most 4 s), waiting for each bind's
+// update as Kyty does. A read in the window faults (the wave halts, the compute ring resets): never on the gfx ring.
+static bool DangerPrtReplaceRace(Device* d, Common* c) {
+	const char*    env      = getenv("PRT_RACE_SWITCHES");
+	const uint32_t switches = env != NULL ? (uint32_t)strtoul(env, NULL, 0) : 10000u;
+	const uint32_t groups   = 4;
+	printf("== danger prt-replace-race: %u wave64 groups read 64 KiB while it switches buffer <-> PRT %u times\n", groups, switches);
+	PrintGpuvmFault(d, "before");
+	PrtVm vm;
+	PrtVmInit(&vm, d);
+	Bo  dst, stop, buf;
+	int r = PrtBuffer(d, &buf, 64 * KiB, 0x00000001u);
+	if (r != 0 || PrtDst(d, &dst, 0x0201000000ull, false) == NULL || PrtDst(d, &stop, 0x0202000000ull, true) == NULL) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	volatile uint32_t* sw = (volatile uint32_t*)stop.cpu;
+	memset(stop.cpu, 0, 4096);
+	memset(dst.cpu, 0, 64 * KiB);
+	const uint64_t x = 0x4300000000ull;
+	if (PrtMap(&vm, x, 2 * MiB) != 0 || PrtVmWait(&vm, 2000) < 0) {
+		return false;
+	}
+	LoadCode(c, (const uint8_t*)k_prt_race_w64, sizeof(k_prt_race_w64));
+	uint32_t ud[7] = {(uint32_t)dst.va, (uint32_t)(dst.va >> 32), (uint32_t)x, (uint32_t)(x >> 32), (uint32_t)stop.va,
+	                  (uint32_t)(stop.va >> 32), 100000000u};
+	Dispatch p     = {c->code.va, 64, 16, 7, false, 64, groups, ud};
+	Ib       ib    = {.n = 0};
+	IbDispatch(&ib, &p);
+	IbPad(&ib);
+	Bo*      bos[] = {&dst, &stop, &c->code};
+	uint64_t seq   = 0;
+	if ((r = Submit(d, &c->ib, &ib, bos, 3, &seq)) != 0) {
+		printf("  submit failed: %s\n", ErrStr(r));
+		return false;
+	}
+	usleep(5000);
+	const double t0    = NowSec();
+	uint32_t     done  = 0;
+	int          early = 1;
+	for (; done < switches && NowSec() - t0 < 4.0; done++) {
+		PrtBind(&vm, &buf, x, 64 * KiB);
+		PrtVmWait(&vm, 50);
+		PrtMap(&vm, x, 64 * KiB);
+		if ((done & 255u) == 255u && (early = WaitOn(d, AMDGPU_HW_IP_COMPUTE, 0, seq, 0)) != 1) {
+			done++;
+			break;
+		}
+	}
+	const double switch_ms = (NowSec() - t0) * 1e3;
+	sw[0]                  = 1;
+	__sync_synchronize();
+	const int     w     = Wait(d, seq, 10.0);
+	const int64_t state = ContextState(d);
+	printf("  %u switches in %.0f ms%s; job %s, context state 0x%" PRIx64 "\n", done, switch_ms,
+	       early != 1 ? " (the job ENDED while switching)" : "", w == 0 ? "signaled" : (w == 1 ? "TIMEOUT" : ErrStr(w)), (uint64_t)state);
+	PrintGpuvmFault(d, "after");
+	if (w != 0 || state != 0) {
+		_exit(3);
+	}
+	const uint32_t* o = (const uint32_t*)dst.cpu;
+	printf("  lane 0: %u rounds, read OR 0x%08x (1: it saw the buffer)\n", o[1], o[0]);
+	PrtMap(&vm, x, 64 * KiB);
+	PrtVmWait(&vm, 2000);
+	BoDestroy(d, &dst);
+	BoDestroy(d, &stop);
+	BoDestroy(d, &buf);
+	return PrtFollowUp(d, c) && early == 1;
+}
+
+// The CP packets of prt-cp-compute / prt-gfx-*, each one job with a WRITE_DATA marker after it.
+static void PrtIbWrite(Ib* ib, bool gfx, uint64_t va, uint32_t value) {
+	IbPush(ib, gfx ? Pkt3Gfx(0x37u, 4) : Pkt3(0x37u, 4)); // WRITE_DATA, memory, write confirm
+	IbPush(ib, (5u << 8) | (1u << 20));
+	IbPush(ib, (uint32_t)va);
+	IbPush(ib, (uint32_t)(va >> 32));
+	IbPush(ib, value);
+}
+
+// Runs one step on the compute ring or the gfx ring; false (and the reason) when it does not finish.
+static bool PrtCpRun(Device* d, Common* c, Bo* mem, Ib* ib, bool gfx, const char* what) {
+	IbPad(ib);
+	Bo*            bos[] = {mem, &c->code};
+	uint64_t       seq   = 0;
+	const uint32_t ip    = gfx ? AMDGPU_HW_IP_GFX : AMDGPU_HW_IP_COMPUTE;
+	int            r     = SubmitOn(d, ip, 0, &c->ib, ib, bos, 2, &seq);
+	int            w     = r == 0 ? WaitOn(d, ip, 0, seq, 15.0) : r;
+	int64_t        st    = ContextState(d);
+	printf("  %-48s %s, ctx 0x%" PRIx64 "\n", what, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st);
+	return w == 0 && st == 0;
+}
+
+// The PRT CP steps: "copy" COPY_DATA from PRT, "dma" DMA_DATA from PRT (CP_SYNC), "write" WRITE_DATA into PRT,
+// "release" RELEASE_MEM data into PRT, "wait" WAIT_REG_MEM == 0 on PRT (never != 0: it would never end), "indirect"
+// DISPATCH_INDIRECT with its arguments in PRT (0 groups: nothing runs; compute ring only), "dispatch" a compute
+// dispatch whose wave loads PRT (global_load). A marker after each must land. Returns false at the first that does not.
+static bool PrtCpStep(Device* d, Common* c, Bo* mem, uint64_t prt, const char* step, bool gfx) {
+	volatile uint32_t* m      = (volatile uint32_t*)mem->cpu;
+	const uint32_t     magic  = 0x70727400u; // "prt"
+	const uint64_t     marker = mem->va + 0x800;
+	memset(mem->cpu, 0xee, 0x1000);
+	__sync_synchronize();
+	Ib       ib = {.n = 0};
+	uint32_t (*pkt)(uint32_t, uint32_t) = gfx ? Pkt3Gfx : Pkt3;
+	bool     check_zero                 = false;
+	uint32_t zero_dw                    = 0;
+	if (strcmp(step, "copy") == 0) {
+		IbPush(&ib, pkt(0x40u, 5)); // COPY_DATA memory -> memory, 32 bits, write confirm
+		IbPush(&ib, 2u | (5u << 8) | (1u << 20));
+		IbPush(&ib, (uint32_t)prt);
+		IbPush(&ib, (uint32_t)(prt >> 32));
+		IbPush(&ib, (uint32_t)mem->va);
+		IbPush(&ib, (uint32_t)(mem->va >> 32));
+		check_zero = true;
+		zero_dw    = 1;
+	} else if (strcmp(step, "dma") == 0) {
+		IbPush(&ib, pkt(0x50u, 6)); // DMA_DATA memory -> memory, CP_SYNC, 256 bytes
+		IbPush(&ib, 1u << 31);
+		IbPush(&ib, (uint32_t)prt);
+		IbPush(&ib, (uint32_t)(prt >> 32));
+		IbPush(&ib, (uint32_t)mem->va);
+		IbPush(&ib, (uint32_t)(mem->va >> 32));
+		IbPush(&ib, 256u);
+		check_zero = true;
+		zero_dw    = 64;
+	} else if (strcmp(step, "write") == 0) {
+		PrtIbWrite(&ib, gfx, prt, 0x77u);
+	} else if (strcmp(step, "release") == 0) {
+		IbPush(&ib, pkt(0x49u, 7)); // RELEASE_MEM CACHE_FLUSH_AND_INV_TS, 32-bit data, no interrupt
+		IbPush(&ib, 0x14u | (5u << 8));
+		IbPush(&ib, 1u << 29);
+		IbPush(&ib, (uint32_t)prt);
+		IbPush(&ib, (uint32_t)(prt >> 32));
+		IbPush(&ib, 0x78u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0u);
+	} else if (strcmp(step, "wait") == 0) {
+		IbPush(&ib, pkt(0x3cu, 6)); // WAIT_REG_MEM memory == 0
+		IbPush(&ib, 3u | (1u << 4));
+		IbPush(&ib, (uint32_t)prt);
+		IbPush(&ib, (uint32_t)(prt >> 32));
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0xffffffffu);
+		IbPush(&ib, 4u);
+	} else if (strcmp(step, "indirect") == 0 && !gfx) {
+		LoadCode(c, k_store_w64, sizeof(k_store_w64));
+		uint32_t ud[3] = {(uint32_t)(mem->va + 0x400), (uint32_t)((mem->va + 0x400) >> 32), 0x5000000u};
+		Dispatch p     = {c->code.va, 64, 8, 3, true, 64, 1, ud};
+		IbDispatch(&ib, &p);
+		ib.n -= 5; // DISPATCH_DIRECT off; on the MEC DISPATCH_INDIRECT takes the arguments' address
+		IbPush(&ib, Pkt3(0x16u, 3));
+		IbPush(&ib, (uint32_t)prt);
+		IbPush(&ib, (uint32_t)(prt >> 32));
+		IbPush(&ib, INITIATOR_COMPUTE_SHADER_EN | INITIATOR_FORCE_START_AT_0 | INITIATOR_ORDER_MODE);
+	} else if (strcmp(step, "dispatch") == 0) {
+		LoadCode(c, (const uint8_t*)k_prt_global_w64, sizeof(k_prt_global_w64));
+		uint32_t ud[4] = {(uint32_t)mem->va, (uint32_t)(mem->va >> 32), (uint32_t)prt, (uint32_t)(prt >> 32)};
+		Dispatch p     = {c->code.va, 64, 16, 4, false, 64, 1, ud};
+		IbDispatch(&ib, &p);
+		IbPush(&ib, pkt(0x46u, 1)); // EVENT_WRITE CS_PARTIAL_FLUSH: the wave's stores before the marker
+		IbPush(&ib, 7u | (4u << 8));
+		check_zero = true;
+		zero_dw    = 64;
+	} else {
+		printf("  unknown step '%s'\n", step);
+		return false;
+	}
+	PrtIbWrite(&ib, gfx, marker, magic);
+	char what[64];
+	snprintf(what, sizeof(what), "%s, PRT at 0x%" PRIx64 ":", step, prt);
+	if (!PrtCpRun(d, c, mem, &ib, gfx, what)) {
+		PrintGpuvmFault(d, "after");
+		_exit(3); // freeing buffers would wait on the stopped ring
+	}
+	for (int i = 0; i < 100 && m[0x200] != magic; i++) {
+		usleep(1000);
+	}
+	bool ok = m[0x200] == magic;
+	if (check_zero) {
+		uint32_t zeros = 0;
+		for (uint32_t i = 0; i < zero_dw; i++) {
+			zeros += m[i] == 0 ? 1u : 0u;
+		}
+		printf("    read %u of %u dwords as 0 (first 0x%08x)\n", zeros, zero_dw, m[0]);
+		ok = ok && zeros == zero_dw;
+	}
+	if (strcmp(step, "indirect") == 0) {
+		printf("    the store dispatch %s\n", m[0x100] == 0xeeeeeeeeu ? "ran no group (0 groups read)" : "RAN");
+		ok = ok && m[0x100] == 0xeeeeeeeeu;
+	}
+	printf("    marker %s\n", m[0x200] == magic ? "landed" : "MISSING");
+	return ok;
+}
+
+// P-3. CP reads and writes of PRT on the compute ring, one job a step (PRT_CP_STEPS, default
+// "copy,dma,write,release,wait,indirect"), the first that does not finish ends the case.
+static bool DangerPrtCpCompute(Device* d, Common* c) {
+	const char* steps = getenv("PRT_CP_STEPS") != NULL ? getenv("PRT_CP_STEPS") : "copy,dma,write,release,wait,indirect";
+	printf("== danger prt-cp-compute: CP packets on PRT, compute ring (%s)\n", steps);
+	PrintGpuvmFault(d, "before");
+	PrtVm vm;
+	PrtVmInit(&vm, d);
+	Bo             mem;
+	const uint64_t prt = 0x4400000000ull;
+	if (PrtDst(d, &mem, 0x0204000000ull, true) == NULL || PrtMap(&vm, prt, 2 * MiB) != 0 || PrtVmWait(&vm, 2000) < 0) {
+		return false;
+	}
+	bool  ok = true;
+	char  list[128];
+	snprintf(list, sizeof(list), "%s", steps);
+	for (char* save = NULL, *s = strtok_r(list, ",", &save); s != NULL; s = strtok_r(NULL, ",", &save)) {
+		ok = PrtCpStep(d, c, &mem, prt, s, false) && ok;
+	}
+	PrintGpuvmFault(d, "after");
+	BoDestroy(d, &mem);
+	return PrtFollowUp(d, c) && ok;
+}
+
+// P-4. The same on the gfx ring, ONE step per run (`--danger prt-gfx-STEP`, STEP copy, dma, write, wait or dispatch;
+// with --awake): a client that does not honour PRT faults, and a fault on the gfx ring takes the board down. Draws
+// (CB, DB, index fetch, vertex fetch, texture sampling into or from PRT) need a draw harness this probe does not have.
+static bool DangerPrtGfx(Device* d, Common* c, const char* step) {
+	printf("== danger prt-gfx-%s: CP packet on PRT, gfx ring\n", step);
+	PrintGpuvmFault(d, "before");
+	PrtVm vm;
+	PrtVmInit(&vm, d);
+	Bo             mem;
+	const uint64_t prt = 0x4400000000ull;
+	if (PrtDst(d, &mem, 0x0204000000ull, true) == NULL || PrtMap(&vm, prt, 2 * MiB) != 0 || PrtVmWait(&vm, 2000) < 0) {
+		return false;
+	}
+	const bool ok = PrtCpStep(d, c, &mem, prt, step, true);
+	PrintGpuvmFault(d, "after");
+	BoDestroy(d, &mem);
+	return PrtFollowUp(d, c) && ok;
+}
+
 static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
 	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order condib condexec exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
+	printf("PRT cases, in risk order: prt-map prt-split prt-read-compute prt-write-compute prt-kfd-tlb prt-replace-race prt-cp-compute prt-gfx-{copy,dma,write,wait,dispatch}\n");
 }
 
 int main(int argc, char** argv) {
@@ -3872,6 +4953,22 @@ int main(int argc, char** argv) {
 			ok = DangerShadow(&d, &c, true);
 		} else if (strcmp(danger, "shadow-pushpop") == 0) {
 			ok = DangerShadowPushPop(&d, &c);
+		} else if (strcmp(danger, "prt-map") == 0) {
+			ok = DangerPrtMap(path);
+		} else if (strcmp(danger, "prt-split") == 0) {
+			ok = DangerPrtSplit(path);
+		} else if (strcmp(danger, "prt-read-compute") == 0) {
+			ok = DangerPrtReadCompute(&d, &c);
+		} else if (strcmp(danger, "prt-write-compute") == 0) {
+			ok = DangerPrtWriteCompute(&d, &c);
+		} else if (strcmp(danger, "prt-kfd-tlb") == 0) {
+			ok = DangerPrtKfdTlb(&d, &c);
+		} else if (strcmp(danger, "prt-replace-race") == 0) {
+			ok = DangerPrtReplaceRace(&d, &c);
+		} else if (strcmp(danger, "prt-cp-compute") == 0) {
+			ok = DangerPrtCpCompute(&d, &c);
+		} else if (strncmp(danger, "prt-gfx-", 8) == 0) {
+			ok = DangerPrtGfx(&d, &c, danger + 8);
 		} else if (strncmp(danger, "regindex-", 9) == 0) {
 			ok = DangerRegIndex(&d, &c, danger + 9);
 		} else {

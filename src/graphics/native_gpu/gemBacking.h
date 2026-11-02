@@ -69,8 +69,11 @@ namespace Libs::Graphics::NativeGpu {
 //
 // GPU mappings of blocks that are not resident point at one shared dummy buffer, so an access the
 // translator did not foresee reads garbage or loses its write instead of faulting: on this board a
-// GPU page fault hangs the ring and can take the whole board down, and so do PRT mappings.
-// DummyWritten() reports when the GPU wrote there.
+// GPU page fault hangs the ring and can take the whole board down. DummyWritten() reports when the
+// GPU wrote there. The dummy holds memory the guest has; guest addresses with nothing mapped are
+// another matter: PRT mappings (AMDGPU_VM_PAGE_PRT, which read zeros and drop writes, as the PS5's
+// unmapped pages of a PRT aperture do) cover the holes of the PRT apertures, the ranges unmaps leave
+// behind with explicit sync, and with KYTY_NATIVE_GPU_PRT_NET the guest's GPU windows (InstallPrtNet).
 //
 // Simpler designs that do not work here (tools/bc250-native-probe): userptr buffers over the memfd
 // cost a page-table walk of their whole size on every submission (~31 ms per frame for 13.5 GiB);
@@ -268,6 +271,45 @@ public:
 		return on;
 	}
 
+	// KYTY_NATIVE_GPU_PRT_NET: which guest GPU addresses with nothing mapped read zeros and drop writes (PRT) instead of
+	// faulting, which on this board halts the wave and the ring with it (InstallPrtNet). 0 "off": only the holes of the
+	// PRT apertures and what unmaps leave behind, as before; 1 "ps5": the extended (AMM) window as well, where the PS5
+	// drops the writes to pages a title never backs; 2 "all": the whole low window [64 KiB, 1 TiB) too. Off by default
+	// until the board's PRT probes (tools/bc250-native-probe --danger prt-*) pass; the default is this one line.
+	static int PrtNetMode() {
+		static const int mode = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_PRT_NET");
+			if (v == nullptr || v[0] == '\0') {
+				return 0;
+			}
+			if (std::strcmp(v, "all") == 0 || std::strcmp(v, "2") == 0) {
+				return 2;
+			}
+			if (std::strcmp(v, "ps5") == 0 || std::strcmp(v, "1") == 0) {
+				return 1;
+			}
+			return 0;
+		}();
+		return mode;
+	}
+	// KYTY_NATIVE_GPU_PRT_NET_SPLIT=0: no PRT pre-split before a bind into a net hole (PreSplitNetUnlocked); for probing only.
+	static bool PrtNetSplit() {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_PRT_NET_SPLIT");
+			return v == nullptr || v[0] != '0';
+		}();
+		return on;
+	}
+	// KYTY_NATIVE_GPU_PRT_NET_AUDIT=1: the translator logs the references it sees into the net ("reads the PRT net
+	// (zeros)"), so the net does not hide translation bugs (a zero base is a translator error to fix). Log only.
+	static bool PrtNetAudit() {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_PRT_NET_AUDIT");
+			return v != nullptr && v[0] == '1';
+		}();
+		return on;
+	}
+
 	// Creates the backing for `size` bytes: opens the device, creates the memfd, its contiguous
 	// alias and the dummy GPU buffer. Returns nullptr on failure. No block is resident yet.
 	static GemBacking* Create(uint64_t size, const char* device = "/dev/dri/renderD128") {
@@ -322,7 +364,78 @@ public:
 		return self;
 	}
 
+	// The guest's GPU address windows, (start, size) each: [0] the low window, [1] the extended (AMM) window; the
+	// caller passes both (no kernel headers here) and the mode picks (PrtNetMode: "ps5" the second, "all" both).
+	// Called once, right after Create, before any view or external range: each window gets one REPLACE ...
+	// AMDGPU_VM_PAGE_PRT, so a GPU access to a guest address nothing maps reads zeros and drops its writes instead of
+	// faulting; guest mappings replace it piece by piece and their unmaps give the PRT back (UnbindView, CloseExternal,
+	// SetPrtAperture). PRT is a property of each page-table entry on gfx10 (no global mode); the windows are 2 MiB
+	// aligned at the top, so the kernel should write them as 1 GiB and 2 MiB entries (expected a few dozen KiB of page
+	// tables; tools/bc250-native-probe --danger prt-map measures it).
+	// Forced off, with a log line, without explicit sync (each REPLACE over PRT would then wait for every CS job of the
+	// VM) and with KFD userptr external ranges (KFD maps them with MAP, which fails over a mapping).
+	// Known limits: [0, 64 KiB) cannot be covered (GEM_VA refuses VA below AMDGPU_VA_RESERVED_BOTTOM), so a null
+	// pointer still faults there; addresses at or above 1 TiB outside the extended window (garbage or tagged pointers,
+	// bits 47:40) are not covered: Kyty's own buffers and KFD's allocations live there, mapped with MAP, and a tagged
+	// function pointer that read zeros would run zeros, a hang without a fault.
+	bool InstallPrtNet(const std::array<std::pair<uint64_t, uint64_t>, 2>& windows, int mode = PrtNetMode()) {
+		if (mode <= 0) {
+			return false;
+		}
+		const char* name = mode >= 2 ? "all" : "ps5";
+		std::lock_guard<std::mutex> lock(m_lock);
+		if (!m_va_explicit || m_kfd_userptr) {
+			std::fprintf(stderr, "GemBacking: no PRT net (KYTY_NATIVE_GPU_PRT_NET=%s): %s\n", name,
+			             !m_va_explicit ? "page-table updates sync implicitly (KYTY_NATIVE_GPU_VA_EXPLICIT=0, or blocks that are "
+			                              "not always valid), so every bind over PRT would wait for every submission"
+			                            : "external ranges are KFD userptr buffers, which KFD maps with MAP, and MAP fails over PRT");
+			return false;
+		}
+		if (!m_views.empty() || !m_external.empty()) {
+			std::fprintf(stderr, "GemBacking: no PRT net (KYTY_NATIVE_GPU_PRT_NET=%s): guest ranges are mapped already\n", name);
+			return false;
+		}
+		struct timespec t0 {};
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		std::string where;
+		for (size_t i = mode >= 2 ? 0 : 1; i < windows.size(); i++) {
+			const auto [start, size] = windows[i];
+			// GEM_VA refuses VA below 64 KiB and the non-canonical hole from 2^47 (it would take a sign-extended address).
+			if (size == 0 || start < kNetBottom || start + size > (1ull << 47u) || start + size < start) {
+				continue;
+			}
+			if (VaOp(AMDGPU_VA_OP_REPLACE, 0, start, 0, size, AMDGPU_VM_PAGE_PRT) != 0) {
+				continue;
+			}
+			m_net[i] = {start, size};
+			char one[96];
+			std::snprintf(one, sizeof(one), "%s[0x%llx, 0x%llx)", where.empty() ? "" : " and ", static_cast<unsigned long long>(start),
+			              static_cast<unsigned long long>(start + size));
+			where += one;
+		}
+		if (where.empty()) {
+			std::fprintf(stderr, "GemBacking: no PRT net (KYTY_NATIVE_GPU_PRT_NET=%s): GEM_VA refused the windows\n", name);
+			return false;
+		}
+		MarkVaStale();
+		const bool      landed = WaitVaUpdates(200);
+		struct timespec t1 {};
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		const double ms = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e3 + static_cast<double>(t1.tv_nsec - t0.tv_nsec) / 1e6;
+		std::fprintf(stderr,
+		             "GemBacking: PRT net over %s (KYTY_NATIVE_GPU_PRT_NET=%s, %.2f ms%s): unmapped guest GPU addresses read 0 and "
+		             "drop writes; KYTY_NATIVE_GPU_PRT_NET=ps5 with KYTY_NATIVE_GPU_PRT_NET_AUDIT=1 logs the translator's references "
+		             "into it\n",
+		             where.c_str(), name, ms, landed ? "" : ", page-table update NOT signaled");
+		return true;
+	}
+
 	~GemBacking() {
+		if (PrtNetOnUnlocked()) {
+			std::fprintf(stderr, "GemBacking: PRT net: %llu pre-splits, %llu unmaps left PRT\n",
+			             static_cast<unsigned long long>(m_net_presplits.load(std::memory_order_relaxed)),
+			             static_cast<unsigned long long>(m_net_unmaps.load(std::memory_order_relaxed)));
+		}
 		if (m_mover.joinable()) {
 			{
 				std::lock_guard<std::mutex> lock(m_mover_lock);
@@ -435,6 +548,7 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
 		VaSync                      va_sync(*this, !InPrtApertureUnlocked(vaddr, size));
+		const bool                  over_prt = PreSplitNetUnlocked(vaddr, size);
 		const bool ok = ForEachBackingPiece(offset, size,
 		                                    [&](const Bo& bo, uint64_t, uint64_t inner, bool resident, bool carved, uint64_t done, uint64_t part) {
 			if (carved) {
@@ -442,6 +556,9 @@ public:
 			}
 			return VaReplace(resident ? bo.handle : m_dummy.handle, vaddr + done, inner, offset + done, part) == 0;
 		});
+		if (over_prt) {
+			MarkVaStale(); // a KFD queue may hold the PRT translations (zeros) of the hole
+		}
 		auto it = m_views.find(vaddr);
 		if (it != m_views.end() && it->second.size == size && it->second.offset == offset) {
 			it->second.gpu = true;
@@ -508,11 +625,15 @@ public:
 		if (m_va_explicit) {
 			const bool ok = VaOp(AMDGPU_VA_OP_REPLACE, 0, vaddr, 0, size, AMDGPU_VM_PAGE_PRT) == 0;
 			MarkVaStale();
+			if (InPrtNetUnlocked(vaddr, size)) {
+				m_net_unmaps.fetch_add(1, std::memory_order_relaxed);
+			}
 			return ok;
 		}
+		// Without explicit sync the PRT net is off (InstallPrtNet), so this covers the aperture holes only.
 		const bool ok = VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, size) == 0;
 		MarkVaStale();
-		MapPrtHolesUnlocked(vaddr, size);
+		MapNetHolesUnlocked(vaddr, size, true);
 		return ok;
 	}
 
@@ -521,11 +642,42 @@ public:
 		return std::any_of(m_prt.begin(), m_prt.end(),
 		                   [&](const auto& a) { return a.second != 0 && vaddr >= a.first && vaddr + size <= a.first + a.second; });
 	}
+	// True when [vaddr, vaddr + size) lies in one window of the PRT net (InstallPrtNet), where every address nothing
+	// maps reads zeros on the GPU. m_net is written once, before any other thread uses the backing.
+	bool InPrtNetUnlocked(uint64_t vaddr, uint64_t size) const {
+		return std::any_of(m_net.begin(), m_net.end(),
+		                   [&](const auto& w) { return w.second != 0 && vaddr >= w.first && vaddr + size <= w.first + w.second; });
+	}
+	[[nodiscard]] bool InPrtNet(uint64_t vaddr, uint64_t size) const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		return InPrtNetUnlocked(vaddr, size);
+	}
+	[[nodiscard]] bool PrtNetOn() const {
+		std::lock_guard<std::mutex> lock(m_lock);
+		return PrtNetOnUnlocked();
+	}
+	// Binds into a net hole that got a PRT pre-split, and unmaps that left PRT in the net, so far.
+	[[nodiscard]] uint64_t NetPresplits() const { return m_net_presplits.load(std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t NetUnmaps() const { return m_net_unmaps.load(std::memory_order_relaxed); }
+
+	// For tests: every GEM_VA this backing issues from now on is appended to *trace (nullptr stops it).
+	struct VaTraceOp {
+		uint32_t op;
+		uint32_t handle;
+		uint64_t vaddr;
+		uint64_t size;
+		uint32_t flags; // page flags, without the explicit-sync flag
+	};
+	void TraceVaOps(std::vector<VaTraceOp>* trace) {
+		std::lock_guard<std::mutex> lock(m_lock);
+		m_va_trace = trace;
+	}
 	// sceKernelSetPrtAperture (index 0-2): on PS5 the GPU reads zeros from, and drops writes to, the
 	// pages of a PRT aperture that nothing is mapped at. Titles map sparse resources into one piece by
 	// piece and clear them whole (My First Gran Turismo's track load), which here faulted and hung the
 	// gfx ring. The holes get PRT mappings, which behave the same; guest mappings replace them
-	// (REPLACE), and unbinding one gives the hole back.
+	// (REPLACE), and unbinding one gives the hole back. Inside the PRT net the holes are PRT with or
+	// without an aperture: an aperture's removal leaves them so, and a new one there has nothing to map.
 	void SetPrtAperture(int index, uint64_t vaddr, uint64_t size) {
 		if (index < 0 || static_cast<size_t>(index) >= m_prt.size()) {
 			return;
@@ -535,12 +687,13 @@ public:
 		const auto old = m_prt[static_cast<size_t>(index)];
 		m_prt[static_cast<size_t>(index)] = {vaddr, size};
 		if (old.second != 0) {
-			ForEachHoleUnlocked(old.first, old.second,
-			                    [&](uint64_t start, uint64_t len) { VaOp(AMDGPU_VA_OP_CLEAR, 0, start, 0, len); });
+			ForEachHoleUnlocked(old.first, old.second, [&](uint64_t start, uint64_t len) {
+				ForEachOutsideNetUnlocked(start, len, [&](uint64_t s, uint64_t l) { VaOp(AMDGPU_VA_OP_CLEAR, 0, s, 0, l); });
+			});
 		}
 		for (const auto& [start, len]: m_prt) {
 			if (len != 0) {
-				MapPrtHolesUnlocked(start, len);
+				MapNetHolesUnlocked(start, len, false);
 			}
 		}
 	}
@@ -834,7 +987,7 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
 		ClearExternalRangeUnlocked(vaddr, size);
-		MapPrtHolesUnlocked(vaddr, size);
+		MapNetHolesUnlocked(vaddr, size, false); // CloseExternal left the net's holes PRT
 		return true;
 	}
 
@@ -1417,7 +1570,8 @@ private:
 	// one before them, which run in order): views, promotions (the dummy's garbage read as descriptors sent GT7's
 	// waves to random addresses), external ranges, an aperture change. Not a view inside a PRT aperture, whose holes
 	// read zeros until the update lands (Demon's Souls maps sparse textures there constantly: 2 ms a frame waiting),
-	// and not unmapping.
+	// and not unmapping. The PRT net does not widen that exception: a view the title maps must be in the page tables
+	// when the call returns, as on the PS5, whether zeros or nothing were there before.
 	struct VaSync {
 		const GemBacking& g;
 		const uint64_t    start;
@@ -1463,6 +1617,9 @@ private:
 			v.vm_timeline_syncobj_out = m_va_syncobj;
 			v.vm_timeline_point       = ++m_va_point;
 			m_va_recent[m_va_point % m_va_recent.size()] = {m_va_point, op, handle == m_dummy.handle ? 2u : handle != 0 ? 1u : 0u, size};
+		}
+		if (m_va_trace != nullptr) {
+			m_va_trace->push_back({op, handle, vaddr, size, page_flags});
 		}
 		const int r = Ioctl(m_va_syncobj != 0 ? static_cast<unsigned long>(DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA, GemVaTimeline))
 		                                      : static_cast<unsigned long>(DRM_IOCTL_AMDGPU_GEM_VA),
@@ -2415,9 +2572,13 @@ private:
 		}
 		const uint32_t flags =
 		    gpu_write ? kRwxPageFlags : (AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_EXECUTABLE);
+		const bool over_prt = PreSplitNetUnlocked(vaddr, size);
 		if (VaOp(AMDGPU_VA_OP_REPLACE, u.handle, vaddr, 0, size, flags) != 0) {
 			GemClose(u.handle);
 			return false;
+		}
+		if (over_prt) {
+			MarkVaStale(); // a KFD queue may hold the PRT translations (zeros) of the hole
 		}
 		m_external.emplace(vaddr, External {vaddr + size, u.handle, gpu_write});
 		m_views_generation++;
@@ -2428,9 +2589,10 @@ private:
 	// portions of a straddling buffer that fall outside the range as their own buffers (closing a GEM
 	// handle unmaps all of its VA, so a survivor needs its own handle). Chunk mappings never appear in
 	// m_external, so they are never touched. Caller holds m_lock.
-	// Calls fn(start, size) for each part of [vaddr, vaddr + size) with no view and no external buffer.
+	// Calls fn(start, size) for each part of [vaddr, vaddr + size) with no view and no external buffer;
+	// with `gpu_only`, views not bound to the GPU yet count as holes (ForEachGpuHoleUnlocked).
 	template <typename Fn>
-	void ForEachHoleUnlocked(uint64_t vaddr, uint64_t size, Fn&& fn) const {
+	void ForEachHoleUnlocked(uint64_t vaddr, uint64_t size, Fn&& fn, bool gpu_only = false) const {
 		const uint64_t                             end = vaddr + size;
 		std::vector<std::pair<uint64_t, uint64_t>> used;
 		auto collect = [&](uint64_t start, uint64_t stop) {
@@ -2440,11 +2602,15 @@ private:
 		};
 		for (auto it = m_views.lower_bound(vaddr); it != m_views.begin();) {
 			--it;
-			collect(it->first, it->first + it->second.size);
+			if (!gpu_only || it->second.gpu) {
+				collect(it->first, it->first + it->second.size);
+			}
 			break;
 		}
 		for (auto it = m_views.lower_bound(vaddr); it != m_views.end() && it->first < end; ++it) {
-			collect(it->first, it->first + it->second.size);
+			if (!gpu_only || it->second.gpu) {
+				collect(it->first, it->first + it->second.size);
+			}
 		}
 		for (auto it = m_external.lower_bound(vaddr); it != m_external.begin();) {
 			--it;
@@ -2467,18 +2633,133 @@ private:
 		}
 	}
 
-	// PRT mappings on the holes of [vaddr, vaddr + size) that lie in a PRT aperture.
-	void MapPrtHolesUnlocked(uint64_t vaddr, uint64_t size) const {
-		for (const auto& [start, len]: m_prt) {
-			const uint64_t lo = std::max(start, vaddr);
-			const uint64_t hi = std::min(start + len, vaddr + size);
-			if (len == 0 || lo >= hi) {
+	// The holes of [vaddr, vaddr + size) as the GPU sees them: MapView records a view (not bound yet) before BindView
+	// maps it, so the plain walker would never find the range being bound as a hole. A view mapped again counts as a
+	// hole too, though the GPU still maps the old one until BindView replaces it: a PRT pre-split there costs one GEM_VA.
+	template <typename Fn>
+	void ForEachGpuHoleUnlocked(uint64_t vaddr, uint64_t size, Fn&& fn) const {
+		ForEachHoleUnlocked(vaddr, size, std::forward<Fn>(fn), true);
+	}
+
+	[[nodiscard]] bool PrtNetOnUnlocked() const {
+		return std::any_of(m_net.begin(), m_net.end(), [](const auto& w) { return w.second != 0; });
+	}
+
+	// Calls fn(start, size) for the parts of [vaddr, vaddr + size) outside the PRT net's windows.
+	template <typename Fn>
+	void ForEachOutsideNetUnlocked(uint64_t vaddr, uint64_t size, Fn&& fn) const {
+		std::vector<std::pair<uint64_t, uint64_t>> parts {{vaddr, vaddr + size}}; // [start, stop)
+		for (const auto& [ws, wl]: m_net) {
+			if (wl == 0) {
 				continue;
 			}
-			ForEachHoleUnlocked(lo, hi - lo, [&](uint64_t hole, uint64_t hole_size) {
-				VaOp(AMDGPU_VA_OP_REPLACE, 0, hole, 0, hole_size, AMDGPU_VM_PAGE_PRT);
+			std::vector<std::pair<uint64_t, uint64_t>> left;
+			for (const auto& [lo, hi]: parts) {
+				if (hi <= ws || lo >= ws + wl) {
+					left.emplace_back(lo, hi);
+					continue;
+				}
+				if (lo < ws) {
+					left.emplace_back(lo, ws);
+				}
+				if (hi > ws + wl) {
+					left.emplace_back(ws + wl, hi);
+				}
+			}
+			parts = std::move(left);
+		}
+		for (const auto& [lo, hi]: parts) {
+			fn(lo, hi - lo);
+		}
+	}
+
+	// Calls fn(start, size) for the parts of [vaddr, vaddr + size) where a GPU hole reads zeros: the PRT apertures,
+	// and with `net` the PRT net's windows; without `net`, the apertures' parts outside the net. Without a net: each
+	// aperture in turn, as the holes were always mapped; with one: sorted and merged, so no range is mapped twice.
+	template <typename Fn>
+	void ForEachPrtRangeUnlocked(uint64_t vaddr, uint64_t size, bool net, Fn&& fn) const {
+		const uint64_t                             end = vaddr + size;
+		std::vector<std::pair<uint64_t, uint64_t>> parts; // [start, stop)
+		auto clip = [&](uint64_t start, uint64_t len, auto&& add) {
+			const uint64_t lo = std::max(start, vaddr);
+			const uint64_t hi = std::min(start + len, end);
+			if (len != 0 && lo < hi) {
+				add(lo, hi);
+			}
+		};
+		if (!PrtNetOnUnlocked()) {
+			for (const auto& [start, len]: m_prt) {
+				clip(start, len, [&](uint64_t lo, uint64_t hi) { fn(lo, hi - lo); });
+			}
+			return;
+		}
+		for (const auto& [start, len]: m_prt) {
+			clip(start, len, [&](uint64_t lo, uint64_t hi) {
+				if (net) {
+					parts.emplace_back(lo, hi);
+				} else {
+					ForEachOutsideNetUnlocked(lo, hi - lo, [&](uint64_t s, uint64_t l) { parts.emplace_back(s, s + l); });
+				}
 			});
 		}
+		if (net) {
+			for (const auto& [start, len]: m_net) {
+				clip(start, len, [&](uint64_t lo, uint64_t hi) { parts.emplace_back(lo, hi); });
+			}
+		}
+		std::sort(parts.begin(), parts.end());
+		uint64_t lo = 0;
+		uint64_t hi = 0;
+		for (const auto& [s, e]: parts) {
+			if (hi > lo && s <= hi) {
+				hi = std::max(hi, e);
+				continue;
+			}
+			if (hi > lo) {
+				fn(lo, hi - lo);
+			}
+			lo = s;
+			hi = e;
+		}
+		if (hi > lo) {
+			fn(lo, hi - lo);
+		}
+	}
+
+	// PRT mappings on the holes of [vaddr, vaddr + size) that lie in a PRT aperture, and with `net` in the PRT net.
+	void MapNetHolesUnlocked(uint64_t vaddr, uint64_t size, bool net) const {
+		ForEachPrtRangeUnlocked(vaddr, size, net, [&](uint64_t lo, uint64_t len) {
+			ForEachHoleUnlocked(lo, len, [&](uint64_t hole, uint64_t hole_size) {
+				VaOp(AMDGPU_VA_OP_REPLACE, 0, hole, 0, hole_size, AMDGPU_VM_PAGE_PRT);
+			});
+		});
+	}
+
+	// With the PRT net on, before a mapping of [vaddr, vaddr + size): every GPU hole piece in it that lies in the net or
+	// in an aperture (PRT now) and is not 1 GiB aligned at both ends first gets a PRT REPLACE of exactly that piece.
+	// A buffer REPLACE inside a huge PRT entry (1 GiB or 2 MiB) makes the kernel allocate child page tables, cleared
+	// to 0, write only the new range, and switch the parent entry at the end of the ioctl, while the rest of the old
+	// PRT mapping waits on prt_va's invalid list until the next CS ioctl or PRT op rewrites it: until then a KFD queue
+	// touching the rest of that GiB faults (a CS job does not, its ioctl rewrites first). A PRT op rewrites the whole
+	// list in its own ioctl, before the switch, and the buffer REPLACE that follows removes exactly its piece: no
+	// remainder. KYTY_NATIVE_GPU_PRT_NET_SPLIT=0 leaves it out (probing only). Returns true when part of the range was
+	// such a hole, which a KFD queue may have cached as PRT (the caller marks the VA stale). Off: nothing, false.
+	bool PreSplitNetUnlocked(uint64_t vaddr, uint64_t size) const {
+		if (!PrtNetOnUnlocked()) {
+			return false;
+		}
+		constexpr uint64_t kGiB = 1ull << 30u;
+		bool               hole = false;
+		ForEachPrtRangeUnlocked(vaddr, size, true, [&](uint64_t lo, uint64_t len) {
+			ForEachGpuHoleUnlocked(lo, len, [&](uint64_t s, uint64_t l) {
+				hole = true;
+				if (PrtNetSplit() && ((s | (s + l)) & (kGiB - 1)) != 0) {
+					VaOp(AMDGPU_VA_OP_REPLACE, 0, s, 0, l, AMDGPU_VM_PAGE_PRT);
+					m_net_presplits.fetch_add(1, std::memory_order_relaxed);
+				}
+			});
+		});
+		return hole;
 	}
 
 	void ClearExternalRangeUnlocked(uint64_t vaddr, uint64_t size) {
@@ -2533,7 +2814,29 @@ private:
 			KfdIoctl(AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fr);
 			return;
 		}
-		VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, ext.end - vaddr);
+		const uint64_t len = ext.end - vaddr;
+		if (InPrtNetUnlocked(vaddr, len)) {
+			// Inside the PRT net the range goes back to PRT, as InstallPrtNet left it, not unmapped. The userptr buffer
+			// is not always valid, so the kernel still syncs this to the VM's CS jobs, as it did the CLEAR.
+			VaOp(AMDGPU_VA_OP_REPLACE, 0, vaddr, 0, len, AMDGPU_VM_PAGE_PRT);
+			m_net_unmaps.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			VaOp(AMDGPU_VA_OP_CLEAR, 0, vaddr, 0, len);
+			if (PrtNetOnUnlocked()) { // a range across a window's edge: its part inside goes PRT
+				std::vector<std::pair<uint64_t, uint64_t>> outside;
+				ForEachOutsideNetUnlocked(vaddr, len, [&](uint64_t s, uint64_t l) { outside.emplace_back(s, s + l); });
+				uint64_t at = vaddr;
+				for (const auto& [s, e]: outside) {
+					if (s > at) {
+						VaOp(AMDGPU_VA_OP_REPLACE, 0, at, 0, s - at, AMDGPU_VM_PAGE_PRT);
+					}
+					at = e;
+				}
+				if (at < ext.end) {
+					VaOp(AMDGPU_VA_OP_REPLACE, 0, at, 0, ext.end - at, AMDGPU_VM_PAGE_PRT);
+				}
+			}
+		}
 		GemClose(ext.handle);
 	}
 
@@ -2582,6 +2885,11 @@ private:
 	bool                          m_mover_stop = false;
 	std::map<uint64_t, External>  m_external; // guest VA -> userptr buffer for non-direct ranges
 	std::array<std::pair<uint64_t, uint64_t>, 3> m_prt {}; // PRT apertures (start, size), SetPrtAperture
+	std::array<std::pair<uint64_t, uint64_t>, 2> m_net {}; // PRT net windows (start, size), size 0 = none (InstallPrtNet)
+	static constexpr uint64_t     kNetBottom = 0x10000ull; // AMDGPU_VA_RESERVED_BOTTOM: GEM_VA refuses VA below
+	mutable std::atomic<uint64_t> m_net_presplits {0};     // PreSplitNetUnlocked's PRT pre-splits
+	mutable std::atomic<uint64_t> m_net_unmaps {0};        // unmaps that left PRT inside the net
+	std::vector<VaTraceOp>*       m_va_trace = nullptr;    // TraceVaOps
 	std::atomic<bool>             m_map_overflow {false}; // a block with GPU access stayed out of map-time residency
 	std::atomic<bool>             m_alloc_failed {false}; // PromoteBackingAtAlloc ran out of RAM: not the PS5 mode
 	std::map<uint64_t, Carve>     m_carves;             // backing start -> display buffer carve; disjoint (CarveGuestRange)

@@ -116,6 +116,14 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `shadow` | CP register shadowing: `CONTEXT_CONTROL` shadow enables and `LOAD_*_REG` addresses, then 16 registers written by SET, by register table, by SET in an IB2 and by register table in an IB2; where each value lands in the shadow buffer (`SHADOW_CLASSES`, `SHADOW_LOAD=0`) |
 | `shadow-restore` | `shadow`, then the SH registers loaded back from the shadow in later jobs and read: with every load on, and twice with amdgpu's load enables (a second DRM context's job in between) |
 | `shadow-pushpop` | libSceAgc's context push and pop (`CONTEXT_CONTROL` + `CLEAR_STATE` CMD 1 / 2) inside a set-up shadow: markers in the shadow before each step, the same `CONTEXT_CONTROL`s without `CLEAR_STATE`, and an SH register changed between a push and a pop and read back |
+| `prt-map` | P-0, no GPU work: a fresh VM gets Kyty's PRT net windows (`[64 KiB, 1 TiB)`, `[8 TiB, +512 GiB)`) by REPLACE PRT; ioctl and page-table update times, VRAM and fdinfo before and after, against 8192 PRT pages of 4 KiB; then 2000 always-valid binds of 16-64 KiB into the low window and back to PRT, without and with the pre-split |
+| `prt-split` | P-6a, no GPU work, no CS: a 64 KiB buffer bound in the middle of a 1 GiB PRT mapping without and with a PRT pre-split; prints the addresses to decode with umr and holds the VM (`PRT_HOLD_SEC`, default 120) |
+| `prt-read-compute` | P-1: global, flat, scalar, buffer (raw V#) and image (linear 1D T#) loads of PRT in a 1 GiB entry, a 2 MiB one, a 4 KiB page, the rest of a 1 GiB mapping a buffer was bound into (pre-split; `PRT_PRESPLIT=0` without), and the buffer; all 0 with no fault (`PRT_LOADS` picks the loads) |
+| `prt-write-compute` | P-2: `global_store`, `buffer_store` and `global_atomic_add` with return into PRT, a load back (0); then a pattern buffer replaces the PRT there and must read intact |
+| `prt-kfd-tlb` | P-5: a wave on a KFD queue logs reads of X while the render node switches X buffer / PRT and bumps an epoch after each page-table update: stale reads and their duration with no flush, a KFD map ioctl flush, or `PRT_TLB_FLUSH_CMD` (a shell command, e.g. the kyty-lodhw op-14 flush) |
+| `prt-replace-race` | P-7: four wave64 groups read 64 KiB round after round while the CPU switches it always-valid buffer / PRT `PRT_RACE_SWITCHES` times (default 10000, 4 s at most): a fault is the REPLACE window (compute ring only) |
+| `prt-cp-compute` | P-3, compute ring, one job a step (`PRT_CP_STEPS`, default `copy,dma,write,release,wait,indirect`): `COPY_DATA` and `DMA_DATA` from PRT (0), `WRITE_DATA` and `RELEASE_MEM` into it, `WAIT_REG_MEM == 0` on it, `DISPATCH_INDIRECT` with its arguments in it (0 groups); a marker after each |
+| `prt-gfx-copy`, `-dma`, `-write`, `-wait`, `-dispatch` | P-4, **gfx ring, one step per run, last**: the same packets, and `dispatch` a compute wave loading PRT from the gfx ring. Draws (CB, DB, index and vertex fetch, texture sampling on PRT) are not covered: the probe has no draw harness |
 
 `--awake SEC` keeps one wave spinning on the compute ring while the case runs, so the graphics block
 never idles into GFXOFF. Cases that stop the ring now `_exit` at once instead of freeing buffers
@@ -140,6 +148,34 @@ an SH register set with shadowing on, a push that also turns gfx SH shadowing of
 the register read back, and the same without `CLEAR_STATE`. Whether a pop restores context registers takes a draw and
 is not checked. Run each alone, e.g. `./bc250-native-probe --danger shadow --awake 5`; a microcode that writes the
 shadow somewhere else may fault the ring.
+
+### PRT cases (for Kyty's `KYTY_NATIVE_GPU_PRT_NET`, not run yet)
+
+`GEM_VA` with `AMDGPU_VM_PAGE_PRT` and no buffer maps a range whose gfx10 page-table entries have PRT set and VALID
+clear: a client that honours it reads zeros and drops writes, one that does not faults as at an unmapped address
+(never worse than today's unmapped VA). Kyty's PRT net maps the guest's GPU windows that way so a stray GPU access reads
+zeros instead of halting the ring; these cases check each client before the net's default goes on. Run them one at a
+time in this order, with `dmesg | tail` and a ping after each and `bc250-power cycle` at hand; stop at the first that
+misbehaves:
+
+```sh
+./bc250-native-probe --danger prt-map
+./bc250-native-probe --danger prt-split          # then umr in a second shell while it holds (PRT_HOLD_SEC=120)
+./bc250-native-probe --danger prt-read-compute
+./bc250-native-probe --danger prt-write-compute
+./bc250-native-probe --danger prt-kfd-tlb        # PRT_TLB_FLUSH_CMD='...' for the op-14 flush in step 4
+./bc250-native-probe --danger prt-replace-race
+./bc250-native-probe --danger prt-cp-compute
+./bc250-native-probe --danger prt-gfx-copy --awake 5     # gfx ring: one per run, last, each may take the board down
+./bc250-native-probe --danger prt-gfx-write --awake 5
+./bc250-native-probe --danger prt-gfx-wait --awake 5
+./bc250-native-probe --danger prt-gfx-dma --awake 5
+./bc250-native-probe --danger prt-gfx-dispatch --awake 5
+```
+
+`prt-split` creates no CS, so its VM has no VMID; umr has to walk it from its page directory (the held process's
+pasid is printed). Without the pre-split, the rest of the 2 MiB and of the 1 GiB around the buffer should read as
+PTE 0 until a CS or a PRT op rewrites them; with it, as PRT.
 
 ### Register shadowing results (2026-10-31, stock amdgpu, kernel 7.2)
 

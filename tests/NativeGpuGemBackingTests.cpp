@@ -602,6 +602,140 @@ int main() {
 	}
 
 	delete gem;
+
+	// Case 8: the PRT net (KYTY_NATIVE_GPU_PRT_NET). For each mode, a fresh backing (its own GPU VM) gets a net over
+	// two windows of reserved host address space (the guest's own windows are fixed addresses a test cannot reserve)
+	// and runs one scripted map/unmap sequence inside the second window, recording its GEM_VAs. Off issues exactly what
+	// the backing issued before the net existed; with a net, the windows go PRT at once, a bind into a hole is
+	// pre-split, unmaps leave PRT instead of clearing, an aperture inside the net maps and clears nothing, and a GPU
+	// store through a view bound inside the net lands.
+	{
+		using Op               = GemBacking::VaTraceOp;
+		const uint64_t gib     = 1ull << 30u;
+		auto*          res_lo  = static_cast<uint8_t*>(ReserveGuest(68ull << 20u));
+		auto*          res_hi  = static_cast<uint8_t*>(ReserveGuest(2 * gib));
+		const uint64_t win_lo  = (reinterpret_cast<uint64_t>(res_lo) + (2ull << 20u) - 1) & ~((2ull << 20u) - 1);
+		const uint64_t win_hi  = (reinterpret_cast<uint64_t>(res_hi) + gib - 1) & ~(gib - 1);
+		const std::array<std::pair<uint64_t, uint64_t>, 2> windows {{{win_lo, 64ull << 20u}, {win_hi, gib}}};
+		const uint64_t view    = win_hi + 0x200000; // a view of backing bytes 0x100000 +128 KiB
+		const uint64_t vlen    = 0x20000;
+		const uint64_t voff    = 0x100000;
+		const uint64_t ext     = win_hi + 0x400000; // an external (non-backed) range of 64 KiB
+		const uint64_t elen    = 0x10000;
+		const uint64_t aper    = win_hi + 0x800000; // a PRT aperture of 2 MiB
+		const uint64_t alen    = 0x200000;
+		const uint32_t prt     = AMDGPU_VM_PAGE_PRT;
+		bool           net_ran = false;
+		for (const int mode: {2, 1, 0}) {
+			GemBacking* g = GemBacking::Create(chunk);
+			Check(g != nullptr, "Create for the PRT net case failed");
+			std::vector<Op> ops;
+			g->TraceVaOps(&ops);
+			const bool net = g->InstallPrtNet(windows, mode);
+			Check(net == g->PrtNetOn(), "PrtNetOn disagrees with InstallPrtNet");
+			Check(mode != 0 || !net, "mode off installed a net");
+			if (mode != 0 && !net) {
+				std::printf("NativeGpuGemBackingTests: PRT net case, mode %d skipped (forced off: no explicit sync here)\n", mode);
+				g->TraceVaOps(nullptr);
+				delete g;
+				continue;
+			}
+			net_ran = net_ran || net;
+			Check(!net || g->InPrtNet(view, vlen), "the view must lie in the net");
+			Check(!net || (mode == 2) == g->InPrtNet(win_lo, 0x1000), "the low window is netted with \"all\" only");
+
+			Check(g->MapView(view, vlen, voff, PROT_READ | PROT_WRITE), "MapView in the net failed");
+			Check(g->BindView(view, vlen, voff), "BindView in the net failed");
+			Check(g->UnbindView(view, vlen), "UnbindView in the net failed");
+			void* host = ::mmap(reinterpret_cast<void*>(ext), elen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+			Check(host == reinterpret_cast<void*>(ext), "external host mapping in the window failed");
+			Check(g->BindExternal(ext, elen, true), "BindExternal in the net failed");
+			Check(g->UnbindExternal(ext, elen), "UnbindExternal in the net failed");
+			g->SetPrtAperture(0, aper, alen);
+			g->SetPrtAperture(0, 0, 0);
+			g->TraceVaOps(nullptr);
+
+			// What every case issues; `explicit_sync` is whether unmaps leave PRT (with a net it must be on).
+			const bool explicit_sync = net || std::any_of(ops.begin(), ops.end(), [&](const Op& o) {
+				                           return o.op == AMDGPU_VA_OP_REPLACE && o.handle == 0 && o.vaddr == view;
+			                           });
+			std::vector<Op> want;
+			auto add = [&](uint32_t op, bool bo, uint64_t va, uint64_t size, bool is_prt) {
+				want.push_back({op, bo ? 1u : 0u, va, size, is_prt ? prt : 0u});
+			};
+			if (net) {
+				if (mode == 2) {
+					add(AMDGPU_VA_OP_REPLACE, false, win_lo, 64ull << 20u, true);
+				}
+				add(AMDGPU_VA_OP_REPLACE, false, win_hi, gib, true);
+				add(AMDGPU_VA_OP_REPLACE, false, view, vlen, true); // pre-split
+			}
+			add(AMDGPU_VA_OP_REPLACE, true, view, vlen, false); // the dummy (the block is not resident)
+			if (explicit_sync) {
+				add(AMDGPU_VA_OP_REPLACE, false, view, vlen, true);
+			} else {
+				add(AMDGPU_VA_OP_CLEAR, false, view, vlen, false);
+			}
+			if (net) {
+				add(AMDGPU_VA_OP_REPLACE, false, ext, elen, true); // pre-split
+			}
+			add(AMDGPU_VA_OP_REPLACE, true, ext, elen, false);
+			add(net ? AMDGPU_VA_OP_REPLACE : AMDGPU_VA_OP_CLEAR, false, ext, elen, net);
+			if (!net) { // the aperture's hole goes PRT, then is cleared; inside the net it is PRT already and stays
+				add(AMDGPU_VA_OP_REPLACE, false, aper, alen, true);
+				add(AMDGPU_VA_OP_CLEAR, false, aper, alen, false);
+			}
+			bool same = ops.size() == want.size();
+			for (size_t i = 0; same && i < ops.size(); i++) {
+				same = ops[i].op == want[i].op && (ops[i].handle != 0) == (want[i].handle != 0) && ops[i].vaddr == want[i].vaddr &&
+				       ops[i].size == want[i].size && (ops[i].flags & prt) == want[i].flags;
+			}
+			if (!same) {
+				for (const auto& o: ops) {
+					std::fprintf(stderr, "  GEM_VA op %u %s 0x%llx +0x%llx%s\n", o.op, o.handle != 0 ? "bo" : "--",
+					             static_cast<unsigned long long>(o.vaddr), static_cast<unsigned long long>(o.size),
+					             (o.flags & prt) != 0 ? " PRT" : "");
+				}
+			}
+			Check(same, mode == 0 ? "KYTY_NATIVE_GPU_PRT_NET=off changed the GEM_VA sequence"
+			                      : "the PRT net's GEM_VA sequence is not the expected one");
+			Check(!net || (g->NetPresplits() == 2 && g->NetUnmaps() == 2), "PRT net statistics wrong");
+
+			if (net) {
+				// A view bound again inside the net and made resident: the GPU writes through it (the pre-split and the
+				// huge PRT entries around it leave its own mapping whole).
+				Check(g->MapView(view, vlen, voff, PROT_READ | PROT_WRITE), "MapView in the net (GPU) failed");
+				Check(g->BindView(view, vlen, voff), "BindView in the net (GPU) failed");
+				Check(g->PromoteGuestRange(view, vlen) == 1, "PromoteGuestRange in the net must promote one block");
+				auto* words = reinterpret_cast<uint32_t*>(view);
+				std::memset(words, 0, vlen);
+				const int fd = g->DrmFd();
+				union drm_amdgpu_ctx c;
+				std::memset(&c, 0, sizeof(c));
+				c.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+				Check(Ioctl(fd, DRM_IOCTL_AMDGPU_CTX, &c) == 0, "PRT net case context allocation failed");
+				const Buffer ib   = CreateBuffer(fd, 64 * 1024, 0x0080000000ull);
+				const Buffer code = CreateBuffer(fd, 64 * 1024, 0x0081000000ull);
+				std::memcpy(code.cpu, kStoreShader, sizeof(kStoreShader));
+				const std::vector<uint32_t> all = g->CreatedHandles();
+				RunStore(fd, c.out.alloc.ctx_id, ib, code, view, 0x7a000000u, static_cast<uint32_t>(vlen / 256), all.data(),
+				         static_cast<uint32_t>(all.size()));
+				for (uint32_t i = 0; i < vlen / 4; i++) {
+					Check(words[i] == 0x7a000000u + i, "GPU write through a view bound inside the PRT net not visible");
+				}
+				Check(g->UnbindView(view, vlen), "UnbindView in the net (GPU) failed");
+			}
+			::munmap(reinterpret_cast<void*>(ext), elen);
+			delete g;
+			std::printf("NativeGpuGemBackingTests: PRT net mode %d: %zu GEM_VAs as expected\n", mode, ops.size());
+		}
+		::munmap(res_lo, 68ull << 20u);
+		::munmap(res_hi, 2 * gib);
+		if (!net_ran) {
+			std::puts("NativeGpuGemBackingTests: the PRT net never went on here; only its off sequence was checked");
+		}
+	}
+
 	std::puts("NativeGpuGemBackingTests: all cases passed");
 	return 0;
 }
