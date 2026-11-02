@@ -5500,29 +5500,30 @@ private:
 			m_acb_translator.SetForcedRefusals(refuse);
 			std::fprintf(stderr, "native shadow: refusing buffers with %zu packet type(s) (test): %s\n", refuse.size(), ops);
 		}
-		// libSceAgc's packets refused until their probes have run on the board, each off (refused, the buffer to Kyty's
-		// command processor) unless its switch is 1: KYTY_NATIVE_GPU_COPY_DATA (COPY_DATA on the gfx ring),
-		// KYTY_NATIVE_GPU_MEC_COPY_DATA (on MEC), KYTY_NATIVE_GPU_ATOMIC_OPS (every no-return ATOMIC_MEM op),
-		// KYTY_NATIVE_GPU_MEM_SEMAPHORE (0x39 as written) and KYTY_NATIVE_GPU_COND_EXEC (any COND_EXEC, its count
-		// recomputed).
+		// libSceAgc's packets the board's probes have run (2.11: copydata on gfx and MEC, atomicops, condexec2), as the
+		// PS5 runs them, each with a switch to refuse it again (0: the buffer goes to Kyty's command processor):
+		// KYTY_NATIVE_GPU_COPY_DATA (COPY_DATA on the gfx ring), KYTY_NATIVE_GPU_MEC_COPY_DATA (on MEC),
+		// KYTY_NATIVE_GPU_ATOMIC_OPS (every no-return ATOMIC_MEM op) and KYTY_NATIVE_GPU_COND_EXEC (any COND_EXEC, its
+		// count recomputed). KYTY_NATIVE_GPU_MEM_SEMAPHORE stays 0: the stock ME took the whole board down on the first
+		// 0x39 (probe memsem, no kernel line), so it is refused unless set to 1 for research.
 		{
-			auto on = [](const char* name) {
+			auto on = [](const char* name, bool def) {
 				const char* v = std::getenv(name);
-				return v != nullptr && v[0] == '1';
+				return v != nullptr && v[0] != '\0' ? v[0] == '1' : def;
 			};
-			const bool copy_data = on("KYTY_NATIVE_GPU_COPY_DATA");
-			const bool mec_copy  = on("KYTY_NATIVE_GPU_MEC_COPY_DATA");
-			const bool atomics   = on("KYTY_NATIVE_GPU_ATOMIC_OPS");
-			const bool semaphore = on("KYTY_NATIVE_GPU_MEM_SEMAPHORE");
-			const bool cond_exec = on("KYTY_NATIVE_GPU_COND_EXEC");
+			const bool copy_data = on("KYTY_NATIVE_GPU_COPY_DATA", true);
+			const bool mec_copy  = on("KYTY_NATIVE_GPU_MEC_COPY_DATA", true);
+			const bool atomics   = on("KYTY_NATIVE_GPU_ATOMIC_OPS", true);
+			const bool semaphore = on("KYTY_NATIVE_GPU_MEM_SEMAPHORE", false);
+			const bool cond_exec = on("KYTY_NATIVE_GPU_COND_EXEC", true);
 			for (Pm4Translator* t: {&m_translator, &m_acb_translator}) {
 				t->SetCopyData(copy_data, mec_copy);
 				t->SetAtomicOps(atomics);
 				t->SetMemSemaphore(semaphore);
 				t->SetCondExec(cond_exec);
 			}
-			if (copy_data || mec_copy || atomics || semaphore || cond_exec) {
-				std::fprintf(stderr, "native shadow: refused forms on: COPY_DATA gfx %d MEC %d, ATOMIC_MEM ops %d, MEM_SEMAPHORE %d, COND_EXEC %d\n",
+			if (!copy_data || !mec_copy || !atomics || semaphore || !cond_exec) {
+				std::fprintf(stderr, "native shadow: libSceAgc forms (not the defaults): COPY_DATA gfx %d MEC %d, ATOMIC_MEM ops %d, MEM_SEMAPHORE %d, COND_EXEC %d\n",
 				             copy_data, mec_copy, atomics, semaphore, cond_exec);
 			}
 		}

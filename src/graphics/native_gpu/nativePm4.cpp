@@ -720,11 +720,16 @@ bool AgcAtomicOp(uint32_t control) {
 // 0x15, OR 0x16, XOR 0x17, INC 0x18, DEC 0x19 (TC_OP_ATOMIC_SWAP_32 0x47 ... TC_OP_ATOMIC_DEC_64 0x79). COMMAND (bits
 // 11:8) 0 once, 1 loop until the compare holds, 2 wait for the write confirm. The returning forms (bit 6 clear) send
 // their result to the CP's internal register, which only a COPY_DATA SRC_SEL 6 reads: refused; so are the float ops.
+// COMMAND 1 refuses: probe atomicops (2.11) sent a no-return CMPSWAP_32 with COMMAND 1 whose compare held, and the
+// stock ME never finished it (the gfx ring stopped until amdgpu reset it), so its loop is not the PS5's on this
+// microcode. COMMAND 3 (send and continue) refuses as well. All 26 ops below passed with COMMAND 2 on the ME and PFP.
 bool NoReturnAtomicOp(uint32_t control) {
 	const uint32_t tc_op   = control & 0x7fu;
 	const uint32_t base    = tc_op & 0x1fu;
 	const uint32_t command = (control >> 8u) & 0xfu;
-	return (tc_op & 0x40u) != 0 && (base == 0x07u || base == 0x08u || (base >= 0x0fu && base <= 0x19u)) && command <= 2u;
+	const uint32_t engine  = control >> 30u; // ENGINE_SEL: the ME or the PFP (libSceAgc's DCB form), never the CE
+	return (tc_op & 0x40u) != 0 && (base == 0x07u || base == 0x08u || (base >= 0x0fu && base <= 0x19u)) &&
+	       (command == 0u || command == 2u) && engine <= 1u;
 }
 
 // Packets that make the GPU do something (as opposed to setting state), for dropping an empty first
@@ -1429,8 +1434,9 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				}
 				const uint32_t src_sel = b[0] & 0xfu;
 				const uint32_t dst_sel = (b[0] >> 8u) & 0xfu;
-				if (size != 6 || (compute && (header & 2u) == 0) || !(src_sel == 1u || src_sel == 2u || src_sel == 5u || src_sel == 9u) ||
-				    !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || (b[3] & 3u) != 0u || (b[3] == 0u && b[4] == 0u)) {
+				if (size != 6 || (compute && (header & 2u) == 0 && !MecPlainOp(IT_COPY_DATA)) || !(src_sel == 1u || src_sel == 2u || src_sel == 5u || src_sel == 9u) ||
+				    !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || (b[3] & 3u) != 0u || (b[3] == 0u && b[4] == 0u) ||
+				    (b[0] >> 30u) > (compute ? 0u : 1u)) { // ENGINE_SEL: the micro engine or the prefetch parser
 					return bad();
 				}
 				break;
@@ -1477,6 +1483,13 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					}
 					dw += 4u; // the chain
 				} else if (b[3] > kExitGuardMaxSkip || dw + size + b[3] > ib.size()) {
+					return bad();
+				}
+				break;
+			// A title's MEM_SEMAPHORE as libSceAgc writes it (SetMemSemaphore): signal or wait, the gfx ring only.
+			case IT_MEM_SEMAPHORE:
+				if (compute || size != 4 || header != Pkt3(IT_MEM_SEMAPHORE, 3, false) || ((b[2] >> 29u) != 6u && (b[2] >> 29u) != 7u) ||
+				    (b[2] & ~((7u << 29u) | (1u << 20u) | (1u << 16u))) != 0) {
 					return bad();
 				}
 				break;
@@ -1680,11 +1693,16 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 		size_t end;      // the range's end, a dword of `in`
 	};
 	std::vector<CondRange> conds;
-	auto                   cond_delta = [&](size_t dw, int64_t delta) {
+	// `len`: the dwords of the call or REWIND at `dw`. A range that ends inside one skips part of the packet on the PS5,
+	// and the CP parses the rest of it as packets; no count over the inlined dwords gives that, so it stops.
+	auto cond_delta = [&](size_t dw, uint32_t len, int64_t delta) {
 		for (const CondRange& c: conds) {
+			if (dw < c.end && c.end < dw + len) {
+				return false;
+			}
 			if (dw < c.end) {
 				const int64_t count = static_cast<int64_t>((*out)[c.count_at] & 0x3fffu) + delta;
-				if (count < 0 || count > 0x3fff) {
+				if (count < 0 || count > 0x3fff || ((*out)[c.count_at] & ~0x3fffu) != 0) { // see the translator's COND_EXEC
 					return false;
 				}
 				(*out)[c.count_at] = ((*out)[c.count_at] & ~0x3fffu) | static_cast<uint32_t>(count);
@@ -1735,8 +1753,8 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if (!flush(dw)) {
 				return stop("too large", dw);
 			}
-			if (!cond_delta(dw, -2)) {
-				return stop("COND_EXEC count out of range", dw);
+			if (!cond_delta(dw, len, -2)) {
+				return stop("COND_EXEC count out of range or its range ending inside the packet", dw);
 			}
 			changed = 1;
 			dw += len;
@@ -1771,8 +1789,8 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 				if (chain) {
 					return changed;
 				}
-				if (!cond_delta(dw, -static_cast<int64_t>(len))) { // an empty call is left out
-					return stop("COND_EXEC count out of range", dw);
+				if (!cond_delta(dw, len, -static_cast<int64_t>(len))) { // an empty call is left out
+					return stop("COND_EXEC count out of range or its range ending inside the packet", dw);
 				}
 				dw += len;
 				run = dw;
@@ -1800,8 +1818,8 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if (FlattenInto({target, size}, out, depth + 1, why, pieces, nullptr) < 0) {
 				return -1;
 			}
-			if (!cond_delta(dw, static_cast<int64_t>(out->size() - before) - static_cast<int64_t>(len))) {
-				return stop("COND_EXEC count out of range", dw);
+			if (!cond_delta(dw, len, static_cast<int64_t>(out->size() - before) - static_cast<int64_t>(len))) {
+				return stop("COND_EXEC count out of range or its range ending inside the packet", dw);
 			}
 			if (marks != nullptr && depth == 0) {
 				marks->push_back(static_cast<uint32_t>(out->size()));
@@ -3947,7 +3965,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// dwords, which on the PS5 are the title's own. The translated range differs in length (patched packets, inserted
 	// waits and stores), so the COND_EXEC goes as written with its count set to the translated range once the walk
 	// reaches the range's end. Inside the range nothing may happen outside the GPU's stream: no direct runs (the IB2s
-	// change the length again), no segment cut, no tracker store or CPU-tail packet, no barrier on our fence, and no
+	// change the length again), no segment cut, no tracker store but a wake, no CPU-tail packet, no barrier on our fence, and no
 	// register write (the shadow copy would take it as done when the CP may skip it). Label writes in it are recorded as
 	// unknown once the range ends: the CP may have skipped them.
 	struct CondExecRange {
@@ -3957,24 +3975,23 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		size_t   count_at      = 0; // its EXEC_COUNT dword in body
 		size_t   segs          = 0;
 		size_t   seg_points    = 0;
-		size_t   queued        = 0;
 		size_t   tail          = 0;
 		size_t   writes        = 0; // local_writes when it began
 		size_t   seg_writes    = 0; // segs.back().writes when it began
 		uint32_t fence_seq     = 0;
 	} cond;
-	// False when something left the GPU's stream inside the range (see above).
+	// False when something left the GPU's stream inside the range (see above). A wake that comes anyway is harmless, also
+	// as a tracker store inside the range (the points a GPU wait there flushes first): the tracker passes a point once
+	// its sequence or a later one is written (Reached), so a store the CP skips with the range is done at the next one.
+	// The COND_EXEC flushes the points queued before it, so everything here was queued inside the range.
 	auto cond_clean = [&]() {
-		if (segs.size() != cond.segs || segs.back().points.size() != cond.seg_points || r.cpu_tail.size() != cond.tail ||
-		    m_fence_seq != cond.fence_seq || queued_points.size() < cond.queued) {
+		if (segs.size() != cond.segs || segs.back().points.size() < cond.seg_points || r.cpu_tail.size() != cond.tail ||
+		    m_fence_seq != cond.fence_seq) {
 			return false;
 		}
-		for (size_t i = cond.queued; i < queued_points.size(); i++) {
-			if (queued_points[i].kind != TrackerPoint::Kind::Wake) { // a wake that comes anyway is harmless
-				return false;
-			}
-		}
-		return true;
+		const auto wake = [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Wake; };
+		return std::all_of(segs.back().points.begin() + static_cast<std::ptrdiff_t>(cond.seg_points), segs.back().points.end(), wake) &&
+		       std::all_of(queued_points.begin(), queued_points.end(), wake);
 	};
 	auto cond_close = [&]() {
 		const size_t count = body.size() - (cond.count_at + 1u);
@@ -5105,8 +5122,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// the address, a wait (7) blocks until it is not 0 and decrements it. Whether the BC-250's stock microcode
 				// runs 0x39 at all is not known (Mesa sends it only on SI/CIK), and a wait whose signal comes from another
 				// ring or the CPU is invisible to the label pipeline; there is no exactly equivalent GPU form (a wait for
-				// >= 1 and an ATOMIC_MEM SUB are not atomic against a second waiter). So it refuses the buffer unless
-				// KYTY_NATIVE_GPU_MEM_SEMAPHORE=1 (after probe memsem), which passes it as written on the gfx ring.
+				// >= 1 and an ATOMIC_MEM SUB are not atomic against a second waiter). Probe memsem (2.11) answered the first
+				// question: the stock ME took the whole board down on a signal, with no kernel line. So it refuses the
+				// buffer; KYTY_NATIVE_GPU_MEM_SEMAPHORE=1 passes it as written for research only.
 				if (!m_mem_semaphore || body_count < 3) {
 					static std::atomic<uint32_t> told {0};
 					if (body_count >= 3 && told.fetch_add(1, std::memory_order_relaxed) < 8) {
@@ -5116,8 +5134,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					soft_unknown(op, dw);
 					break;
 				}
-				const uint64_t addr = (bptr[0] & ~7u) | (static_cast<uint64_t>(bptr[1]) << 32u);
-				if (m_compute_ring || !labels || !label_gpu(addr, 8)) {
+				// libSceAgc's form only (agc_mem_semaphore): three dwords, ADDR_LO bits 31:3, ADDR_HI, then SEM_SEL (31:29) 6 or
+				// 7, SIGNAL_TYPE (20) and USE_MAILBOX (16), CLIENT_CODE (25:24) 0. Any other select or bit is not a packet
+				// the PS5's libSceAgc writes, and what the stock microcode makes of it is not known.
+				const uint32_t sem_sel = bptr[2] >> 29u;
+				const uint64_t addr    = (bptr[0] & ~7u) | (static_cast<uint64_t>(bptr[1]) << 32u);
+				if (body_count != 3 || (sem_sel != 6u && sem_sel != 7u) || (bptr[2] & ~((7u << 29u) | (1u << 20u) | (1u << 16u))) != 0 ||
+				    m_compute_ring || !labels || !label_gpu(addr, 8)) {
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2]};
 					return fail(op, dw, RefuseWhy::SemaphoreForm);
 				}
@@ -5171,8 +5194,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const bool     clock   = src_sel == 9u;
 				const uint64_t src     = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
 				const uint64_t dst     = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
-				if (!(src_mem || imm || clock) || !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || dst == 0 || (dst & 3u) != 0 ||
-				    (src_mem && src == 0)) {
+				// ENGINE_SEL (bits 31:30, gfx ring): libSceAgc's DCB form picks the micro engine or the prefetch parser (bit 30,
+				// AgcDcbCopyData), both of which run it as written; the constant engine (2) is not in a DCB's stream, and MEC
+				// has no engine field (AgcAcbCopyData leaves the bits 0). A 64-bit copy's addresses hold bits 31:3 only
+				// (DST_64B_ADDR_LO, SRC_64B_ADDR_LO): the CP would write elsewhere than the label bookkeeping and the tracker's
+				// fallbacks assume, so an address not aligned to the copy's size refuses.
+				const uint32_t engine = bptr[0] >> 30u;
+				if (!(src_mem || imm || clock) || !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || dst == 0 || (dst & (bytes - 1u)) != 0 ||
+				    (src_mem && (src == 0 || (src & (bytes - 1u)) != 0)) || engine > (m_compute_ring ? 0u : 1u)) {
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]};
 					return fail(op, dw, RefuseWhy::CopyDataForm);
 				}
@@ -5184,6 +5213,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					cpu.size = static_cast<uint32_t>(bytes);
 					tracker_point(std::move(cpu));
 					note_write({dst, 0, false, false, wide});
+					r.label_writes.emplace_back(dst, 0u); // this buffer writes the label, as a WRITE_DATA the tracker stores
 					stats.timestamps++;
 					NoteOnce(30, "COPY_DATA of the GPU clock written by the tracker (CPU clock)");
 					break;
@@ -5196,6 +5226,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					cpu.data = wide ? std::vector<uint32_t> {bptr[1], bptr[2]} : std::vector<uint32_t> {bptr[1]};
 					tracker_point(std::move(cpu));
 					note_write({dst, value, true, false, wide});
+					r.label_writes.emplace_back(dst, value);
 					stats.labels_cpu++;
 					NoteOnce(31, "COPY_DATA immediate written by the tracker (GPU cannot reach it)");
 					break;
@@ -5594,13 +5625,21 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// a COND_EXEC ahead of the ME, so a PFP_SYNC_ME first lets it see the ME's writes before it, as the PS5's
 					// microcode does.
 					const uint64_t addr = (bptr[0] & ~3u) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
-					if (!m_cond_exec || m_compute_ring || cond.active || body_count != 4 || addr == 0 ||
-					    next + (bptr[3] & 0x3fffu) > dcb.size()) {
+					// libSceAgc masks EXEC_COUNT to 14 bits (AgcDcbCondExec); the CP reads more of the dword (probe condexec:
+					// a 20005-dword skip on MEC), so a count with higher bits is not libSceAgc's and its range is not known.
+					// A flag the tracker writes in this segment (a store, atomic or timestamp the GPU cannot do) lands on the
+					// CPU after the GPU has passed the COND_EXEC, where the PS5's CP reads the title's value: refused too.
+					const bool cpu_flag = std::any_of(segs.back().writes.begin(), segs.back().writes.end(), [&](const LabelWrite& w) {
+						uint64_t v = 0;
+						return !w.gpu && w.Covers(addr, false, &v) != 0;
+					});
+					if (!m_cond_exec || m_compute_ring || cond.active || body_count != 4 || addr == 0 || (bptr[3] & ~0x3fffu) != 0 ||
+					    next + bptr[3] > dcb.size() || cpu_flag) {
 						return fail(op, dw, RefuseWhy::CondExecForm);
 					}
-					if (irq_pending) {
-						flush_points(); // an interrupt queued before the range fires before it, not inside
-					}
+					// The points queued before the range (an interrupt, a store the GPU cannot do) go before it, not inside
+					// where the CP may skip their store.
+					flush_points();
 					body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
 					body.push_back(0);
 					stats.pfp_syncs_emitted++;
@@ -5612,7 +5651,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					cond.end        = next + (bptr[3] & 0x3fffu);
 					cond.segs       = segs.size();
 					cond.seg_points = segs.back().points.size();
-					cond.queued     = queued_points.size();
 					cond.tail       = r.cpu_tail.size();
 					cond.writes     = local_writes.size();
 					cond.seg_writes = segs.back().writes.size();

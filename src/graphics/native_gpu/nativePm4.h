@@ -322,8 +322,9 @@ enum class RefuseWhy : uint8_t {
 	ContextControlOnMec,
 	CondExecForm,
 	AtomicForm,
-	CopyDataForm,  // COPY_DATA from or to registers, GDS, perf counters or atomic results; or into memory the GPU cannot write
-	SemaphoreForm, // MEM_SEMAPHORE on MEC, or on memory the GPU cannot reach
+	CopyDataForm,  // COPY_DATA from or to registers, GDS, perf counters or atomic results, of the constant engine, a 64-bit
+	               // copy off an 8-byte address; or memory to memory the GPU cannot write
+	SemaphoreForm, // MEM_SEMAPHORE not in libSceAgc's form, on MEC, or on memory the GPU cannot reach
 	InPlace,
 	Validate,
 	ValidateResume,
@@ -1101,8 +1102,9 @@ public:
 	// so the safety net (the buffer handed to Kyty's command processor) can be exercised without a broken title.
 	void SetForcedRefusals(std::set<uint32_t> ops) { m_force_refuse = std::move(ops); }
 
-	// libSceAgc's packets the translator refused so far, each behind its switch until a probe has run it on the board
-	// (off: refused as before, the buffer goes to Kyty's command processor). Native labels only.
+	// libSceAgc's packets the translator once refused, each behind a switch (off: refused, the buffer goes to Kyty's
+	// command processor). The backend turns on what the board's probes have run (all but MEM_SEMAPHORE, which took the
+	// board down); a bare Pm4Translator has them off. Native labels only.
 	// COPY_DATA (KYTY_NATIVE_GPU_COPY_DATA, KYTY_NATIVE_GPU_MEC_COPY_DATA): memory, immediate or GPU clock to memory, as
 	// written where the GPU may write the destination.
 	void SetCopyData(bool gfx, bool mec) {

@@ -616,11 +616,14 @@ typedef struct {
 	Bo code;
 } Common;
 
-// Commands and code live in write-combined GTT, like Mesa's IBs, so the CP never sees stale lines.
+// Commands and code live in write-combined GTT, like Mesa's IBs. The IB is mapped UC on the GPU as well, as Kyty's
+// is (AMDGPU_GEM_CREATE_UNCACHED): every case rewrites it in place, and with the default MTYPE the CP fetched a
+// back-to-back job's IB from GL2 lines of the job before it (copydata 2.11: the second of two submits ran the first's
+// commands again, its own never landed; 20 ms of idle, long enough for GFXOFF, hid it).
 static int CommonInit(Device* d, Common* c) {
 	int r = MemCreate(d, &c->ib, MEM_GTT_USWC, 64 * KiB, NULL);
 	if (r == 0) {
-		r = BoBind(d, &c->ib, 0x0080000000ull, 0);
+		r = BoBind(d, &c->ib, 0x0080000000ull, AMDGPU_VM_MTYPE_UC);
 	}
 	if (r == 0) {
 		r = MemCreate(d, &c->code, MEM_GTT_USWC, 64 * KiB, NULL);
@@ -2897,6 +2900,9 @@ typedef struct {
 	bool     on;
 } Awake;
 
+// Set while --awake's wave runs, for a danger case whose step must not meet an idle graphics block.
+static bool g_awake_on = false;
+
 static bool AwakeStart(Device* d, Awake* a, double sec) {
 	memset(a, 0, sizeof(*a));
 	int r = MemCreate(d, &a->prog, MEM_GTT, 64 * KiB, NULL);
@@ -2938,7 +2944,8 @@ static bool AwakeStart(Device* d, Awake* a, double sec) {
 	while (pv[0] == 0 && pv[1] == 0 && NowSec() - t0 < 1.0) {
 	}
 	printf("awake: a compute wave spins for %.1f s (%s)\n", sec, pv[0] || pv[1] ? "running" : "not seen running");
-	a->on = true;
+	a->on      = true;
+	g_awake_on = true;
 	return true;
 }
 
@@ -3008,6 +3015,605 @@ static bool DangerClock(Device* d, Common* c) {
 	}
 	BoDestroy(d, &mem);
 	return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The guest's own packet forms the translator keeps behind a switch until the board has run them (copydata,
+// atomicops, memsem, condexec2). Each step is one job on the ring the translator would send the packet to, followed
+// by a WRITE_DATA marker, so a CP that stops on the packet is told apart from one that ran it and went on. A gfx step
+// uses the header libSceAgc writes in a DCB (no shader-type bit), a compute step the header the translator sends to
+// MEC (shader-type bit set). The compute steps run on compute ring 1, so --awake's wave on ring 0 does not hold them up.
+
+// Packet header for the ring a step runs on.
+static uint32_t GuestPkt(bool cs, uint32_t op, uint32_t body_dw) {
+	return cs ? Pkt3(op, body_dw) : Pkt3Gfx(op, body_dw);
+}
+
+// WRITE_DATA of one dword to memory (DST_SEL 5), write confirmed: the marker after a step.
+static void GuestMark(Ib* ib, bool cs, uint64_t va, uint32_t value) {
+	IbPush(ib, GuestPkt(cs, 0x37u, 4));
+	IbPush(ib, (5u << 8) | (1u << 20));
+	IbPush(ib, (uint32_t)va);
+	IbPush(ib, (uint32_t)(va >> 32));
+	IbPush(ib, value);
+}
+
+static void PrintDwords(const char* what, const uint32_t* dw, uint32_t n) {
+	printf("    %s:", what);
+	for (uint32_t i = 0; i < n; i++) {
+		printf(" %08x", dw[i]);
+	}
+	printf("\n");
+}
+
+// True when `name` is one of the comma-separated entries of `list` (or the list is "all").
+static bool ListHas(const char* list, const char* name) {
+	if (strcmp(list, "all") == 0) {
+		return true;
+	}
+	const size_t n = strlen(name);
+	for (const char* p = list; *p != '\0';) {
+		const char*  e   = strchr(p, ',');
+		const size_t len = e != NULL ? (size_t)(e - p) : strlen(p);
+		if (len == n && strncmp(p, name, n) == 0) {
+			return true;
+		}
+		p += len + (e != NULL ? 1u : 0u);
+	}
+	return false;
+}
+
+// Submits one step and waits for it at most timeout_sec. A step that does not finish, or after which the context
+// was reset, ends the process: freeing the buffers would wait on the stopped ring.
+static void GuestRun(Device* d, Bo* ib_bo, Ib* ib, bool cs, Bo* const* bos, uint32_t num_bos, double timeout_sec,
+                     const char* what) {
+	IbPad(ib);
+	const uint32_t ip   = cs ? AMDGPU_HW_IP_COMPUTE : AMDGPU_HW_IP_GFX;
+	const uint32_t ring = cs ? 1u : 0u;
+	uint64_t       seq  = 0;
+	const double   t0   = NowSec();
+	int            r    = SubmitOn(d, ip, ring, ib_bo, ib, bos, num_bos, &seq);
+	const int      w    = r == 0 ? WaitOn(d, ip, ring, seq, timeout_sec) : r;
+	const double   t    = NowSec() - t0;
+	const int64_t  st   = ContextState(d);
+	printf("  %-44s %s after %.2f ms, ctx 0x%" PRIx64 "\n", what, w == 1 ? "TIMEOUT" : ErrStr(w), t * 1e3, (uint64_t)st);
+	if (w != 0 || st != 0) {
+		printf("  the step did not finish: the %s ring is stopped or was reset; exiting without freeing buffers\n",
+		       cs ? "compute" : "gfx");
+		PrintGpuvmFault(d, "after the step");
+		_exit(3);
+	}
+}
+
+// A UC GTT buffer for a guest-form case: the CPU sees the GPU's writes and the GPU the CPU's without cache actions.
+static bool GuestMem(Device* d, Bo* mem, uint64_t va) {
+	int r = MemCreate(d, mem, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, mem, va, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, mem);
+		return false;
+	}
+	memset(mem->cpu, 0, 64 * KiB);
+	__sync_synchronize();
+	return true;
+}
+
+// COPY_DATA 0x40 as libSceAgc's AgcDcbCopyData / AgcAcbCopyData write it (header 0xC0044000, five body dwords: CONTROL,
+// source address or immediate, destination address), field layout from Linux's gfx10 nvd.h: SRC_SEL [3:0] (1 TC_L2_OBSOLETE,
+// 2 TC_L2, 5 immediate, 9 GPU clock), DST_SEL [11:8] (2 TC_L2, 5 TC_L2_OBSOLETE), COUNT_SEL bit 16 (64 bits), WR_CONFIRM
+// bit 20. libSceAgc's DCB builder takes SRC_SEL and DST_SEL from the title's enum shifted right by one, so a title may send
+// either memory select; Mesa's gfx10 code sends 1 and 5, the gfx10 names are 2 and 2. Never a register select: a COPY_DATA
+// from or to a register stops the gfx ring from a user IB (probe regindex). COPYDATA_RING=gfx (default) or compute,
+// COPYDATA_STEP=mem,mem64,memobs,imm,imm64,clock or all (default), COPYDATA_DST=2 (default), 5 or (gfx only) 1 for the
+// immediate and clock steps, COPYDATA_ENGINE=0 (default, the ME) or 1 (gfx only, the PFP: libSceAgc's DCB form takes
+// ENGINE_SEL from the low bit of the title's source enum, and the translator passes both). The clock read stopped an idle
+// gfx ring before (GFXOFF): the clock step runs only with --awake, or with COPYDATA_CLOCK_IDLE=1 to find out on purpose.
+// A compute-ring step that stops MEC can take the board down (exitguard): run compute steps one at a time, last.
+static bool DangerCopyData(Device* d, Common* c) {
+	const char*    ring_env = getenv("COPYDATA_RING");
+	const bool     cs       = ring_env != NULL && strcmp(ring_env, "compute") == 0;
+	const char*    steps    = getenv("COPYDATA_STEP") != NULL ? getenv("COPYDATA_STEP") : "all";
+	const char*    dst_env  = getenv("COPYDATA_DST");
+	const uint32_t dst_knob = dst_env != NULL ? (uint32_t)strtoul(dst_env, NULL, 0) : 2u;
+	const char*    eng_env  = getenv("COPYDATA_ENGINE");
+	const uint32_t engine   = eng_env != NULL ? (uint32_t)strtoul(eng_env, NULL, 0) : 0u;
+	const bool     idle_ok  = getenv("COPYDATA_CLOCK_IDLE") != NULL && strcmp(getenv("COPYDATA_CLOCK_IDLE"), "1") == 0;
+	printf("== danger copydata: COPY_DATA memory, immediate and GPU clock into memory, %s ring (steps %s, DST_SEL %u, ENGINE %u)\n",
+	       cs ? "compute ring 1" : "gfx", steps, dst_knob, engine);
+	if (dst_knob != 2u && dst_knob != 5u && (cs || dst_knob != 1u)) {
+		printf("  COPYDATA_DST must be 2 or 5, or 1 on the gfx ring (memory); a register select stops the ring\n");
+		return false;
+	}
+	if (engine > (cs ? 0u : 1u)) {
+		printf("  COPYDATA_ENGINE must be 0, or 1 on the gfx ring: MEC has no engine field and a DCB has no constant engine\n");
+		return false;
+	}
+	Bo mem;
+	if (!GuestMem(d, &mem, 0x0740000000ull)) {
+		return false;
+	}
+	static const struct {
+		const char* name;
+		uint32_t    src_sel;
+		uint32_t    dst_sel; // 0: COPYDATA_DST
+		bool        wide;
+	} kSteps[] = {
+	    {"mem", 2, 2, false},    // TC_L2 to TC_L2, 32 bits
+	    {"mem64", 2, 2, true},   // the same, 64 bits
+	    {"memobs", 1, 5, false}, // TC_L2_OBSOLETE to TC_L2_OBSOLETE (Mesa's COPY_DATA_SRC_MEM / COPY_DATA_DST_MEM)
+	    {"imm", 5, 0, false},    // immediate, 32 bits: the high source dword is not written
+	    {"imm64", 5, 0, true},   // immediate, 64 bits
+	    {"clock", 9, 0, true},   // the GPU clock, twice, 64 bits
+	};
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	bool               ok    = true;
+	bool               any   = false;
+	for (size_t k = 0; k < ARRAY_SIZE(kSteps); k++) {
+		if (!ListHas(steps, kSteps[k].name)) {
+			continue;
+		}
+		any                    = true;
+		const uint32_t src_sel = kSteps[k].src_sel;
+		if (src_sel == 9u && !g_awake_on && !idle_ok) {
+			// GFXOFF: a clock read on an idle graphics block stopped the gfx ring (danger clock).
+			printf("  %s: skipped without --awake (COPYDATA_CLOCK_IDLE=1 runs it on an idle GPU)\n", kSteps[k].name);
+			ok = false;
+			continue;
+		}
+		const uint32_t dst_sel = kSteps[k].dst_sel != 0 ? kSteps[k].dst_sel : dst_knob;
+		const bool     wide    = kSteps[k].wide;
+		const uint32_t slot    = 0x100u + 0x40u * (uint32_t)k; // source at +0, destination at +0x10, second clock at +0x20
+		const uint64_t src     = mem.va + slot;
+		const uint64_t dst     = mem.va + slot + 0x10u;
+		const uint64_t marker  = mem.va + 0x800u + 4u * (uint32_t)k;
+		const uint32_t mark    = 0xc0da0000u | (uint32_t)k;
+		const uint64_t value   = 0x0123456789abcdefull ^ ((uint64_t)k << 56); // memory source or immediate
+		volatile uint32_t* s   = m + slot / 4;
+		s[0]                   = (uint32_t)value;
+		s[1]                   = (uint32_t)(value >> 32);
+		for (uint32_t i = 2; i < 12; i++) {
+			s[i] = 0x5e5e5e5eu; // the destination and its neighbours
+		}
+		m[(0x800u + 4u * (uint32_t)k) / 4] = 0;
+		__sync_synchronize();
+		Ib       ib      = {.n = 0};
+		uint32_t control = src_sel | (dst_sel << 8) | ((wide ? 1u : 0u) << 16) | (1u << 20) | (engine << 30);
+		IbPush(&ib, GuestPkt(cs, 0x40u, 5));
+		IbPush(&ib, control);
+		IbPush(&ib, src_sel == 5u ? (uint32_t)value : src_sel == 9u ? 0u : (uint32_t)src);
+		IbPush(&ib, src_sel == 5u ? (wide ? (uint32_t)(value >> 32) : 0xdeadbeefu) : src_sel == 9u ? 0u : (uint32_t)(src >> 32));
+		IbPush(&ib, (uint32_t)dst);
+		IbPush(&ib, (uint32_t)(dst >> 32));
+		if (src_sel == 9u) {
+			// A second clock read after a write the CP must finish first: the two values must be ordered.
+			GuestMark(&ib, cs, mem.va + slot + 0x30u, 0x7177u);
+			IbPush(&ib, GuestPkt(cs, 0x40u, 5));
+			IbPush(&ib, control);
+			IbPush(&ib, 0u);
+			IbPush(&ib, 0u);
+			IbPush(&ib, (uint32_t)(dst + 0x10u));
+			IbPush(&ib, (uint32_t)((dst + 0x10u) >> 32));
+		}
+		GuestMark(&ib, cs, marker, mark);
+		char what[64];
+		snprintf(what, sizeof(what), "%s (SRC_SEL %u -> DST_SEL %u, %u bits):", kSteps[k].name, src_sel, dst_sel, wide ? 64u : 32u);
+		PrintDwords("packet", ib.dw, 6);
+		GuestRun(d, &c->ib, &ib, cs, bos, 1, 1.0, what);
+		const bool landed = m[(0x800u + 4u * (uint32_t)k) / 4] == mark;
+		bool       good   = false;
+		if (src_sel == 9u) {
+			const uint64_t t0 = (uint64_t)s[4] | ((uint64_t)s[5] << 32);
+			const uint64_t t1 = (uint64_t)s[8] | ((uint64_t)s[9] << 32);
+			good              = t0 != 0 && t0 != 0x5e5e5e5e5e5e5e5eull && t1 >= t0 && t1 != 0x5e5e5e5e5e5e5e5eull;
+			printf("    clocks %" PRIu64 " then %" PRIu64 " (%+.2f us at %u kHz): %s\n", t0, t1,
+			       d->info.gpu_counter_freq != 0 ? (double)(int64_t)(t1 - t0) * 1e3 / d->info.gpu_counter_freq : 0.0,
+			       d->info.gpu_counter_freq, good ? "non-zero and ordered" : "NOT as expected");
+		} else {
+			const uint32_t want_lo = (uint32_t)value;
+			const uint32_t want_hi = wide ? (uint32_t)(value >> 32) : 0x5e5e5e5eu;
+			good = s[4] == want_lo && s[5] == want_hi && s[3] == 0x5e5e5e5eu && s[6] == 0x5e5e5e5eu;
+			printf("    destination %08x %08x (want %08x %08x), neighbours %08x %08x: %s\n", s[4], s[5], want_lo, want_hi,
+			       s[3], s[6], good ? "as expected" : "NOT as expected");
+		}
+		printf("    marker %s\n", landed ? "landed" : "MISSING");
+		ok = ok && good && landed;
+	}
+	if (!any) {
+		printf("  no step matches COPYDATA_STEP=%s\n", steps);
+		ok = false;
+	}
+	BoDestroy(d, &mem);
+	printf("  %s\n", ok ? "every step ran and wrote what it should" : "a step did not write what it should");
+	return ok;
+}
+
+// What a no-return ATOMIC_MEM op leaves in memory, by gfx10's TC_OP (Linux navi10_enum.h): bit 6 no return, bit 5
+// 64 bits, the low five bits the op. INC and DEC wrap at the source as the TC's do. False for an op the translator's
+// NoReturnAtomicOp does not pass.
+static bool AtomicExpect(uint32_t tc_op, uint64_t old, uint64_t src, uint64_t cmp, uint64_t* out) {
+	const bool     wide = (tc_op & 0x20u) != 0;
+	const uint64_t mask = wide ? ~0ull : 0xffffffffull;
+	const int64_t  so   = wide ? (int64_t)old : (int64_t)(int32_t)(uint32_t)old;
+	const int64_t  ss   = wide ? (int64_t)src : (int64_t)(int32_t)(uint32_t)src;
+	old &= mask;
+	src &= mask;
+	cmp &= mask;
+	uint64_t v = 0;
+	if ((tc_op & 0x40u) == 0) {
+		return false;
+	}
+	switch (tc_op & 0x1fu) {
+		case 0x07: v = src; break;
+		case 0x08: v = old == cmp ? src : old; break;
+		case 0x0f: v = old + src; break;
+		case 0x10: v = old - src; break;
+		case 0x11: v = so < ss ? old : src; break;
+		case 0x12: v = old < src ? old : src; break;
+		case 0x13: v = so > ss ? old : src; break;
+		case 0x14: v = old > src ? old : src; break;
+		case 0x15: v = old & src; break;
+		case 0x16: v = old | src; break;
+		case 0x17: v = old ^ src; break;
+		case 0x18: v = old >= src ? 0 : old + 1; break;
+		case 0x19: v = (old == 0 || old > src) ? src : old - 1; break;
+		default: return false;
+	}
+	*out = v & mask;
+	return true;
+}
+
+// The source operand per op, chosen so the result differs from the old value and a wrong signedness, width or op
+// would show: SMIN takes a value only signed-smaller, UMAX one only unsigned-larger, ADD and SUB carry across the
+// halves of a 64-bit word, INC and DEC have a limit they do not reach.
+static uint64_t AtomicSource(uint32_t tc_op) {
+	const bool wide = (tc_op & 0x20u) != 0;
+	switch (tc_op & 0x1fu) {
+		case 0x07:
+		case 0x08: return wide ? 0x0123456789abcdefull : 0x01234567u;
+		case 0x0f: return wide ? 0x10u : 0x00010001u;
+		case 0x10: return wide ? 0xfffffff1ull : 0x00010001u;
+		case 0x11: return wide ? 0x8000000000000001ull : 0x80000001u;
+		case 0x12: return 5u;
+		case 0x13: return wide ? 0x7ffffffffffffff0ull : 0x7ffffff0u;
+		case 0x14: return wide ? 0xc000000000000000ull : 0xc0000000u;
+		case 0x15: return wide ? 0x0ff00ff00ff00ff0ull : 0x0ff00ff0u;
+		case 0x16: return wide ? 0x0101010101010101ull : 0x01010101u;
+		case 0x17: return wide ? 0xffff0000ffff0000ull : 0xffff0000u;
+		default: return wide ? ~0ull : 0xffffffffu; // INC, DEC: the limit
+	}
+}
+
+// ATOMIC_MEM 0x1E with every no-return integer TC_OP the translator passes with KYTY_NATIVE_GPU_ATOMIC_OPS=1, in
+// libSceAgc's form (agc_atomic_mem: header 0xC0071E00, CONTROL = ENGINE [31:30] | CACHE_POLICY [26:25] | COMMAND [11:8]
+// | ATOMIC [6:0], address, source, compare, loop interval; the fields as Linux's nvd.h PACKET3_ATOMIC_MEM). One op per job
+// on a word with a known old value, its neighbour dword checked too, a WRITE_DATA marker after it. ATOMIC_OP=<hex>[,..]
+// (default: the 26 ops NoReturnAtomicOp passes, 32 then 64 bits), ATOMIC_CMD 0 or 2 (default 2, wait for the write
+// confirm, as libSceAgc's own uses; 1, loop until the compare holds, only for CMPSWAP, as NoReturnAtomicOp passes it),
+// ATOMIC_ENGINE 0 (the ME) or 1 (default, the PFP, as libSceAgc's DCB form sets it). CMPSWAP compares with the old value,
+// so it swaps; a COMMAND 1 compare that never holds would loop. The gfx ring only: the translator never sends an
+// ATOMIC_MEM to MEC (the tracker performs a compute ring's on the CPU), and a stopped MEC can take the board down.
+static bool DangerAtomicOps(Device* d, Common* c) {
+	const char*    ring_env = getenv("ATOMIC_RING");
+	const bool     cs       = false;
+	const char*    cmd_env  = getenv("ATOMIC_CMD");
+	const uint32_t command  = cmd_env != NULL ? (uint32_t)strtoul(cmd_env, NULL, 0) : 2u;
+	const char*    eng_env  = getenv("ATOMIC_ENGINE");
+	const uint32_t engine   = eng_env != NULL ? (uint32_t)strtoul(eng_env, NULL, 0) : 1u;
+	if (ring_env != NULL && strcmp(ring_env, "gfx") != 0) {
+		printf("  ATOMIC_RING: only gfx; the translator never sends ATOMIC_MEM to MEC\n");
+		return false;
+	}
+	if (command > 2u || engine > 1u) {
+		printf("  ATOMIC_CMD must be 0, 1 or 2 and ATOMIC_ENGINE 0 or 1 (the forms NoReturnAtomicOp passes)\n");
+		return false;
+	}
+	uint32_t       ops[64];
+	uint32_t       num_ops = 0;
+	const char*    list    = getenv("ATOMIC_OP");
+	if (list != NULL) {
+		for (const char* p = list; *p != '\0' && num_ops < ARRAY_SIZE(ops);) {
+			char* e        = NULL;
+			ops[num_ops++] = (uint32_t)strtoul(p, &e, 16) & 0x7fu;
+			if (e == p) {
+				printf("  ATOMIC_OP: cannot parse '%s'\n", p);
+				return false;
+			}
+			p = *e == ',' ? e + 1 : e;
+		}
+	} else {
+		static const uint32_t kBases[] = {0x07, 0x08, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19};
+		for (uint32_t w = 0; w < 2; w++) {
+			for (size_t i = 0; i < ARRAY_SIZE(kBases); i++) {
+				ops[num_ops++] = 0x40u | (w << 5) | kBases[i];
+			}
+		}
+	}
+	printf("== danger atomicops: ATOMIC_MEM no-return TC_OPs, %s ring, COMMAND %u, ENGINE %u, %u ops\n",
+	       cs ? "compute ring 1" : "gfx", command, engine, num_ops);
+	if (command == 1u) {
+		printf("  COMMAND 1 loops until the compare holds: only CMPSWAP with a met compare is safe\n");
+	}
+	Bo mem;
+	if (!GuestMem(d, &mem, 0x0740000000ull)) {
+		return false;
+	}
+	volatile uint32_t* m       = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[]   = {&mem};
+	bool               ok      = true;
+	const uint64_t     old64   = 0x4a5a5a5afffffff0ull;
+	const uint32_t     old32   = 0x4a5a5a5au;
+	uint32_t           passed  = 0;
+	for (uint32_t k = 0; k < num_ops; k++) {
+		const uint32_t op   = ops[k];
+		const bool     wide = (op & 0x20u) != 0;
+		const uint64_t old  = wide ? old64 : old32;
+		const uint64_t src  = AtomicSource(op);
+		uint64_t       want = 0;
+		if (!AtomicExpect(op, old, src, old, &want)) {
+			printf("  op 0x%02x: not a no-return integer op the translator passes; skipped\n", op);
+			ok = false;
+			continue;
+		}
+		if (command == 1u && (op & 0x1fu) != 0x08u) {
+			// The translator passes COMMAND 1 only on a compare-swap; any other op would wait for a compare it has no
+			// return value for.
+			printf("  op 0x%02x: COMMAND 1 only with CMPSWAP; skipped\n", op);
+			ok = false;
+			continue;
+		}
+		const uint32_t     slot   = 0x100u + 0x20u * k; // up to 0x8f0 for 64 ops; the markers are at 0x1000
+		const uint64_t     va     = mem.va + slot;
+		volatile uint32_t* w      = m + slot / 4;
+		const uint32_t     mark   = 0xa70a0000u | k;
+		w[0]                      = (uint32_t)old;
+		w[1]                      = wide ? (uint32_t)(old >> 32) : 0x77777777u;
+		w[2]                      = 0x77777777u;
+		w[3]                      = 0x77777777u;
+		m[(0x1000u + 4u * k) / 4]  = 0;
+		__sync_synchronize();
+		Ib ib = {.n = 0};
+		IbPush(&ib, GuestPkt(cs, 0x1eu, 8));
+		IbPush(&ib, (engine << 30) | (command << 8) | op);
+		IbPush(&ib, (uint32_t)va);
+		IbPush(&ib, (uint32_t)(va >> 32));
+		IbPush(&ib, (uint32_t)src);
+		IbPush(&ib, (uint32_t)(src >> 32));
+		IbPush(&ib, (uint32_t)old); // the compare: CMPSWAP (and COMMAND 1) see it met
+		IbPush(&ib, (uint32_t)(old >> 32));
+		IbPush(&ib, 6u);
+		GuestMark(&ib, cs, mem.va + 0x1000u + 4u * k, mark);
+		char what[48];
+		snprintf(what, sizeof(what), "op 0x%02x (%u bits):", op, wide ? 64u : 32u);
+		PrintDwords("packet", ib.dw, 9);
+		GuestRun(d, &c->ib, &ib, cs, bos, 1, 1.0, what);
+		const uint64_t got    = (uint64_t)w[0] | (wide ? (uint64_t)w[1] << 32 : 0u);
+		const bool     intact = (wide || w[1] == 0x77777777u) && w[2] == 0x77777777u && w[3] == 0x77777777u;
+		const bool     landed = m[(0x1000u + 4u * k) / 4] == mark;
+		const bool     good   = got == want && intact && landed;
+		printf("    old 0x%" PRIx64 " src 0x%" PRIx64 ": 0x%" PRIx64 " (want 0x%" PRIx64 "), neighbours %s, marker %s: %s\n", old,
+		       (uint64_t)(src & (wide ? ~0ull : 0xffffffffull)), got, want, intact ? "intact" : "CHANGED", landed ? "landed" : "MISSING",
+		       good ? "ok" : "NOT as expected");
+		passed += good ? 1u : 0u;
+		ok = ok && good;
+	}
+	BoDestroy(d, &mem);
+	printf("  %u of %u ops wrote what they should\n", passed, num_ops);
+	return ok;
+}
+
+// MEM_SEMAPHORE 0x39 on the gfx ring, in libSceAgc's form (AgcDcbMemSemaphore, Kyty's agc_mem_semaphore: header
+// 0xC0023900, address low & ~7, address high, then SEM_SEL [31:29] 6 signal / 7 wait | SIGNAL_TYPE bit 20 | USE_MAILBOX
+// bit 16); the field values are those of Linux's nvd.h (PACKET3_SEM_SEL_SIGNAL, PACKET3_SEM_SEL_WAIT,
+// PACKET3_SEM_SEL_SIGNAL_TYPE 0 increment / 1 write 1, PACKET3_SEM_USE_MAILBOX). Mesa sends 0x39 only on SI/CIK, and
+// whether gfx10's stock ME runs it is what this case finds out: an illegal opcode or a wait that never ends stops the
+// gfx ring (amdgpu's lockup timeout then resets it). Mailbox 0 only. MEMSEM_STEP=signal (default): two signals then,
+// in a second job, a wait, on a 64-bit counter at 0; the counter must read 2 (1 with MEMSEM_SIGNAL_TYPE=1) and then one
+// less. MEMSEM_STEP=waitfirst: a wait on the counter at 0 must not finish in 1 s, then the CPU writes 1 and the job must
+// finish within 100 ms, leaving 0. If it does not, a compute-ring WRITE_DATA writes the 1 through the GPU's caches
+// (a wait that does not see the CPU's store but polls); every wait is bounded.
+static bool DangerMemSem(Device* d, Common* c) {
+	// 2.11: the first signal took the whole board down at once, with no kernel line (stock gfx10 ME); only on purpose.
+	if (getenv("MEMSEM_I_KNOW") == NULL || strcmp(getenv("MEMSEM_I_KNOW"), "1") != 0) {
+		printf("== danger memsem: refused: MEM_SEMAPHORE killed the board on 2.11 (set MEMSEM_I_KNOW=1 to run it anyway)\n");
+		return false;
+	}
+	const char*    step_env = getenv("MEMSEM_STEP");
+	const bool     first    = step_env != NULL && strcmp(step_env, "waitfirst") == 0;
+	const char*    type_env = getenv("MEMSEM_SIGNAL_TYPE");
+	const uint32_t type     = type_env != NULL ? (uint32_t)strtoul(type_env, NULL, 0) & 1u : 0u;
+	printf("== danger memsem: MEM_SEMAPHORE (0x39) on the gfx ring, step %s, SIGNAL_TYPE %u (%s)\n",
+	       first ? "waitfirst" : "signal", type, type != 0 ? "write 1" : "increment");
+	Bo mem, rib;
+	if (!GuestMem(d, &mem, 0x0740000000ull)) {
+		return false;
+	}
+	int r = MemCreate(d, &rib, MEM_GTT_USWC, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &rib, 0x0741000000ull, 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m       = (volatile uint32_t*)mem.cpu;
+	volatile uint32_t* counter = m + 0x100 / 4;
+	const uint64_t     sem     = mem.va + 0x100;
+	Bo*                bos[]   = {&mem};
+	counter[0]                 = 0;
+	counter[1]                 = 0;
+	counter[2]                 = 0x5e5e5e5eu; // the neighbour
+	__sync_synchronize();
+	const uint32_t sel_signal = (6u << 29) | (type << 20);
+	const uint32_t sel_wait   = 7u << 29;
+#define MEMSEM_PKT(ib, sel)                                                  \
+	do {                                                                 \
+		IbPush(&(ib), Pkt3Gfx(0x39u, 3));                             \
+		IbPush(&(ib), (uint32_t)sem & ~7u);                           \
+		IbPush(&(ib), (uint32_t)(sem >> 32));                         \
+		IbPush(&(ib), (sel));                                         \
+	} while (0)
+	bool ok = true;
+	if (!first) {
+		Ib ib = {.n = 0};
+		MEMSEM_PKT(ib, sel_signal);
+		MEMSEM_PKT(ib, sel_signal);
+		GuestMark(&ib, false, mem.va + 0x800, 0x5e3a0001u);
+		PrintDwords("signal job", ib.dw, ib.n);
+		GuestRun(d, &c->ib, &ib, false, bos, 1, 1.0, "two signals:");
+		const uint32_t want1 = type != 0 ? 1u : 2u;
+		printf("    counter %08x %08x (want %08x 00000000), neighbour %08x, marker %s\n", counter[0], counter[1], want1,
+		       counter[2], m[0x800 / 4] == 0x5e3a0001u ? "landed" : "MISSING");
+		ok = counter[0] == want1 && counter[1] == 0 && counter[2] == 0x5e5e5e5eu && m[0x800 / 4] == 0x5e3a0001u;
+		if (counter[0] == 0) {
+			printf("  the signal left the counter at 0: a wait would never end; not running it\n");
+			ok = false;
+		} else {
+			ib.n = 0;
+			MEMSEM_PKT(ib, sel_wait);
+			GuestMark(&ib, false, mem.va + 0x804, 0x5e3a0002u);
+			PrintDwords("wait job", ib.dw, ib.n);
+			const uint32_t before = counter[0];
+			GuestRun(d, &c->ib, &ib, false, bos, 1, 1.0, "wait on a signalled counter:");
+			printf("    counter %08x %08x (want %08x 00000000), neighbour %08x, marker %s\n", counter[0], counter[1], before - 1u,
+			       counter[2], m[0x804 / 4] == 0x5e3a0002u ? "landed" : "MISSING");
+			ok = ok && counter[0] == before - 1u && counter[1] == 0 && counter[2] == 0x5e5e5e5eu && m[0x804 / 4] == 0x5e3a0002u;
+		}
+	} else {
+		Ib ib = {.n = 0};
+		MEMSEM_PKT(ib, sel_wait);
+		GuestMark(&ib, false, mem.va + 0x808, 0x5e3a0003u);
+		IbPad(&ib);
+		PrintDwords("wait job", ib.dw, ib.n);
+		uint64_t seq = 0;
+		r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 1, &seq);
+		if (r != 0) {
+			printf("  submit failed: %s\n", ErrStr(r));
+			_exit(3);
+		}
+		int w = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0);
+		printf("  wait on counter 0, first second: %s, ctx 0x%" PRIx64 ", marker %s\n",
+		       w == 1 ? "blocked (as it should)" : (w == 0 ? "FINISHED without a signal" : ErrStr(w)), (uint64_t)ContextState(d),
+		       m[0x808 / 4] == 0x5e3a0003u ? "landed" : "missing");
+		if (w != 1) {
+			printf("    counter %08x %08x after it\n", counter[0], counter[1]);
+			if (w != 0) {
+				_exit(3);
+			}
+			BoDestroy(d, &rib);
+			BoDestroy(d, &mem);
+			return false;
+		}
+		counter[0] = 1;
+		__sync_synchronize();
+		const double t0 = NowSec();
+		w               = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 0.1);
+		const double t  = NowSec() - t0;
+		printf("  the CPU wrote 1: job %s %.2f ms later\n", w == 0 ? "finished" : (w == 1 ? "NOT finished" : ErrStr(w)), t * 1e3);
+		bool rescued = false;
+		if (w == 1 && m[0x808 / 4] == 0x5e3a0003u) {
+			// The marker after the wait landed in time: the CP went on, only the fence (an interrupt) is late.
+			printf("  the marker after the wait landed within 100 ms; the fence is late\n");
+			w = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0);
+		} else if (w == 1) {
+			// The CPU's store may sit behind a GL2 line the wait polls; a GPU write goes through it.
+			Ib rescue = {.n = 0};
+			GuestMark(&rescue, true, sem, 1u);
+			IbPad(&rescue);
+			Bo*      rbos[] = {&mem};
+			uint64_t rseq   = 0;
+			if (SubmitOn(d, AMDGPU_HW_IP_COMPUTE, 1, &rib, &rescue, rbos, 1, &rseq) == 0) {
+				const int rw = WaitOn(d, AMDGPU_HW_IP_COMPUTE, 1, rseq, 1.0);
+				rescued      = rw == 0;
+				printf("  rescue: compute ring 1 WRITE_DATA of 1: %s\n", rw == 1 ? "TIMEOUT" : ErrStr(rw));
+			}
+			w = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0);
+			printf("  after the rescue: job %s\n", w == 0 ? "finished" : (w == 1 ? "still NOT finished" : ErrStr(w)));
+		}
+		const int64_t st = ContextState(d);
+		printf("    counter %08x %08x (want 0 0), neighbour %08x, marker %s, ctx 0x%" PRIx64 "\n", counter[0], counter[1], counter[2],
+		       m[0x808 / 4] == 0x5e3a0003u ? "landed" : "MISSING", (uint64_t)st);
+		if (w != 0 || st != 0) {
+			printf("  the gfx ring is stopped on the wait; exiting without freeing buffers (amdgpu's lockup timeout resets it)\n");
+			_exit(3);
+		}
+		ok = !rescued && counter[0] == 0 && counter[1] == 0 && counter[2] == 0x5e5e5e5eu && m[0x808 / 4] == 0x5e3a0003u;
+	}
+#undef MEMSEM_PKT
+	BoDestroy(d, &rib);
+	BoDestroy(d, &mem);
+	printf("  %s\n", ok ? "MEM_SEMAPHORE ran as the PS5's does" : "MEM_SEMAPHORE did NOT run as the PS5's does");
+	return ok;
+}
+
+// A title's COND_EXEC (AgcDcbCondExec: header 0xC0032200, address & ~3, 0, EXEC_COUNT & 0x3fff) over a WRITE_DATA and
+// a store dispatch, the generic form the translator passes with KYTY_NATIVE_GPU_COND_EXEC=1, on the gfx ring. With the
+// word 1 both run; with 0 neither does, and the WRITE_DATA after the range lands either way. The packet itself is
+// proven (condexec); this is the shape of a guest range. CONDEXEC2_WORD=1 or 0 runs one (default both, 1 first).
+static bool DangerCondExec2(Device* d, Common* c) {
+	const char* word_env = getenv("CONDEXEC2_WORD");
+	printf("== danger condexec2: a title's COND_EXEC over a WRITE_DATA and a dispatch, gfx ring (word %s)\n",
+	       word_env != NULL ? word_env : "1 then 0");
+	Bo mem;
+	if (!GuestMem(d, &mem, 0x0740000000ull)) {
+		return false;
+	}
+	LoadCode(c, k_store_w64, sizeof(k_store_w64));
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem, &c->code};
+	bool               ok    = true;
+	bool               any   = false;
+	for (uint32_t word = 1; word != ~0u; word--) {
+		if (word_env != NULL && (uint32_t)strtoul(word_env, NULL, 0) != word) {
+			continue;
+		}
+		any = true;
+		const uint64_t addr  = mem.va;
+		const uint64_t a     = mem.va + 0x100, b = mem.va + 0x104, dst = mem.va + 0x1000;
+		const uint32_t base  = 0x5200000u + word * 0x100u;
+		memset(mem.cpu, 0, 64 * KiB);
+		m[0] = word;
+		__sync_synchronize();
+		Ib ib = {.n = 0};
+		IbPush(&ib, Pkt3Gfx(0x22u, 4));
+		IbPush(&ib, (uint32_t)addr & ~3u);
+		IbPush(&ib, (uint32_t)(addr >> 32));
+		IbPush(&ib, 0u);
+		const uint32_t cnt  = ib.n;
+		IbPush(&ib, 0u);
+		const uint32_t from = ib.n;
+		GuestMark(&ib, false, a, 0xa0000000u | word);
+		uint32_t ud[3] = {(uint32_t)dst, (uint32_t)(dst >> 32), base};
+		Dispatch p     = {c->code.va, 64, 8, 3, true, 64, 1, ud};
+		IbDispatch(&ib, &p);
+		ib.dw[cnt] = (ib.n - from) & 0x3fffu;
+		GuestMark(&ib, false, b, 0xb0000000u | word);
+		PrintDwords("COND_EXEC", ib.dw, 5);
+		char what[48];
+		snprintf(what, sizeof(what), "word %u, EXEC_COUNT %u:", word, ib.dw[cnt]);
+		GuestRun(d, &c->ib, &ib, false, bos, 2, 1.0, what);
+		uint32_t stores = 0;
+		for (uint32_t i = 0; i < 64; i++) {
+			stores += m[0x1000 / 4 + i] == base + i ? 1u : 0u;
+		}
+		const bool want   = word != 0;
+		const bool landed = m[0x100 / 4] == (0xa0000000u | word);
+		const bool after  = m[0x104 / 4] == (0xb0000000u | word);
+		const bool good   = landed == want && stores == (want ? 64u : 0u) && after;
+		printf("    WRITE_DATA in the range %s, dispatch wrote %u of 64, WRITE_DATA after it %s: %s\n", landed ? "landed" : "skipped",
+		       stores, after ? "landed" : "MISSING", good ? "as expected" : "NOT as expected");
+		ok = ok && good;
+	}
+	if (!any) {
+		printf("  CONDEXEC2_WORD must be 1 or 0\n");
+		ok = false;
+	}
+	BoDestroy(d, &mem);
+	return ok;
 }
 
 // The register-table packets without register reads: a COPY_DATA read of a UCONFIG register stops
@@ -5025,7 +5631,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order condib condexec exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
+	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
 	printf("PRT cases, in risk order: prt-map prt-split prt-read-compute prt-write-compute prt-kfd-tlb prt-replace-race prt-cp-compute prt-gfx-{copy,dma,write,wait,dispatch}\n");
 }
 
@@ -5121,6 +5727,14 @@ int main(int argc, char** argv) {
 			ok = DangerCondExec(&d, &c);
 		} else if (strcmp(danger, "exitguard") == 0) {
 			ok = DangerExitGuard(&d, &c);
+		} else if (strcmp(danger, "copydata") == 0) {
+			ok = DangerCopyData(&d, &c);
+		} else if (strcmp(danger, "atomicops") == 0) {
+			ok = DangerAtomicOps(&d, &c);
+		} else if (strcmp(danger, "memsem") == 0) {
+			ok = DangerMemSem(&d, &c);
+		} else if (strcmp(danger, "condexec2") == 0) {
+			ok = DangerCondExec2(&d, &c);
 		} else if (strcmp(danger, "atomicmem") == 0) {
 			ok = DangerAtomicMem(&d, &c);
 		} else if (strcmp(danger, "atomicand") == 0) {
