@@ -421,6 +421,9 @@ constexpr std::array<uint32_t, 3> kCpShadowWaitOn  = {0xc0012800u, 0x00000000u, 
 bool CpShadowTailOk(std::span<const uint32_t> ib);
 // The shadow buffer the packet check lets LOAD_*_REG name, and with it the shadowing CONTEXT_CONTROL (0: none).
 void SetCpShadowValidation(uint64_t va);
+// Whether the packet check lets MEM_SEMAPHORE (0x39) through: only for KYTY_NATIVE_GPU_MEM_SEMAPHORE=asis, the research
+// pass-through. The stock CP turns it into a hardware semaphore request that took the whole board down (2.11).
+void SetMemSemaphoreValidation(bool asis);
 
 // A piece of a gfx ring's batch as CP shadowing sees it (Shadow::AppendBatch).
 struct CpShadowPiece {
@@ -572,6 +575,12 @@ struct LabelWrite {
 	// low one, so a 32-bit write there decides it (ASTRO BOT waits on 64-bit labels with mask
 	// 0xffffffff and writes them as two 32-bit halves).
 	int Covers(uint64_t a, bool wide_wait, uint64_t* out, uint64_t wait_mask = ~0ull) const;
+
+	// A MEM_SEMAPHORE signal's increment (Pm4Translator::SetMemSemaphore): the 64-bit counter's value is not known when
+	// translating, but it is at least 1 once the write has landed, so the semaphore's own wait (!= 0 on all 64 bits) is
+	// met by it (SignalMeets) where Covers can only say unknown.
+	bool nonzero = false;
+	[[nodiscard]] bool SignalMeets(const WaitCond& w) const;
 };
 
 struct TrackerPoint {
@@ -1103,8 +1112,8 @@ public:
 	void SetForcedRefusals(std::set<uint32_t> ops) { m_force_refuse = std::move(ops); }
 
 	// libSceAgc's packets the translator once refused, each behind a switch (off: refused, the buffer goes to Kyty's
-	// command processor). The backend turns on what the board's probes have run (all but MEM_SEMAPHORE, which took the
-	// board down); a bare Pm4Translator has them off. Native labels only.
+	// command processor). The backend turns on what the board's probes have run, MEM_SEMAPHORE in its translated form
+	// only (as written it took the board down); a bare Pm4Translator has them off. Native labels only.
 	// COPY_DATA (KYTY_NATIVE_GPU_COPY_DATA, KYTY_NATIVE_GPU_MEC_COPY_DATA): memory, immediate or GPU clock to memory, as
 	// written where the GPU may write the destination.
 	void SetCopyData(bool gfx, bool mec) {
@@ -1113,8 +1122,11 @@ public:
 	}
 	// ATOMIC_MEM (KYTY_NATIVE_GPU_ATOMIC_OPS): every integer TC_OP, returning or not, not only libSceAgc's swap and AND.
 	void SetAtomicOps(bool on) { m_atomic_ops = on; }
-	// MEM_SEMAPHORE (KYTY_NATIVE_GPU_MEM_SEMAPHORE): signal and wait as written on the gfx ring.
-	void SetMemSemaphore(bool on) { m_mem_semaphore = on; }
+	// MEM_SEMAPHORE (KYTY_NATIVE_GPU_MEM_SEMAPHORE): Translate turns a signal into our barrier and an ATOMIC_MEM add or
+	// swap, a wait into a WAIT_REG_MEM_64 for != 0 and an ATOMIC_MEM subtract, through the translator's own wait and
+	// atomic paths; AsIs passes the title's 0x39 on as written (research only: it took the board down on 2.11).
+	enum class MemSemaphore : uint8_t { Refuse, Translate, AsIs };
+	void SetMemSemaphore(MemSemaphore mode) { m_mem_semaphore = mode; }
 	// COND_EXEC in any form (KYTY_NATIVE_GPU_COND_EXEC) on the gfx ring, its EXEC_COUNT recomputed over the translated
 	// dwords; libSceAgc's two context-check forms are taken either way.
 	void SetCondExec(bool on) { m_cond_exec = on; }
@@ -1363,7 +1375,7 @@ private:
 	bool                         m_copy_data     = false;
 	bool                         m_mec_copy_data = false;
 	bool                         m_atomic_ops    = false;
-	bool                         m_mem_semaphore = false;
+	MemSemaphore                 m_mem_semaphore = MemSemaphore::Refuse;
 	bool                         m_cond_exec     = false;
 	std::set<uint64_t>           m_inspect; // KYTY_NATIVE_GPU_INSPECT_PS: pixel or compute shaders
 	bool                         m_compact_refs = false;

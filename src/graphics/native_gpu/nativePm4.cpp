@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #if defined(__linux__)
@@ -709,6 +710,22 @@ uint32_t NextWaitFlipToken() {
 	}
 }
 
+// MEM_SEMAPHORE's counter (the translated signal's and wait's ATOMIC_MEM and the wait's WAIT_REG_MEM_64): their
+// CACHE_POLICY (bits 26:25: 0 LRU, 1 STREAM, 2 NOA, 3 BYPASS). Guest memory is mapped non-coherent; an LRU write stays in
+// GL2 until a write-back, where neither the CPU (the tracker's held waits, Kyty) nor a CPU-side atomic sees it, and an
+// LRU wait does not see the CPU's store (1.11). BYPASS, as the PS5's CPU-read labels carry, keeps the counter in memory
+// for both. Probe atomicops with ATOMIC_POLICY and ATOMIC_MEM_NC=1 (2.11): the CPU sees ADD_64, SWAP_64 and SUB_64 on
+// an NC word right after the fence with NOA (2) and BYPASS (3), never with STREAM (1) or LRU (0), as for RELEASE_MEM
+// labels. KYTY_NATIVE_GPU_MEM_SEMAPHORE_POLICY=2 picks NOA; anything else is BYPASS.
+uint32_t MemSemaphorePolicy() {
+	static const uint32_t policy = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_MEM_SEMAPHORE_POLICY");
+		const uint32_t p = v != nullptr && v[0] != '\0' ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 3u;
+		return p == 2u ? 2u : 3u; // LRU and STREAM are never seen (see above): the waits would never end
+	}();
+	return policy;
+}
+
 // ATOMIC_MEM in the forms libSceAgc writes: the flag swap around a context push or pop and SetWorkloadsActive's
 // 64-bit swap (TC_OP 0x67), SetWorkloadComplete's 64-bit AND (0x75).
 bool AgcAtomicOp(uint32_t control) {
@@ -1026,6 +1043,10 @@ int LabelWrite::Covers(uint64_t a, bool wide_wait, uint64_t* out, uint64_t wait_
 	return 0;
 }
 
+bool LabelWrite::SignalMeets(const WaitCond& w) const {
+	return nonzero && wide && w.wide && w.addr == addr && w.function == 4 && w.ref == 0 && w.mask == ~0ull;
+}
+
 void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len) {
 	if (dw + len > ib.size()) {
 		return;
@@ -1147,6 +1168,7 @@ static bool MecGuestWaitOk(uint32_t control) {
 namespace {
 
 std::atomic<int> g_validate_strict {-1}; // -1: KYTY_NATIVE_GPU_VALIDATE_STRICT decides
+std::atomic<bool> g_mem_semaphore_asis {false}; // SetMemSemaphoreValidation
 
 bool ValidateStrict() {
 	int v = g_validate_strict.load(std::memory_order_relaxed);
@@ -1242,6 +1264,10 @@ bool ValidateNativeIbBlacklist(std::span<const uint32_t> ib, bool lod_stats, uin
 		const uint32_t* b  = ib.data() + dw + 1;
 		const uint32_t  n  = size - 1u; // body dwords
 		if (PrivilegedOp(op) || (compute && GraphicsOnlyOp(op))) {
+			return bad();
+		}
+		// MEM_SEMAPHORE is translated (case IT_MEM_SEMAPHORE): one that reaches the CP took the whole board down.
+		if (op == IT_MEM_SEMAPHORE && !g_mem_semaphore_asis.load(std::memory_order_relaxed)) {
 			return bad();
 		}
 		// On MEC these need the shader-type bit unless MEC runs their plain form (KYTY_NATIVE_GPU_MEC_PLAIN_OPS); a title's
@@ -1488,9 +1514,9 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					return bad();
 				}
 				break;
-			// A title's MEM_SEMAPHORE as libSceAgc writes it (SetMemSemaphore): signal or wait, the gfx ring only.
-			case IT_MEM_SEMAPHORE:
-				if (compute || size != 4 || header != Pkt3(IT_MEM_SEMAPHORE, 3, false) || ((b[2] >> 29u) != 6u && (b[2] >> 29u) != 7u) ||
+			// A title's MEM_SEMAPHORE as libSceAgc writes it (SetMemSemaphore, AsIs only): signal or wait, the gfx ring only.
+			case IT_MEM_SEMAPHORE: // only the asis research pass-through (SetMemSemaphoreValidation): it took the board down
+				if (!g_mem_semaphore_asis.load(std::memory_order_relaxed) || compute || size != 4 || header != Pkt3(IT_MEM_SEMAPHORE, 3, false) || ((b[2] >> 29u) != 6u && (b[2] >> 29u) != 7u) ||
 				    (b[2] & ~((7u << 29u) | (1u << 20u) | (1u << 16u))) != 0) {
 					return bad();
 				}
@@ -1871,6 +1897,10 @@ void SetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint32_
 
 void SetCpShadowValidation(uint64_t va) {
 	g_cp_shadow_va.store(va, std::memory_order_relaxed);
+}
+
+void SetMemSemaphoreValidation(bool asis) {
+	g_mem_semaphore_asis.store(asis, std::memory_order_relaxed);
 }
 
 void EmitCpShadowOff(std::vector<uint32_t>& ib) {
@@ -4002,10 +4032,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		body[cond.count_at] = (body[cond.count_at] & ~0x3fffu) | static_cast<uint32_t>(count);
 		for (size_t i = cond.writes; i < local_writes.size(); i++) {
-			local_writes[i].known = false;
+			local_writes[i].known   = false;
+			local_writes[i].nonzero = false;
 		}
 		for (size_t i = cond.seg_writes; i < segs.back().writes.size(); i++) {
-			segs.back().writes[i].known = false;
+			segs.back().writes[i].known   = false;
+			segs.back().writes[i].nonzero = false;
 		}
 		cond.active = false;
 		direct      = direct_base;
@@ -4058,6 +4090,223 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		r.injected  = true;
 		seg_effects = true;
 	}
+	// An ATOMIC_MEM `pk` (header and body): the title's, or one of ours (`own`: a MEM_SEMAPHORE's, any integer op
+	// whatever SetAtomicOps says, never run in place, its label write recorded by the caller). Returns the refusal, if
+	// any; `gpu` tells whether the GPU performs it (otherwise the tracker does on the CPU, or Kyty's command processor).
+	auto atomic_mem = [&](std::span<const uint32_t> pk, bool own, bool& in_place, bool& gpu) -> std::optional<RefuseWhy> {
+		const uint32_t* const bptr = pk.data() + 1;
+		gpu                        = false;
+		// libSceAgc's flag swap around a context push or pop, and the workload swap and AND of SetWorkloadsActive and
+		// SetWorkloadComplete (into the driver's workload words): as written on the gfx ring, where the GPU may
+		// write the address. MEC has not run an ATOMIC_MEM on this board, and memory the GPU cannot write must not
+		// get one: with native labels the tracker performs it on the CPU when the GPU gets there. Without native
+		// labels Kyty's command processor runs the whole buffer and performs it, so a compute ring leaves it out.
+		// With KYTY_NATIVE_GPU_ATOMIC_OPS (on by default) every integer op goes the same way (IntegerAtomicOp), the
+		// tracker running it on the CPU with the same TC_OP (CpuAtomicMem).
+		if (pk.size() != 9 || !(AgcAtomicOp(bptr[0]) || ((own || m_atomic_ops) && IntegerAtomicOp(bptr[0])))) {
+			return RefuseWhy::AtomicForm;
+		}
+		const uint64_t addr  = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+		const uint64_t bytes = (bptr[0] & 0x20u) != 0 ? 8u : 4u;
+		if (labels && (m_compute_ring || !label_gpu(addr, bytes))) {
+			TrackerPoint cpu_atomic;
+			cpu_atomic.kind = TrackerPoint::Kind::Atomic;
+			cpu_atomic.addr = addr;
+			cpu_atomic.data = {bptr[0], bptr[3], bptr[4], bptr[5], bptr[6]};
+			tracker_point(std::move(cpu_atomic));
+			if (!own) {
+				note_write({addr, 0, false, false, bytes == 8u});
+			}
+			stats.atomics_cpu++;
+			NoteOnce(24, "ATOMIC_MEM performed by the tracker (compute ring, or memory the GPU cannot write)");
+			return std::nullopt;
+		}
+		if (m_compute_ring) {
+			return std::nullopt;
+		}
+		if (direct && !own) {
+			in_place = true;
+		} else {
+			body.insert(body.end(), pk.begin(), pk.end());
+		}
+		if (!labels) {
+			add_ref(addr, bytes, false); // label_gpu has added it otherwise
+		}
+		note_gpu_written(addr, addr + bytes);
+		if (labels && !own && !AgcAtomicOp(bptr[0])) {
+			note_write({addr, 0, false, true, bytes == 8u}); // a value the GPU computes
+		}
+		gpu = true;
+		return std::nullopt;
+	};
+	// A WAIT_REG_MEM or WAIT_REG_MEM_64 `pk` (header and body): the title's at `at`, or one of ours standing in for the
+	// title's packet at `at` (`own`: a MEM_SEMAPHORE's wait, which the audit leaves out). Returns the refusal, if any.
+	auto wait_mem = [&](std::span<const uint32_t> pk, uint32_t at, bool own) -> std::optional<RefuseWhy> {
+		const uint32_t        size       = static_cast<uint32_t>(pk.size());
+		const uint32_t        body_count = size - 1u;
+		const uint32_t        op         = (pk[0] >> 8u) & 0xffu;
+		const uint32_t* const bptr       = pk.data() + 1;
+		// Shadow mode drops guest waits: native IBs run one at a time and to completion before
+		// Kyty records the same DCB, and Kyty's Vulkan path does the real synchronization. Passing
+		// a wait through would hang the gfx ring on a label that Kyty only writes later. The
+		// condition is still evaluated against guest memory now, so the stats show which waits a
+		// primary (non-shadow) native path will have to honour.
+		const bool     wide = op == IT_WAIT_REG_MEM_64;
+		const uint32_t need = wide ? 8u : 6u;
+		// WaitUntilSafeForRendering: the PS5's GPU waits here until the display buffer's label is 0 (off
+		// screen). Kyty's flip is a Vulkan copy on this same gfx pipe, so a GPU wait could hold up the very flip
+		// that frees the buffer. Kyty's command processor waits instead, at the padding NOP that follows (the
+		// IT_NOP case puts it in the CPU tail), as for R_WAIT_FLIP_DONE; the wait stays out of the IB.
+		if (!own && wide && WaitFlipPadFollows(dcb, static_cast<size_t>(at) + size)) {
+			stats.waits_flip++;
+			NoteOnce(23, "WaitUntilSafeForRendering's label wait left to Kyty's command processor (CPU tail)");
+			return std::nullopt;
+		}
+		if (m_audit && !own && body_count >= 1) {
+			AuditWait(r.sync, wide, bptr[0]);
+		}
+		if (body_count < need) {
+			return RefuseWhy::ShortBody;
+		}
+		if ((bptr[0] & 0x10u) == 0) {
+			return RefuseWhy::RegisterWait; // register waits are refused
+		}
+		const uint64_t addr = (static_cast<uint64_t>(bptr[1]) & (wide ? ~0x7ull : ~0x3ull)) |
+		                      (static_cast<uint64_t>(bptr[2] & 0x3ffffu) << 32u);
+		uint64_t ref  = bptr[3];
+		uint64_t mask = wide ? bptr[5] : bptr[4];
+		if (wide) {
+			ref |= static_cast<uint64_t>(bptr[4]) << 32u;
+			mask |= static_cast<uint64_t>(bptr[6]) << 32u;
+		}
+		bool     met   = false;
+		uint64_t value = 0;
+		if (addr != 0) {
+			value = wide ? *reinterpret_cast<const volatile uint64_t*>(addr)
+			             : *reinterpret_cast<const volatile uint32_t*>(addr);
+			met   = WaitConditionMet(bptr[0] & 0x7u, value & mask, ref);
+		}
+		stats.waits_dropped++;
+		if (!met) {
+			stats.waits_unmet++;
+			r.unmet_waits.push_back({addr, ref, value, bptr[0] & 0x7u, at, stats.draws, stats.dispatches});
+		}
+		const bool pfp = (bptr[0] & (1u << 8u)) != 0;
+		if (labels) {
+			// The latest label write of this buffer decides; otherwise the backend does, from what is
+			// ahead in the ring and from guest memory.
+			WaitCond w {addr, ref, mask, bptr[0] & 0x7u, wide, pfp};
+			LabelOracle::Plan plan    = LabelOracle::Plan::Split;
+			bool              decided = false;
+			size_t            decider = 0; // the local write that decides the wait
+			for (auto it = local_writes.rbegin(); it != local_writes.rend() && !decided; ++it) {
+				uint64_t  v = 0;
+				const int c = it->Covers(addr, wide, &v, mask);
+				if (c != 0) {
+					decided = true;
+					decider = static_cast<size_t>(local_writes.rend() - it) - 1u;
+					plan    = ((c == 1 && w.Met(v)) || it->SignalMeets(w)) && it->gpu ? LabelOracle::Plan::Native : LabelOracle::Plan::Split;
+				}
+			}
+			const bool own_label = decided && plan == LabelOracle::Plan::Native;
+			if (!decided) {
+				plan = m_labels->PlanWait(w);
+			}
+			if (plan == LabelOracle::Plan::Native && !m_native_waits) {
+				plan = LabelOracle::Plan::Met;
+			}
+			// A native wait reads whatever the GPU is mapped at. If that is not this label,
+			// hold the segment: the tracker (or a later CPU write) puts the value in guest
+			// memory, and the barrier is the only GPU wait.
+			if (plan == LabelOracle::Plan::Native && !label_gpu(addr, 4)) {
+				plan = LabelOracle::Plan::Split;
+			}
+			if (plan == LabelOracle::Plan::Native) {
+				flush_points();
+			}
+			const bool timed = plan == LabelOracle::Plan::Native && m_time_pairs != 0 && !m_compute_ring;
+			const uint64_t wait_pair = timed ? m_time_wait_va + 16ull * (m_time_waits % m_time_pairs) : 0u;
+			// The guest's packet as written where the gfx CP runs it (SetWaitsVerbatim), else our form; built aside, so
+			// a form that fails halfway leaves nothing behind and the wrap goes only around a wait that is there.
+			const bool as_written = plan == LabelOracle::Plan::Native && (pk[0] & 2u) == 0 &&
+			                        (m_compute_ring ? MecGuestWaitOk(bptr[0]) : m_waits_verbatim && GuestWaitControlOk(bptr[0]));
+			std::vector<uint32_t> wait_pk;
+			if (as_written) {
+				wait_pk.assign(pk.begin(), pk.end());
+			}
+			// SetAudit: the title's CACHE_POLICY, lost unless the GPU runs its own packet (our wait, a barrier, a hold).
+			if (m_audit && !own && ((bptr[0] >> 25u) & 3u) != 0u && !as_written) {
+				r.sync.policy_lost[static_cast<size_t>(wide ? AuditSync::Wait64 : AuditSync::Wait)]++;
+			}
+			const bool emitted = plan == LabelOracle::Plan::Native && (as_written || EmitNativeWait(wait_pk, w, m_compute_ring));
+			// SetCpShadowWaitOff: the clock copies and the guard inside the wrap, nothing that SETs or LOADs.
+			const bool wrap = emitted && wait_wrap;
+			if (wrap) {
+				wait_off();
+			}
+			if (timed) {
+				EmitClockCopy(body, wait_pair);
+			}
+			if (emitted) {
+				body.insert(body.end(), wait_pk.begin(), wait_pk.end());
+				segs.back().gpu_waits.push_back(w);
+				guard_after_wait(!pfp);
+			}
+			if (timed) {
+				EmitClockCopy(body, wait_pair + 8);
+				m_time_wait_info[m_time_waits % m_time_pairs] = {addr, ref, stats.draws, met};
+				m_time_waits++;
+			}
+			if (wrap) {
+				wait_on(!pfp && !gfx_guards); // an ME wait's guard has PFP_SYNC_ME before it
+			}
+			if (plan == LabelOracle::Plan::Native && !emitted) {
+				plan = LabelOracle::Plan::Split;
+			}
+			if (plan == LabelOracle::Plan::Native && own_label) {
+				// A GPU sync within this buffer: the release that wrote the label it waits for need not
+				// write GL2 back for the CPU.
+				for (auto& rel: label_releases) {
+					if (rel.strip != 0u && rel.write == decider) {
+						body[rel.event_dw] &= ~rel.strip;
+						rel.strip = 0u;
+						stats.label_wb_stripped++;
+					}
+				}
+			}
+			// SetAudit: a wait the GPU runs, or a barrier, with the index of the first point after it (flush_points
+			// has run for a GPU wait). A held one is the next segment's `wait`.
+			if (m_audit && plan != LabelOracle::Plan::Split) {
+				segs.back().audit_waits.push_back(
+				    {w, static_cast<uint32_t>(segs.back().points.size()), plan == LabelOracle::Plan::Met, own_label, met});
+			}
+			switch (plan) {
+				case LabelOracle::Plan::Native:
+					stats.waits_native++;
+					seg_effects = true;
+					NoteOnce(8, "guest WAIT_REG_MEM passed through (a GPU write satisfies it)");
+					break;
+				case LabelOracle::Plan::Met:
+					emit_barrier(pfp);
+					seg_effects = true;
+					NoteOnce(10, "guest WAIT_REG_MEM already met (barrier)");
+					break;
+				case LabelOracle::Plan::Split:
+					split_at_wait(w);
+					NoteOnce(9, "guest WAIT_REG_MEM held on the CPU (no known writer yet)");
+					break;
+			}
+			return std::nullopt;
+		}
+		// The guest waits for its own end-of-pipe label: everything before has finished and its
+		// writes are visible. The label itself is written by Kyty later, so give the GPU the same
+		// guarantee with a fence of ours.
+		if (m_audit && !own && ((bptr[0] >> 25u) & 3u) != 0u) {
+			r.sync.policy_lost[static_cast<size_t>(wide ? AuditSync::Wait64 : AuditSync::Wait)]++;
+		}
+		emit_barrier(pfp);
+		return std::nullopt;
+	};
 	while (dw < dcb.size()) {
 		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
@@ -4781,165 +5030,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 
 			case IT_WAIT_REG_MEM:
 			case IT_WAIT_REG_MEM_64: {
-				// Shadow mode drops guest waits: native IBs run one at a time and to completion before
-				// Kyty records the same DCB, and Kyty's Vulkan path does the real synchronization. Passing
-				// a wait through would hang the gfx ring on a label that Kyty only writes later. The
-				// condition is still evaluated against guest memory now, so the stats show which waits a
-				// primary (non-shadow) native path will have to honour.
-				const bool     wide     = op == IT_WAIT_REG_MEM_64;
-				const uint32_t need     = wide ? 8u : 6u;
-				// WaitUntilSafeForRendering: the PS5's GPU waits here until the display buffer's label is 0 (off
-				// screen). Kyty's flip is a Vulkan copy on this same gfx pipe, so a GPU wait could hold up the very flip
-				// that frees the buffer. Kyty's command processor waits instead, at the padding NOP that follows (the
-				// IT_NOP case puts it in the CPU tail), as for R_WAIT_FLIP_DONE; the wait stays out of the IB.
-				if (wide && WaitFlipPadFollows(dcb, static_cast<size_t>(dw) + size)) {
-					stats.waits_flip++;
-					NoteOnce(23, "WaitUntilSafeForRendering's label wait left to Kyty's command processor (CPU tail)");
-					break;
+				if (const auto why = wait_mem(dcb.subspan(dw, size), dw, false)) {
+					return fail(op, dw, *why);
 				}
-				if (m_audit && body_count >= 1) {
-					AuditWait(r.sync, wide, bptr[0]);
-				}
-				if (body_count < need) {
-					return fail(op, dw, RefuseWhy::ShortBody);
-				}
-				if ((bptr[0] & 0x10u) == 0) {
-					return fail(op, dw, RefuseWhy::RegisterWait); // register waits are refused
-				}
-				const uint64_t addr = (static_cast<uint64_t>(bptr[1]) & (wide ? ~0x7ull : ~0x3ull)) |
-				                      (static_cast<uint64_t>(bptr[2] & 0x3ffffu) << 32u);
-				uint64_t ref  = bptr[3];
-				uint64_t mask = wide ? bptr[5] : bptr[4];
-				if (wide) {
-					ref |= static_cast<uint64_t>(bptr[4]) << 32u;
-					mask |= static_cast<uint64_t>(bptr[6]) << 32u;
-				}
-				bool     met   = false;
-				uint64_t value = 0;
-				if (addr != 0) {
-					value = wide ? *reinterpret_cast<const volatile uint64_t*>(addr)
-					             : *reinterpret_cast<const volatile uint32_t*>(addr);
-					met   = WaitConditionMet(bptr[0] & 0x7u, value & mask, ref);
-				}
-				stats.waits_dropped++;
-				if (!met) {
-					stats.waits_unmet++;
-					r.unmet_waits.push_back({addr, ref, value, bptr[0] & 0x7u, dw, stats.draws, stats.dispatches});
-				}
-				const bool pfp = (bptr[0] & (1u << 8u)) != 0;
-				if (labels) {
-					// The latest label write of this buffer decides; otherwise the backend does, from what is
-					// ahead in the ring and from guest memory.
-					WaitCond w {addr, ref, mask, bptr[0] & 0x7u, wide, pfp};
-					LabelOracle::Plan plan    = LabelOracle::Plan::Split;
-					bool              decided = false;
-					size_t            decider = 0; // the local write that decides the wait
-					for (auto it = local_writes.rbegin(); it != local_writes.rend() && !decided; ++it) {
-						uint64_t  v = 0;
-						const int c = it->Covers(addr, wide, &v, mask);
-						if (c != 0) {
-							decided = true;
-							decider = static_cast<size_t>(local_writes.rend() - it) - 1u;
-							plan    = c == 1 && w.Met(v) && it->gpu ? LabelOracle::Plan::Native : LabelOracle::Plan::Split;
-						}
-					}
-					const bool own_label = decided && plan == LabelOracle::Plan::Native;
-					if (!decided) {
-						plan = m_labels->PlanWait(w);
-					}
-					if (plan == LabelOracle::Plan::Native && !m_native_waits) {
-						plan = LabelOracle::Plan::Met;
-					}
-					// A native wait reads whatever the GPU is mapped at. If that is not this label,
-					// hold the segment: the tracker (or a later CPU write) puts the value in guest
-					// memory, and the barrier is the only GPU wait.
-					if (plan == LabelOracle::Plan::Native && !label_gpu(addr, 4)) {
-						plan = LabelOracle::Plan::Split;
-					}
-					if (plan == LabelOracle::Plan::Native) {
-						flush_points();
-					}
-					const bool timed = plan == LabelOracle::Plan::Native && m_time_pairs != 0 && !m_compute_ring;
-					const uint64_t wait_pair = timed ? m_time_wait_va + 16ull * (m_time_waits % m_time_pairs) : 0u;
-					// The guest's packet as written where the gfx CP runs it (SetWaitsVerbatim), else our form; built aside, so
-					// a form that fails halfway leaves nothing behind and the wrap goes only around a wait that is there.
-					const bool as_written = plan == LabelOracle::Plan::Native && (dcb[dw] & 2u) == 0 &&
-					                        (m_compute_ring ? MecGuestWaitOk(bptr[0]) : m_waits_verbatim && GuestWaitControlOk(bptr[0]));
-					std::vector<uint32_t> wait_pk;
-					if (as_written) {
-						wait_pk.assign(dcb.begin() + dw, dcb.begin() + dw + size);
-					}
-					// SetAudit: the title's CACHE_POLICY, lost unless the GPU runs its own packet (our wait, a barrier, a hold).
-					if (m_audit && ((bptr[0] >> 25u) & 3u) != 0u && !as_written) {
-						r.sync.policy_lost[static_cast<size_t>(wide ? AuditSync::Wait64 : AuditSync::Wait)]++;
-					}
-					const bool emitted = plan == LabelOracle::Plan::Native && (as_written || EmitNativeWait(wait_pk, w, m_compute_ring));
-					// SetCpShadowWaitOff: the clock copies and the guard inside the wrap, nothing that SETs or LOADs.
-					const bool wrap = emitted && wait_wrap;
-					if (wrap) {
-						wait_off();
-					}
-					if (timed) {
-						EmitClockCopy(body, wait_pair);
-					}
-					if (emitted) {
-						body.insert(body.end(), wait_pk.begin(), wait_pk.end());
-						segs.back().gpu_waits.push_back(w);
-						guard_after_wait(!pfp);
-					}
-					if (timed) {
-						EmitClockCopy(body, wait_pair + 8);
-						m_time_wait_info[m_time_waits % m_time_pairs] = {addr, ref, stats.draws, met};
-						m_time_waits++;
-					}
-					if (wrap) {
-						wait_on(!pfp && !gfx_guards); // an ME wait's guard has PFP_SYNC_ME before it
-					}
-					if (plan == LabelOracle::Plan::Native && !emitted) {
-						plan = LabelOracle::Plan::Split;
-					}
-					if (plan == LabelOracle::Plan::Native && own_label) {
-						// A GPU sync within this buffer: the release that wrote the label it waits for need not
-						// write GL2 back for the CPU.
-						for (auto& rel: label_releases) {
-							if (rel.strip != 0u && rel.write == decider) {
-								body[rel.event_dw] &= ~rel.strip;
-								rel.strip = 0u;
-								stats.label_wb_stripped++;
-							}
-						}
-					}
-					// SetAudit: a wait the GPU runs, or a barrier, with the index of the first point after it (flush_points
-					// has run for a GPU wait). A held one is the next segment's `wait`.
-					if (m_audit && plan != LabelOracle::Plan::Split) {
-						segs.back().audit_waits.push_back(
-						    {w, static_cast<uint32_t>(segs.back().points.size()), plan == LabelOracle::Plan::Met, own_label, met});
-					}
-					switch (plan) {
-						case LabelOracle::Plan::Native:
-							stats.waits_native++;
-							seg_effects = true;
-							NoteOnce(8, "guest WAIT_REG_MEM passed through (a GPU write satisfies it)");
-							break;
-						case LabelOracle::Plan::Met:
-							emit_barrier(pfp);
-							seg_effects = true;
-							NoteOnce(10, "guest WAIT_REG_MEM already met (barrier)");
-							break;
-						case LabelOracle::Plan::Split:
-							split_at_wait(w);
-							NoteOnce(9, "guest WAIT_REG_MEM held on the CPU (no known writer yet)");
-							break;
-					}
-					break;
-				}
-				// The guest waits for its own end-of-pipe label: everything before has finished and its
-				// writes are visible. The label itself is written by Kyty later, so give the GPU the same
-				// guarantee with a fence of ours.
-				if (m_audit && ((bptr[0] >> 25u) & 3u) != 0u) {
-					r.sync.policy_lost[static_cast<size_t>(wide ? AuditSync::Wait64 : AuditSync::Wait)]++;
-				}
-				emit_barrier(pfp);
 				break;
 			}
 			case IT_DMA_DATA:
@@ -5120,14 +5213,28 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				break;
 			case IT_MEM_SEMAPHORE: {
-				// libSceAgc's AgcDcbMemSemaphore / AgcAcbMemSemaphore: a signal (SEM_SEL 6) increments the mailbox counter at
-				// the address, a wait (7) blocks until it is not 0 and decrements it. Whether the BC-250's stock microcode
-				// runs 0x39 at all is not known (Mesa sends it only on SI/CIK), and a wait whose signal comes from another
-				// ring or the CPU is invisible to the label pipeline; there is no exactly equivalent GPU form (a wait for
-				// >= 1 and an ATOMIC_MEM SUB are not atomic against a second waiter). Probe memsem (2.11) answered the first
-				// question: the stock ME took the whole board down on a signal, with no kernel line. So it refuses the
-				// buffer; KYTY_NATIVE_GPU_MEM_SEMAPHORE=1 passes it as written for research only.
-				if (!m_mem_semaphore || body_count < 3) {
+				// libSceAgc's AgcDcbMemSemaphore / AgcAcbMemSemaphore: a 64-bit counter at the address (Kyty's command
+				// processor: CommandProcessor::MemSemaphore). A signal (SEM_SEL 6), once everything before it has retired,
+				// adds 1 to it (SIGNAL_TYPE 0) or writes 1 (SIGNAL_TYPE 1); a wait (7) blocks until it is not 0, then takes 1
+				// off. The PS5's microcode and the stock one both turn 0x39 into a hardware semaphore request (a signal is an
+				// end-of-pipe event with DATA_SEL 6, a wait the semaphore block's poll), and on the BC-250 that request took
+				// the whole board down at once (probe memsem, 2.11): the packet must never reach the CP. So it is built from
+				// what the board has run, through the translator's own paths (plans, wraps, guards, tracker points, label
+				// bookkeeping): a signal is our barrier (end of pipe and a wait for it, the guarantee the guest gets from
+				// waiting for its own end-of-pipe label) and then an ATOMIC_MEM add or swap; a wait is a WAIT_REG_MEM_64 for
+				// != 0, planned like the title's own waits (on the GPU behind a known writer, a barrier when memory already
+				// meets it, else held on the CPU), and then an ATOMIC_MEM subtract. Both atomics are no-return, 64-bit,
+				// COMMAND 2 (wait for the write confirm), on the micro engine: the PFP would run the signal's ahead of the
+				// barrier's ME-side wait. On a compute ring, or memory the GPU cannot write, the tracker performs them on the
+				// CPU (CpuAtomicMem), each stored right behind its packet (not at the segment's end) so it lands as soon as the
+				// GPU has passed: still a little later than on the PS5, where a later signal is harmless but a later subtract
+				// lets a wait that polls in between (the next buffer of the same queue, another ring) pass on the same signal,
+				// as in the limit below. The atomics and the wait carry MemSemaphorePolicy's CACHE_POLICY, so the CPU and the
+				// other ring see the counter in memory. One limit: the wait and its subtract are two packets, not one atomic
+				// step, so a second waiter that polls between them can pass on the same signal; the PS5's semaphore block
+				// serialises them. One waiter per counter at a time is exact. KYTY_NATIVE_GPU_MEM_SEMAPHORE=0 refuses the
+				// buffer, =asis passes the title's packet on as written (research only).
+				if (m_mem_semaphore == MemSemaphore::Refuse || body_count < 3) {
 					static std::atomic<uint32_t> told {0};
 					if (body_count >= 3 && told.fetch_add(1, std::memory_order_relaxed) < 8) {
 						std::fprintf(stderr, "native shadow: MEM_SEMAPHORE %08x %08x %08x refused (KYTY_NATIVE_GPU_MEM_SEMAPHORE)\n", bptr[0],
@@ -5138,23 +5245,79 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				// libSceAgc's form only (agc_mem_semaphore): three dwords, ADDR_LO bits 31:3, ADDR_HI, then SEM_SEL (31:29) 6 or
 				// 7, SIGNAL_TYPE (20) and USE_MAILBOX (16), CLIENT_CODE (25:24) 0. Any other select or bit is not a packet
-				// the PS5's libSceAgc writes, and what the stock microcode makes of it is not known.
+				// the PS5's libSceAgc writes. The mailbox only notifies (an interrupt nobody here waits for).
 				const uint32_t sem_sel = bptr[2] >> 29u;
 				const uint64_t addr    = (bptr[0] & ~7u) | (static_cast<uint64_t>(bptr[1]) << 32u);
-				if (body_count != 3 || (sem_sel != 6u && sem_sel != 7u) || (bptr[2] & ~((7u << 29u) | (1u << 20u) | (1u << 16u))) != 0 ||
-				    m_compute_ring || !labels || !label_gpu(addr, 8)) {
+				const bool     form    = body_count == 3 && (sem_sel == 6u || sem_sel == 7u) &&
+				                  (bptr[2] & ~((7u << 29u) | (1u << 20u) | (1u << 16u))) == 0;
+				if (m_mem_semaphore == MemSemaphore::AsIs) {
+					if (!form || m_compute_ring || !labels || !label_gpu(addr, 8)) {
+						r.unknown_detail = {bptr[0], bptr[1], bptr[2]};
+						return fail(op, dw, RefuseWhy::SemaphoreForm);
+					}
+					if (direct) {
+						in_place = true;
+					} else {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					}
+					note_gpu_written(addr, addr + 8);
+					note_write({addr, 0, false, true, true}); // the counter, both a signal and a wait change it
+					seg_effects = true;
+					NoteOnce(33, "MEM_SEMAPHORE as the title wrote it");
+					break;
+				}
+				if (!form || !labels || addr == 0) {
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2]};
 					return fail(op, dw, RefuseWhy::SemaphoreForm);
 				}
-				if (direct) {
-					in_place = true;
-				} else {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				const uint32_t policy = MemSemaphorePolicy() << 25u;
+				// ATOMIC_MEM (gfx10's TC_OP: bit 6 no return, bit 5 64-bit) with source 1, no compare, no loop interval.
+				const auto atomic = [&](uint32_t tc_op) {
+					return std::array<uint32_t, 9> {Pkt3(IT_ATOMIC_MEM, 8, false), policy | (2u << 8u) | tc_op, static_cast<uint32_t>(addr),
+					                                static_cast<uint32_t>(addr >> 32u), 1u, 0u, 0u, 0u, 0u};
+				};
+				bool gpu    = false;
+				bool unused = false; // ours never runs in place
+				if (sem_sel == 6u) {
+					emit_barrier(false);
+					const bool write = (bptr[2] & (1u << 20u)) != 0;
+					if (const auto why = atomic_mem(atomic(write ? 0x67u : 0x6fu), true, unused, gpu)) { // SWAP_64 or ADD_64
+						return fail(op, dw, *why);
+					}
+					if (!gpu) {
+						flush_points(); // the tracker's add as soon as the GPU is here, not at the segment's end
+					}
+					// What a later wait reads: 1 after the swap, at least 1 after the add (SignalMeets).
+					LabelWrite counter {addr, 1u, write, gpu, true};
+					counter.nonzero = true;
+					note_write(counter);
+					seg_effects = true;
+					NoteOnce(34, "MEM_SEMAPHORE signal (barrier, ATOMIC_MEM)");
+					break;
 				}
-				note_gpu_written(addr, addr + 8);
-				note_write({addr, 0, false, true, true}); // the counter, both a signal and a wait change it
+				// ENGINE_SEL the PFP on the gfx ring, so nothing behind the wait is fetched before the counter is seen; MEC
+				// has only the micro engine. The poll interval is the translator's own waits'.
+				const std::array<uint32_t, 9> wait {Pkt3(IT_WAIT_REG_MEM_64, 8, false),
+				                                    policy | (m_compute_ring ? 0u : 1u << 8u) | (1u << 4u) | 4u, // NOT_EQUAL, memory
+				                                    static_cast<uint32_t>(addr),
+				                                    static_cast<uint32_t>(addr >> 32u),
+				                                    0u,
+				                                    0u,
+				                                    0xffffffffu,
+				                                    0xffffffffu,
+				                                    kWaitPoll};
+				if (const auto why = wait_mem(wait, dw, true)) {
+					return fail(op, dw, *why);
+				}
+				if (const auto why = atomic_mem(atomic(0x70u), true, unused, gpu)) { // SUB_64
+					return fail(op, dw, *why);
+				}
+				if (!gpu) {
+					flush_points(); // the tracker's subtract right behind the wait, not after the rest of the segment
+				}
+				note_write({addr, 0, false, gpu, true});
 				seg_effects = true;
-				NoteOnce(33, "MEM_SEMAPHORE as the title wrote it");
+				NoteOnce(35, "MEM_SEMAPHORE wait (WAIT_REG_MEM_64 != 0, ATOMIC_MEM subtract)");
 				break;
 			}
 			case IT_DRAW_INDEX_MULTI_INST: {
@@ -5666,43 +5829,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			}
 			case IT_ATOMIC_MEM: {
-				// libSceAgc's flag swap around a context push or pop, and the workload swap and AND of SetWorkloadsActive and
-				// SetWorkloadComplete (into the driver's workload words): as written on the gfx ring, where the GPU may
-				// write the address. MEC has not run an ATOMIC_MEM on this board, and memory the GPU cannot write must not
-				// get one: with native labels the tracker performs it on the CPU when the GPU gets there. Without native
-				// labels Kyty's command processor runs the whole buffer and performs it, so a compute ring leaves it out.
-				// With KYTY_NATIVE_GPU_ATOMIC_OPS (on by default) every integer op goes the same way (IntegerAtomicOp), the
-				// tracker running it on the CPU with the same TC_OP (CpuAtomicMem).
-				if (body_count != 8 || !(AgcAtomicOp(bptr[0]) || (m_atomic_ops && IntegerAtomicOp(bptr[0])))) {
-					return fail(op, dw, RefuseWhy::AtomicForm);
-				}
-				const uint64_t addr  = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
-				const uint64_t bytes = (bptr[0] & 0x20u) != 0 ? 8u : 4u;
-				if (labels && (m_compute_ring || !label_gpu(addr, bytes))) {
-					TrackerPoint cpu_atomic;
-					cpu_atomic.kind = TrackerPoint::Kind::Atomic;
-					cpu_atomic.addr = addr;
-					cpu_atomic.data = {bptr[0], bptr[3], bptr[4], bptr[5], bptr[6]};
-					tracker_point(std::move(cpu_atomic));
-					note_write({addr, 0, false, false, bytes == 8u});
-					stats.atomics_cpu++;
-					NoteOnce(24, "ATOMIC_MEM performed by the tracker (compute ring, or memory the GPU cannot write)");
-					break;
-				}
-				if (m_compute_ring) {
-					break;
-				}
-				if (direct) {
-					in_place = true;
-				} else {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-				}
-				if (!labels) {
-					add_ref(addr, bytes, false); // label_gpu has added it otherwise
-				}
-				note_gpu_written(addr, addr + bytes);
-				if (labels && !AgcAtomicOp(bptr[0])) {
-					note_write({addr, 0, false, true, bytes == 8u}); // a value the GPU computes
+				bool gpu = false;
+				if (const auto why = atomic_mem(dcb.subspan(dw, size), false, in_place, gpu)) {
+					return fail(op, dw, *why);
 				}
 				break;
 			}

@@ -3214,6 +3214,7 @@ using Libs::Graphics::NativeGpu::kCpShadowOff;
 using Libs::Graphics::NativeGpu::kCpShadowShDw;
 using Libs::Graphics::NativeGpu::kCpShadowUconfigDw;
 using Libs::Graphics::NativeGpu::SetCpShadowValidation;
+using Libs::Graphics::NativeGpu::SetMemSemaphoreValidation;
 
 constexpr uint64_t kTestShadowVa = 0x400003F80000ull; // where the backend puts S (NativeSubmitter::CpShadowVa)
 constexpr uint32_t IT_PFP_SYNC_ME = 0x42;
@@ -5303,7 +5304,7 @@ void TestMemSemaphoreAnd3A() {
 	t.SetAudit(true); // the refusals' reasons
 	auto off = t.Translate(cb);
 	Check(!off.ok && off.unknown_op == IT_MEM_SEMAPHORE_T, "MEM_SEMAPHORE refused while the switch is off");
-	t.SetMemSemaphore(true);
+	t.SetMemSemaphore(Pm4Translator::MemSemaphore::AsIs);
 	auto on = t.Translate(cb);
 	Check(on.ok && std::search(on.ib.begin(), on.ib.end(), cb.begin(), cb.end()) != on.ib.end(), "MEM_SEMAPHORE as written with the switch");
 	Pm4Translator c;
@@ -5312,7 +5313,7 @@ void TestMemSemaphoreAnd3A() {
 	c.SetAudit(true); // the refusals' reasons
 	c.SetComputeQueue(true);
 	c.SetComputeRing(true);
-	c.SetMemSemaphore(true);
+	c.SetMemSemaphore(Pm4Translator::MemSemaphore::AsIs);
 	auto rc = c.Translate(cb);
 	Check(!rc.ok && RefusedFor(rc, RefuseWhy::SemaphoreForm), "MEM_SEMAPHORE on MEC refused");
 
@@ -5636,12 +5637,15 @@ void TestMemSemaphoreForms() {
 	TestOracle    o;
 	t.SetNativeLabels(&o, kTrackerVa);
 	t.SetAudit(true); // the refusals' reasons
-	t.SetMemSemaphore(true);
+	t.SetMemSemaphore(Pm4Translator::MemSemaphore::AsIs);
 	for (uint32_t control: {6u << 29u, (6u << 29u) | (1u << 20u) | (1u << 16u), 7u << 29u, (7u << 29u) | (1u << 16u)}) {
 		const auto cb = sem(control, false);
 		const auto r  = t.Translate(cb);
+		SetMemSemaphoreValidation(true); // what the backend sets for KYTY_NATIVE_GPU_MEM_SEMAPHORE=asis
 		Check(r.ok && std::search(r.ib.begin(), r.ib.end(), cb.begin(), cb.end()) != r.ib.end() && PassesBothChecks(r.ib, NativeIbKind::Gfx),
 		      "MEM_SEMAPHORE signal and wait as written pass both packet checks");
+		SetMemSemaphoreValidation(false);
+		Check(!ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "the default packet check stops a MEM_SEMAPHORE outside asis");
 	}
 	for (const auto& cb: {sem(5u << 29u, false), sem(0u, false), sem((6u << 29u) | (1u << 24u), false), sem(7u << 29u, true)}) {
 		const auto r = t.Translate(cb);
@@ -5652,9 +5656,255 @@ void TestMemSemaphoreForms() {
 	ou.unwritable = addr;
 	u.SetNativeLabels(&ou, kTrackerVa);
 	u.SetAudit(true); // the refusals' reasons
-	u.SetMemSemaphore(true);
+	u.SetMemSemaphore(Pm4Translator::MemSemaphore::AsIs);
 	const auto ru = u.Translate(sem(6u << 29u, false));
 	Check(!ru.ok && RefusedFor(ru, RefuseWhy::SemaphoreForm), "MEM_SEMAPHORE on memory the GPU cannot write refused");
+}
+
+// MEM_SEMAPHORE translated (SetMemSemaphore Translate, the backend's default): 0x39 never reaches the CP (the stock ME
+// took the board down on it). A signal is our barrier and then a no-return 64-bit ATOMIC_MEM add (SIGNAL_TYPE 0) or swap
+// (1) of 1, COMMAND 2 on the micro engine; a wait is a WAIT_REG_MEM_64 for != 0 through the guest-wait path, then an
+// ATOMIC_MEM subtract of 1. On MEC or memory the GPU cannot write the atomics are the tracker's.
+void TestMemSemaphoreTranslated() {
+	using MemSemaphore = Pm4Translator::MemSemaphore;
+	alignas(8) static volatile uint64_t counter = 0;
+	const uint64_t                      addr    = reinterpret_cast<uint64_t>(&counter);
+	constexpr uint32_t                  kPolicy = 3u << 25u; // BYPASS (MemSemaphorePolicy's default)
+	constexpr uint32_t                  kAtomic = kPolicy | (2u << 8u);
+	auto signal = [&](std::vector<uint32_t>& cb, bool write) {
+		Append(cb, IT_MEM_SEMAPHORE_T, {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), (6u << 29u) | (write ? 1u << 20u : 0u)}, false);
+	};
+	auto wait = [&](std::vector<uint32_t>& cb) {
+		Append(cb, IT_MEM_SEMAPHORE_T, {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), (7u << 29u) | (1u << 16u)}, false);
+	};
+	auto is_atomic = [&](const Packet& p, uint32_t tc_op) {
+		return p.op == IT_ATOMIC_MEM_T && p.body == std::vector<uint32_t>({kAtomic | tc_op, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u,
+		                                                                    0u, 0u, 0u, 0u});
+	};
+	auto is_wait = [&](const Packet& p, uint32_t engine) {
+		return p.op == 0x93u && p.body == std::vector<uint32_t>({kPolicy | (engine << 8u) | (1u << 4u) | 4u, static_cast<uint32_t>(addr),
+		                                                         static_cast<uint32_t>(addr >> 32u), 0u, 0u, 0xffffffffu, 0xffffffffu, 4u});
+	};
+	// The index of the first packet `pred` holds for, past `from`; pkts.size() if none.
+	auto find = [](const std::vector<Packet>& pkts, size_t from, auto pred) {
+		for (size_t i = from; i < pkts.size(); i++) {
+			if (pred(pkts[i])) {
+				return i;
+			}
+		}
+		return pkts.size();
+	};
+	auto fence_release = [](const Packet& p) {
+		return p.op == 0x49u && p.body.size() >= 4 && p.body[2] == static_cast<uint32_t>(kFenceVa) && p.body[3] == static_cast<uint32_t>(kFenceVa >> 32u);
+	};
+	auto fence_wait = [](const Packet& p) {
+		return p.op == 0x3Cu && p.body.size() >= 3 && p.body[1] == static_cast<uint32_t>(kFenceVa) && p.body[2] == static_cast<uint32_t>(kFenceVa >> 32u);
+	};
+	auto no_semaphore = [](const Pm4TranslateResult& r) {
+		return Count(Decode(r.ib), IT_MEM_SEMAPHORE_T) == 0 && std::find(r.ib.begin(), r.ib.end(), Pkt3(IT_MEM_SEMAPHORE_T, 3, false)) == r.ib.end();
+	};
+	auto translator = [&](TestOracle& o, bool compute) {
+		auto t = std::make_unique<Pm4Translator>();
+		t->SetNativeLabels(&o, kTrackerVa);
+		t->SetFenceAddress(kFenceVa);
+		t->SetAudit(true); // the refusals' reasons
+		t->SetMemSemaphore(MemSemaphore::Translate);
+		if (compute) {
+			t->SetComputeQueue(true);
+			t->SetComputeRing(true);
+		}
+		return t;
+	};
+	counter = 0;
+
+	// The switch: a bare translator and Refuse refuse it, Translate does not pass 0x39 on.
+	{
+		std::vector<uint32_t> cb;
+		signal(cb, false);
+		Pm4Translator bare;
+		TestOracle    ob;
+		bare.SetNativeLabels(&ob, kTrackerVa);
+		bare.SetAudit(true); // the refusals' reasons
+		auto rb = bare.Translate(cb);
+		Check(!rb.ok && rb.unknown_op == IT_MEM_SEMAPHORE_T && RefusedFor(rb, RefuseWhy::Unknown), "MEM_SEMAPHORE refused by a bare translator");
+		bare.SetMemSemaphore(MemSemaphore::Refuse);
+		Check(!bare.Translate(cb).ok, "MEM_SEMAPHORE refused with Refuse");
+		bare.SetMemSemaphore(MemSemaphore::AsIs);
+		auto ra = bare.Translate(cb);
+		Check(ra.ok && Count(Decode(ra.ib), IT_MEM_SEMAPHORE_T) == 1, "AsIs passes the title's packet on");
+		bare.SetMemSemaphore(MemSemaphore::Translate);
+		auto rt = bare.Translate(cb);
+		Check(rt.ok && no_semaphore(rt), "Translate leaves no 0x39 in the IB");
+		// Without native labels there is no tracker or label bookkeeping to build it on: refused as before.
+		Pm4Translator plain;
+		plain.SetAudit(true); // the refusals' reasons
+		plain.SetMemSemaphore(MemSemaphore::Translate);
+		auto rp = plain.Translate(cb);
+		Check(!rp.ok && RefusedFor(rp, RefuseWhy::SemaphoreForm), "MEM_SEMAPHORE without native labels refused");
+	}
+	// Signals on the gfx ring: barrier, then ADD_64 (SIGNAL_TYPE 0) or SWAP_64 (1) of 1, no 0x39.
+	for (const bool write: {false, true}) {
+		TestOracle            o;
+		auto                  t = translator(o, false);
+		std::vector<uint32_t> cb;
+		signal(cb, write);
+		auto       r    = t->Translate(cb);
+		const auto pkts = Decode(r.ib);
+		const auto rel  = find(pkts, 0, fence_release);
+		const auto fw   = find(pkts, rel, fence_wait);
+		const auto at   = find(pkts, 0, [&](const Packet& p) { return is_atomic(p, write ? 0x67u : 0x6fu); });
+		Check(r.ok && no_semaphore(r) && Count(pkts, IT_ATOMIC_MEM_T) == 1, "a signal is one ATOMIC_MEM, no 0x39");
+		Check(rel < fw && fw < at && at < pkts.size(), "the signal's atomic follows our barrier (end of pipe, and the wait for it)");
+		Check(!pkts[at].compute && (pkts[at].body[0] >> 30u) == 0u, "on the micro engine, the gfx header");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "a translated signal passes both packet checks");
+		Check(o.asked == 0, "a signal asks the oracle nothing");
+		bool written = false;
+		for (const auto& w: r.segments.back().writes) {
+			written = written || (w.addr == addr && w.wide && w.gpu && w.nonzero);
+		}
+		Check(written, "the counter's write is recorded as the GPU's, not 0");
+	}
+	// A signal on MEC: our barrier on the compute ring, the add the tracker's (no ATOMIC_MEM to MEC).
+	{
+		TestOracle            o;
+		auto                  t = translator(o, true);
+		std::vector<uint32_t> cb;
+		signal(cb, false);
+		auto       r    = t->Translate(cb);
+		const auto pkts = Decode(r.ib);
+		bool       cpu  = false;
+		for (const auto& p: AllPoints(r)) {
+			cpu = cpu || (p.kind == TrackerPoint::Kind::Atomic && p.addr == addr && p.data == std::vector<uint32_t>({kAtomic | 0x6fu, 1u, 0u, 0u, 0u}));
+		}
+		Check(r.ok && no_semaphore(r) && Count(pkts, IT_ATOMIC_MEM_T) == 0 && cpu, "a signal on MEC is the tracker's ADD_64");
+		Check(find(pkts, 0, fence_release) < pkts.size(), "after our barrier");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "a translated signal passes both packet checks on MEC");
+	}
+	// Memory the GPU cannot write on the gfx ring: the tracker's atomics too.
+	{
+		TestOracle o;
+		o.unwritable = addr;
+		auto                  t = translator(o, false);
+		std::vector<uint32_t> cb;
+		signal(cb, true);
+		auto r   = t->Translate(cb);
+		bool cpu = false;
+		for (const auto& p: AllPoints(r)) {
+			cpu = cpu || (p.kind == TrackerPoint::Kind::Atomic && p.addr == addr && p.data[0] == (kAtomic | 0x67u));
+		}
+		Check(r.ok && no_semaphore(r) && Count(Decode(r.ib), IT_ATOMIC_MEM_T) == 0 && cpu, "a signal on unwritable memory is the tracker's SWAP_64");
+	}
+	// Signal then wait in one buffer: our signal is the latest write to the counter, so the wait runs on the GPU as the
+	// guest-form WAIT_REG_MEM_64 for != 0 (PFP), then SUB_64; nothing held, the oracle not asked.
+	{
+		TestOracle o;
+		o.plan = LabelOracle::Plan::Split; // would hold it, if asked
+		auto t = translator(o, false);
+		t->SetWaitsVerbatim(true);
+		std::vector<uint32_t> cb;
+		signal(cb, false);
+		wait(cb);
+		auto       r    = t->Translate(cb);
+		const auto pkts = Decode(r.ib);
+		const auto add  = find(pkts, 0, [&](const Packet& p) { return is_atomic(p, 0x6fu); });
+		const auto w    = find(pkts, add, [&](const Packet& p) { return is_wait(p, 1u); });
+		const auto sub  = find(pkts, w, [&](const Packet& p) { return is_atomic(p, 0x70u); });
+		Check(r.ok && no_semaphore(r) && sub < pkts.size(), "signal, wait: ADD_64, the wait for != 0, SUB_64 in order");
+		Check(r.segments.size() == 1 && o.asked == 0 && r.stats.waits_native == 1, "the wait on our own signal runs on the GPU");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "signal and wait pass both packet checks");
+		// Without SetWaitsVerbatim there is no native form of a != wait (EmitNativeWait: EQUAL only): held instead.
+		TestOracle o2;
+		auto       t2 = translator(o2, false);
+		auto       r2 = t2->Translate(cb);
+		Check(r2.ok && no_semaphore(r2) && r2.segments.size() == 2 && r2.segments[1].held && r2.segments[1].wait_len == 0,
+		      "without guest-form waits the wait is held on the CPU, not emitted as something else");
+		Check(Count(Decode(r2.ib), 0x93u) == 0 && PassesBothChecks(r2.ib, NativeIbKind::Gfx), "and no WAIT_REG_MEM_64 is emitted for it");
+		// A second wait: the subtract left the counter unknown, so it is held.
+		std::vector<uint32_t> twice = cb;
+		wait(twice);
+		auto r3 = t->Translate(twice);
+		Check(r3.ok && no_semaphore(r3) && r3.segments.size() == 2 && r3.segments[1].held, "a second wait after the subtract is held");
+		Check(Count(Decode(r3.ib), IT_ATOMIC_MEM_T) == 3, "and its subtract still follows");
+	}
+	// A wait with no known writer: the oracle decides. Split holds it on the CPU (function NOT_EQUAL, 64-bit, ref 0) with
+	// the subtract in the held piece; Met is our barrier, then the subtract; Native the guest-form wait.
+	{
+		TestOracle o;
+		o.plan = LabelOracle::Plan::Split;
+		auto                  t = translator(o, false);
+		std::vector<uint32_t> cb;
+		wait(cb);
+		auto r = t->Translate(cb);
+		Check(r.ok && no_semaphore(r) && o.asked == 1 && o.last.function == 4u && o.last.wide && o.last.ref == 0u && o.last.mask == ~0ull &&
+		          o.last.addr == addr,
+		      "the oracle is asked about != 0 on the 64-bit counter");
+		// The empty piece before the wait is left out.
+		Check(r.segments.back().held && r.segments.back().wait.function == 4u && r.segments.back().wait.wide, "held on the CPU");
+		const std::vector<uint32_t> held(r.ib.begin() + r.segments.back().begin, r.ib.begin() + r.segments.back().end);
+		const auto                  hp = Decode(held);
+		Check(find(hp, 0, [&](const Packet& p) { return is_atomic(p, 0x70u); }) < hp.size(), "the subtract runs in the held piece");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "a held wait passes both packet checks");
+
+		TestOracle om;
+		om.plan    = LabelOracle::Plan::Met;
+		auto t2    = translator(om, false);
+		auto r2    = t2->Translate(cb);
+		auto p2    = Decode(r2.ib);
+		auto fence = find(p2, 0, fence_release);
+		Check(r2.ok && r2.segments.size() == 1 && fence < find(p2, fence, [&](const Packet& p) { return is_atomic(p, 0x70u); }) &&
+		          find(p2, 0, [&](const Packet& p) { return is_atomic(p, 0x70u); }) < p2.size(),
+		      "a wait memory already meets: our barrier, then the subtract");
+
+		TestOracle on;
+		on.plan = LabelOracle::Plan::Native;
+		auto t3 = translator(on, false);
+		t3->SetWaitsVerbatim(true);
+		auto r3 = t3->Translate(cb);
+		auto p3 = Decode(r3.ib);
+		Check(r3.ok && r3.segments.size() == 1 && find(p3, 0, [&](const Packet& p) { return is_wait(p, 1u); }) < p3.size() &&
+		          PassesBothChecks(r3.ib, NativeIbKind::Gfx),
+		      "a wait the oracle sends to the GPU: the guest-form WAIT_REG_MEM_64");
+	}
+	// A wait on MEC the oracle sends to the GPU (a KFD queue): the guest form on the micro engine, the subtract the tracker's.
+	{
+		TestOracle o;
+		o.plan = LabelOracle::Plan::Native;
+		auto                  t = translator(o, true);
+		std::vector<uint32_t> cb;
+		wait(cb);
+		auto       r    = t->Translate(cb);
+		const auto pkts = Decode(r.ib);
+		bool       cpu  = false;
+		for (const auto& p: AllPoints(r)) {
+			cpu = cpu || (p.kind == TrackerPoint::Kind::Atomic && p.addr == addr && p.data == std::vector<uint32_t>({kAtomic | 0x70u, 1u, 0u, 0u, 0u}));
+		}
+		Check(r.ok && no_semaphore(r) && find(pkts, 0, [&](const Packet& p) { return is_wait(p, 0u); }) < pkts.size() &&
+		          Count(pkts, IT_ATOMIC_MEM_T) == 0 && cpu,
+		      "a wait on MEC: the guest-form wait, the tracker's SUB_64");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "a translated wait passes both packet checks on MEC");
+	}
+	// Forms libSceAgc does not write still refuse when translating.
+	{
+		TestOracle o;
+		auto       t = translator(o, false);
+		for (const uint32_t control: {5u << 29u, (6u << 29u) | (1u << 24u), (7u << 29u) | 1u}) {
+			std::vector<uint32_t> cb;
+			Append(cb, IT_MEM_SEMAPHORE_T, {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), control}, false);
+			auto r = t->Translate(cb);
+			Check(!r.ok && RefusedFor(r, RefuseWhy::SemaphoreForm), "MEM_SEMAPHORE in another form refused when translating");
+		}
+	}
+	// The strict packet check itself never gets 0x39 from a translation, and still refuses it on MEC.
+	{
+		using Libs::Graphics::NativeGpu::SetNativeIbValidation;
+		using Libs::Graphics::NativeGpu::ValidateNativeIb;
+		std::vector<uint32_t> raw;
+		signal(raw, false);
+		SetNativeIbValidation(true);
+		Check(!ValidateNativeIb(raw, false, nullptr, NativeIbKind::Compute), "the strict check refuses 0x39 on MEC");
+		SetNativeIbValidation(false);
+	}
+	Check(counter == 0, "translating never touches the counter");
 }
 
 // COND_EXEC end to end, as nativeShadow runs it: FlattenIndirectBuffers inlines a call in the range and drops a REWIND,
@@ -5880,6 +6130,7 @@ int main() {
 	TestCopyDataForms();
 	TestAtomicOpTable();
 	TestMemSemaphoreForms();
+	TestMemSemaphoreTranslated();
 	TestCondExecThroughFlatten();
 	TestAuditIbUnchanged();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");

@@ -5504,8 +5504,9 @@ private:
 		// PS5 runs them, each with a switch to refuse it again (0: the buffer goes to Kyty's command processor):
 		// KYTY_NATIVE_GPU_COPY_DATA (COPY_DATA on the gfx ring), KYTY_NATIVE_GPU_MEC_COPY_DATA (on MEC),
 		// KYTY_NATIVE_GPU_ATOMIC_OPS (every no-return ATOMIC_MEM op) and KYTY_NATIVE_GPU_COND_EXEC (any COND_EXEC, its
-		// count recomputed). KYTY_NATIVE_GPU_MEM_SEMAPHORE stays 0: the stock ME took the whole board down on the first
-		// 0x39 (probe memsem, no kernel line), so it is refused unless set to 1 for research.
+		// count recomputed). KYTY_NATIVE_GPU_MEM_SEMAPHORE: the stock ME took the whole board down on the first 0x39 (probe
+		// memsem, no kernel line), so by default (translate, or 1) the translator builds it from our barrier, a wait and
+		// ATOMIC_MEM; 0 refuses it, asis passes the title's packet on as written (research only).
 		{
 			auto on = [](const char* name, bool def) {
 				const char* v = std::getenv(name);
@@ -5514,7 +5515,12 @@ private:
 			const bool copy_data = on("KYTY_NATIVE_GPU_COPY_DATA", true);
 			const bool mec_copy  = on("KYTY_NATIVE_GPU_MEC_COPY_DATA", true);
 			const bool atomics   = on("KYTY_NATIVE_GPU_ATOMIC_OPS", true);
-			const bool semaphore = on("KYTY_NATIVE_GPU_MEM_SEMAPHORE", false);
+			using MemSemaphore = Pm4Translator::MemSemaphore;
+			const char*        sem_env   = std::getenv("KYTY_NATIVE_GPU_MEM_SEMAPHORE");
+			const MemSemaphore semaphore = sem_env == nullptr || sem_env[0] == '\0' ? MemSemaphore::Translate
+			                               : std::strcmp(sem_env, "asis") == 0     ? MemSemaphore::AsIs
+			                               : sem_env[0] == '0'                     ? MemSemaphore::Refuse
+			                                                                       : MemSemaphore::Translate;
 			const bool cond_exec = on("KYTY_NATIVE_GPU_COND_EXEC", true);
 			for (Pm4Translator* t: {&m_translator, &m_acb_translator}) {
 				t->SetCopyData(copy_data, mec_copy);
@@ -5522,9 +5528,11 @@ private:
 				t->SetMemSemaphore(semaphore);
 				t->SetCondExec(cond_exec);
 			}
-			if (!copy_data || !mec_copy || !atomics || semaphore || !cond_exec) {
-				std::fprintf(stderr, "native shadow: libSceAgc forms (not the defaults): COPY_DATA gfx %d MEC %d, ATOMIC_MEM ops %d, MEM_SEMAPHORE %d, COND_EXEC %d\n",
-				             copy_data, mec_copy, atomics, semaphore, cond_exec);
+			SetMemSemaphoreValidation(semaphore == MemSemaphore::AsIs);
+			if (!copy_data || !mec_copy || !atomics || semaphore != MemSemaphore::Translate || !cond_exec) {
+				std::fprintf(stderr, "native shadow: libSceAgc forms (not the defaults): COPY_DATA gfx %d MEC %d, ATOMIC_MEM ops %d, MEM_SEMAPHORE %s, COND_EXEC %d\n",
+				             copy_data, mec_copy, atomics, semaphore == MemSemaphore::AsIs ? "asis" : semaphore == MemSemaphore::Refuse ? "refused" : "translated",
+				             cond_exec);
 			}
 		}
 		// KYTY_NATIVE_GPU_GDS_SHADERS=1 runs draws with GDS shaders natively, =skip leaves just those
@@ -6769,7 +6777,7 @@ private:
 			if (c == 0) {
 				return std::nullopt;
 			}
-			return c == 1 && wait.Met(v) && w.gpu ? Plan::Native : Plan::Split;
+			return ((c == 1 && wait.Met(v)) || w.SignalMeets(wait)) && w.gpu ? Plan::Native : Plan::Split;
 		};
 		if (auto q = m_pending.find(m_translating); q != m_pending.end()) {
 			for (auto p = q->second.rbegin(); p != q->second.rend(); ++p) {
