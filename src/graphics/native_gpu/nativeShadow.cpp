@@ -2,6 +2,7 @@
 
 #include "graphics/native_gpu/nativePm4.h"
 #include "graphics/native_gpu/nativeSubmit.h" // KYTY_GEM_BACKING_SUPPORTED + NativeSubmitter
+#include "graphics/native_gpu/nativeWatch.h"
 #include "graphics/native_gpu/shaderPatcher.h"
 #include "graphics/native_gpu/shaderScan.h"
 
@@ -11,12 +12,15 @@
 #include "libs/agc.h"
 #include "libs/controller.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <atomic>
 #include <bitset>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <optional>
 #include <cstdio>
 #include <cstdlib>
@@ -1034,6 +1038,15 @@ public:
 	static constexpr uint32_t SelGfxPipe(uint32_t pipe) { return kSel | pipe; }
 	static constexpr uint32_t SelHqd(uint32_t me, uint32_t pipe, uint32_t queue) { return kSel | queue << 8u | me << 2u | pipe; }
 	int ReadReg(uint32_t reg, uint32_t sel, uint32_t* value) { return Call(12u | sel << 8u, reg, 0, value); }
+	// Any register by its absolute dword offset (op 4), e.g. CP_ME_HEADER_DUMP for the watchdog's last word.
+	int ReadAbs(uint32_t reg, uint32_t* value) { return Call(4, reg, 0, value); }
+	// The watchdog's L2: every wave of gfx VMID `vmid` killed (op 17, SQ_CMD KILL broadcast for the VMID, as amdgpu's
+	// gfx9 soft recovery), only if the helper finds `pasid` behind that VMID and on the caller's DRM fd. -EINVAL from a
+	// helper without the op.
+	int SqKill(uint32_t vmid, uint32_t pasid) {
+		uint32_t v = 0;
+		return Call(17u | vmid << 8u, pasid, 0, &v);
+	}
 	// Invalidates the gfx hub TLB of KFD's VMIDs 8-15 (op 14); 0 once acknowledged.
 	int InvalidateKfdTlb() { return Call(14u | 0xff00u << 8u, 0, 0, nullptr); }
 	// reg = (reg & ~mask) | (value & mask) if the helper allows it; `now` is the register afterwards.
@@ -1429,8 +1442,14 @@ public:
 		if (bench_min != 0 && !acb && out != nullptr && dcb.size() >= bench_min && (m_bench_count++ % 120) == 0) {
 			bench_snap = tr.Clone();
 		}
+		ArmInjectLocked(acb, agr);
 		const double       t_core      = NowSecShadow();
 		Pm4TranslateResult result      = tr.Translate(dcb);
+		if (result.injected) {
+			std::fprintf(stderr, "native inject: %s at dcb %llu (%s %llu carries the wait on scratch + %u)\n", InjectName(),
+			             static_cast<unsigned long long>(m_frames), kind, static_cast<unsigned long long>(frame), kInjectOffset);
+			std::fflush(stderr);
+		}
 		m_phase_ms[acb ? 2 : 0] += (t_core - t_translate) * 1e3;
 		m_phase_ms[acb ? 3 : 1] += (NowSecShadow() - t_core) * 1e3;
 		if (bench_snap != nullptr) {
@@ -1748,6 +1767,7 @@ public:
 			m_cps_fmask_gpu += result.stats.cp_shadow_fmask_gpu;
 			m_cps_dcc_gpu += result.stats.cp_shadow_dcc_gpu;
 			m_cps_dcc_back += result.stats.cp_shadow_dcc_back;
+			m_cps_wait_wraps += result.stats.cp_shadow_wait_wraps;
 			if (result.cp_shadow) {
 				m_cps_sets += result.stats.preamble_cx + result.stats.preamble_sh + result.stats.preamble_uc;
 			}
@@ -1882,20 +1902,27 @@ public:
 		if (!r.submitted) {
 			std::fprintf(stderr,
 			             "native shadow: %s %llu submit failed: %s (after %d retries, %zu BOs)\n", kind,
-			             static_cast<unsigned long long>(frame), std::strerror(-r.err), r.retries,
+			             static_cast<unsigned long long>(frame),
+			             r.timed_out ? "a slot's earlier submission did not finish (timeout or reset)" : std::strerror(-r.err), r.retries,
 			             handles.size());
-			Disable("submit error");
+			if (r.timed_out || r.err == -ECANCELED || r.err == -ENODEV) {
+				OnGpuFailureLocked(r.timed_out ? "slot wait" : "submission refused after a reset", r.err);
+			} else {
+				Disable("submit error");
+			}
 			return false;
 		}
 		m_last_seq = r.seq;
+		if (m_submitter->Async()) {
+			WatchNoteGfxJob(0, r.seq);
+		}
 		if (r.timed_out || r.reset || !r.completed) {
 			std::fprintf(stderr,
-			             "native shadow: %s %llu %s after %.1f ms (ib %zu dw, %u draws); "
-			             "disabling native path\n",
+			             "native shadow: %s %llu %s after %.1f ms (ib %zu dw, %u draws)\n",
 			             kind, static_cast<unsigned long long>(frame),
 			             r.timed_out ? "TIMED OUT" : (r.reset ? "context RESET" : "did not complete"),
 			             r.seconds * 1e3, result.ib.size(), result.stats.draws);
-			Disable("timeout or reset");
+			OnGpuFailureLocked(r.timed_out ? "timeout" : (r.reset ? "context reset" : "did not complete"), 0);
 			return false;
 		}
 
@@ -2444,16 +2471,17 @@ public:
 				             "native shadow: CP shadow (%s) per flip: %.2f shadow preambles with %.0f LOAD dwords (%.0f registers, %.2f anchors) and "
 				             "%.0f SETs; %.2f resumes put in front of a chunk, %.2f shadowing-off guards before another translator's piece, %.2f "
 				             "gfx job ends; %.2f context pushes and %.2f pops on the GPU; %.2f FMASK fixes on the GPU, %.2f display-DCC "
-				             "fixes on the GPU (INFO from a verbatim table) and %.2f DCC given back\n",
+				             "fixes on the GPU (INFO from a verbatim table) and %.2f DCC given back; %.1f GPU waits with shadowing off around them\n",
 				             m_cp_shadow == CpShadowMode::Record ? "record" : "load", static_cast<double>(m_cps_preambles) / m_flips,
 				             static_cast<double>(m_cps_load_dw) / m_flips, static_cast<double>(m_cps_load_regs) / m_flips,
 				             static_cast<double>(m_cps_anchors) / m_flips, static_cast<double>(m_cps_sets) / m_flips,
 				             static_cast<double>(resumes - m_cps_resumes_mark) / m_flips, static_cast<double>(guards - m_cps_guards_mark) / m_flips,
 				             static_cast<double>(m_cps_job_ends) / m_flips, static_cast<double>(m_cps_pushes) / m_flips,
 				             static_cast<double>(m_cps_pops) / m_flips, static_cast<double>(m_cps_fmask_gpu) / m_flips,
-				             static_cast<double>(m_cps_dcc_gpu) / m_flips, static_cast<double>(m_cps_dcc_back) / m_flips);
+				             static_cast<double>(m_cps_dcc_gpu) / m_flips, static_cast<double>(m_cps_dcc_back) / m_flips,
+				             static_cast<double>(m_cps_wait_wraps) / m_flips);
 				m_cps_preambles = m_cps_load_dw = m_cps_load_regs = m_cps_anchors = m_cps_sets = m_cps_job_ends = 0;
-				m_cps_pushes = m_cps_pops = m_cps_fmask_gpu = m_cps_dcc_gpu = m_cps_dcc_back = 0;
+				m_cps_pushes = m_cps_pops = m_cps_fmask_gpu = m_cps_dcc_gpu = m_cps_dcc_back = m_cps_wait_wraps = 0;
 				m_cps_resumes_mark = resumes;
 				m_cps_guards_mark  = guards;
 				if (m_cp_checks != 0) {
@@ -3136,7 +3164,7 @@ public:
 	}
 
 	// Waits for the last CS submitted to tracker `slot`. True when that ring is idle (or nothing was
-	// submitted there). Each ring has its own fence. A timeout disables the native path.
+	// submitted there). Each ring has its own fence. A timeout or a fence error is a GPU failure (OnGpuFailureLocked).
 	bool WaitSlot(uint32_t slot) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		SlotFence fence;
@@ -3150,17 +3178,19 @@ public:
 		if (fence.seq == 0) {
 			return true;
 		}
-		if (m_submitter != nullptr &&
-		    m_submitter->WaitSeq(fence.seq, m_timeout_sec, {fence.ip_type, fence.ring})) {
+		const int status = m_submitter != nullptr ? m_submitter->WaitSeqStatus(fence.seq, m_timeout_sec, {fence.ip_type, fence.ring}) : 1;
+		if (status == 0) {
 			return true;
 		}
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (!m_disabled) {
-			std::fprintf(stderr, "native shadow: ring slot %u submission %llu TIMED OUT; disabling native path %s\n", slot,
-			             static_cast<unsigned long long>(fence.seq), m_submitter->QueueState({fence.ip_type, fence.ring}).c_str());
+			// A fence error is amdgpu's reset of the job (-ETIME, -ECANCELED), not a slow ring.
+			std::fprintf(stderr, "native shadow: ring slot %u submission %llu %s %s\n", slot, static_cast<unsigned long long>(fence.seq),
+			             status < 0 ? (std::string("came back with ") + std::strerror(-status) + " (amdgpu reset it)").c_str() : "TIMED OUT",
+			             m_submitter->QueueState({fence.ip_type, fence.ring}).c_str());
 			DumpHangLocked();
 			RunHangHook();
-			Disable("timeout");
+			OnGpuFailureLocked(status < 0 ? "fence error" : "timeout", status < 0 ? status : 0);
 		}
 #else
 		(void)slot;
@@ -3256,17 +3286,18 @@ public:
 		return std::exchange(m_last_seq, 0);
 	}
 
-	// Waits for an async submission; false on a timeout (the native path then disables itself).
+	// Waits for an async submission; false on a timeout or a fence error (a GPU failure, OnGpuFailureLocked).
 	bool WaitSubmission(uint64_t seq) {
 #if KYTY_GEM_BACKING_SUPPORTED
-		if (m_submitter != nullptr && m_submitter->WaitSeq(seq, m_timeout_sec)) {
+		const int status = m_submitter != nullptr ? m_submitter->WaitSeqStatus(seq, m_timeout_sec) : 1;
+		if (status == 0) {
 			return true;
 		}
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (!m_disabled) {
-			std::fprintf(stderr, "native shadow: submission %llu TIMED OUT; disabling native path\n",
-			             static_cast<unsigned long long>(seq));
-			Disable("timeout");
+			std::fprintf(stderr, "native shadow: submission %llu %s\n", static_cast<unsigned long long>(seq),
+			             status < 0 ? (std::string("came back with ") + std::strerror(-status) + " (amdgpu reset it)").c_str() : "TIMED OUT");
+			OnGpuFailureLocked(status < 0 ? "fence error" : "timeout", status < 0 ? status : 0);
 		}
 #else
 		(void)seq;
@@ -3443,6 +3474,7 @@ public:
 		m_exit_waits.push_back(ExitWaits {slot, end_seq, std::move(waits)});
 	}
 
+	enum class StopMode { Exit, Watch };
 	// Stops the title's GPU work where it stands, as the PS5 kernel stops a title's queues when it ends,
 	// and returns once the rings have left it behind (or after 2 s). Nothing more is submitted; the exit
 	// guards (Pm4Translator::SetExitGuard) are armed, so the CP leaves each IB at its next guard; the KFD
@@ -3453,16 +3485,25 @@ public:
 	// arguments the title had not written yet, and the writes went into memory reused since (ASTRO BOT
 	// stopped while loading: "Illegal register access", a GPU reset the BC-250 did not survive).
 	// Once per process; a second caller returns when the first is done.
-	void StopGpu(const char* why) {
+	//
+	// StopMode::Watch (the hang watchdog, OnGpuFailure): the stop has to be done before amdgpu's gfx timer fires, as
+	// the PS5 kernel ends a hung title before anything else suffers. The KFD queues are destroyed on a thread of their
+	// own beside the gfx release (a queue with halted waves takes KFD about 4 s, sixteen of them were the 81 s of
+	// cp-shadow-hang-fatal), the release goes on until `deadline` (NowSecShadow seconds; 0: 2 s) and `each_round` runs
+	// after every round (the watchdog's wave kill). Exit mode keeps the order every title was verified with (KFD
+	// first), unless KYTY_NATIVE_GPU_STOP_KFD_PARALLEL=1. True when the gfx rings were idle at the end.
+	bool StopGpu(const char* why, StopMode mode = StopMode::Exit, double deadline = 0.0, const std::function<void()>& each_round = {}) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		std::lock_guard<std::mutex> once(m_stop_mutex);
 		if (m_stopped || m_submitter == nullptr || !m_enabled) {
 			m_stopped = true;
-			return;
+			return m_stop_idle;
 		}
 		m_stopped = true;
 		m_stopping.store(true, std::memory_order_release);
-		const double t0 = NowSecShadow();
+		const double t0    = NowSecShadow();
+		const bool   watch = mode == StopMode::Watch;
+		const double until = deadline > t0 ? deadline : t0 + 2.0;
 		// Another thread may hold the lock while it waits on the GPU, for the very ring this releases.
 		std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
 		for (int i = 0; i < 100 && !lock.try_lock(); i++) {
@@ -3477,13 +3518,27 @@ public:
 		*reinterpret_cast<volatile uint32_t*>(sc + kExitAbortOffset) = 1;
 		*reinterpret_cast<volatile uint32_t*>(sc + kExitRunOffset)   = 0;
 		__sync_synchronize();
-		const uint32_t kfd = m_submitter->DestroyKfdQueues();
-		const double   t_kfd = NowSecShadow();
-		bool stream_ended = false;
-		if (lock.owns_lock() && m_stream == StreamState::Cont) {
-			PublishStreamLocked(m_stream_pending, 0, 0, false);
-			m_stream     = StreamState::Off;
-			stream_ended = true;
+		static const bool kfd_parallel_env = EnvOn("KYTY_NATIVE_GPU_STOP_KFD_PARALLEL");
+		const bool        kfd_parallel     = watch || kfd_parallel_env;
+		uint32_t          kfd              = 0;
+		if (kfd_parallel) {
+			// Process exit destroys whatever this thread has not got to yet, the same way.
+			NativeSubmitter* submitter = m_submitter;
+			std::thread([submitter, t0] {
+				const uint32_t n = submitter->DestroyKfdQueues();
+				std::fprintf(stderr, "native shadow: stop: %u KFD queues destroyed in %.1f ms (beside the gfx release)\n", n,
+				             (NowSecShadow() - t0) * 1e3);
+				std::fflush(stderr);
+			}).detach();
+		} else {
+			kfd = m_submitter->DestroyKfdQueues();
+		}
+		const double t_kfd = NowSecShadow();
+		// A streamed DCB's chain: its CP waits for the next chunk. Ended without m_mutex (the worker may hold it for
+		// the whole stall), retried each round until the trampoline it waits for is free.
+		bool stream_ended = EndStreamForStop();
+		if (lock.owns_lock() && m_stream != StreamState::Off) {
+			m_stream = StreamState::Off;
 		}
 		std::vector<ExitWaits> pending;
 		{
@@ -3495,12 +3550,38 @@ public:
 		for (const ExitWaits& e: pending) {
 			unfinished += !on_kfd(e.slot) && !Reached(e.end_seq, e.slot) ? 1u : 0u;
 		}
+		// A wait's word: guest memory, or the scratch page for the hang tests' injected wait (kInjectOffset).
+		const uint64_t scratch_va = m_submitter->ScratchVa();
+		auto           in_scratch = [&](const WaitCond& w) { return w.addr >= scratch_va && w.addr + 8u <= scratch_va + NativeSubmitter::kScratchSize; };
+		auto           read_word  = [&](const WaitCond& w, uint64_t* cur) {
+            if (in_scratch(w)) {
+                *cur = w.wide ? *reinterpret_cast<volatile uint64_t*>(sc + (w.addr - scratch_va))
+                              : *reinterpret_cast<volatile uint32_t*>(sc + (w.addr - scratch_va));
+                return true;
+            }
+            return m_gem->ReadGuest(w.addr, cur, w.wide ? 8 : 4) != 0;
+		};
+		auto write_word = [&](const WaitCond& w, uint64_t v) {
+			if (in_scratch(w)) {
+				if (w.wide) {
+					*reinterpret_cast<volatile uint64_t*>(sc + (w.addr - scratch_va)) = v;
+				} else {
+					*reinterpret_cast<volatile uint32_t*>(sc + (w.addr - scratch_va)) = static_cast<uint32_t>(v);
+				}
+				__sync_synchronize();
+				return;
+			}
+			m_gem->WriteGuest(w.addr, &v, w.wide ? 8 : 4);
+		};
 		uint32_t released = 0;
 		bool     idle     = false;
 		for (;;) {
 			idle = m_submitter->CsIdle(0.0);
-			if (idle || NowSecShadow() - t0 > 2.0) {
+			if (idle || NowSecShadow() > until) {
 				break;
+			}
+			if (!stream_ended) {
+				stream_ended = EndStreamForStop();
 			}
 			std::set<uint32_t> slots_done;
 			for (const ExitWaits& e: pending) {
@@ -3509,11 +3590,11 @@ public:
 				}
 				for (const WaitCond& w: e.waits) {
 					uint64_t cur = 0;
-					if (m_gem->ReadGuest(w.addr, &cur, w.wide ? 8 : 4) == 0 || w.Met(cur)) {
+					if (!read_word(w, &cur) || w.Met(cur)) {
 						continue;
 					}
 					const uint64_t v = SatisfyingValue(w, cur);
-					m_gem->WriteGuest(w.addr, &v, w.wide ? 8 : 4);
+					write_word(w, v);
 					if (released++ < 16) {
 						std::fprintf(stderr, "native shadow: stop: ring slot %u waits on 0x%llx (%s, func %u, ref 0x%llx): held 0x%llx, released\n",
 						             e.slot, static_cast<unsigned long long>(w.addr), w.wide ? "64-bit" : "32-bit", w.function,
@@ -3523,14 +3604,20 @@ public:
 					break;
 				}
 			}
+			if (each_round) {
+				each_round();
+			}
 			struct timespec nap = {0, 2000000};
 			nanosleep(&nap, nullptr);
 		}
+		m_stop_idle = idle;
 		std::fprintf(stderr,
-		             "native shadow: stop (%s): %u KFD queues destroyed in %.1f ms%s, %u unfinished segments with GPU waits, %u guest "
-		             "waits released, rings %s after %.0f ms\n",
-		             why, kfd, (t_kfd - t0) * 1e3, stream_ended ? ", stream chain ended" : "", unfinished, released,
-		             idle ? "idle" : "STILL BUSY", (NowSecShadow() - t0) * 1e3);
+		             "native shadow: stop (%s): %s%s, %u unfinished segments with GPU waits, %u guest waits released, rings %s after "
+		             "%.0f ms\n",
+		             why, kfd_parallel ? "KFD queues destroyed beside it" : (std::to_string(kfd) + " KFD queues destroyed in " +
+		                                                                     std::to_string(static_cast<int>((t_kfd - t0) * 1e3)) + " ms").c_str(),
+		             stream_ended ? ", stream chain ended" : "", unfinished, released, idle ? "idle" : "STILL BUSY",
+		             (NowSecShadow() - t0) * 1e3);
 		if (!idle) {
 			std::fprintf(stderr, "native shadow: stop: %s\n", m_submitter->QueueState({}).c_str());
 		}
@@ -3544,8 +3631,541 @@ public:
 		if (AuditOn()) {
 			PrintAudit("stop", true, lock.owns_lock());
 		}
+		return idle;
 #else
 		(void)why;
+		(void)mode;
+		(void)deadline;
+		(void)each_round;
+		return true;
+#endif
+	}
+
+	// A streamed DCB's chain ended for a stop, without m_mutex: the CP waits on the stream counter for chunk n = counter + 1
+	// (the head's wait, or the last part's); trampoline n gets shadowing off (kCpShadowOff, the job's end) and the counter
+	// n, which is what PublishStreamLocked(n, 0, 0) writes, minus the bookkeeping m_mutex guards. Only once the CP has left
+	// behind the chunk that last used that trampoline (PublishStreamLocked's own rule), else false and the caller tries
+	// again. m_stream_pub keeps the worker's publishing out meanwhile; it publishes nothing once m_stopping is set. With no
+	// stream open nobody waits for n, and a head submitted before the stop that has not run yet finds its chain ended.
+	bool EndStreamForStop() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		while (m_stream_pub.test_and_set(std::memory_order_acquire)) {
+			struct timespec nap = {0, 50000};
+			nanosleep(&nap, nullptr);
+		}
+		volatile uint8_t* sc   = m_submitter->ScratchCpu();
+		const uint32_t    flag = *reinterpret_cast<volatile uint32_t*>(sc + kStreamFlagOffset);
+		const uint32_t    done = *reinterpret_cast<volatile uint32_t*>(sc + kStreamDoneOffset);
+		const uint32_t    n    = flag + 1u;
+		bool              ok   = n <= kStreamTramps || static_cast<int32_t>(done - (n - kStreamTramps)) >= 0;
+		if (ok) {
+			auto*    t = reinterpret_cast<volatile uint32_t*>(sc + StreamTrampOffset(n));
+			uint32_t k = 0;
+			for (; k < kCpShadowOff.size(); k++) {
+				t[k] = kCpShadowOff[k];
+			}
+			for (; k < 8; k++) {
+				t[k] = 0xffff1000u;
+			}
+			__sync_synchronize();
+			*reinterpret_cast<volatile uint32_t*>(sc + kStreamFlagOffset) = n;
+			__sync_synchronize();
+		}
+		m_stream_pub.clear(std::memory_order_release);
+		return ok;
+#else
+		return true;
+#endif
+	}
+
+	// A GPU failure seen on the submit side (with m_mutex held): a ring timeout, a fence amdgpu reset, a submission it
+	// refused after a reset. KYTY_NATIVE_GPU_ON_HANG=exit (the default) ends the title as the PS5 kernel does: nothing
+	// more is translated or submitted, and a thread of its own stops the title's GPU work (StopGpu, Watch mode) and ends
+	// the process with KYTY_NATIVE_GPU_WATCH_EXIT_CODE, instead of the native path turning itself off and the process
+	// lingering with KFD queues and the relay still running. The thread, because StopGpu wants m_mutex, which this
+	// caller holds. Once per process, shared with the watchdog: whoever comes second only stops submitting. `err`: the
+	// fence's -errno, 0 for a timeout. =disable keeps the old Disable().
+	void OnGpuFailureLocked(const char* why, int err) {
+		if (!m_on_hang_exit) {
+			if (!m_disabled) {
+				Disable(why);
+			}
+			return;
+		}
+		m_disabled = true;
+		m_active.store(false, std::memory_order_release);
+		if (m_failure_taken.exchange(true)) {
+			return;
+		}
+		DumpStreamJournal();
+		std::fprintf(stderr, "native watch: GPU failure on the submit side (%s%s%s): stopping the title's GPU work and exiting\n", why,
+		             err != 0 ? ", " : "", err != 0 ? std::strerror(-err) : "");
+		std::fflush(stderr);
+		const std::string trigger = why;
+		const bool        reset   = err != 0;
+		std::thread([this, trigger, reset] {
+			const double now = NowSecShadow();
+			StopAndExit(trigger, now + 2.0, reset);
+		}).detach();
+	}
+
+	// L1-L3 and the exit (the watchdog's escalation and OnGpuFailureLocked's): StopGpu in Watch mode until `deadline`,
+	// with the optional wave kill (L2) once L1 has had KYTY_NATIVE_GPU_WATCH_L1_MS; if the rings are still busy and amdgpu
+	// has not reset our job already (`reset_seen`), a last line on where the CP stands (L3) and a wait for amdgpu's reset;
+	// then gpu-fault.txt and _exit. A hung title dies, the board lives: amdgpu never resets anything when L1 or L2 work.
+	[[noreturn]] void StopAndExit(const std::string& trigger, double deadline, bool reset_seen) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		const double t0       = NowSecShadow();
+		uint32_t     kills    = 0;
+		double       t_kill   = 0.0;
+		bool         kill_off = !m_watch_sqkill || !m_watch_hw.On();
+		auto         each_round = [&]() {
+			if (kill_off) {
+				return;
+			}
+			const double now = NowSecShadow();
+			if (deadline - now < 0.5 || (kills == 0 && now - t0 < m_watch_l1_ms * 1e-3) || (kills == 1 && now - t_kill < 0.150) || kills >= 2) {
+				return;
+			}
+			// L2 (KYTY_NATIVE_GPU_WATCH_SQKILL=1): the title's waves killed through the helper (op 17: SQ_CMD KILL for the
+			// VMID, broadcast, as amdgpu's soft recovery on gfx9), so a draw or barrier behind a hung wave finishes and the
+			// next exit guard takes the job out. The VMID is the gfx one op 13 gives our PASID; a gfx fault's must match it.
+			uint32_t       vmid  = m_watch_hw.GfxVmid(m_watch_pasid);
+			const uint32_t fault = FaultVmid(m_watch_fault_status.load(std::memory_order_relaxed));
+			if (m_watch_fault_status.load(std::memory_order_relaxed) != 0 && fault >= 1 && fault <= 7 && fault != vmid) {
+				std::fprintf(stderr, "native watch: L2: the fault's VMID %u is not ours (%u); no kill\n", fault, vmid);
+				kill_off = true;
+				return;
+			}
+			if (vmid == 0) {
+				std::fprintf(stderr, "native watch: L2: no gfx VMID for PASID %u; no kill\n", m_watch_pasid);
+				kill_off = true;
+				return;
+			}
+			const int r = m_watch_hw.SqKill(vmid, m_watch_pasid);
+			kills++;
+			t_kill = now;
+			if (r == -EINVAL) {
+				std::fprintf(stderr, "native watch: L2: the kyty-lodhw helper has no wave kill (op 17); skipped\n");
+				kill_off = true;
+				return;
+			}
+			std::fprintf(stderr, "native watch: L2: waves of VMID %u killed (attempt %u, %d) at %.0f ms\n", vmid, kills, r, (now - t0) * 1e3);
+		};
+		const bool idle = StopGpu(("watch: " + trigger).c_str(), StopMode::Watch, deadline, each_round);
+		const char* outcome = idle ? "stopped" : "NOT stopped";
+		if (!idle && !reset_seen) {
+			// L3: the CP's last packet headers, read once (each read shifts its 8-entry history). A WAIT_REG_MEM header
+			// (0xc0053c00) means the CP sits at a wait, where part A leaves shadowing off: amdgpu's reset is likely
+			// survivable. Anything else (a draw, a partial flush behind hung waves) likely is not in load mode.
+			uint32_t  hdr = 0;
+			const int hr  = m_watch_hw.On() ? m_watch_hw.ReadAbs(0x1260u + 0x0f41u, &hdr) : -ENOTCONN;
+			std::fprintf(stderr,
+			             "native watch: could not stop the title's GPU work before amdgpu's reset (%lld ms); shadow wrap %s, last progress "
+			             "%.0f ms ago, CP_ME_HEADER_DUMP %s0x%08x\n",
+			             static_cast<long long>(m_watch_cfg.t_gfx_ms), m_translator.CpShadowWaitWrap() ? "on" : "off",
+			             NowSecShadow() * 1e3 - m_watch_last_progress_ms.load(std::memory_order_relaxed), hr == 0 ? "" : "(no helper) ", hdr);
+			std::fflush(stderr);
+			// Then amdgpu's reset (our fence's error) or the rings going idle after all, up to its timeout and 2 s more.
+			const double until = t0 + (m_watch_cfg.t_gfx_ms < 0 ? 10.0 : static_cast<double>(m_watch_cfg.t_gfx_ms) * 1e-3 + 2.0);
+			while (NowSecShadow() < until) {
+				if (WatchFenceError() != 0) {
+					outcome = "reset by amdgpu";
+					break;
+				}
+				if (m_submitter->CsIdle(0.0)) {
+					outcome = "idle late";
+					break;
+				}
+				struct timespec nap = {0, 20000000};
+				nanosleep(&nap, nullptr);
+			}
+		}
+		WriteGpuFault(trigger, outcome);
+		std::fprintf(stderr, "native watch: %s: title's GPU work %s, exit %d\n", trigger.c_str(), outcome, m_watch_exit_code);
+		std::fflush(stderr);
+		std::fflush(stdout);
+		::_exit(m_watch_exit_code);
+#else
+		(void)trigger;
+		(void)deadline;
+		(void)reset_seen;
+		::_exit(m_watch_exit_code);
+#endif
+	}
+
+	// The first error among the watched gfx jobs' fences (-ETIME / -ECANCELED / -ENODEV), 0 if none.
+	int WatchFenceError() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		for (uint32_t ring = 0; ring < 2; ring++) {
+			WatchRing&     q = m_watch_rings[ring];
+			const uint32_t h = q.head.load(std::memory_order_acquire);
+			if (h == q.tail.load(std::memory_order_acquire)) {
+				continue;
+			}
+			NativeSubmitter::RingTarget target;
+			target.ring = ring;
+			if (const int st = m_submitter->PollSeq(q.jobs[h % WatchRing::kSize].seq, target); st < 0) {
+				return st;
+			}
+		}
+#endif
+		return 0;
+	}
+
+	// ~/.local/share/KytyPS5-Native/data/gpu-fault.txt (XDG_DATA_HOME honoured), for the Decky plugin and the run
+	// wrapper: what stopped the title, when, which one, and how the stop went.
+	void WriteGpuFault(const std::string& trigger, const char* outcome) const {
+		const char* xdg  = std::getenv("XDG_DATA_HOME");
+		const char* home = std::getenv("HOME");
+		std::string dir  = xdg != nullptr && xdg[0] != '\0' ? std::string(xdg) : (home != nullptr ? std::string(home) + "/.local/share" : std::string());
+		if (dir.empty()) {
+			return;
+		}
+		dir += "/KytyPS5-Native/data";
+		const std::string path = dir + "/gpu-fault.txt";
+		if (std::FILE* f = std::fopen(path.c_str(), "w"); f != nullptr) {
+			const std::time_t now = std::time(nullptr);
+			char              when[64];
+			std::strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+			std::fprintf(f, "trigger: %s\ntime: %s\ntitle: %s\nstop: %s\nexit: %d\n", trigger.c_str(), when, m_title_id.c_str(), outcome,
+			             m_watch_exit_code);
+			std::fclose(f);
+		} else {
+			std::fprintf(stderr, "native watch: %s not written (%s)\n", path.c_str(), std::strerror(errno));
+		}
+	}
+
+	// The submit side's note of a gfx job for the watchdog (with m_mutex held: one producer at a time).
+	void WatchNoteGfxJob(uint32_t ring, uint64_t seq) {
+		if (!m_watch_on.load(std::memory_order_relaxed) || ring > 1) {
+			return;
+		}
+		WatchRing&     q = m_watch_rings[ring];
+		const uint32_t t = q.tail.load(std::memory_order_relaxed);
+		if (t - q.head.load(std::memory_order_acquire) >= WatchRing::kSize) {
+			m_watch_q_full.fetch_add(1, std::memory_order_relaxed); // the watchdog is behind by a whole ring: T1 fires on its own
+			return;
+		}
+		q.jobs[t % WatchRing::kSize] = WatchJob {seq, NowSecShadow() * 1e3};
+		q.tail.store(t + 1, std::memory_order_release);
+	}
+
+	// The watchdog (KYTY_NATIVE_GPU_WATCH, on unless 0; "log" detects and logs only): every
+	// KYTY_NATIVE_GPU_WATCH_POLL_MS it pops the gfx jobs whose fences signalled, reads the progress words (the gfx
+	// rings' trackers, the stream's chunk counter), the VM's last GPU page fault and the context's reset state, and
+	// feeds WatchDecider. It never takes m_mutex: the submit thread may hold it for the whole of a slot wait.
+	void WatchLoop() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		::prctl(PR_SET_TIMERSLACK, 1ul, 0ul, 0ul, 0ul);
+		WatchDecider         d(m_watch_cfg);
+		volatile uint8_t*    sc            = m_submitter->ScratchCpu();
+		bool                 fault_query   = true;
+		bool                 other_reset   = false;
+		double               logged_start  = -1.0;
+		double               logged_prog   = -1.0;
+		WatchTrigger         logged_kind   = WatchTrigger::None;
+		double               not_ours_prog = -1.0;
+		const struct timespec nap          = {0, static_cast<long>(m_watch_poll_ms * 1e6)};
+		for (;;) {
+			nanosleep(&nap, nullptr);
+			if (m_stopping.load(std::memory_order_acquire) || m_failure_taken.load(std::memory_order_acquire)) {
+				return; // a stop is under way elsewhere (exit, a signal, the submit side's failure)
+			}
+			const double now = NowSecShadow() * 1e3;
+			WatchSample  s;
+			s.now_ms      = now;
+			int    err    = 0;
+			double start  = std::numeric_limits<double>::infinity();
+			for (uint32_t ring = 0; ring < 2; ring++) {
+				WatchRing& q = m_watch_rings[ring];
+				for (;;) {
+					const uint32_t h = q.head.load(std::memory_order_relaxed);
+					if (h == q.tail.load(std::memory_order_acquire)) {
+						break;
+					}
+					const WatchJob              j = q.jobs[h % WatchRing::kSize];
+					NativeSubmitter::RingTarget target;
+					target.ring    = ring;
+					const int st   = m_submitter->PollSeq(j.seq, target);
+					if (st == 0) {
+						q.last_signal = now;
+						q.head.store(h + 1, std::memory_order_release);
+						continue;
+					}
+					err           = st < 0 && err == 0 ? st : err;
+					s.gfx_pending = true;
+					// The ring runs its jobs in order: this one started when it was submitted or when the one before it
+					// signalled, whichever was later (a job of another process in between only starts it later still).
+					start = std::min(start, std::max(j.t_submit, q.last_signal));
+					break;
+				}
+			}
+			s.gfx_start_ms = s.gfx_pending ? start : 0.0;
+			const uint32_t flag = *reinterpret_cast<volatile uint32_t*>(sc + kStreamFlagOffset);
+			const uint32_t done = *reinterpret_cast<volatile uint32_t*>(sc + kStreamDoneOffset);
+			s.progress          = {TrackerValue(0), TrackerValue(kGfx1Slot), done};
+			s.stream_parked     = m_watch_stream_open.load(std::memory_order_acquire) && done == flag;
+			if (fault_query) {
+				s.fault_valid = m_submitter->GpuvmFault(&s.fault.addr, &s.fault.status, &s.fault.vmhub);
+				if (!s.fault_valid) {
+					fault_query = false;
+					std::fprintf(stderr, "native watch: this kernel has no AMDGPU_INFO_GPUVM_FAULT (Linux 6.10): page faults are not watched (T2 off)\n");
+				}
+			}
+			const uint32_t flags   = m_submitter->ContextState();
+			const bool     ours    = (flags & (AMDGPU_CTX_QUERY2_FLAGS_GUILTY | AMDGPU_CTX_QUERY2_FLAGS_VRAMLOST)) != 0;
+			s.reset                = err != 0 || ours;
+			if (!s.reset && (flags & AMDGPU_CTX_QUERY2_FLAGS_RESET) != 0 && !other_reset) {
+				other_reset = true;
+				std::fprintf(stderr, "native watch: amdgpu reset something (context flags 0x%x) and our jobs are fine: going on\n", flags);
+			}
+			const WatchTrigger trig = d.Feed(s);
+			m_watch_last_progress_ms.store(d.LastProgressMs(), std::memory_order_relaxed);
+			if (s.fault_valid) {
+				m_watch_fault_status.store(d.Fault().status, std::memory_order_relaxed);
+			}
+			if (trig == WatchTrigger::None || (m_watch_mode == WatchMode::Reset && trig != WatchTrigger::Reset)) {
+				continue;
+			}
+			const GpuvmFault& f = d.Fault();
+			char detail[384];
+			std::snprintf(detail, sizeof(detail),
+			              "oldest gfx job %.0f ms old, no progress for %.0f ms, tracker %u/%u, stream %u/%u%s, fault 0x%llx status 0x%08x "
+			              "(VMID %u, CID 0x%x, %s), context 0x%x%s%s",
+			              s.gfx_pending ? now - s.gfx_start_ms : 0.0, now - d.LastProgressMs(), s.progress[0], s.progress[1], done, flag,
+			              s.stream_parked ? " (parked)" : "", static_cast<unsigned long long>(f.addr), f.status, FaultVmid(f.status),
+			              FaultCid(f.status), FaultWrite(f.status) ? "write" : "read", flags, err != 0 ? ", fence " : "",
+			              err != 0 ? std::strerror(-err) : "");
+			if (trig == WatchTrigger::StreamParkLog) {
+				std::fprintf(stderr, "native watch: CPU-side stall: the CP waits for stream chunk %u the worker owes (%s)\n", flag + 1u, detail);
+				continue;
+			}
+			if (trig == WatchTrigger::VmFault && !m_watch_fault_exit) {
+				std::fprintf(stderr, "native watch: GPU page fault (KYTY_NATIVE_GPU_WATCH_FAULT=log, going on): %s\n", detail);
+				continue;
+			}
+			// T1 only: a stalled gfx queue running another VMID is gamescope's (or another process's) hang, not ours.
+			// amdgpu resets its job and re-emits ours; nothing to stop. Read twice, 20 ms apart.
+			if (trig == WatchTrigger::GfxStall && m_watch_hw.On()) {
+				if (not_ours_prog == d.LastProgressMs()) {
+					continue;
+				}
+				const uint32_t mine = m_watch_hw.GfxVmid(m_watch_pasid);
+				uint32_t       v0 = 0, v1 = 0;
+				const int      r0 = m_watch_hw.ReadReg(0x1260u + 0x1e81u, LodStatsHw::SelHqd(0, 0, 0), &v0);
+				struct timespec gap = {0, 20000000};
+				nanosleep(&gap, nullptr);
+				const int r1 = m_watch_hw.ReadReg(0x1260u + 0x1e81u, LodStatsHw::SelHqd(0, 0, 0), &v1);
+				v0 &= 0xfu;
+				v1 &= 0xfu;
+				if (r0 == 0 && r1 == 0 && mine != 0 && v0 == v1 && v0 != 0 && v0 != mine) {
+					not_ours_prog = d.LastProgressMs();
+					std::fprintf(stderr, "native watch: gfx ring stuck in VMID %u (not ours, %u): left to amdgpu (%s)\n", v0, mine, detail);
+					continue;
+				}
+			}
+			const double deadline = d.DeadlineMs() * 1e-3;
+			if (m_watch_mode == WatchMode::Log && trig != WatchTrigger::Reset) {
+				// Once per stall (a stall is its start and its last progress) and per fault. A reset has happened already:
+				// the title stops as in every mode.
+				if (trig != logged_kind || d.StartMs() != logged_start || d.LastProgressMs() != logged_prog || trig == WatchTrigger::VmFault) {
+					logged_kind  = trig;
+					logged_start = d.StartMs();
+					logged_prog  = d.LastProgressMs();
+					std::fprintf(stderr, "native watch: would stop (%s; %s; amdgpu's reset due in %.0f ms)\n", WatchTriggerName(trig), detail,
+					             (deadline - NowSecShadow()) * 1e3 + m_watch_cfg.margin_ms);
+				}
+				continue;
+			}
+			if (m_failure_taken.exchange(true)) {
+				return;
+			}
+			// L0: what fired, and where everything stands.
+			std::fprintf(stderr, "native watch: %s: %s; stopping the title's GPU work (deadline in %.0f ms)\n", WatchTriggerName(trig), detail,
+			             (deadline - NowSecShadow()) * 1e3);
+			DumpStreamJournalTry();
+			if (!m_hang_dump.empty()) {
+				std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
+				for (int i = 0; i < 50 && !lock.try_lock(); i++) {
+					struct timespec ms = {0, 1000000};
+					nanosleep(&ms, nullptr);
+				}
+				if (lock.owns_lock()) {
+					DumpHangLocked();
+				} else {
+					std::fprintf(stderr, "native watch: hang dump skipped (the submit thread holds the lock)\n");
+				}
+			}
+			if (m_watch_hook) {
+				RunHangHook();
+			}
+			std::fflush(stderr);
+			const bool reset = trig == WatchTrigger::Reset;
+			StopAndExit(WatchTriggerName(trig), reset || !std::isfinite(deadline) ? NowSecShadow() + 2.0 : deadline, reset);
+		}
+#endif
+	}
+	void DumpStreamJournalTry() {
+		std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+		if (lock.owns_lock()) {
+			DumpStreamJournal();
+		}
+	}
+
+	// KYTY_NATIVE_GPU_INJECT_HANG=<kind>[@<dcb>] (hang tests; once per process, from DCB <dcb>, 900 by default, about
+	// 15 s in): wait (a guarded, wrapped wait nobody satisfies at a DCB's start: the watchdog stops it, no amdgpu reset),
+	// wait-nowatch (the same with the watchdog off: amdgpu's reset meets the wrap), wait-bare (unguarded, unwrapped and
+	// unregistered, refused unless CP shadowing is off: the L3 and post-reset paths), stream (the worker publishes a
+	// chunk 3.5 s late: T1s), kfd-wait (the wait at the start of the next ACB, on a KFD queue: nothing stops it unless gfx
+	// waits on it).
+	// Hang survival's switches, read once at Init (after the submitter's mode is known):
+	//   KYTY_NATIVE_GPU_ON_HANG           exit (default) | disable: a GPU failure on the submit side ends the title
+	//                                     (OnGpuFailureLocked) or turns the native path off as before
+	//   KYTY_NATIVE_GPU_WATCH             1 (default, async submission only) | log (detect and log, never stop) | 0
+	//   KYTY_NATIVE_GPU_WATCH_POLL_MS     20
+	//   KYTY_NATIVE_GPU_WATCH_GFX_MS      T1, clamp(0.3 x amdgpu's gfx lockup_timeout, 500, 1500)
+	//   KYTY_NATIVE_GPU_WATCH_STREAM_MS   T1s, 3000
+	//   KYTY_NATIVE_GPU_WATCH_MARGIN_MS   1000: the stop has to be done this long before amdgpu's timer
+	//   KYTY_NATIVE_GPU_WATCH_L1_MS       300: L1's time before L2
+	//   KYTY_NATIVE_GPU_WATCH_FAULT       exit (default) | log
+	//   KYTY_NATIVE_GPU_WATCH_SQKILL      0 (default) | 1: L2 through the helper's op 17, if it has it
+	//   KYTY_NATIVE_GPU_WATCH_HOOK        0 | 1: KYTY_NATIVE_GPU_HANG_HOOK in the watchdog's path (it eats the deadline)
+	//   KYTY_NATIVE_GPU_WATCH_EXIT_CODE   70 (EX_SOFTWARE)
+	//   KYTY_NATIVE_GPU_STREAM_MAX_MS     amdgpu's gfx timeout less 2 s (half of one of 4 s or less; 0: no bound)
+	// amdgpu's timeout is the first field of /sys/module/amdgpu/parameters/lockup_timeout (2000 when it is missing or 0,
+	// none when negative), the timer the watchdog has to beat.
+	void InitWatch() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		auto ms = [](const char* name, double def) {
+			const char* v = std::getenv(name);
+			return v != nullptr && v[0] != '\0' ? std::strtod(v, nullptr) : def;
+		};
+		m_on_hang_exit = !EnvIs("KYTY_NATIVE_GPU_ON_HANG", "disable");
+		std::string lockup;
+		if (std::FILE* f = std::fopen("/sys/module/amdgpu/parameters/lockup_timeout", "re"); f != nullptr) {
+			char line[128] = {};
+			if (std::fgets(line, sizeof(line), f) != nullptr) {
+				lockup = line;
+			}
+			std::fclose(f);
+		}
+		m_watch_cfg.t_gfx_ms  = ParseGfxLockupTimeoutMs(lockup);
+		m_watch_cfg.gfx_ms    = ms("KYTY_NATIVE_GPU_WATCH_GFX_MS", WatchConfig::DefaultGfxMs(m_watch_cfg.t_gfx_ms));
+		m_watch_cfg.stream_ms = ms("KYTY_NATIVE_GPU_WATCH_STREAM_MS", 3000.0);
+		m_watch_cfg.margin_ms = ms("KYTY_NATIVE_GPU_WATCH_MARGIN_MS", 1000.0);
+		m_watch_poll_ms       = std::max(1.0, ms("KYTY_NATIVE_GPU_WATCH_POLL_MS", 20.0));
+		m_watch_l1_ms         = ms("KYTY_NATIVE_GPU_WATCH_L1_MS", 300.0);
+		m_watch_fault_exit    = !EnvIs("KYTY_NATIVE_GPU_WATCH_FAULT", "log");
+		m_watch_sqkill        = EnvIs("KYTY_NATIVE_GPU_WATCH_SQKILL", "1");
+		m_watch_hook          = EnvIs("KYTY_NATIVE_GPU_WATCH_HOOK", "1");
+		m_watch_exit_code     = static_cast<int>(ms("KYTY_NATIVE_GPU_WATCH_EXIT_CODE", 70.0));
+		m_stream_max_s        = ms("KYTY_NATIVE_GPU_STREAM_MAX_MS", WatchConfig::DefaultStreamMaxMs(m_watch_cfg.t_gfx_ms)) * 1e-3;
+		Loader::SystemContentParamSfoGetString("TITLE_ID", &m_title_id);
+		const char* w = std::getenv("KYTY_NATIVE_GPU_WATCH");
+		m_watch_mode  = !m_on_hang_exit || !m_submitter->Async()       ? WatchMode::Off
+		                : w != nullptr && std::strcmp(w, "0") == 0     ? WatchMode::Reset
+		                : w != nullptr && std::strcmp(w, "log") == 0 ? WatchMode::Log
+		                                                             : WatchMode::On;
+		if (m_inject == InjectKind::WaitNoWatch && m_watch_mode != WatchMode::Off) {
+			m_watch_mode = WatchMode::Reset; // amdgpu's reset is the test, and what follows it
+		}
+		std::fprintf(stderr,
+		             "native watch: amdgpu gfx timeout %lld ms; on a GPU failure %s; watchdog %s (stall %.0f ms, stream park %.0f ms, margin "
+		             "%.0f ms, faults %s, wave kill %s); stream heads end after %.0f ms\n",
+		             static_cast<long long>(m_watch_cfg.t_gfx_ms), m_on_hang_exit ? "the title stops and exits" : "the native path turns off",
+		             !m_submitter->Async()              ? "off (synchronous submission)"
+		             : m_watch_mode == WatchMode::Off   ? "off"
+		             : m_watch_mode == WatchMode::Reset ? "on amdgpu resets only"
+		             : m_watch_mode == WatchMode::Log   ? "log only (resets acted on)"
+		                                                : "on",
+		             m_watch_cfg.gfx_ms, m_watch_cfg.stream_ms, m_watch_cfg.margin_ms, m_watch_fault_exit ? "stop" : "logged",
+		             m_watch_sqkill ? "on" : "off", m_stream_max_s * 1e3);
+		// Sync mode's Disable deletes the submitter, and the sync path sees every job's end itself.
+		if (m_watch_mode == WatchMode::Off) {
+			return;
+		}
+		if (m_watch_hw.Connect()) {
+			m_watch_pasid = LodStatsHw::Pasid(m_gem->DrmFd());
+		}
+		m_watch_on.store(true, std::memory_order_release);
+		std::thread([this] { WatchLoop(); }).detach();
+#endif
+	}
+
+	enum class InjectKind { None, Wait, WaitNoWatch, WaitBare, Stream, KfdWait };
+	const char* InjectName() const {
+		switch (m_inject) {
+			case InjectKind::Wait: return "wait";
+			case InjectKind::WaitNoWatch: return "wait-nowatch";
+			case InjectKind::WaitBare: return "wait-bare";
+			case InjectKind::Stream: return "stream";
+			case InjectKind::KfdWait: return "kfd-wait";
+			default: return "none";
+		}
+	}
+	void ParseInject() {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_INJECT_HANG");
+		if (v == nullptr || v[0] == '\0' || std::strcmp(v, "0") == 0) {
+			return;
+		}
+		std::string kind = v;
+		if (const size_t at = kind.find('@'); at != std::string::npos) {
+			m_inject_dcb = std::strtoull(kind.c_str() + at + 1, nullptr, 0);
+			kind.resize(at);
+		}
+		m_inject = kind == "wait"           ? InjectKind::Wait
+		           : kind == "wait-nowatch" ? InjectKind::WaitNoWatch
+		           : kind == "wait-bare"    ? InjectKind::WaitBare
+		           : kind == "stream"       ? InjectKind::Stream
+		           : kind == "kfd-wait"     ? InjectKind::KfdWait
+		                                    : InjectKind::None;
+		if (m_inject == InjectKind::None) {
+			std::fprintf(stderr, "native inject: KYTY_NATIVE_GPU_INJECT_HANG=%s is not one of wait, wait-nowatch, wait-bare, stream, kfd-wait\n", v);
+			return;
+		}
+		std::fprintf(stderr, "native inject: %s from dcb %llu on (hang test)\n", InjectName(), static_cast<unsigned long long>(m_inject_dcb));
+	}
+	// Before a buffer is translated: the inject's wait goes to the translator of the buffer it belongs in, once.
+	void ArmInjectLocked(bool acb, bool agr) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_inject_armed || m_frames <= m_inject_dcb || agr) {
+			return;
+		}
+		const uint64_t va = m_submitter->ScratchVa() + kInjectOffset;
+		switch (m_inject) {
+			case InjectKind::Wait:
+			case InjectKind::WaitNoWatch:
+				if (!acb) {
+					m_translator.SetInjectWait(va);
+					m_inject_armed = true;
+				}
+				break;
+			case InjectKind::WaitBare:
+				if (!acb) {
+					if (m_cp_shadow != CpShadowMode::Off) {
+						std::fprintf(stderr, "native inject: wait-bare refused: CP shadowing is on (run it with KYTY_NATIVE_GPU_CP_SHADOW=0)\n");
+						m_inject = InjectKind::None;
+						return;
+					}
+					m_translator.SetInjectWait(va, true);
+					m_inject_armed = true;
+				}
+				break;
+			case InjectKind::KfdWait:
+				if (acb) {
+					if (!m_kfd_queues) {
+						std::fprintf(stderr, "native inject: kfd-wait: ACBs are not on KFD queues; the wait goes to the next ACB's ring anyway\n");
+					}
+					m_acb_translator.SetInjectWait(va);
+					m_inject_armed = true;
+				}
+				break;
+			default: break;
+		}
+#else
+		(void)acb;
+		(void)agr;
 #endif
 	}
 
@@ -3876,9 +4496,17 @@ private:
 
 	// The CP waits (PFP, so it parses nothing past it) until the stream counter reaches `n`, then chains
 	// to trampoline `n`, 8 dwords that PublishStreamLocked fills.
-	void AppendStreamWaitLocked(std::vector<uint32_t>& ib, uint32_t n) const {
+	// `shadow_on`: CP shadowing is on where the wait sits (the stream is the shadowing translator's). With the wait wrap
+	// (Pm4Translator::SetCpShadowWaitOff) it goes off first, as at every GPU wait of a shadowing job: the worker may owe
+	// the next chunk for long, and a reset there must not find shadowing on. The next part turns it on again right
+	// after its counter write (m_stream_wait_off).
+	void AppendStreamWaitLocked(std::vector<uint32_t>& ib, uint32_t n, bool shadow_on = false) {
 		const uint64_t flag  = m_submitter->ScratchVa() + kStreamFlagOffset;
 		const uint64_t tramp = m_submitter->ScratchVa() + StreamTrampOffset(n);
+		m_stream_wait_off    = shadow_on && m_translator.CpShadowWaitWrap();
+		if (m_stream_wait_off) {
+			ib.insert(ib.end(), kCpShadowWaitOff.begin(), kCpShadowWaitOff.end());
+		}
 		ib.push_back(StatPkt3(0x3c, 6));                     // WAIT_REG_MEM
 		ib.push_back(5u | (1u << 4u) | (1u << 8u));          // greater or equal, memory, PFP
 		ib.push_back(static_cast<uint32_t>(flag));
@@ -3920,6 +4548,22 @@ private:
 			const double waited = NowSecShadow() - t0;
 			m_stream_wait_s += waited;
 		}
+		// A stop ends the chain itself without m_mutex (EndStreamForStop): from then on nothing is published, and a
+		// publish under way finishes before the stop looks at the counter.
+		if (m_stopping.load(std::memory_order_acquire)) {
+			return;
+		}
+		while (m_stream_pub.test_and_set(std::memory_order_acquire)) {
+			struct timespec nap = {0, 50000};
+			nanosleep(&nap, nullptr);
+		}
+		struct PubEnd {
+			std::atomic_flag& f;
+			~PubEnd() { f.clear(std::memory_order_release); }
+		} pub_end {m_stream_pub};
+		if (m_stopping.load(std::memory_order_acquire)) {
+			return;
+		}
 		NoteStream('P', n, va, len);
 		auto* t = reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + StreamTrampOffset(n));
 		uint32_t k = 0;
@@ -3940,6 +4584,9 @@ private:
 		__sync_synchronize();
 		*reinterpret_cast<volatile uint32_t*>(m_submitter->ScratchCpu() + kStreamFlagOffset) = n;
 		__sync_synchronize();
+		if (va == 0) {
+			m_watch_stream_open.store(false, std::memory_order_release);
+		}
 		if (va == 0 && AuditOn()) {
 			Audit().StreamClosed(NowSecShadow());
 		}
@@ -3953,7 +4600,10 @@ private:
 				return;
 			}
 			const uint32_t n = ++m_stream_counter;
-			AppendStreamWaitLocked(batch, n);
+			{
+				CpShadowBatch* hcs = CpShadowBatchLocked(0);
+				AppendStreamWaitLocked(batch, n, hcs != nullptr && hcs->EndOn(false));
+			}
 			const uint64_t before = m_last_seq;
 			SubmitBufferLocked(batch, 0, true); // it chains on: the job ends where the stream does
 			if (m_disabled || m_last_seq == before) {
@@ -3965,7 +4615,26 @@ private:
 			m_stream_handles  = m_gem->CreatedHandles().size();
 			m_stream_pending  = n;
 			m_stream          = StreamState::Cont;
+			m_stream_head_t   = NowSecShadow();
+			m_watch_stream_open.store(true, std::memory_order_release);
 			m_stream_chunks++;
+			return;
+		}
+		// KYTY_NATIVE_GPU_STREAM_MAX_MS: amdgpu times the head's CS, not the progress inside it, so a legal long stream
+		// (a level load chained chunk after chunk) would be reset as a hang. Past the bound the chain ends here, at a chunk
+		// boundary, as before a blocking slot wait (SetBeforeBlockingWait), and this chunk goes as a CS of its own with
+		// its resume in front (CpShadowBatch::Front); the DCB's later chunks follow as CSs, the next DCB streams again.
+		if (m_stream_max_s > 0.0 && !m_stream_final && NowSecShadow() - m_stream_head_t > m_stream_max_s) {
+			PublishStreamLocked(m_stream_pending, 0, 0);
+			m_stream       = StreamState::Off;
+			m_cp_stream_on = false;
+			m_stream_breaks++;
+			if (m_stream_age_breaks++ < 4) {
+				std::fprintf(stderr, "native shadow: stream head older than %.0f ms (KYTY_NATIVE_GPU_STREAM_MAX_MS): chain ended at chunk %u, "
+				                     "the rest goes as CSs\n",
+				             m_stream_max_s * 1e3, m_stream_pending);
+			}
+			SubmitBufferLocked(batch, 0);
 			return;
 		}
 		// A buffer created since the head CS is not in its BO list: end the chain there.
@@ -3973,6 +4642,11 @@ private:
 		std::vector<uint32_t> ib;
 		AppendStreamDoneLocked(ib, m_stream_pending); // also in an empty chunk, or PublishStreamLocked would wait for it
 		const size_t done_dw = ib.size();
+		// The previous part turned shadowing off for its wait on this chunk: on again, as the part ended (outside the
+		// fallback's copy below, whose CS starts from scratch with its resume).
+		if (m_stream_wait_off) {
+			ib.insert(ib.end(), kCpShadowWaitOn.begin(), kCpShadowWaitOn.end());
+		}
 		// CP shadowing: a chunk of ours without a preamble at the part's front carries on from the stream, unless
 		// what ended the previous part (another translator's piece) left shadowing off.
 		CpShadowBatch*                  cs    = CpShadowBatchLocked(0);
@@ -3986,7 +4660,7 @@ private:
 		uint32_t     next    = 0;
 		if (!end) {
 			next = m_stream_counter + 1;
-			AppendStreamWaitLocked(ib, next);
+			AppendStreamWaitLocked(ib, next, part_on);
 		} else {
 			EmitCpShadowOff(ib); // the head's job ends with this part
 		}
@@ -4004,6 +4678,16 @@ private:
 			m_stream_fallbacks++;
 			return;
 		}
+		// KYTY_NATIVE_GPU_INJECT_HANG=stream: the worker owes the CP this chunk for 3.5 s, once (a CPU-side stall the
+		// watchdog's T1s sees: the CP parked on the stream counter, and the head's CS getting old).
+		if (m_inject == InjectKind::Stream && !m_inject_done && m_frames >= m_inject_dcb) {
+			m_inject_done = true;
+			std::fprintf(stderr, "native inject: stream at dcb %llu: chunk %u published 3.5 s late\n", static_cast<unsigned long long>(m_frames),
+			             m_stream_pending);
+			std::fflush(stderr);
+			struct timespec nap = {3, 500000000};
+			nanosleep(&nap, nullptr);
+		}
 		PublishStreamLocked(m_stream_pending, va, ib.size());
 		if (AuditOn()) { // the head's job goes on, and its waits are the GPU's from now on
 			Audit().StreamPart(m_audit_batch[0], NowSecShadow(), ib.size(), end);
@@ -4018,6 +4702,7 @@ private:
 		if (end) {
 			m_stream      = StreamState::Off;
 			m_cp_stream_on = false;
+			m_watch_stream_open.store(false, std::memory_order_release);
 		} else {
 			m_stream_counter = next;
 			m_stream_pending = next;
@@ -4082,15 +4767,25 @@ private:
 			if (audit_job) {
 				Audit().JobFailed(slot);
 			}
-			std::fprintf(stderr, "native shadow: batch submit failed: %s (%zu BOs, ip %u ring %u)\n", std::strerror(-r.err),
+			std::fprintf(stderr, "native shadow: batch submit failed: %s (%zu BOs, ip %u ring %u)\n",
+			             r.timed_out ? "a slot's earlier submission did not finish (timeout or reset)" : std::strerror(-r.err),
 			             handles.size(), target.ip_type, target.ring);
-			Disable("submit error");
+			// A slot whose earlier job amdgpu reset, or a context amdgpu cancelled, is a GPU failure, not a refused
+			// submission: the title stops as on a hang (OnGpuFailure). Other errors leave the path as before.
+			if (r.timed_out || r.err == -ECANCELED || r.err == -ENODEV) {
+				OnGpuFailureLocked(r.timed_out ? "slot wait" : "submission refused after a reset", r.err);
+			} else {
+				Disable("submit error");
+			}
 			return;
 		}
 		m_cs_ms_total += r.cs_seconds * 1e3;
 		m_last_seq = r.seq;
 		if (slot < kTrackerSlots) {
 			m_slot_fence[slot] = SlotFence {r.seq, target.ip_type, target.ring};
+		}
+		if (GfxSlot(slot) && target.ip_type == AMDGPU_HW_IP_GFX) {
+			WatchNoteGfxJob(target.ring, r.seq);
 		}
 #else
 		(void)batch;
@@ -4879,6 +5574,7 @@ private:
 			for (uint32_t i = 0; i < 8; i++) {
 				reinterpret_cast<volatile uint32_t*>(sc + kExitStubOffset)[i] = kCpShadowOff[i];
 			}
+			*reinterpret_cast<volatile uint32_t*>(sc + kInjectOffset) = 0;
 			__sync_synchronize();
 		}
 		InitLodStatsHw();
@@ -5028,6 +5724,11 @@ private:
 			                                                   : Pm4Translator::DepthDebugMode::None));
 			std::fprintf(stderr, "native shadow: depth experiment %s\n", depth);
 		}
+		// Part A of hang survival (Pm4Translator::SetCpShadowWaitOff): GPU waits with CP shadowing off in load mode;
+		// KYTY_NATIVE_GPU_SHADOW_WAIT_OFF=0 leaves them as before, =all wraps them in record mode as well.
+		m_translator.SetCpShadowWaitOff(!EnvIs("KYTY_NATIVE_GPU_SHADOW_WAIT_OFF", "0"), EnvIs("KYTY_NATIVE_GPU_SHADOW_WAIT_OFF", "all"));
+		ParseInject();
+		InitWatch();
 		m_enabled = true;
 		m_active.store(true, std::memory_order_release);
 		std::fprintf(stderr, "native shadow: enabled (gfx-ring shadow submission, %.1f s timeout)\n",
@@ -5541,11 +6242,13 @@ private:
 	bool                  m_cp_foreign_logged = false;
 	CpShadowBatch         m_cp_batch[2];
 	bool                  m_cp_stream_on      = false;
+	bool                  m_stream_wait_off   = false; // the last stream wait went with shadowing off (AppendStreamWaitLocked)
 	// Its flip stats (sums since the last report, the resumes and guards as running totals with their marks), and the
 	// checker's last result.
 	uint64_t              m_cps_preambles = 0, m_cps_load_dw = 0, m_cps_load_regs = 0, m_cps_anchors = 0, m_cps_sets = 0;
 	uint64_t              m_cps_job_ends = 0, m_cps_resumes = 0, m_cps_resumes_mark = 0, m_cps_guards_mark = 0;
 	uint64_t              m_cps_pushes = 0, m_cps_pops = 0, m_cps_fmask_gpu = 0, m_cps_dcc_gpu = 0, m_cps_dcc_back = 0;
+	uint64_t              m_cps_wait_wraps = 0; // Pm4TranslateStats::cp_shadow_wait_wraps
 	uint64_t              m_context_ops = 0, m_context_checks = 0; // Pm4TranslateStats::context_ops / context_checks
 	uint64_t              m_cp_checks     = 0;
 	uint32_t              m_cp_check_busy = 0;
@@ -5562,6 +6265,9 @@ private:
 	static constexpr uint32_t kExitAbortOffset = 2056;
 	static constexpr uint32_t kExitRunOffset   = 2060;
 	static constexpr uint32_t kExitStubOffset  = 4064;
+	// KYTY_NATIVE_GPU_INJECT_HANG's wait word (Pm4Translator::SetInjectWait), between the run word and the trampolines:
+	// 0 from Init on, written by nobody but a stop's release of the injected wait.
+	static constexpr uint32_t kInjectOffset = 2064;
 	// The guest waits each emitted segment gives the GPU, until the GPU has passed the segment's end
 	// point (StopGpu releases those of the segments it has not).
 	struct ExitWaits {
@@ -5574,6 +6280,54 @@ private:
 	std::mutex            m_stop_mutex;
 	bool                  m_stopped = false;
 	std::atomic<bool>     m_stopping {false}; // nothing more is submitted, whoever holds m_mutex
+	bool                  m_stop_idle = false; // what the stop found (a second caller gets it)
+	// A stop ends a stream's chain without m_mutex (EndStreamForStop); this keeps the worker's publishing out meanwhile.
+	std::atomic_flag      m_stream_pub = ATOMIC_FLAG_INIT;
+	// Hang survival (WatchLoop, OnGpuFailureLocked, StopAndExit).
+	// Off: no thread (KYTY_NATIVE_GPU_ON_HANG=disable, or synchronous submission). Reset: KYTY_NATIVE_GPU_WATCH=0, only
+	// amdgpu's reset of our job is acted on (part C: the title stops and exits instead of lingering), no stall or fault
+	// is. Log: stalls and faults logged ("would stop"), a reset acted on. On: everything acted on.
+	enum class WatchMode { Off, Reset, Log, On };
+	struct WatchJob {
+		uint64_t seq      = 0;
+		double   t_submit = 0.0; // ms, NowSecShadow's clock
+	};
+	// A gfx ring's jobs in submission order: pushed with m_mutex held, popped by the watchdog once signalled.
+	struct WatchRing {
+		static constexpr uint32_t kSize = 1024;
+		std::array<WatchJob, kSize> jobs {};
+		std::atomic<uint32_t>       head {0};
+		std::atomic<uint32_t>       tail {0};
+		double                      last_signal = 0.0; // the watchdog's: when it saw the last popped one signalled (ms)
+	};
+	WatchRing             m_watch_rings[2];
+	std::atomic<bool>     m_watch_on {false};
+	std::atomic<uint64_t> m_watch_q_full {0};
+	WatchMode             m_watch_mode       = WatchMode::Off;
+	WatchConfig           m_watch_cfg;
+	double                m_watch_poll_ms    = 20.0;
+	double                m_watch_l1_ms      = 300.0;
+	bool                  m_watch_fault_exit = true;
+	bool                  m_watch_sqkill     = false;
+	bool                  m_watch_hook       = false;
+	int                   m_watch_exit_code  = 70;
+	bool                  m_on_hang_exit     = true;
+	std::atomic<bool>     m_failure_taken {false}; // the watchdog or the submit side is ending the title
+	std::atomic<double>   m_watch_last_progress_ms {0.0};
+	std::atomic<uint32_t> m_watch_fault_status {0};
+	LodStatsHw            m_watch_hw; // the watchdog's own helper connection (ownership check, L2, L3)
+	uint32_t              m_watch_pasid = 0;
+	std::string           m_title_id;
+	// KYTY_NATIVE_GPU_STREAM_MAX_MS: a stream head's CS older than this ends its chain at the next chunk.
+	double                m_stream_max_s      = 0.0;
+	double                m_stream_head_t     = 0.0;
+	uint64_t              m_stream_age_breaks = 0;
+	std::atomic<bool>     m_watch_stream_open {false}; // a stream's chain is open (the CP may park on its counter)
+	// KYTY_NATIVE_GPU_INJECT_HANG (ParseInject).
+	InjectKind            m_inject       = InjectKind::None;
+	uint64_t              m_inject_dcb   = 900;
+	bool                  m_inject_armed = false;
+	bool                  m_inject_done  = false; // the stream kind's delay has happened
 	// Per-ring batches and the last fence on each (KYTY_NATIVE_GPU_ACB_RINGS). Slot 0 is gfx.
 	struct SlotFence {
 		uint64_t seq     = 0;

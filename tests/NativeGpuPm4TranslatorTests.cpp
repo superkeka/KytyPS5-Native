@@ -3244,6 +3244,10 @@ struct ToyCp {
 	std::array<bool, 4>         base {};
 	uint32_t                    loads = 0; // LOADs that loaded
 	uint32_t                    dmas  = 0; // DMA_DATA copies
+	// SetCpShadowWaitOff: every WAIT_REG_MEM runs with shadowing off (a hang there must leave the CP outside a shadow
+	// region when amdgpu resets the queue); `waits` counts them.
+	bool                        waits_unshadowed = false;
+	uint32_t                    waits            = 0;
 
 	bool InS(uint64_t va) const { return va >= kTestShadowVa && va < kTestShadowVa + 4ull * s.size(); }
 	static uint32_t Bit(int c) { return c == kCtx ? 1u << 1u : c == kUc ? 1u << 15u : c == kGsh ? 1u << 16u : 1u << 24u; }
@@ -3350,6 +3354,12 @@ struct ToyCp {
 					s[(at - kTestShadowVa) / 4u] &= b[3];
 					break;
 				}
+				case 0x3Cu: // WAIT_REG_MEM: met at once here
+					waits++;
+					if (waits_unshadowed) {
+						Check(shadow == 0u, "a GPU wait runs with shadowing off");
+					}
+					break;
 				case 0x22u: { // COND_EXEC: on a word in S's area (the FMASK fix) as the CP does; an exit guard's abort
 				             // word is 0 (no stop armed), so the dwords it guards are skipped
 					const uint64_t at = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
@@ -4517,6 +4527,295 @@ void TestCpShadowCbInserts() {
 	}
 }
 
+// SetCpShadowWaitOff: the wraps of an IB in order. Every WAIT_REG_MEM sits between kCpShadowWaitOff and
+// kCpShadowWaitOn, nothing but waits, barriers, PFP_SYNC_ME, exit guards, clock copies and fillers in between, and an
+// ME wait is followed by PFP_SYNC_ME before the "on". `waits_out`: waits outside any wrap.
+struct WaitWrapScan {
+	bool     ok        = true;
+	uint32_t wraps     = 0;
+	uint32_t waits     = 0;
+	uint32_t waits_out = 0;
+};
+WaitWrapScan ScanWaitWraps(std::span<const uint32_t> ib) {
+	using Libs::Graphics::NativeGpu::kCpShadowWaitOff;
+	using Libs::Graphics::NativeGpu::kCpShadowWaitOn;
+	WaitWrapScan out;
+	bool         in         = false;
+	bool         me_pending = false;
+	for (size_t dw = 0; dw < ib.size();) {
+		const uint32_t size = PacketSizeDw(ib[dw]);
+		const uint32_t op   = (ib[dw] >> 8u) & 0xffu;
+		if (dw + size > ib.size()) {
+			out.ok = false;
+			break;
+		}
+		const bool off = size == 3 && std::equal(kCpShadowWaitOff.begin(), kCpShadowWaitOff.end(), ib.begin() + static_cast<std::ptrdiff_t>(dw));
+		const bool on  = size == 3 && std::equal(kCpShadowWaitOn.begin(), kCpShadowWaitOn.end(), ib.begin() + static_cast<std::ptrdiff_t>(dw));
+		if (off) {
+			out.ok &= !in;
+			in         = true;
+			me_pending = false;
+			out.wraps++;
+		} else if (on && in) {
+			out.ok &= !me_pending;
+			in = false;
+		} else if (op == IT_CONTEXT_CONTROL) {
+			out.ok &= !in; // a gated preamble's {0, enables} outside a wrap, kCpShadowOff, the full preamble's
+		} else if (op == 0x3Cu) {
+			out.waits++;
+			out.waits_out += in ? 0u : 1u;
+			me_pending |= in && (ib[dw + 1] & (1u << 8u)) == 0;
+		} else if (op == IT_PFP_SYNC_ME) {
+			me_pending = false;
+		} else if (in && op != 0x49u && op != 0x22u && op != 0x3Fu && op != 0x40u && op != IT_NOP) {
+			out.ok = false; // a SET, a LOAD, a draw inside the wrap
+		}
+		dw += size;
+	}
+	out.ok &= !in;
+	return out;
+}
+
+// Part A of hang survival: load mode wraps every GPU wait (a guest wait the GPU runs, a barrier on our fence, a held
+// segment's barrier and wait), so the CP sits at a hang with shadowing off; neither LabelPipeline patch touches the
+// pair; record and off mode, and KYTY_NATIVE_GPU_SHADOW_WAIT_OFF=0, keep the old bytes; the packet check takes the new
+// CONTEXT_CONTROL only while S is registered.
+void TestCpShadowWaitWrap() {
+	using Libs::Graphics::NativeGpu::kCpShadowWaitOff;
+	using Libs::Graphics::NativeGpu::NopOut;
+	constexpr uint64_t kAbort = 0x400000fff808ull, kRun = 0x400000fff80cull, kStub = 0x400000ffffe0ull;
+	static uint32_t    label = 0;
+	const uint64_t     addr  = reinterpret_cast<uint64_t>(&label);
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x00Cu, 0x11u}, false);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	AppendWait(dcb, addr, 1); // an ME wait
+	Append(dcb, IT_SET_SH_REG, {0x00Cu, 0x12u}, false);
+	Append(dcb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, false);
+	Append(dcb, 0x3Cu, {3u | (1u << 4u) | (1u << 8u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 2u, 0xffffffffu, 4u},
+	       false); // a PFP wait
+	Append(dcb, IT_DISPATCH_DIRECT, {3u, 1u, 1u, 1u}, false);
+	auto setup = [&](Pm4Translator& t, TestOracle& o, CpShadowMode mode, bool guards) {
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetWaitsVerbatim(true);
+		t.SetFenceAddress(kFenceVa);
+		if (guards) {
+			t.SetExitGuard(kAbort, kRun, kStub);
+		}
+		t.SetCpShadow(mode == CpShadowMode::Off ? 0u : kTestShadowVa, mode);
+	};
+	SetCpShadowValidation(kTestShadowVa);
+	for (const bool guards: {true, false}) {
+		for (const auto plan: {LabelOracle::Plan::Native, LabelOracle::Plan::Met, LabelOracle::Plan::Split}) {
+			Pm4Translator t;
+			TestOracle    o;
+			setup(t, o, CpShadowMode::Load, guards);
+			o.plan = plan;
+			ToyCp cp;
+			cp.Seed(t);
+			cp.waits_unshadowed = true;
+			const auto r = t.Translate(dcb);
+			Check(r.ok && r.cp_shadow, "load mode: translated");
+			const WaitWrapScan scan = ScanWaitWraps(r.ib);
+			Check(scan.ok && scan.waits >= 2 && scan.waits_out == 0 && scan.wraps == r.stats.cp_shadow_wait_wraps && scan.wraps >= 2,
+			      "(a) every GPU wait between the wrap's two packets, nothing that SETs or LOADs between them, PFP_SYNC_ME after an ME wait");
+			Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "(a) the packet check takes the wrapped IB");
+			cp.Job(AsJob(r.ib));
+			Check(cp.waits == scan.waits && cp.sh[0x00C] == 0x12u, "(a) the toy CP runs every wait unshadowed, and the state ends as written");
+			if (plan != LabelOracle::Plan::Split) {
+				continue;
+			}
+			// (b) LabelPipeline NOPs either the held segment's barrier or its wait: the pair is outside both.
+			Check(r.segments.size() == 3, "(b) two held segments");
+			for (size_t k = 1; k < r.segments.size(); k++) {
+				const auto& s = r.segments[k];
+				Check(s.held && s.barrier_len != 0 && s.wait_len != 0, "(b) a held segment with a barrier and a native wait");
+				for (const auto& [from, len]: {std::pair {s.barrier_dw, s.barrier_len}, std::pair {s.wait_dw, s.wait_len}}) {
+					Check(from >= 3 && std::equal(kCpShadowWaitOff.begin(), kCpShadowWaitOff.end(), r.ib.begin() + s.barrier_dw - 3),
+					      "(b) the off packet right before the barrier");
+					for (uint32_t i = from; i < from + len; i++) {
+						Check(r.ib[i] != Pkt3(IT_CONTEXT_CONTROL, 2, false), "(b) no CONTEXT_CONTROL inside a patch range");
+					}
+					std::vector<uint32_t> patched = r.ib;
+					NopOut(patched, from, len);
+					const WaitWrapScan p = ScanWaitWraps(patched);
+					Check(p.ok && p.wraps == scan.wraps && p.waits_out == 0, "(b) the patched IB keeps every wrap");
+					Check(ValidateNativeIb(patched, false, nullptr, NativeIbKind::Gfx), "(b) and passes the packet check");
+					ToyCp pc;
+					pc.Seed(t);
+					pc.waits_unshadowed = true;
+					pc.Job(AsJob(patched));
+				}
+			}
+		}
+	}
+	// (c) Off and record mode, and the switch at 0 in load mode: no wrap, the waits as before.
+	for (const auto plan: {LabelOracle::Plan::Native, LabelOracle::Plan::Met, LabelOracle::Plan::Split}) {
+		std::vector<std::vector<Packet>> stripped;
+		for (int variant = 0; variant < 4; variant++) {
+			Pm4Translator t;
+			TestOracle    o;
+			const CpShadowMode mode = variant == 0 ? CpShadowMode::Off : variant == 1 ? CpShadowMode::Record : CpShadowMode::Load;
+			setup(t, o, mode, true);
+			if (variant == 2) {
+				t.SetCpShadowWaitOff(false);
+			}
+			o.plan       = plan;
+			const auto r = t.Translate(dcb);
+			const auto scan = ScanWaitWraps(r.ib);
+			if (variant < 3) {
+				Check(r.ok && scan.ok && scan.wraps == 0 && r.stats.cp_shadow_wait_wraps == 0 && scan.waits >= 2 && scan.waits_out == scan.waits,
+				      "(c) off, record, and load with the switch at 0: no wrap");
+			} else {
+				Check(r.ok && scan.ok && scan.wraps >= 2 && scan.waits_out == 0, "(c) load: wrapped");
+			}
+			if (variant >= 2) {
+				// The same packets but the wrap's: its CONTEXT_CONTROLs and the PFP_SYNC_ME it adds.
+				std::vector<Packet> pkts;
+				for (const auto& p: Decode(r.ib)) {
+					const bool wrap_cc = p.op == IT_CONTEXT_CONTROL && p.body.size() == 2 && p.body[0] == 0u;
+					if (!wrap_cc && p.op != IT_PFP_SYNC_ME) {
+						pkts.push_back(p);
+					}
+				}
+				stripped.push_back(std::move(pkts));
+			}
+		}
+		Check(stripped.size() == 2 && stripped[0].size() == stripped[1].size(), "(c) wrapped and unwrapped differ only by the wrap");
+		for (size_t i = 0; i < stripped[0].size(); i++) {
+			Check(stripped[0][i].op == stripped[1][i].op && stripped[0][i].body == stripped[1][i].body, "(c) packet for packet");
+		}
+	}
+	// Record mode with the wrap asked for there too.
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		setup(t, o, CpShadowMode::Record, true);
+		t.SetCpShadowWaitOff(true, true);
+		o.plan       = LabelOracle::Plan::Native;
+		const auto r = t.Translate(dcb);
+		const auto scan = ScanWaitWraps(r.ib);
+		Check(r.ok && scan.ok && scan.wraps == 2 && scan.waits_out == 0, "record mode wraps when asked to");
+	}
+	// The compute ring has no CONTEXT_CONTROL: never wrapped.
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetComputeQueue(true);
+		t.SetComputeRing(true);
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		o.plan = LabelOracle::Plan::Met;
+		std::vector<uint32_t> acb;
+		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+		AppendWait(acb, addr, 1);
+		acb[acb.size() - 7] |= 2u; // the compute header
+		Append(acb, IT_DISPATCH_DIRECT, {2u, 1u, 1u, 1u}, true);
+		const auto r = t.Translate(acb);
+		Check(r.ok && ScanWaitWraps(r.ib).wraps == 0 && FindFirst(Decode(r.ib), IT_CONTEXT_CONTROL) == nullptr, "no wrap on a compute ring");
+	}
+	// (d) The packet check: the "off, load untouched" form only on the gfx ring and only while S is registered.
+	{
+		std::vector<uint32_t> ib(kCpShadowWaitOff.begin(), kCpShadowWaitOff.end());
+		ib.insert(ib.end(), {0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u});
+		SetCpShadowValidation(kTestShadowVa);
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "(d) the wait's off form passes with S registered");
+		Check(!ValidateNativeIb(ib, false, nullptr, NativeIbKind::Compute), "(d) not on a compute ring");
+		Libs::Graphics::NativeGpu::SetNativeIbValidation(false);
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "(d) the default check takes it as well");
+		Libs::Graphics::NativeGpu::SetNativeIbValidation(true);
+		SetCpShadowValidation(0);
+		Check(!ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "(d) refused without a shadow buffer");
+		Libs::Graphics::NativeGpu::SetNativeIbValidation(false);
+		Check(!ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "(d) by the default check too");
+		Libs::Graphics::NativeGpu::SetNativeIbValidation(true);
+		std::vector<uint32_t> other = {Pkt3(IT_CONTEXT_CONTROL, 2, false), 0x80000000u, 0x00000000u};
+		SetCpShadowValidation(kTestShadowVa);
+		Check(!ValidateNativeIb(other, false, nullptr, NativeIbKind::Gfx), "(d) another CONTEXT_CONTROL stays refused");
+	}
+	SetCpShadowValidation(0);
+}
+
+// KYTY_NATIVE_GPU_INJECT_HANG (SetInjectWait): the hang tests' wait appears exactly once, at the body's start, wrapped
+// in load mode, guarded and registered for the stop; the bare one is refused with shadowing on and goes unwrapped and
+// unregistered without it.
+void TestInjectWait() {
+	constexpr uint64_t kAbort = 0x400000fff808ull, kRun = 0x400000fff80cull, kStub = 0x400000ffffe0ull;
+	constexpr uint64_t kInject = 0x400000fff810ull;
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_SH_REG, {0x00Cu, 0x11u}, false);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	auto waits_on = [&](const std::vector<uint32_t>& ib) {
+		uint32_t n = 0;
+		for (const auto& p: Decode(ib)) {
+			n += p.op == 0x3Cu && p.body.size() >= 3 && p.body[1] == static_cast<uint32_t>(kInject) && p.body[3] == 1u ? 1u : 0u;
+		}
+		return n;
+	};
+	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Off}) {
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		t.SetExitGuard(kAbort, kRun, kStub);
+		t.SetCpShadow(mode == CpShadowMode::Off ? 0u : kTestShadowVa, mode);
+		t.SetInjectWait(kInject);
+		Check(t.InjectWaitArmed(), "armed");
+		const auto r = t.Translate(dcb);
+		const auto scan = ScanWaitWraps(r.ib);
+		Check(r.ok && r.injected && waits_on(r.ib) == 1 && !t.InjectWaitArmed(), "the injected wait once, then disarmed");
+		Check(r.segments.size() == 1 && r.segments[0].gpu_waits.size() == 1 && r.segments[0].gpu_waits[0].addr == kInject &&
+		          r.segments[0].gpu_waits[0].ref == 1u,
+		      "registered as a GPU wait of its segment (the stop releases it)");
+		Check(mode == CpShadowMode::Load ? (scan.ok && scan.wraps == 1 && scan.waits_out == 0) : (scan.wraps == 0 && scan.waits_out == 1),
+		      "wrapped in load mode only");
+		SetCpShadowValidation(mode == CpShadowMode::Load ? kTestShadowVa : 0u);
+		Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "the packet check takes it");
+		SetCpShadowValidation(0);
+		const auto r2 = t.Translate(dcb);
+		Check(r2.ok && !r2.injected && waits_on(r2.ib) == 0, "the next buffer has none");
+	}
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		t.SetExitGuard(kAbort, kRun, kStub);
+		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		t.SetInjectWait(kInject, true);
+		const auto r = t.Translate(dcb);
+		Check(r.ok && !r.injected && waits_on(r.ib) == 0 && t.InjectWaitArmed(), "a bare wait is refused while shadowing is on");
+	}
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		t.SetExitGuard(kAbort, kRun, kStub);
+		t.SetInjectWait(kInject, true);
+		const auto r = t.Translate(dcb);
+		Check(r.ok && r.injected && waits_on(r.ib) == 1 && r.segments[0].gpu_waits.empty() && ScanWaitWraps(r.ib).wraps == 0,
+		      "the bare wait without shadowing: unwrapped and not registered");
+	}
+	{
+		// A KFD queue's (kfd-wait): a compute wait, no wrap, registered.
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetComputeQueue(true);
+		t.SetComputeRing(true);
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		t.SetInjectWait(kInject);
+		std::vector<uint32_t> acb;
+		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+		const auto r = t.Translate(acb);
+		Check(r.ok && r.injected && waits_on(r.ib) == 1 && r.segments[0].gpu_waits.size() == 1 &&
+		          ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Compute),
+		      "on a compute ring: the compute wait, registered");
+	}
+}
+
 // KYTY_NATIVE_GPU_AUDIT (SetAudit): the guest's sync packets field by field, from its own dwords.
 size_t Form(Libs::Graphics::NativeGpu::AuditSync s) {
 	return static_cast<size_t>(s);
@@ -5231,6 +5530,8 @@ int main() {
 	TestCpShadowPushPopCpu();
 	TestCpShadowPushPopGpu();
 	TestCpShadowCbInserts();
+	TestCpShadowWaitWrap();
+	TestInjectWait();
 	TestAuditSyncFields();
 	TestAuditPolicyLost();
 	TestAuditWaitsRecorded();

@@ -1562,14 +1562,17 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					return bad();
 				}
 				break;
-			// CONTEXT_CONTROL only in the translator's two forms: shadowing and loading off (every preamble, every
-			// job's end), and CP shadowing's enables while a shadow buffer is registered. The title's is dropped.
+			// CONTEXT_CONTROL only in the translator's forms: shadowing and loading off (every preamble, every job's
+			// end), and while a shadow buffer is registered CP shadowing's enables and shadowing off around a GPU wait
+			// with the load control untouched (kCpShadowWaitOff). The title's is dropped.
 			case IT_CONTEXT_CONTROL: {
 				const bool off    = b[0] == 0x80000000u && b[1] == 0x80000000u;
-				// The shadow preamble's enables, with every load on or (gated) the load control left as amdgpu set it.
-				const bool shadow = g_cp_shadow_va.load(std::memory_order_relaxed) != 0 && (b[0] == kCpShadowEnables || b[0] == 0u) &&
-				                    b[1] == kCpShadowEnables;
-				if (compute || header != Pkt3(IT_CONTEXT_CONTROL, 2, false) || (!off && !shadow)) {
+				const bool on_s   = g_cp_shadow_va.load(std::memory_order_relaxed) != 0;
+				// The shadow preamble's enables, with every load on or (gated, and after a wait) the load control left as
+				// amdgpu or the job set it.
+				const bool shadow = on_s && (b[0] == kCpShadowEnables || b[0] == 0u) && b[1] == kCpShadowEnables;
+				const bool wait   = on_s && b[0] == kCpShadowWaitOff[1] && b[1] == kCpShadowWaitOff[2];
+				if (compute || header != Pkt3(IT_CONTEXT_CONTROL, 2, false) || (!off && !shadow && !wait)) {
 					return bad();
 				}
 				break;
@@ -3557,7 +3560,24 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// parser does (ENGINE_SEL = PFP) on a label the micro engine has just written is how the guest keeps
 	// the PFP from fetching ahead of the ME past a cache flush; PFP_SYNC_ME is that synchronization
 	// without memory.
-	auto emit_barrier = [&](bool pfp) {
+	//
+	// SetCpShadowWaitOff: in a shadowing job every GPU wait runs with shadowing off, so a job that hangs there leaves
+	// the CP outside a shadow region when amdgpu resets the queue (kCpShadowWaitOff). wait_on's `me_unsynced`: the
+	// last wait was the ME's and nothing after it synced the PFP, so PFP_SYNC_ME first, or the PFP would turn
+	// shadowing on again while the ME still waits.
+	const bool wait_wrap = CpShadowWaitWrap();
+	auto       wait_off  = [&]() {
+		body.insert(body.end(), kCpShadowWaitOff.begin(), kCpShadowWaitOff.end());
+		stats.cp_shadow_wait_wraps++;
+	};
+	auto wait_on = [&](bool me_unsynced) {
+		if (me_unsynced) {
+			body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
+			body.push_back(0);
+		}
+		body.insert(body.end(), kCpShadowWaitOn.begin(), kCpShadowWaitOn.end());
+	};
+	auto emit_barrier_raw = [&](bool pfp) {
 		if (m_fence_va != 0) {
 			const uint32_t seq = ++m_fence_seq;
 			body.push_back(Pkt3(IT_RELEASE_MEM, 7, m_compute_ring));
@@ -3585,6 +3605,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			body.push_back(0);
 			stats.pfp_syncs_emitted++;
 		}
+	};
+	// The barrier as a whole between the wrap's two packets; the ME's wait on our fence gets its PFP_SYNC_ME before
+	// the "on" whatever the guest's engine was (a barrier has drained the pipe already, so it costs little).
+	auto emit_barrier = [&](bool pfp) {
+		if (!wait_wrap || m_fence_va == 0) {
+			emit_barrier_raw(pfp);
+			return;
+		}
+		wait_off();
+		emit_barrier_raw(pfp);
+		wait_on(!pfp);
 	};
 
 	// Native labels: the segments of the IB (body offsets until it is assembled), where each starts in
@@ -3760,21 +3791,33 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			dcc_done   = 0;
 		}
 		s.wait  = w;
-		s.barrier_dw = static_cast<uint32_t>(body.size());
-		emit_barrier(w.pfp);
-		s.barrier_len = static_cast<uint32_t>(body.size()) - s.barrier_dw;
-		s.wait_dw     = static_cast<uint32_t>(body.size());
 		// No native form (not EQUAL, or a 64-bit wait on both halves), or an address the GPU cannot
 		// reach: only seeing the label in memory releases it. A WAIT_REG_MEM there reads the dummy.
-		s.wait_len = 0;
 		// The native form polls one dword. That dword has to be resident; the rest of a 64-bit
-		// wait is not what this packet reads.
-		if (label_gpu(w.addr, 4)) {
-			s.wait_len = EmitNativeWait(body, w, m_compute_ring) ? static_cast<uint32_t>(body.size()) - s.wait_dw : 0u;
+		// wait is not what this packet reads. Built aside: a form that fails halfway leaves nothing behind.
+		std::vector<uint32_t> native;
+		const bool            has_native = label_gpu(w.addr, 4) && EmitNativeWait(native, w, m_compute_ring);
+		// SetCpShadowWaitOff: the wrap's "off" before the barrier and its "on" after the guard, so neither patch range
+		// (barrier_dw/len, wait_dw/len) holds them: whichever of the two LabelPipeline NOPs, the pair stays.
+		const bool wrap = wait_wrap && (m_fence_va != 0 || has_native);
+		if (wrap) {
+			wait_off();
 		}
+		s.barrier_dw = static_cast<uint32_t>(body.size());
+		emit_barrier_raw(w.pfp);
+		s.barrier_len = static_cast<uint32_t>(body.size()) - s.barrier_dw;
+		s.wait_dw     = static_cast<uint32_t>(body.size());
+		if (has_native) {
+			body.insert(body.end(), native.begin(), native.end());
+		}
+		s.wait_len = has_native ? static_cast<uint32_t>(native.size()) : 0u;
 		guard_from = body.size();
 		if (s.wait_len != 0) {
 			guard_after_wait(!w.pfp); // a PFP wait's native form ends with PFP_SYNC_ME
+		}
+		if (wrap) {
+			// A PFP wait's barrier and native form end with PFP_SYNC_ME, an ME wait's guard has one before it.
+			wait_on(!w.pfp && !(gfx_guards && s.wait_len != 0));
 		}
 		seg_effects = true;
 		stats.waits_split++;
@@ -3949,6 +3992,35 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		direct      = direct_base;
 		return true;
 	};
+	// SetInjectWait (KYTY_NATIVE_GPU_INJECT_HANG): a wait nobody satisfies where the body starts, after the preamble, so
+	// in load mode shadowing is on there, as at a title's own wait. The guarded form is what a guest wait the GPU gets
+	// looks like (wrapped, a guard after it, in gpu_waits for the stop to release); the bare one is an unknown stuck point.
+	if (m_inject_wait_va != 0 && labels) {
+		WaitCond w;
+		w.addr     = m_inject_wait_va;
+		w.ref      = 1;
+		w.mask     = 0xffffffffu;
+		w.function = 3;
+		if (m_inject_wait_bare && cp_shadow) {
+			NoteOnce(40, "injected bare wait refused: CP shadowing is on (a shadowed hang without the wrap is fatal)");
+		} else if (m_inject_wait_bare) {
+			EmitNativeWait(body, w, m_compute_ring);
+			r.injected  = true;
+			seg_effects = true;
+		} else {
+			if (wait_wrap) {
+				wait_off();
+			}
+			EmitNativeWait(body, w, m_compute_ring);
+			segs.back().gpu_waits.push_back(w);
+			guard_after_wait(true);
+			if (wait_wrap) {
+				wait_on(!gfx_guards);
+			}
+			r.injected  = true;
+			seg_effects = true;
+		}
+	}
 	while (dw < dcb.size()) {
 		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
@@ -4752,21 +4824,29 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					const bool timed = plan == LabelOracle::Plan::Native && m_time_pairs != 0 && !m_compute_ring;
 					const uint64_t wait_pair = timed ? m_time_wait_va + 16ull * (m_time_waits % m_time_pairs) : 0u;
-					if (timed) {
-						EmitClockCopy(body, wait_pair);
-					}
-					// The guest's packet as written where the gfx CP runs it (SetWaitsVerbatim), else our form.
+					// The guest's packet as written where the gfx CP runs it (SetWaitsVerbatim), else our form; built aside, so
+					// a form that fails halfway leaves nothing behind and the wrap goes only around a wait that is there.
 					const bool as_written = plan == LabelOracle::Plan::Native && (dcb[dw] & 2u) == 0 &&
 					                        (m_compute_ring ? MecGuestWaitOk(bptr[0]) : m_waits_verbatim && GuestWaitControlOk(bptr[0]));
+					std::vector<uint32_t> wait_pk;
 					if (as_written) {
-						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						wait_pk.assign(dcb.begin() + dw, dcb.begin() + dw + size);
 					}
 					// SetAudit: the title's CACHE_POLICY, lost unless the GPU runs its own packet (our wait, a barrier, a hold).
 					if (m_audit && ((bptr[0] >> 25u) & 3u) != 0u && !as_written) {
 						r.sync.policy_lost[static_cast<size_t>(wide ? AuditSync::Wait64 : AuditSync::Wait)]++;
 					}
-					const bool emitted = plan == LabelOracle::Plan::Native && (as_written || EmitNativeWait(body, w, m_compute_ring));
+					const bool emitted = plan == LabelOracle::Plan::Native && (as_written || EmitNativeWait(wait_pk, w, m_compute_ring));
+					// SetCpShadowWaitOff: the clock copies and the guard inside the wrap, nothing that SETs or LOADs.
+					const bool wrap = emitted && wait_wrap;
+					if (wrap) {
+						wait_off();
+					}
+					if (timed) {
+						EmitClockCopy(body, wait_pair);
+					}
 					if (emitted) {
+						body.insert(body.end(), wait_pk.begin(), wait_pk.end());
 						segs.back().gpu_waits.push_back(w);
 						guard_after_wait(!pfp);
 					}
@@ -4774,6 +4854,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						EmitClockCopy(body, wait_pair + 8);
 						m_time_wait_info[m_time_waits % m_time_pairs] = {addr, ref, stats.draws, met};
 						m_time_waits++;
+					}
+					if (wrap) {
+						wait_on(!pfp && !gfx_guards); // an ME wait's guard has PFP_SYNC_ME before it
 					}
 					if (plan == LabelOracle::Plan::Native && !emitted) {
 						plan = LabelOracle::Plan::Split;
@@ -5737,6 +5820,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		m_cp_shadow_force_load = false;
 	}
 	r.cp_shadow = cp_shadow;
+	if (r.injected) {
+		m_inject_wait_va = 0; // once: a refused buffer leaves it armed for the next one
+	}
 
 	// Copies body[from, to) to the IB, each direct run in it as IB2s into the guest's buffer. Returns,
 	// per run, (body offset where it ends, dwords removed up to there) to move later body offsets.

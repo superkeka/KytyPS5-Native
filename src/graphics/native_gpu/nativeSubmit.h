@@ -373,10 +373,11 @@ public:
 		n += m_kfd_relay != nullptr && m_kfd_relay->Stop() ? 1u : 0u;
 		return n;
 	}
-	// True once every CS submission (not a KFD queue's) has completed, waiting up to `timeout_sec` each.
+	// True once every CS submission (not a KFD queue's) has completed, waiting up to `timeout_sec` each. A job amdgpu
+	// reset counts as done: its fence came back with an error, and it is off the ring.
 	bool CsIdle(double timeout_sec) {
 		for (const SlotUse& slot: m_slot) {
-			if (slot.seq != 0 && Queue(slot.target) == nullptr && !WaitSeq(slot.seq, timeout_sec, slot.target)) {
+			if (slot.seq != 0 && Queue(slot.target) == nullptr && WaitSeqStatus(slot.seq, timeout_sec, slot.target) == 1) {
 				return false;
 			}
 		}
@@ -678,9 +679,13 @@ public:
 		return out;
 	}
 
-	bool WaitSeq(uint64_t seq, double timeout_sec, RingTarget target = {}) {
+	bool WaitSeq(uint64_t seq, double timeout_sec, RingTarget target = {}) { return WaitSeqStatus(seq, timeout_sec, target) == 0; }
+	// WaitSeq that tells why: 0 signalled, 1 not yet (the timeout ran out), or -errno. A job amdgpu reset comes back with
+	// its fence error: -ETIME for the guilty one, -ECANCELED for the context's later ones (amdgpu_fence's re-emit), -ENODEV
+	// once the device is gone. A KFD queue's sequence is 0 or 1. Thread-safe: an ioctl on fixed state.
+	int WaitSeqStatus(uint64_t seq, double timeout_sec, RingTarget target = {}) {
 		if (const KfdQueue* q = Queue(target); q != nullptr) {
-			return q->Wait(seq, timeout_sec);
+			return q->Wait(seq, timeout_sec) ? 0 : 1;
 		}
 		union drm_amdgpu_wait_cs w;
 		std::memset(&w, 0, sizeof(w));
@@ -692,8 +697,42 @@ public:
 		w.in.ip_type = target.ip_type;
 		w.in.ring    = target.ring;
 		w.in.ctx_id  = m_ctx;
-		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w) == 0 && w.out.status == 0;
+		const int r  = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w);
+		return r != 0 ? r : (w.out.status == 0 ? 0 : 1);
 	}
+	// The watchdog's look at a submission: WaitSeqStatus without waiting.
+	int PollSeq(uint64_t seq, RingTarget target = {}) { return WaitSeqStatus(seq, 0.0, target); }
+	// AMDGPU_CTX_OP_QUERY_STATE2's flags for our context (AMDGPU_CTX_QUERY2_FLAGS_*); 0 when the query fails. RESET alone
+	// moves with any reset of the device, another process's per-queue reset included; GUILTY and VRAMLOST are ours.
+	[[nodiscard]] uint32_t ContextState() const {
+		union drm_amdgpu_ctx ctx;
+		std::memset(&ctx, 0, sizeof(ctx));
+		ctx.in.op     = AMDGPU_CTX_OP_QUERY_STATE2;
+		ctx.in.ctx_id = m_ctx;
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CTX, &ctx) == 0 ? static_cast<uint32_t>(ctx.out.state.flags) : 0u;
+	}
+	// The VM's last GPU page fault (AMDGPU_INFO_GPUVM_FAULT, Linux 6.10; the kernel keeps the last one per PASID and
+	// never clears it; KFD queues share the VM after ACQUIRE_VM). False when the kernel does not have the query.
+	bool GpuvmFault(uint64_t* addr, uint32_t* status, uint32_t* vmhub) const {
+		struct {
+			uint64_t addr;
+			uint32_t status;
+			uint32_t vmhub;
+		} f {};
+		struct drm_amdgpu_info request;
+		std::memset(&request, 0, sizeof(request));
+		request.return_pointer = reinterpret_cast<uintptr_t>(&f);
+		request.return_size    = sizeof(f);
+		request.query          = kInfoGpuvmFault;
+		if (Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_INFO, &request) != 0) {
+			return false;
+		}
+		*addr   = f.addr;
+		*status = f.status;
+		*vmhub  = f.vmhub;
+		return true;
+	}
+	static constexpr uint32_t kInfoGpuvmFault = 0x23; // AMDGPU_INFO_GPUVM_FAULT, for older uapi headers
 
 private:
 	// A KFD queue per guest compute queue, up to the tracker's 32 slots less the gfx one (PS5 titles

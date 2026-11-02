@@ -229,6 +229,9 @@ struct Pm4TranslateStats {
 	uint32_t cp_shadow_fmask_gpu = 0;
 	uint32_t cp_shadow_dcc_gpu   = 0;
 	uint32_t cp_shadow_dcc_back  = 0; // and the DCC given back on the GPU (EmitCpShadowDccRestore)
+	// GPU waits run with shadowing off around them (SetCpShadowWaitOff): 6 dwords each, plus PFP_SYNC_ME where
+	// nothing else gave the ME wait one.
+	uint32_t cp_shadow_wait_wraps = 0;
 };
 
 // KYTY_NATIVE_GPU_AUDIT (Pm4Translator::SetAudit): the title's sync packets field by field, from its own dwords (not
@@ -401,6 +404,17 @@ enum class CpShadowMode { Off, Record, Load };
 constexpr std::array<uint32_t, 8> kCpShadowOff = {0xc0012800u, 0x80000000u, 0x80000000u, 0xffff1000u,
                                                   0xffff1000u, 0xffff1000u, 0xffff1000u, 0xffff1000u};
 void EmitCpShadowOff(std::vector<uint32_t>& ib);
+// Shadowing off around a GPU wait in a shadowing job (Pm4Translator::SetCpShadowWaitOff), and back on with the job's
+// enables. The load control is left alone (dw1 bit 31 clear: not updated), so a LOAD later in the same job (a pop, a
+// gated preamble) still loads; kCpShadowOff would turn the loads off too. The enables live in the CP's own state:
+// amdgpu's per-queue reset (CP_VMID_RESET and the MQD restore) keeps them, and the ring test and the other contexts'
+// re-emitted jobs that follow would be shadowed into S's address in VMID 0 and in their own VMs (a CPG VM fault, a
+// second timeout, a MODE1 reset the BC-250 does not come back from; GT7, 31.10). A job that hangs never reaches its
+// own end, but the CP sits at a wait in nearly every hang, so with shadowing off there the reset is survivable, as it
+// is with CP shadowing off altogether. On the PS5 the kernel owns the queue and its state; nothing of the title's
+// stays armed across a reset there.
+constexpr std::array<uint32_t, 3> kCpShadowWaitOff = {0xc0012800u, 0x00000000u, 0x80000000u};
+constexpr std::array<uint32_t, 3> kCpShadowWaitOn  = {0xc0012800u, 0x00000000u, kCpShadowEnables};
 // True when the last packet of `ib` before trailing fillers is that CONTEXT_CONTROL, or an INDIRECT_BUFFER chain
 // that is not an exit guard's (a streamed DCB's head and parts chain on, and their last part ends with it).
 bool CpShadowTailOk(std::span<const uint32_t> ib);
@@ -866,6 +880,8 @@ struct Pm4TranslateResult {
 	// segment does not carry on from the piece before it in the same job.
 	bool                    cp_shadow = false;
 	std::vector<uint32_t>   cp_shadow_resume;
+	// SetInjectWait: this buffer carries the injected wait (once per arming).
+	bool                    injected = false;
 	// SetAudit: the guest's sync packets field by field, and what refused the buffer (each opcode and reason once, at
 	// most 8), up to where the walk stopped.
 	Pm4SyncAudit            sync;
@@ -1124,6 +1140,28 @@ public:
 	// left other state in the CP, as an AGR buffer on the gfx ring does).
 	void SetCpShadowGatedLoads(bool on) { m_cp_shadow_gated = on; }
 	void ForceCpShadowLoad() { m_cp_shadow_force_load = true; }
+	// KYTY_NATIVE_GPU_SHADOW_WAIT_OFF (on unless 0): in load mode every GPU wait of the gfx ring runs between
+	// kCpShadowWaitOff and kCpShadowWaitOn, the ME's with PFP_SYNC_ME before the "on" (the PFP must not turn shadowing
+	// back on while the ME still waits): guest waits, held segments' barrier and wait, and barriers on our fence. Between
+	// the two only waits, barriers, PFP_SYNC_ME, the exit guard and clock copies, never a SET or a LOAD. `record` puts it
+	// in record mode as well (shadowing is on there too; off by default so record mode keeps its bytes for A/B).
+	void SetCpShadowWaitOff(bool on, bool record = false) {
+		m_cp_shadow_wait_off    = on;
+		m_cp_shadow_wait_record = record;
+	}
+	[[nodiscard]] bool CpShadowWaitWrap() const {
+		return m_cp_shadow_wait_off && (CpShadow() == CpShadowMode::Load || (m_cp_shadow_wait_record && CpShadow() == CpShadowMode::Record));
+	}
+	// KYTY_NATIVE_GPU_INJECT_HANG (hang tests): the next buffer translated with native labels starts its body, after the
+	// preamble, with a wait on the dword at `va` for 1 that nobody writes; 0 disarms. As a guest wait the GPU gets: the
+	// wrap above, an exit guard after it, and in the segment's gpu_waits, so a stop releases it. `bare`: none of that,
+	// an unknown stuck point no stop can release; refused while CP shadowing is on (a shadowed hang without the wrap is
+	// the known-fatal case). Cleared once a buffer carries it (Pm4TranslateResult::injected).
+	void SetInjectWait(uint64_t va, bool bare = false) {
+		m_inject_wait_va   = va;
+		m_inject_wait_bare = bare;
+	}
+	[[nodiscard]] bool InjectWaitArmed() const { return m_inject_wait_va != 0; }
 	// Collect the LOD statistics banks of the T#s each draw and dispatch reaches. Graphics draws
 	// scan every stage's user-data SGPRs (PS, VS, GS, ES, HS, LS) and USER_DATA_ADDR; dispatches
 	// scan COMPUTE_USER_DATA_0..15. Descriptor tables those pointers name are read two levels deep
@@ -1328,6 +1366,10 @@ private:
 	bool                         m_draw_offset_verbatim = false;
 	bool                         m_cp_shadow_gated      = false;
 	bool                         m_cp_shadow_force_load = false;
+	bool                         m_cp_shadow_wait_off    = true;  // SetCpShadowWaitOff
+	bool                         m_cp_shadow_wait_record = false;
+	uint64_t                     m_inject_wait_va        = 0;     // SetInjectWait
+	bool                         m_inject_wait_bare      = false;
 	bool                         m_pfp_sync_indirect = false;
 	bool                         m_cp_dma_idle       = true;
 	bool                         m_waits_verbatim    = false;

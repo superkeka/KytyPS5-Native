@@ -51,6 +51,17 @@ if(BUILD_TESTING)
 	add_dependencies(kyty_tests native_gpu_pm4_translator_tests)
 endif()
 
+# Hang watchdog decisions (nativeWatch.h): header-only and pure, so it runs everywhere.
+add_executable(native_gpu_watch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuWatchTests.cpp"
+)
+target_include_directories(native_gpu_watch_tests PRIVATE ${inc_headers})
+
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_watch COMMAND $<TARGET_FILE:native_gpu_watch_tests>)
+	add_dependencies(kyty_tests native_gpu_watch_tests)
+endif()
+
 # The root helper (tools/bc250-lodhw): the privileged registers the native backend needs (LOD
 # statistics, KFD TLB flushes). Built with the emulator and shipped next to it with its service
 # and installer (sudo ./install-helper.sh).
