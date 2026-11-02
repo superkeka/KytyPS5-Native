@@ -1644,8 +1644,10 @@ public:
 			}
 			InspectDraw(frame, snap);
 		}
-		// A shader that uses GDS hung the board in ASTRO BOT even with a GDS partition; until that is
-		// understood such DCBs stay on Kyty unless KYTY_NATIVE_GPU_GDS_SHADERS=1.
+		// A shader that uses GDS runs natively when every job has the GDS partition, as on the PS5. Without one
+		// (KYTY_NATIVE_GPU_GDS=0, or amdgpu gave none) its DCB stays on Kyty, as with KYTY_NATIVE_GPU_GDS_SHADERS=0. The
+		// ASTRO BOT hang once blamed on such a shader (24.10) came from the same bisection as the FMASK/CMASK one, which
+		// 1.11 traced to Kyty's HLE; primary mode has run them natively since.
 		// Skip mode learns GDS shaders as they appear: the DCB that introduces one was translated
 		// before the scan, so it goes to Kyty whole and the translator drops that shader's draws from
 		// the next DCB on.
@@ -1764,7 +1766,6 @@ public:
 			m_cps_anchors += result.stats.cp_shadow_anchors;
 			m_cps_pushes += result.stats.cp_shadow_pushes;
 			m_cps_pops += result.stats.cp_shadow_pops;
-			m_cps_fmask_gpu += result.stats.cp_shadow_fmask_gpu;
 			m_cps_dcc_gpu += result.stats.cp_shadow_dcc_gpu;
 			m_cps_dcc_back += result.stats.cp_shadow_dcc_back;
 			m_cps_wait_wraps += result.stats.cp_shadow_wait_wraps;
@@ -2470,18 +2471,17 @@ public:
 				std::fprintf(stderr,
 				             "native shadow: CP shadow (%s) per flip: %.2f shadow preambles with %.0f LOAD dwords (%.0f registers, %.2f anchors) and "
 				             "%.0f SETs; %.2f resumes put in front of a chunk, %.2f shadowing-off guards before another translator's piece, %.2f "
-				             "gfx job ends; %.2f context pushes and %.2f pops on the GPU; %.2f FMASK fixes on the GPU, %.2f display-DCC "
-				             "fixes on the GPU (INFO from a verbatim table) and %.2f DCC given back; %.1f GPU waits with shadowing off around them\n",
+				             "gfx job ends; %.2f context pushes and %.2f pops on the GPU; %.2f display-DCC fixes on the GPU (INFO from a "
+				             "verbatim table) and %.2f DCC given back; %.1f GPU waits with shadowing off around them\n",
 				             m_cp_shadow == CpShadowMode::Record ? "record" : "load", static_cast<double>(m_cps_preambles) / m_flips,
 				             static_cast<double>(m_cps_load_dw) / m_flips, static_cast<double>(m_cps_load_regs) / m_flips,
 				             static_cast<double>(m_cps_anchors) / m_flips, static_cast<double>(m_cps_sets) / m_flips,
 				             static_cast<double>(resumes - m_cps_resumes_mark) / m_flips, static_cast<double>(guards - m_cps_guards_mark) / m_flips,
 				             static_cast<double>(m_cps_job_ends) / m_flips, static_cast<double>(m_cps_pushes) / m_flips,
-				             static_cast<double>(m_cps_pops) / m_flips, static_cast<double>(m_cps_fmask_gpu) / m_flips,
-				             static_cast<double>(m_cps_dcc_gpu) / m_flips, static_cast<double>(m_cps_dcc_back) / m_flips,
-				             static_cast<double>(m_cps_wait_wraps) / m_flips);
+				             static_cast<double>(m_cps_pops) / m_flips, static_cast<double>(m_cps_dcc_gpu) / m_flips,
+				             static_cast<double>(m_cps_dcc_back) / m_flips, static_cast<double>(m_cps_wait_wraps) / m_flips);
 				m_cps_preambles = m_cps_load_dw = m_cps_load_regs = m_cps_anchors = m_cps_sets = m_cps_job_ends = 0;
-				m_cps_pushes = m_cps_pops = m_cps_fmask_gpu = m_cps_dcc_gpu = m_cps_dcc_back = m_cps_wait_wraps = 0;
+				m_cps_pushes = m_cps_pops = m_cps_dcc_gpu = m_cps_dcc_back = m_cps_wait_wraps = 0;
 				m_cps_resumes_mark = resumes;
 				m_cps_guards_mark  = guards;
 				if (m_cp_checks != 0) {
@@ -5325,12 +5325,12 @@ private:
 		std::vector<uint32_t> save(kCpShadowSaveBytes / 4u, 0u);
 		m_translator.WriteCpShadowImage(image, save);
 		volatile uint32_t* s = m_submitter->CpShadowCpu();
-		const auto fix = CpShadowFixTables(); // the register offsets of the FMASK and display-DCC fixes' tables
+		const auto fix = CpShadowFixTables(); // the register offsets of the display-DCC fix's tables
 		for (uint64_t i = 0; i < NativeSubmitter::kCpShadowReserve / 4u; i++) {
 			const uint64_t p = i - kCpShadowSaveOffset / 4u;
-			const uint64_t f = i - kCpShadowFixOffset / 4u;
+			const uint64_t f = i - kCpShadowDccFixOffset / 4u;
 			s[i]             = i < image.size()                                       ? image[i]
-			                   : i >= kCpShadowFixOffset / 4u && f < fix.size()       ? fix[f]
+			                   : i >= kCpShadowDccFixOffset / 4u && f < fix.size()    ? fix[f]
 			                   : i >= kCpShadowSaveOffset / 4u && p < save.size()     ? save[p]
 			                                                                          : 0u;
 		}
@@ -5425,18 +5425,6 @@ private:
 		if (EnvOn("KYTY_NATIVE_GPU_NO_DCC")) {
 			m_translator.SetNoDcc(true);
 			std::fprintf(stderr, "native shadow: render targets without DCC (experiment)\n");
-		}
-		if (EnvOn("KYTY_NATIVE_GPU_FMASK_FIX")) {
-			m_translator.SetFmaskFix(true);
-			std::fprintf(stderr, "native shadow: CB_COLORn_FMASK = BASE on targets without FMASK (experiment)\n");
-		}
-		if (EnvOn("KYTY_NATIVE_GPU_NO_CMASK_CLEAR")) {
-			// Experiment, MRT4 by default: up to 28.10 ASTRO BOT's CMASK-only fast clear there hung the CB (no longer
-			// since 1.11, see fix_fmask). Turning it off everywhere leaves fast-cleared targets stale (8x8 squares).
-			const char*    v     = std::getenv("KYTY_NATIVE_GPU_NO_CMASK_CLEAR_SLOTS");
-			const uint32_t slots = v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0x10u;
-			m_translator.SetNoCmaskClear(true, slots);
-			std::fprintf(stderr, "native shadow: no CMASK fast clear on targets without DCC in MRT slots 0x%02x\n", slots);
 		}
 		if (const char* mask = std::getenv("KYTY_NATIVE_GPU_TARGET_MASK"); mask != nullptr) {
 			m_translator.SetTargetMask(static_cast<uint32_t>(std::strtoul(mask, nullptr, 0)));
@@ -5540,13 +5528,14 @@ private:
 				             cond_exec, multi_inst);
 			}
 		}
-		// KYTY_NATIVE_GPU_GDS_SHADERS=1 runs draws with GDS shaders natively, =skip leaves just those
-		// draws out of the IB (the rest of their DCB runs natively); unset leaves whole DCBs to Kyty.
+		// Shaders that use GDS run natively wherever every job has the GDS partition (NativeSubmitter: 48 KiB from base
+		// 0 in every mode, as the PS5 kernel gives a title's VMID), as on the PS5. KYTY_NATIVE_GPU_GDS_SHADERS=0 leaves
+		// whole DCBs with such a shader to Kyty, =skip leaves just those draws out of the IB (the rest of their DCB runs
+		// natively), =1 runs them natively even without a partition.
 		if (const char* g = std::getenv("KYTY_NATIVE_GPU_GDS_SHADERS"); g != nullptr) {
 			m_skip_gds_shaders  = std::strcmp(g, "skip") == 0;
 			m_allow_gds_shaders = !m_skip_gds_shaders && g[0] == '1';
-		} else {
-			m_allow_gds_shaders = EnvOn("KYTY_NATIVE_GPU_PRIMARY"); // primary mode has the GDS partition
+			m_gds_shaders_set   = true;
 		}
 		m_collect_targets = std::getenv("KYTY_NATIVE_GPU_DUMP_FLIPS") != nullptr || EnvOn("KYTY_NATIVE_GPU_CTL");
 		if (EnvOn("KYTY_NATIVE_GPU_CTL")) {
@@ -5619,6 +5608,9 @@ private:
 		InstallStopDrain();
 		m_translator.SetGdsAvailable(m_submitter->HasGds());
 		m_acb_translator.SetGdsAvailable(m_submitter->HasGds());
+		if (!m_gds_shaders_set) {
+			m_allow_gds_shaders = m_submitter->HasGds();
+		}
 		m_acb_translator.SetComputeQueue(true);
 		// Residency only needs the 16 MiB buckets the GPU may touch, unless descriptor tables are
 		// followed or unmapped references logged: those need every reference.
@@ -5641,10 +5633,6 @@ private:
 		// KYTY_NATIVE_GPU_CP_SHADOW_GATED=0 reloads before every job (CLEAR_STATE and every load on).
 		if (!EnvIs("KYTY_NATIVE_GPU_CP_SHADOW_GATED", "0")) {
 			m_translator.SetCpShadowGatedLoads(true);
-		}
-		// DRAW_INDEX_OFFSET_2 runs as the title wrote it; KYTY_NATIVE_GPU_DRAW_OFFSET_VERBATIM=0 makes it DRAW_INDEX_2.
-		if (!EnvIs("KYTY_NATIVE_GPU_DRAW_OFFSET_VERBATIM", "0")) {
-			m_translator.SetDrawIndexOffsetVerbatim(true);
 		}
 		if (EnvIs("KYTY_NATIVE_GPU_IRQ_AT_RELEASE", "0")) {
 			m_translator.SetInterruptsAtRelease(false);
@@ -5693,11 +5681,6 @@ private:
 				             "RCIU CAM through kyty-lodhw: %s)\n",
 				             std::strerror(-r));
 			}
-		}
-		if (EnvOn("KYTY_NATIVE_GPU_ACQUIRE_FULL")) {
-			m_translator.SetAcquireFull(true);
-			m_acb_translator.SetAcquireFull(true);
-			std::fprintf(stderr, "native shadow: every ACQUIRE_MEM is a full cache writeback and invalidate\n");
 		}
 		if (EnvOn("KYTY_NATIVE_GPU_GDS_DMA_SYNC")) {
 			m_translator.SetGdsDmaSync(true);
@@ -6284,7 +6267,7 @@ private:
 	// checker's last result.
 	uint64_t              m_cps_preambles = 0, m_cps_load_dw = 0, m_cps_load_regs = 0, m_cps_anchors = 0, m_cps_sets = 0;
 	uint64_t              m_cps_job_ends = 0, m_cps_resumes = 0, m_cps_resumes_mark = 0, m_cps_guards_mark = 0;
-	uint64_t              m_cps_pushes = 0, m_cps_pops = 0, m_cps_fmask_gpu = 0, m_cps_dcc_gpu = 0, m_cps_dcc_back = 0;
+	uint64_t              m_cps_pushes = 0, m_cps_pops = 0, m_cps_dcc_gpu = 0, m_cps_dcc_back = 0;
 	uint64_t              m_cps_wait_wraps = 0; // Pm4TranslateStats::cp_shadow_wait_wraps
 	uint64_t              m_context_ops = 0, m_context_checks = 0; // Pm4TranslateStats::context_ops / context_checks
 	uint64_t              m_cp_checks     = 0;
@@ -6572,6 +6555,7 @@ private:
 	std::set<uint64_t> m_gds_shaders;         // shaders seen using GDS instructions
 	bool               m_allow_gds_shaders = false;
 	bool               m_skip_gds_shaders  = false;
+	bool               m_gds_shaders_set   = false; // KYTY_NATIVE_GPU_GDS_SHADERS decides, not the GDS partition
 	size_t             m_skipped_shader_count = 0;
 	uint32_t           m_gds_refused       = 0;
 	double        m_timeout_sec    = kDefaultTimeoutSec;
@@ -7979,7 +7963,8 @@ private:
 				}
 				break;
 			case TrackerPoint::Kind::Atomic: {
-				// libSceAgc's ATOMIC_MEM where the GPU does not run it (a compute ring, or memory the GPU cannot write):
+				// libSceAgc's ATOMIC_MEM where the GPU does not run it (memory the GPU cannot write, or MEC with
+				// KYTY_NATIVE_GPU_ACB_ATOMICS=0):
 				// its TC_OP on the CPU, atomically, 64-bit with bit 5 set (CpuAtomicMem). A swap (7) stores the source, an
 				// AND (0x15) masks the word with it (SetWorkloadsActive, SetWorkloadComplete); with KYTY_NATIVE_GPU_ATOMIC_OPS=1
 				// any integer op (IntegerAtomicOp), a compare-swap with the compare value in data[3..4].

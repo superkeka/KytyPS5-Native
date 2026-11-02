@@ -389,8 +389,9 @@ void TestAgcTagsVerbatim() {
 	      "a compute ring drops it");
 }
 
-// GFX9+ only updates the CP's copy of VGT_PRIMITIVE_TYPE / VGT_INDEX_TYPE through
-// SET_UCONFIG_REG_INDEX (index 1 / 2), in the body and in the preamble of the next IB alike.
+// The PFP only updates its copy of VGT_INDEX_TYPE through SET_UCONFIG_REG_INDEX (index 2): Kyty's own writes (an
+// expanded table, the preamble of the next IB) use the index forms (1 / 2); the title's own SET_UCONFIG_REG goes as
+// written, several registers in one packet included, as the PS5's PFP runs it.
 void TestUconfigIndexedRegisters() {
 	Pm4Translator         t;
 	std::vector<uint32_t> pairs = {0x242u, 0x4u, 0x243u, 0x1u, 0x25Bu, 0x8040u};
@@ -415,9 +416,20 @@ void TestUconfigIndexedRegisters() {
 		}
 	}
 	// The preamble replays the committed shadow too, so each register shows up there and in the body.
-	Check(prim_idx1 == 3 && prim_plain == 0, "VGT_PRIMITIVE_TYPE must use index 1, also when the guest wrote it plain");
-	Check(type_idx2 == 2, "VGT_INDEX_TYPE must use index 2");
+	Check(prim_idx1 == 2 && prim_plain == 1, "VGT_PRIMITIVE_TYPE: index 1 where Kyty writes it, the title's plain write as written");
+	Check(type_idx2 == 2, "VGT_INDEX_TYPE must use index 2 where Kyty writes it");
 	Check(ge_plain == 2, "GE_CNTL stays a plain SET_UCONFIG_REG");
+
+	// A title's multi-register SET_UCONFIG_REG over whitelisted registers, VGT_INDEX_TYPE among them: one packet, as written.
+	{
+		Pm4Translator         tm;
+		std::vector<uint32_t> multi;
+		Append(multi, IT_SET_UCONFIG_REG, {0x242u, 0x4u, 0x1u}, false); // VGT_PRIMITIVE_TYPE, VGT_INDEX_TYPE
+		const auto rm = tm.Translate(multi);
+		Check(rm.ok && std::search(rm.ib.begin(), rm.ib.end(), multi.begin(), multi.end()) != rm.ib.end() && rm.stats.set_uconfig == 1,
+		      "a title's multi-register SET_UCONFIG_REG goes as written");
+		Check(ValidateNativeIb(rm.ib, false, nullptr, NativeIbKind::Gfx), "and passes the gfx-ring check");
+	}
 
 	// The next IB's preamble replays the shadow with the same encodings.
 	std::vector<uint32_t> next;
@@ -657,50 +669,29 @@ void TestDrawIndexOffset() {
 	Append(dcb, 0x35u /* IT_DRAW_INDEX_OFFSET_2 */, {0x33cu, 0x75cu, 0x33cu, 0u}, false);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.draws == 1, "DRAW_INDEX_OFFSET_2 translated");
-	const auto pkts = Decode(r.ib);
-	Check(Count(pkts, 0x35u) == 0, "DRAW_INDEX_OFFSET_2 does not reach the IB");
-	const Packet* d = FindFirst(pkts, IT_DRAW_INDEX_2);
-	const uint64_t addr = 0x210000000ull + 0x75cull * 4u;
-	Check(d != nullptr && d->body.size() == 5 && d->body[0] == 0x33cu && d->body[1] == static_cast<uint32_t>(addr) &&
-	          d->body[2] == static_cast<uint32_t>(addr >> 32u) && d->body[3] == 0x33cu,
-	      "DRAW_INDEX_OFFSET_2 becomes DRAW_INDEX_2 at INDEX_BASE + offset * index size");
+	const auto    pkts = Decode(r.ib);
+	const Packet* d    = FindFirst(pkts, 0x35u);
+	Check(Count(pkts, IT_DRAW_INDEX_2) == 0 && d != nullptr && d->body == std::vector<uint32_t>({0x33cu, 0x75cu, 0x33cu, 0u}),
+	      "DRAW_INDEX_OFFSET_2 goes as written, as the PS5's CP runs it");
+	Check(HasRef(r.refs, 0x210000000ull, 0, false), "and the index buffer it draws from is referenced");
 }
 
-void TestFmaskFix() {
+void TestFmaskAsWritten() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
-	// MRT0 and MRT4 bound and writable; MRT4 has no FMASK (0), MRT0 already points it at its base.
+	// MRT0 and MRT4 bound and writable; MRT4 has no FMASK (0), MRT0 points it at its base.
 	Append(dcb, IT_SET_CONTEXT_REG, {0x08Eu, 0xf000fu}, false);
 	Append(dcb, IT_SET_CONTEXT_REG, {0x318u, 0x50fc300u}, false);
 	Append(dcb, IT_SET_CONTEXT_REG, {0x321u, 0x50fc300u}, false);
 	Append(dcb, IT_SET_CONTEXT_REG, {0x318u + 4u * 0xFu, 0x5125700u}, false);
 	Append(dcb, IT_SET_CONTEXT_REG, {0x321u + 4u * 0xFu, 0x0u}, false);
 	Append(dcb, 0x2Du /* IT_DRAW_INDEX_AUTO */, {3u, 2u}, false);
-	{
-		Pm4Translator off;
-		const auto    r0 = off.Translate(dcb);
-		bool       set_fmask = false;
-		for (const auto& p: Decode(r0.ib)) {
-			set_fmask |= p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x321u + 4u * 0xFu && p.body[1] != 0u;
-		}
-		Check(r0.ok && r0.stats.fmask_fixed == 0 && !set_fmask, "by default the title's FMASK 0 runs as written");
-	}
-	t.SetFmaskFix(true);
-	auto r = t.Translate(dcb);
-	Check(r.ok && r.stats.fmask_fixed == 1, "one target without FMASK fixed");
-	uint32_t fmask4 = 0;
-	size_t   fix_at = 0, draw_at = 0, i = 0;
+	const auto r         = t.Translate(dcb);
+	bool       set_fmask = false;
 	for (const auto& p: Decode(r.ib)) {
-		if (p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x321u + 4u * 0xFu) {
-			fmask4 = p.body[1];
-			fix_at = i;
-		}
-		if (p.op == 0x2Du) {
-			draw_at = i;
-		}
-		i++;
+		set_fmask |= p.op == IT_SET_CONTEXT_REG && p.body.size() >= 2 && p.body[0] == 0x321u + 4u * 0xFu && p.body[1] != 0u;
 	}
-	Check(fmask4 == 0x5125700u && fix_at < draw_at, "CB_COLOR4_FMASK = CB_COLOR4_BASE before the draw");
+	Check(r.ok && !set_fmask, "the title's FMASK 0 runs as written, as on the PS5");
 }
 
 void TestComputeQueueDispatchIndirect() {
@@ -924,26 +915,15 @@ void TestPs5RegOverrides() {
 	      "the preamble sets LOAD_COLLISION_WAVEID before the game writes the register");
 }
 
-void TestAcquireFull() {
+void TestAcquireAsWritten() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
 	Append(dcb, 0x58u, {0x0u, 0x1000u, 0x0u, 0x40000u, 0x0u, 0xau, 0x4000u}, false);
-	const Packet* a = nullptr;
-	auto          p0 = Decode(t.Translate(dcb).ib);
-	a                = FindFirst(p0, 0x58u);
-	Check(a != nullptr && a->body[6] == 0x4000u && a->body[1] == 0x1000u, "ACQUIRE_MEM passes through by default");
-	t.SetAcquireFull(true);
-	auto p1 = Decode(t.Translate(dcb).ib);
-	a       = FindFirst(p1, 0x58u);
-	Check(a != nullptr && a->body[1] == 0xffffffffu && a->body[2] == 0xffu && a->body[3] == 0u &&
-	          (a->body[6] & 0xc3f1u) == 0xc3f1u,
-	      "full ACQUIRE_MEM covers all memory and every cache level");
-	bool cb = false, db = false;
-	for (const auto& p: p1) {
-		cb = cb || (p.op == 0x46u && p.body.size() == 1 && p.body[0] == 0x2eu);
-		db = db || (p.op == 0x46u && p.body.size() == 1 && p.body[0] == 0x2cu);
-	}
-	Check(cb && db, "the gfx ring flushes CB and DB metadata before a full ACQUIRE_MEM");
+	const auto    p0 = Decode(t.Translate(dcb).ib);
+	const Packet* a  = FindFirst(p0, 0x58u);
+	Check(a != nullptr && a->body == std::vector<uint32_t>({0x0u, 0x1000u, 0x0u, 0x40000u, 0x0u, 0xau, 0x4000u}) &&
+	          Count(p0, 0x46u) == 0,
+	      "ACQUIRE_MEM goes as written, with no metadata flush before it");
 }
 
 void TestGpuRefs() {
@@ -1339,9 +1319,27 @@ void TestLabelsWriteData() {
 		const auto pl    = Decode(rl.ib);
 		const auto* lw   = FindFirst(pl, IT_WRITE_DATA);
 		const auto* disp = FindFirst(pl, IT_DISPATCH_DIRECT);
-		Check(rl.ok && lw != nullptr && lw->compute && lw->body.size() == 43 && lw->body[42] == 39u &&
-		          (lw->body[0] >> 30u) == 0u && disp != nullptr && lw < disp,
-		      "a 40-dword WRITE_DATA on a compute ring is one ME WRITE_DATA ahead of the dispatch");
+		Check(rl.ok && lw != nullptr && lw->compute && lw->body.size() == 43 && lw->body[42] == 39u && lw->body[0] == body[0] &&
+		          disp != nullptr && lw < disp,
+		      "a 40-dword WRITE_DATA on a compute ring is one WRITE_DATA ahead of the dispatch, ENGINE_SEL and WR_CONFIRM as written");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(rl.ib, false, &bad, NativeIbKind::Compute), "and passes the compute-ring check");
+		// DST_SEL 1 has no MEC handler (stock or the PS5's): refused on a compute ring, as written on the gfx ring.
+		std::vector<uint32_t> sel1;
+		Append(sel1, IT_WRITE_DATA, {(1u << 8u) | (1u << 20u), 0x02000400u, 0x2u, 5u}, true);
+		tc.SetAudit(true);
+		const auto rs = tc.Translate(sel1);
+		tc.SetAudit(false);
+		Check(!rs.ok && rs.refusals.size() == 1 && rs.refusals[0].why == Libs::Graphics::NativeGpu::RefuseWhy::WriteDataOnMec,
+		      "a WRITE_DATA with DST_SEL 1 on a compute ring is refused");
+		const std::vector<uint32_t> sel1_ib = {Pkt3(IT_WRITE_DATA, 4, true), (1u << 8u) | (1u << 20u), 0x02000400u, 0x2u, 5u};
+		Check(!ValidateNativeIb(sel1_ib, false, &bad, NativeIbKind::Compute), "and the compute-ring check refuses it");
+		Pm4Translator tg;
+		TestOracle    og;
+		tg.SetNativeLabels(&og, kTrackerVa);
+		std::vector<uint32_t> sel1_gfx;
+		Append(sel1_gfx, IT_WRITE_DATA, {(1u << 8u) | (1u << 20u), 0x02000400u, 0x2u, 5u}, false);
+		Check(tg.Translate(sel1_gfx).ok, "the gfx ring takes DST_SEL 1");
 	}
 
 	// Memory the GPU cannot write: the tracker writes it.
@@ -1450,7 +1448,7 @@ void TestLabelsAsWritten() {
 	Check(pl != nullptr && ((pl->body[1] >> 16u) & 3u) == 1u && pl->body[0] == (0x06000514u | (1u << 12u) | (1u << 21u)),
 	      "a label sent to L2 goes as written, write-backs added (the PS5's shared memory is coherent, NC here is not)");
 
-	// GL2_WB without GLM_WB: as written too (KYTY_NATIVE_GPU_RELEASE_GLM_WB=1 adds GLM_WB).
+	// GL2_WB without GLM_WB: as written too, as on the PS5.
 	std::vector<uint32_t> wb;
 	AppendGuestRelease(wb, 0, 0, 0, 0, 0, 0x00200528u);
 	auto        rw = t.Translate(wb);
@@ -2085,11 +2083,38 @@ void TestSonyWorkloads() {
 		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
 		auto r          = t.Translate(acb);
 		const auto pkts = Decode(r.ib);
+		// MEC runs them as written, the title's plain header kept (probe atomicops and mecplain on compute ring 1, 2.11).
+		std::vector<size_t> at;
+		for (size_t i = 0; i + 9 <= r.ib.size(); i++) {
+			if (r.ib[i] == 0xc0071e00u && (r.ib[i + 1] == 0x267u || r.ib[i + 1] == 0x275u)) {
+				at.push_back(i);
+			}
+		}
+		Check(r.ok && r.unknown_ops.empty() && Count(pkts, 0x1Eu) == 2 && r.stats.atomics_cpu == 0 && r.stats.atomics_mec == 2 &&
+		          atomics(r).empty() && at.size() == 2 && r.ib[at[0] + 1] == 0x267u && r.ib[at[1] + 1] == 0x275u,
+		      "an ACB's on a compute ring: MEC runs them as written, plain headers, in order");
+		Check(HasRef(r.refs, word, 8, false), "the workload word is made resident for MEC");
+		Check(FindFirst(pkts, IT_SET_UCONFIG_REG) == nullptr && FindFirst(pkts, IT_WRITE_DATA) == nullptr, "its markers stay off MEC");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "the IB passes both compute packet checks");
+		Check(!PassesBothChecks(r.ib, NativeIbKind::Gfx), "and not the gfx ones (a compute header elsewhere)");
+	}
+	{
+		// On MEC too a word the GPU cannot write gets the tracker's CPU atomics.
+		Pm4Translator t;
+		TestOracle    o;
+		o.unwritable = word;
+		t.SetComputeQueue(true);
+		t.SetComputeRing(true);
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(kFenceVa);
+		std::vector<uint32_t> acb;
+		AppendSonyWorkloads(acb, true, 4u, mask, 3u, word);
+		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+		auto r          = t.Translate(acb);
 		const std::vector<uint32_t> acb_swap  = {0x267u, swap[1], swap[2], 0u, 0u};
 		const std::vector<uint32_t> acb_clear = {0x275u, clear[1], clear[2], 0u, 0u};
-		Check(r.ok && r.unknown_ops.empty() && Count(pkts, 0x1Eu) == 0 && atomics(r) == std::vector<std::vector<uint32_t>>({acb_swap, acb_clear}),
-		      "an ACB's on a compute ring: the tracker performs them");
-		Check(FindFirst(pkts, IT_SET_UCONFIG_REG) == nullptr && FindFirst(pkts, IT_WRITE_DATA) == nullptr, "its markers stay off MEC");
+		Check(r.ok && Count(Decode(r.ib), 0x1Eu) == 0 && r.stats.atomics_mec == 0 && atomics(r) == std::vector<std::vector<uint32_t>>({acb_swap, acb_clear}),
+		      "an ACB's on a word the GPU cannot write: the tracker performs them, in order");
 		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "the IB passes both compute packet checks");
 	}
 	{
@@ -2157,7 +2182,51 @@ void TestLabelsWait64() {
 
 	o.plan  = LabelOracle::Plan::Split;
 	auto rs = t.Translate(dcb);
-	Check(rs.segments.size() == 2 && rs.segments[1].wait_len == 7, "a held 64-bit wait carries its 32-bit form");
+	Check(rs.segments.size() == 2 && rs.segments[1].wait_len == 9 &&
+	          rs.ib[rs.segments[1].wait_dw] == Pkt3(0x93u, 8, false) &&
+	          std::vector<uint32_t>(rs.ib.begin() + rs.segments[1].wait_dw + 1, rs.ib.begin() + rs.segments[1].wait_dw + 9) ==
+	              std::vector<uint32_t>({3u | (1u << 4u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0u,
+	                                     0xffffffffu, 0u, 4u}),
+	      "a held 64-bit wait carries the title's WAIT_REG_MEM_64");
+
+	// Kyty's own form of a held wait (EmitNativeWait): the title's function, width and engine for every compare function
+	// 1..6 (probe waitforms, 2.11), no PFP_SYNC_ME after a PFP one; ALWAYS has none (barrier only). The same with the
+	// guest's waits as written off.
+	for (const bool verbatim: {true, false}) {
+		t.SetWaitsVerbatim(verbatim);
+		for (const uint32_t function: {0u, 1u, 2u, 3u, 4u, 5u, 6u}) {
+			for (const bool wide: {false, true}) {
+				for (const bool pfp_wait: {false, true}) {
+					const uint32_t        control = function | (1u << 4u) | (pfp_wait ? 1u << 8u : 0u);
+					std::vector<uint32_t> d;
+					Append(d, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+					if (wide) {
+						Append(d, 0x93u, {control, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 7u, 0u, 0xffu, 0u, 4u}, false);
+					} else {
+						Append(d, 0x3Cu, {control, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 7u, 0xffu, 4u}, false);
+					}
+					auto r2 = t.Translate(d);
+					const bool proven = function >= 1u && function <= 6u;
+					bool       ok     = r2.ok && r2.segments.size() == 2;
+					if (ok && proven) {
+						const auto&           seg  = r2.segments[1];
+						const uint32_t* const w    = r2.ib.data() + seg.wait_dw;
+						const auto            tail = Decode(std::vector<uint32_t>(r2.ib.begin() + seg.wait_dw + seg.wait_len, r2.ib.begin() + seg.end));
+						ok = seg.wait_len == (wide ? 9u : 7u) && w[0] == Pkt3(wide ? 0x93u : 0x3Cu, wide ? 8u : 6u, false) && w[1] == control &&
+						     w[4] == 7u && w[wide ? 6u : 5u] == 0xffu && w[wide ? 8u : 6u] == 4u &&
+						     (!pfp_wait || tail.empty() || tail[0].op != 0x42u);
+					} else if (ok) {
+						ok = r2.segments[1].wait_len == 0u;
+					}
+					uint32_t bad2 = 0;
+					Check(ok && ValidateNativeIb(r2.ib, false, &bad2, NativeIbKind::Gfx),
+					      proven ? "a held wait: the title's function, width and engine, no PFP_SYNC_ME after a PFP one"
+					             : "a held ALWAYS wait: no GPU form, the barrier alone");
+				}
+			}
+		}
+	}
+	t.SetWaitsVerbatim(true);
 }
 
 void TestValidateNativeIb() {
@@ -2192,8 +2261,9 @@ void TestValidateNativeIb() {
 		const auto pkts = Decode(r.ib);
 		const auto* wd   = FindFirst(pkts, IT_WRITE_DATA);
 		Check(wd == nullptr || (wd->body[0] & (1u << 20u)) != 0, "a WRITE_DATA in it is write-confirmed");
-		Check(plan == LabelOracle::Plan::Native || FindFirst(pkts, 0x93u) == nullptr,
-		      "a 64-bit guest wait only where it runs on the GPU as written");
+		const auto* w64 = FindFirst(pkts, 0x93u);
+		Check(plan == LabelOracle::Plan::Met ? w64 == nullptr : w64 != nullptr && w64->body[7] == 4u,
+		      "a 64-bit guest wait in Kyty's form where the GPU runs it or holds it (waits as written off), none at a barrier");
 	}
 
 	auto rejects = [&](std::vector<uint32_t> ib, const char* what) {
@@ -2211,7 +2281,8 @@ void TestValidateNativeIb() {
 			ib.push_back(0xffff1000u);
 		}
 		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Gfx), "a guest PFP WAIT_REG_MEM_64 on memory passes on gfx");
-		Check(!ValidateNativeIb(ib, false, nullptr, NativeIbKind::Compute), "and is rejected on a compute ring");
+		Check(ValidateNativeIb(ib, false, nullptr, NativeIbKind::Compute),
+		      "and on a compute ring (MEC's WAIT_REG_MEM_64 never reads ENGINE_SEL, stock or the PS5's)");
 	}
 	rejects({0xc0033700u, 0x200u, 0x1000u, 0u, 1u}, "WRITE_DATA without write confirm rejected");
 	rejects({0xc0033700u, 0x100000u, 0x1000u, 0u, 1u}, "WRITE_DATA to a register rejected");
@@ -2252,9 +2323,9 @@ void TestValidateNativeIb() {
 	std::vector<uint32_t> wd = {0xc0033700u, 0x100500u, 0x1000u, 0u, 1u, 0xffff1000u, 0xffff1000u, 0xffff1000u};
 	Check(ValidateNativeIb(wd, false), "a write-confirmed WRITE_DATA to memory passes");
 	uint32_t bad = ~0u;
-	Check(!ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "on a compute ring it needs the compute bit");
+	Check(ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "on a compute ring with the title's plain header (probe mecplain)");
 	wd[0] = 0xc0033702u;
-	Check(ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "with it, it passes there");
+	Check(ValidateNativeIb(wd, false, &bad, NativeIbKind::Compute), "and with the compute bit");
 }
 
 // AgcDcbContextStateOp as libSceAgc writes it: a push and a pop around a register write. The shadow does
@@ -2355,6 +2426,28 @@ void TestComputeRingPackets() {
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "the IB passes the compute-ring check");
 	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "a compute-bit release is not a gfx-ring packet");
+
+	// A PFP-engine wait goes to MEC as written too, any compare function the gfx CP takes: MEC's WAIT_REG_MEM and
+	// WAIT_REG_MEM_64 never read ENGINE_SEL (microcode, stock and the PS5's). No PFP_SYNC_ME on MEC.
+	static uint64_t label64 = 0;
+	for (const bool wide: {false, true}) {
+		const uint64_t        at = wide ? reinterpret_cast<uint64_t>(&label64) : addr;
+		std::vector<uint32_t> pfp;
+		Append(pfp, IT_WRITE_DATA, {5u << 8u, static_cast<uint32_t>(at), static_cast<uint32_t>(at >> 32u), 1u}, true);
+		const uint32_t control = 5u | (1u << 4u) | (1u << 8u) | (2u << 25u); // >=, PFP, CACHE_POLICY 2
+		std::vector<uint32_t> pk;
+		if (wide) {
+			Append(pk, 0x93u, {control, static_cast<uint32_t>(at), static_cast<uint32_t>(at >> 32u), 1u, 0u, 0xffu, 0u, 0x10u}, false);
+		} else {
+			Append(pk, 0x3Cu, {control, static_cast<uint32_t>(at), static_cast<uint32_t>(at >> 32u), 1u, 0xffu, 0x10u}, false);
+		}
+		pfp.insert(pfp.end(), pk.begin(), pk.end());
+		auto rp = t.Translate(pfp);
+		Check(rp.ok && rp.stats.waits_native == 1 && std::search(rp.ib.begin(), rp.ib.end(), pk.begin(), pk.end()) != rp.ib.end() &&
+		          FindFirst(Decode(rp.ib), 0x42u) == nullptr,
+		      wide ? "an ACB's PFP WAIT_REG_MEM_64 goes to MEC as written" : "an ACB's PFP WAIT_REG_MEM goes to MEC as written");
+		Check(ValidateNativeIb(rp.ib, false, &bad, NativeIbKind::Compute), "and passes the compute-ring check");
+	}
 
 	std::vector<uint32_t> draw;
 	Append(draw, IT_DRAW_INDEX_2, {3u, 0x40000000u, 0x2u, 3u, 0u}, false);
@@ -2690,7 +2783,7 @@ void TestLabelsGpuOnly() {
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the gfx packet check");
 
-	// On a compute ring the constant-engine write is a compute-bit micro engine WRITE_DATA.
+	// On a compute ring the constant-engine write goes as written, with the compute bit: MEC never reads ENGINE_SEL.
 	{
 		Pm4Translator tc;
 		TestOracle    oc;
@@ -2704,7 +2797,7 @@ void TestLabelsGpuOnly() {
 		const auto rc = tc.Translate(acb);
 		const auto pc = Decode(rc.ib);
 		const auto* wd = FindFirst(pc, IT_WRITE_DATA);
-		Check(rc.ok && wd != nullptr && wd->compute && (wd->body[0] >> 30u) == 0u && rc.stats.labels_cpu == 0 &&
+		Check(rc.ok && wd != nullptr && wd->compute && wd->body[0] == ((5u << 8u) | (2u << 30u)) && rc.stats.labels_cpu == 0 &&
 		          ValidateNativeIb(rc.ib, false, &bad, NativeIbKind::Compute),
 		      "a compute-ring constant-engine write is the GPU's and passes the compute check");
 	}
@@ -2940,6 +3033,44 @@ void TestFlattenIndirectBuffers() {
 	buf = branch(called, 3);
 	out.clear();
 	Check(!FlattenIndirectBuffers(buf, &out), "a branch on memory is not inlined");
+
+	// SetFlattenBranchLog (KYTY_NATIVE_GPU_LOG_BRANCHES=1): a line per always-taken branch, once, saying what the parent
+	// runs after it and where the target ends; the flattening is the same.
+	{
+		using Libs::Graphics::NativeGpu::SetFlattenBranchLog;
+		std::FILE* log = std::tmpfile();
+		SetFlattenBranchLog(log);
+		std::vector<uint32_t> parent = branch(called, 0);
+		parent.insert(parent.end(), nop_b.begin(), nop_b.end());
+		const auto tail_va = reinterpret_cast<uint64_t>(parent.data() + 14);
+		// A target that chains back to the parent's tail (libSceAgc's jump back), and one with no chain.
+		std::vector<uint32_t> back = {0xc0001000u, 0x1111u, 0xc0023f00u, static_cast<uint32_t>(tail_va), static_cast<uint32_t>(tail_va >> 32u),
+		                              static_cast<uint32_t>(nop_b.size()) | (1u << 20u)};
+		std::vector<uint32_t> parent2 = branch(back, 0);
+		parent2.insert(parent2.end(), nop_b.begin(), nop_b.end());
+		// The jump back goes to parent2's own tail.
+		const auto tail2 = reinterpret_cast<uint64_t>(parent2.data() + 14);
+		back[3]          = static_cast<uint32_t>(tail2);
+		back[4]          = static_cast<uint32_t>(tail2 >> 32u);
+		std::vector<uint32_t> plain_out, back_out;
+		const bool            plain_ok = FlattenIndirectBuffers(parent, &plain_out);
+		FlattenIndirectBuffers(parent, &plain_out); // the same branch again: no second line
+		const bool back_ok = FlattenIndirectBuffers(parent2, &back_out);
+		SetFlattenBranchLog(nullptr);
+		std::string text;
+		std::rewind(log);
+		for (int c = std::fgetc(log); c != EOF; c = std::fgetc(log)) {
+			text += static_cast<char>(c);
+		}
+		std::fclose(log);
+		const size_t lines = static_cast<size_t>(std::count(text.begin(), text.end(), '\n'));
+		Check(plain_ok && plain_out == std::vector<uint32_t>({0xc0001000u, 0x1111u, 0xc0001000u, 0xbbbbu}) && back_ok &&
+		          back_out == std::vector<uint32_t>({0xc0001000u, 0x1111u, 0xc0001000u, 0xbbbbu, 0xc0001000u, 0xbbbbu}),
+		      "with the log on the flattening is the same (a target chaining back runs the tail twice)");
+		Check(lines == 2 && text.find("the PS5 would not run it") != std::string::npos &&
+		          text.find("chains back to the parent's tail: it runs twice here") != std::string::npos,
+		      "one line per branch: no chain at the target's end, and a chain back to the parent's tail");
+	}
 
 	// The chunked layout titles use: a valid REWIND, then a chain to the next chunk; nothing after
 	// the chain runs.
@@ -3355,14 +3486,15 @@ struct ToyCp {
 					s[(at - kTestShadowVa) / 4u] &= b[3];
 					break;
 				}
-				case 0x3Cu: // WAIT_REG_MEM: met at once here
+				case 0x3Cu: // WAIT_REG_MEM and WAIT_REG_MEM_64: met at once here
+				case 0x93u:
 					waits++;
 					if (waits_unshadowed) {
 						Check(shadow == 0u, "a GPU wait runs with shadowing off");
 					}
 					break;
-				case 0x22u: { // COND_EXEC: on a word in S's area (the FMASK fix) as the CP does; an exit guard's abort
-				             // word is 0 (no stop armed), so the dwords it guards are skipped
+				case 0x22u: { // COND_EXEC: on a word in S's area as the CP does; an exit guard's abort word is 0 (no stop
+				             // armed), so the dwords it guards are skipped
 					const uint64_t at = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
 					if (!InS(at) || s[(at - kTestShadowVa) / 4u] == 0u) {
 						dw += b[3];
@@ -3396,7 +3528,7 @@ struct ToyCp {
 		                     std::span<uint32_t>(s.data() + Libs::Graphics::NativeGpu::kCpShadowSaveOffset / 4u,
 		                                         Libs::Graphics::NativeGpu::kCpShadowSaveBytes / 4u));
 		const auto fix = Libs::Graphics::NativeGpu::CpShadowFixTables();
-		std::copy(fix.begin(), fix.end(), s.begin() + Libs::Graphics::NativeGpu::kCpShadowFixOffset / 4u);
+		std::copy(fix.begin(), fix.end(), s.begin() + Libs::Graphics::NativeGpu::kCpShadowDccFixOffset / 4u);
 	}
 };
 
@@ -3551,9 +3683,10 @@ void TestCpShadowPreamble() {
 	      "each LOAD names its class's region of S");
 	using Ranges = std::vector<std::pair<uint32_t, uint32_t>>;
 	Check(LoadRanges(pkts, IT_LOAD_UC, false) == Ranges({{0x24Au, 2u}, {0x25Bu, 1u}}) && LoadRanges(pkts, IT_LOAD_CX, false) == Ranges({{0x10u, 3u}, {0x20u, 1u}}) &&
-	          LoadRanges(pkts, IT_LOAD_SH, false) == Ranges({{0x00Cu, 4u}}) && LoadRanges(pkts, IT_LOAD_SH, true) == Ranges({{0x240u, 1u}}),
-	      "the keys in runs, SH split at 0x200, the registers S does not restore left out");
-	Check(r.stats.cp_shadow_load_regs == 3 + 4 + 4 + 1 && r.stats.cp_shadow_load_dw == 7 + 7 + 5 + 5, "LOAD counts");
+	          LoadRanges(pkts, IT_LOAD_SH, false) == Ranges({{0x007u, 1u}, {0x00Cu, 4u}}) && LoadRanges(pkts, IT_LOAD_SH, true) == Ranges({{0x240u, 1u}}),
+	      "the keys in runs, SH split at 0x200, RSRC3_PS among them (probe shadow-restore w14), the registers S does not "
+	      "restore left out");
+	Check(r.stats.cp_shadow_load_regs == 3 + 4 + 5 + 1 && r.stats.cp_shadow_load_dw == 7 + 7 + 7 + 5, "LOAD counts");
 	Check(!SetsReg(pkts, IT_SET_CONTEXT_REG, 0x10u) && !SetsReg(pkts, IT_SET_SH_REG, 0x00Cu) && !SetsReg(pkts, IT_SET_SH_REG, 0x240u) &&
 	          !SetsReg(pkts, IT_SET_UCONFIG_REG, 0x24Au),
 	      "no SET of a register it LOADs");
@@ -3564,15 +3697,15 @@ void TestCpShadowPreamble() {
 		if (p.op == IT_SET_CONTEXT_REG || p.op == IT_SET_SH_REG || p.op == IT_SET_UCONFIG_REG || p.op == IT_SET_UCONFIG_REG_INDEX) {
 			first_set = std::min(first_set, i);
 		}
-		rsrc3 = rsrc3 || (p.op == IT_SET_SH_REG && !p.compute && p.body == std::vector<uint32_t>({0x007u, 9u}));
+		rsrc3 = rsrc3 || (p.op == IT_SET_SH_REG && !p.compute && p.body.size() >= 1 && p.body[0] == 0x007u);
 		mgmt  = mgmt || (p.op == IT_SET_SH_REG && p.compute && p.body == std::vector<uint32_t>({0x216u, 0xffffu}));
 		nop   = nop || (p.op == IT_SET_SH_REG && p.compute && p.body == std::vector<uint32_t>({0x280u, 1u}));
 		prim  = prim || (p.op == IT_SET_UCONFIG_REG_INDEX && p.body == std::vector<uint32_t>({0x10000242u, 4u}));
 		sc    = sc || (p.op == IT_SET_CONTEXT_REG && p.body == std::vector<uint32_t>({0x310u, 5u}));
 	}
-	Check(rsrc3 && mgmt && nop && prim && sc && first_set > 7, "RSRC3, STATIC_THREAD_MGMT, SH 0x280, the INDEX form and "
-	                                                         "PA_SC_SHADER_CONTROL are SET, after the LOADs");
-	Check(r.stats.preamble_cx == 1 && r.stats.preamble_sh == 3 && r.stats.preamble_uc == 1, "only those are counted as SETs");
+	Check(!rsrc3 && mgmt && nop && prim && sc && first_set > 7, "STATIC_THREAD_MGMT, SH 0x280, the INDEX form and "
+	                                                          "PA_SC_SHADER_CONTROL are SET, after the LOADs; RSRC3 is not");
+	Check(r.stats.preamble_cx == 1 && r.stats.preamble_sh == 2 && r.stats.preamble_uc == 1, "only those are counted as SETs");
 	// The packet check: LOADs and the enables only from the registered S, on the gfx ring.
 	uint32_t bad = 0;
 	Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx) && ((r.ib[bad] >> 8u) & 0xffu) == IT_CONTEXT_CONTROL,
@@ -3601,8 +3734,8 @@ void TestCpShadowPreamble() {
 // S's seed: every key below 0x400 at its place, with the values the IB writes.
 void TestCpShadowImage() {
 	Pm4Translator t;
-	t.SetNoCmaskClear(true, 0x10u); // MRT4 without DCC loses FAST_CLEAR
-	Start(t, {{0x358u, (1u << 13u) | 0x40u}, {0x10u, 3u}}, {{0x00Cu, 5u}, {0x241u, 6u}}, {{0x24Au, 7u}});
+	t.SetNoDcc(true); // MRT4's INFO loses DCC_ENABLE
+	Start(t, {{0x358u, (1u << 28u) | 0x40u}, {0x10u, 3u}}, {{0x00Cu, 5u}, {0x241u, 6u}}, {{0x24Au, 7u}});
 	std::vector<uint32_t> dcb;
 	Append(dcb, IT_SET_CONTEXT_REG, {0x410u, 9u}, false); // above the dense range
 	Check(t.Translate(dcb).ok, "a buffer with a context register above 0x400");
@@ -4234,24 +4367,20 @@ void TestCpShadowPushPopGpu() {
 }
 
 // Load mode: the CPU's inserts on CB registers the copy took from a verbatim table (the CP reads the table when it
-// runs: here the pairs change after the translation, as a GPU write would change them). The FMASK fix runs on the GPU
-// from the values the CP holds (a late BASE; a late FMASK that is not 0 stays), once until they change, with the
-// zero word for a register S has no value for; the GPU's FMASK is SET again by a context switch, and the fix follows
-// a GPU pop to what the GPU holds again. With CP shadowing off (or in record mode) it stays on the CPU as before.
-// And the packet check of the fix's DMA_DATA and COND_EXEC. The display-DCC insert is left out on a late INFO only.
+// runs: here the pairs change after the translation, as a GPU write would change them). A target without FMASK runs as
+// the title wrote it: no FMASK insert, on the CPU or the GPU, in any mode. The packet check of the display-DCC fix's
+// DMA_DATA, and of a COND_EXEC on S or its tables (none of the translator's). The display-DCC insert is left out on a
+// late INFO only.
 void TestCpShadowCbInserts() {
 	using Libs::Graphics::NativeGpu::kCpShadowDmaControl;
 	using Libs::Graphics::NativeGpu::kCpShadowDmaWordCommand;
 	using Libs::Graphics::NativeGpu::kCpShadowDccAnd;
 	using Libs::Graphics::NativeGpu::kCpShadowDccFixOffset;
-	using Libs::Graphics::NativeGpu::kCpShadowFixOffset;
-	using Libs::Graphics::NativeGpu::kCpShadowZeroOffset;
 	using Libs::Graphics::NativeGpu::ValidateNativeIb;
 	constexpr uint32_t IT_DMA_DATA = 0x50, IT_COND_EXEC = 0x22, IT_ATOMIC_MEM = 0x1E;
 	constexpr uint32_t kBase0 = 0x318, kFmask0 = 0x321, kInfo0 = 0x31C, kMask = 0x08E, kBaseExt0 = 0x390, kFmaskExt0 = 0x3A0;
 	const uint64_t     cx_va   = kTestShadowVa + 0x1000u;
-	const uint64_t     zero_va = kTestShadowVa + kCpShadowZeroOffset;
-	const uint64_t     fix_va  = kTestShadowVa + kCpShadowFixOffset;
+	const uint64_t     fix_va  = kTestShadowVa + kCpShadowDccFixOffset;
 	auto draw  = [](std::vector<uint32_t>& d) { Append(d, IT_DRAW_INDEX_AUTO, {3u, 0u}, false); };
 	auto op    = [](std::vector<uint32_t>& d, uint32_t o) { d.insert(d.end(), {0xc0001200u, o}); }; // 1 push, 2 pop, 3 push + clear
 	auto count = [](const std::vector<Packet>& pkts, uint32_t code) {
@@ -4274,147 +4403,43 @@ void TestCpShadowCbInserts() {
 	};
 	const Regs start = {{kMask, 0xFu}, {kBase0, 0x1000u}, {kFmask0, 0u}, {kBaseExt0, 0u}, {kFmaskExt0, 0u}};
 
-	// A late BASE (0x100 when translated, 0x2000 when run), and the second time a late FMASK (0, then 0x3000).
+	// A late BASE (0x100 when translated, 0x2000 when run) on a target without FMASK: the CP draws it as the title wrote it.
 	for (const CpShadowMode mode: {CpShadowMode::Load, CpShadowMode::Record, CpShadowMode::Off}) {
-		for (const bool late_fmask: {false, true}) {
-			Pm4Translator t;
-			t.SetFmaskFix(true);
-			if (mode != CpShadowMode::Off) {
-				t.SetCpShadow(kTestShadowVa, mode);
-			}
-			Start(t, start, {}, {});
-			ToyCp cp;
-			cp.Seed(t);
-			std::vector<uint32_t> pairs = {kBase0, 0x100u};
-			if (late_fmask) {
-				pairs.insert(pairs.end(), {kFmask0, 0u});
-			}
-			std::vector<uint32_t> dcb;
-			AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
-			draw(dcb);
-			draw(dcb);
-			auto r = t.Translate(dcb);
-			pairs[1] = 0x2000u;
-			if (late_fmask) {
-				pairs[3] = 0x3000u;
-			}
-			const auto pkts = Decode(r.ib);
-			if (mode != CpShadowMode::Load) {
-				Check(r.ok && count(pkts, IT_DMA_DATA) == 0 && SetsReg(pkts, IT_SET_CONTEXT_REG, kFmask0) && r.stats.fmask_fixed == 1 &&
-				          r.stats.cp_shadow_fmask_gpu == 0,
-				      mode == CpShadowMode::Off ? "CP shadowing off: the CPU's FMASK fix, as before" : "record mode: the CPU's FMASK fix, as before");
-				continue;
-			}
-			// Without a late FMASK the copy's 0 is the GPU's: no check, two copies (BASE, BASE_EXT); with one, four.
-			Check(r.ok && r.stats.cp_shadow_fmask_gpu == 1 && r.stats.fmask_fixed == 0 && count(pkts, IT_DMA_DATA) == (late_fmask ? 4u : 2u) &&
-			          count(pkts, IT_COND_EXEC) == (late_fmask ? 1u : 0u) && !SetsReg(pkts, IT_SET_CONTEXT_REG, kFmask0),
-			      "load mode: one FMASK fix on the GPU for both draws, no SET from the copy");
-			Check(dmas_from(pkts, cx_va + 4u * kBase0) == std::vector<uint64_t>({fix_va + 4u}) &&
-			          dmas_from(pkts, cx_va + 4u * kBaseExt0) == std::vector<uint64_t>({fix_va + 12u}),
-			      "BASE and BASE_EXT from S into the first table's values");
-			Check(valid(r.ib), "the packet check takes the fix");
+		Pm4Translator t;
+		if (mode != CpShadowMode::Off) {
+			t.SetCpShadow(kTestShadowVa, mode);
+		}
+		Start(t, start, {}, {});
+		ToyCp cp;
+		cp.Seed(t);
+		std::vector<uint32_t> pairs = {kBase0, 0x100u};
+		std::vector<uint32_t> dcb;
+		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
+		draw(dcb);
+		draw(dcb);
+		auto r = t.Translate(dcb);
+		pairs[1] = 0x2000u;
+		const auto pkts      = Decode(r.ib);
+		bool       set_fmask = false; // a SET of FMASK to anything but the title's 0 (the preamble replays that)
+		for (const auto& p: pkts) {
+			set_fmask |= p.op == IT_SET_CONTEXT_REG && p.body.size() == 2 && (p.body[0] & 0xffffu) == kFmask0 && p.body[1] != 0u;
+		}
+		Check(r.ok && count(pkts, IT_DMA_DATA) == 0 && count(pkts, IT_COND_EXEC) == 0 && !set_fmask && dmas_from(pkts, cx_va + 4u * kBase0).empty(),
+		      "a target without FMASK: no FMASK insert on the CPU or the GPU");
+		if (mode == CpShadowMode::Load) {
+			Check(valid(r.ib), "the packet check takes it");
 			cp.Job(AsJob(r.ib));
-			Check(cp.cx[kBase0] == 0x2000u && cp.cx[kFmask0] == (late_fmask ? 0x3000u : 0x2000u) && cp.s[kCpShadowContextDw + kFmask0] == cp.cx[kFmask0],
-			      late_fmask ? "a late FMASK that is not 0 stays" : "FMASK = the BASE the CP holds, not the copy's, in S too");
+			Check(cp.cx[kBase0] == 0x2000u && cp.cx[kFmask0] == 0u, "the CP holds the late BASE and the title's FMASK 0");
 		}
 	}
 
-	// A BASE_EXT S has no value for (no key: amdgpu's clear state, 0, on the GPU): the zero word is copied for it.
+	// The packet check: no COND_EXEC on S or its fix tables (none of the translator's reads them), the display-DCC fix's
+	// DMA_DATA only from a context register of S into a value dword of its tables.
 	{
-		Pm4Translator t;
-		t.SetFmaskFix(true);
-		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
-		Start(t, {{kMask, 0xFu}, {kBase0, 0x1000u}, {kFmask0, 0u}}, {}, {});
-		ToyCp cp;
-		cp.Seed(t);
-		std::vector<uint32_t> pairs = {kBase0, 0x100u};
-		std::vector<uint32_t> dcb;
-		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
-		draw(dcb);
-		auto r = t.Translate(dcb);
-		pairs[1] = 0x2000u;
-		const auto pkts = Decode(r.ib);
-		Check(r.ok && dmas_from(pkts, zero_va) == std::vector<uint64_t>({fix_va + 12u}) && dmas_from(pkts, cx_va + 4u * kBaseExt0).empty(),
-		      "BASE_EXT without a value in S: the zero word");
-		Check(valid(r.ib), "the packet check takes a copy of the zero word");
-		cp.Job(AsJob(r.ib));
-		Check(cp.cx[kFmask0] == 0x2000u && cp.cx[kFmaskExt0] == 0u, "FMASK = BASE, FMASK_EXT = 0");
-	}
-
-	// The Demon's Souls case: a late BASE, a draw, a push, the title's own target inside the window, a draw, the pop,
-	// a draw. The GPU pop gives back the late BASE and the FMASK the GPU set for it; the copy has neither, so the
-	// last fix is the GPU's again. The CPU pop SETs the copy's BASE, and the fix follows it on the CPU.
-	for (const bool gpu: {true, false}) {
-		Pm4Translator t;
-		t.SetFmaskFix(true);
-		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
-		t.SetCpShadowPushPop(gpu);
-		Start(t, start, {}, {});
-		ToyCp cp;
-		cp.Seed(t);
-		std::vector<uint32_t> pairs = {kBase0, 0x100u};
-		std::vector<uint32_t> dcb;
-		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
-		draw(dcb);
-		op(dcb, 1u);
-		Append(dcb, IT_SET_CONTEXT_REG, {kBase0, 0x4000u}, false);
-		Append(dcb, IT_SET_CONTEXT_REG, {kFmask0, 0u}, false);
-		draw(dcb);
-		op(dcb, 2u);
-		draw(dcb);
-		auto r = t.Translate(dcb);
-		pairs[1] = 0x2000u;
-		// Inside the window FMASK_EXT is still the one the GPU's first fix set, so that fix is the GPU's too (on the
-		// copy's BASE and FMASK, no check). The CPU pop SETs it back, and the last fix is the CPU's.
-		Check(r.ok && r.stats.cp_shadow_fmask_gpu == (gpu ? 3u : 2u) && r.stats.fmask_fixed == (gpu ? 0u : 1u),
-		      gpu ? "GPU pop: every fix on the GPU" : "CPU pop: the fixes before it on the GPU, the one after on the CPU");
-		Check(valid(r.ib), "the packet check takes it");
-		cp.Job(AsJob(r.ib));
-		Check(cp.cx[kBase0] == (gpu ? 0x2000u : 0x100u) && cp.cx[kFmask0] == cp.cx[kBase0],
-		      gpu ? "GPU pop: FMASK = the late BASE the pop gave back" : "CPU pop: FMASK = the BASE it SET");
-	}
-
-	// A push with a clear after a GPU fix: the clear SETs the late BASE and the GPU's FMASK to the defaults although
-	// the copy holds those values already; the pop in the next buffer gives back both, and the fix after it is the GPU's.
-	{
-		Pm4Translator t;
-		t.SetFmaskFix(true);
-		t.SetCpShadow(kTestShadowVa, CpShadowMode::Load);
-		t.SetCpShadowPushPop(true);
-		Start(t, start, {}, {});
-		ToyCp cp;
-		cp.Seed(t);
-		std::vector<uint32_t> pairs = {kBase0, 0x1000u};
-		std::vector<uint32_t> dcb;
-		AppendIndirect(dcb, IT_SET_CONTEXT_REG_INDIRECT, pairs, 0x80000000u);
-		draw(dcb);
-		op(dcb, 3u);
-		auto r = t.Translate(dcb);
-		pairs[1] = 0x2000u;
-		const auto pkts = Decode(r.ib);
-		Check(r.ok && r.stats.cp_shadow_fmask_gpu == 1 && SetsReg(pkts, IT_SET_CONTEXT_REG, kBase0) && SetsReg(pkts, IT_SET_CONTEXT_REG, kFmask0) &&
-		          SetsReg(pkts, IT_SET_CONTEXT_REG, kFmaskExt0),
-		      "the clear SETs BASE, FMASK and FMASK_EXT although the copy sees no change");
-		cp.Job(AsJob(r.ib));
-		Check(cp.cx[kBase0] == 0x1000u && cp.cx[kFmask0] == 0u && cp.cx[kFmaskExt0] == 0u, "the GPU holds the defaults after the clear");
-		std::vector<uint32_t> dcb2;
-		op(dcb2, 2u);
-		draw(dcb2);
-		auto r2 = t.Translate(dcb2);
-		Check(r2.ok && r2.stats.cp_shadow_pops == 1 && r2.stats.cp_shadow_fmask_gpu == 1 && r2.stats.fmask_fixed == 0,
-		      "the pop, then the GPU's fix (the pushed BASE came from a table)");
-		Check(valid(r2.ib), "the packet check takes it");
-		cp.Job(AsJob(r2.ib));
-		Check(cp.cx[kBase0] == 0x2000u && cp.cx[kFmask0] == 0x2000u, "after the pop: the late BASE and its FMASK");
-	}
-
-	// The packet check: the fix's COND_EXEC only on a value dword over one of its tables, its DMA_DATA only from a
-	// context register of S or the zero word into a value dword.
-	{
-		auto cond = [&](uint64_t on, uint64_t table) {
+		auto cond = [&](uint64_t on) {
 			std::vector<uint32_t> ib = {Pkt3(IT_COND_EXEC, 4, false), static_cast<uint32_t>(on), static_cast<uint32_t>(on >> 32u), 0u, 5u,
-			                            Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false), static_cast<uint32_t>(table), static_cast<uint32_t>(table >> 32u),
-			                            0x80000000u, 2u};
+			                            Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false), static_cast<uint32_t>(fix_va), static_cast<uint32_t>(fix_va >> 32u),
+			                            0x80000000u, 1u};
 			return valid(ib);
 		};
 		auto word = [&](uint64_t from, uint64_t to) {
@@ -4422,20 +4447,12 @@ void TestCpShadowCbInserts() {
 			                            static_cast<uint32_t>(to), static_cast<uint32_t>(to >> 32u), kCpShadowDmaWordCommand};
 			return valid(ib);
 		};
-		Check(cond(fix_va + 20u, fix_va + 16u) && cond(fix_va + 32u * 7u + 20u, fix_va + 32u * 7u + 16u), "the fix's COND_EXEC passes");
-		Check(!cond(fix_va + 16u, fix_va + 16u) && !cond(fix_va + 20u, fix_va + 8u) && !cond(fix_va + 20u, fix_va + 0xF8u) &&
-		          !cond(cx_va + 4u * kFmask0, fix_va + 16u),
-		      "on an offset dword, over a table not at an entry or out of the area, or on S itself: refused");
-		std::vector<uint32_t> other = {Pkt3(IT_COND_EXEC, 4, false), static_cast<uint32_t>(fix_va + 20u), static_cast<uint32_t>((fix_va + 20u) >> 32u),
-		                               0u, 5u};
-		Append(other, IT_SET_CONTEXT_REG, {0x10u, 1u, 2u, 3u}, false);
-		Check(!valid(other), "a COND_EXEC on the fix tables over anything else is refused");
-		Check(word(cx_va + 4u * kBase0, fix_va + 4u) && word(zero_va, fix_va + 12u) && word(cx_va + 4u * 0x3FFu, fix_va + 0xFCu),
-		      "the fix's DMA_DATA passes");
-		Check(!word(cx_va + 4u * kBase0, fix_va) && !word(cx_va + 4u * kBase0, fix_va + 8u) && !word(cx_va + 4u * kBase0, fix_va + 0x184u) &&
-		          !word(cx_va + 0x1000u, fix_va + 4u) && !word(zero_va + 4u, fix_va + 4u) && !word(cx_va + 4u * kBase0, zero_va) &&
-		          !word(cx_va + 4u * kBase0, cx_va + 4u * kFmask0),
-		      "into an offset dword, past the tables, from outside S's context region, into the zero word or into S: refused");
+		Check(!cond(fix_va + 4u) && !cond(fix_va + 16u * 7u + 12u) && !cond(cx_va + 4u * kFmask0), "a COND_EXEC on S or the fix tables is refused");
+		Check(word(cx_va + 4u * kInfo0, fix_va + 4u) && word(cx_va + 4u * kInfo0, fix_va + 12u) && word(cx_va + 4u * 0x3FFu, fix_va + 0x7Cu),
+		      "the display-DCC fix's DMA_DATA passes");
+		Check(!word(cx_va + 4u * kInfo0, fix_va) && !word(cx_va + 4u * kInfo0, fix_va + 8u) && !word(cx_va + 4u * kInfo0, fix_va + 0x84u) &&
+		          !word(cx_va + 0x1000u, fix_va + 4u) && !word(cx_va + 4u * kInfo0, cx_va + 4u * kFmask0),
+		      "into an offset dword, past the tables, from outside S's context region or into S: refused");
 	}
 
 	// Display DCC: a target in a video-out buffer is drawn without DCC. Off, and in load mode with INFO the title's SET,
@@ -5215,7 +5232,7 @@ void TestCopyData() {
 	Check(ri.ok && Count(Decode(ri.ib), IT_COPY_DATA_T) == 0 && cpu_store, "an immediate into unwritable memory is the tracker's store");
 	auto rm = u.Translate(copy(mem_to_mem, src, dst));
 	Check(!rm.ok && RefusedFor(rm, RefuseWhy::CopyDataForm), "memory to unwritable memory refused");
-	// MEC: only with its own switch, with the shader-type bit.
+	// MEC: only with its own switch, with the title's plain header (probe mecplain, 2.11).
 	Pm4Translator c;
 	TestOracle    oc;
 	c.SetNativeLabels(&oc, kTrackerVa);
@@ -5228,7 +5245,7 @@ void TestCopyData() {
 	auto rc = c.Translate(copy(mem_to_mem, src, dst));
 	const auto pc = Decode(rc.ib);
 	const auto* cp = FindFirst(pc, IT_COPY_DATA_T);
-	Check(rc.ok && cp != nullptr && cp->compute && PassesBothChecks(rc.ib, NativeIbKind::Compute), "COPY_DATA on MEC with the shader-type bit");
+	Check(rc.ok && cp != nullptr && !cp->compute && PassesBothChecks(rc.ib, NativeIbKind::Compute), "COPY_DATA on MEC with the title's plain header");
 }
 
 // ATOMIC_MEM (SetAtomicOps, KYTY_NATIVE_GPU_ATOMIC_OPS): any integer op as written on the gfx ring, on the CPU
@@ -5392,26 +5409,20 @@ void TestMultiInst() {
 		      "the strict check takes the packet only with NOT_EOP, as the translator passes it on");
 
 		// The packet sets VGT_DMA_BASE as INDEX_BASE does: a later DRAW_INDEX_OFFSET_2 draws from that buffer, in this
-		// DCB and the next. A fresh translator, so the base can only come from this DCB's packet.
+		// DCB and the next (the index buffer it reads is referenced). A fresh translator, so the base can only come from
+		// this DCB's packet.
 		Pm4Translator f;
 		f.SetMultiInst(true);
 		std::vector<uint32_t> later = dcb;
 		Append(later, IT_DRAW_INDEX_OFFSET_T, {0x40u, 5u, 6u, 0u}, false);
-		auto          rl  = f.Translate(later);
-		const auto    pl  = Decode(rl.ib);
-		const Packet* off = nullptr;
-		for (const auto& p: pl) {
-			off = p.op == IT_DRAW_INDEX_2 ? &p : off;
-		}
-		const uint64_t addr = kIndex + 5u * 4u;
-		Check(rl.ok && off != nullptr && off->body[1] == static_cast<uint32_t>(addr) && off->body[2] == static_cast<uint32_t>(addr >> 32u),
+		auto rl = f.Translate(later);
+		Check(rl.ok && Count(Decode(rl.ib), IT_DRAW_INDEX_OFFSET_T) == 1 && HasRef(rl.refs, kIndex, 0, false),
 		      "a later DRAW_INDEX_OFFSET_2 sees the packet's index base");
 		std::vector<uint32_t> next;
 		Append(next, IT_DRAW_INDEX_OFFSET_T, {0x40u, 7u, 6u, 0u}, false);
-		auto          rn = f.Translate(next);
-		const auto    pn = Decode(rn.ib);
-		const Packet* dn = FindFirst(pn, IT_DRAW_INDEX_2);
-		Check(rn.ok && dn != nullptr && dn->body[1] == static_cast<uint32_t>(kIndex + 7u * 4u), "and so does one in the next DCB");
+		auto rn = f.Translate(next);
+		Check(rn.ok && Count(Decode(rn.ib), IT_DRAW_INDEX_OFFSET_T) == 1 && HasRef(rn.refs, kIndex, 0, false),
+		      "and so does one in the next DCB");
 	}
 	{
 		auto r = t.Translate(multi(0u, 36u, 0x80u));
@@ -5481,14 +5492,20 @@ void TestCondExecRecount() {
 	t.SetCondExec(true);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.cond_execs == 1, "a title's COND_EXEC translated");
-	size_t at = 0;
-	for (size_t i = 2; i + 5 <= r.ib.size(); i++) {
-		if (r.ib[i] == Pkt3(IT_COND_EXEC_T, 4, false) && r.ib[i + 1] == static_cast<uint32_t>(fa) &&
-		    r.ib[i - 2] == ((3u << 30u) | (0x42u << 8u))) {
-			at = i;
+	// Where the COND_EXEC on the flag sits in `ib`, and whether PFP_SYNC_ME is right in front of it.
+	auto find_cond = [&](const std::vector<uint32_t>& ib, bool* synced) {
+		size_t found = 0;
+		for (size_t i = 2; i + 5 <= ib.size(); i++) {
+			if (ib[i] == Pkt3(IT_COND_EXEC_T, 4, false) && ib[i + 1] == static_cast<uint32_t>(fa)) {
+				found   = i;
+				*synced = ib[i - 2] == ((3u << 30u) | (0x42u << 8u));
+			}
 		}
-	}
-	Check(at != 0, "the COND_EXEC behind a PFP_SYNC_ME");
+		return found;
+	};
+	bool         synced = true;
+	const size_t at     = find_cond(r.ib, &synced);
+	Check(at != 0 && !synced && r.stats.pfp_syncs_emitted == 0, "the title's COND_EXEC as written, no PFP_SYNC_ME of ours in front of it");
 	const uint32_t count = r.ib[at + 4];
 	Check(at + 5 + count + after.size() <= r.ib.size() && std::equal(after.begin(), after.end(), r.ib.begin() + at + 5 + count),
 	      "its count reaches exactly the translated range's end");
@@ -5500,6 +5517,37 @@ void TestCondExecRecount() {
 		}
 	}
 	Check(unknown, "a label written in the range is unknown afterwards");
+
+	// Kyty moved something of its own in front of the range: a tracker store the queued points flush there (a label the
+	// GPU cannot write), or the start of a held segment (a wait nobody satisfies yet). Then PFP_SYNC_ME goes first.
+	{
+		Pm4Translator m;
+		TestOracle    om;
+		om.unwritable = 0x202020800ull;
+		m.SetNativeLabels(&om, kTrackerVa);
+		m.SetCondExec(true);
+		std::vector<uint32_t> stored;
+		Append(stored, IT_WRITE_DATA, {(5u << 8u) | (1u << 20u), 0x02020800u, 0x2u, 3u}, false);
+		stored.insert(stored.end(), dcb.begin(), dcb.end());
+		const auto rs = m.Translate(stored);
+		bool       ss = false;
+		Check(rs.ok && find_cond(rs.ib, &ss) != 0 && ss, "a tracker store flushed before the range: PFP_SYNC_ME first");
+		Check(PassesBothChecks(rs.ib, NativeIbKind::Gfx), "and it passes both packet checks");
+		om.plan = LabelOracle::Plan::Split;
+		std::vector<uint32_t> held;
+		Append(held, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		AppendWait(held, wait_b, 1);
+		held.insert(held.end(), dcb.begin(), dcb.end());
+		const auto rh = m.Translate(held);
+		bool       sh = false;
+		Check(rh.ok && rh.segments.size() == 2 && rh.segments[1].held && find_cond(rh.ib, &sh) != 0 && sh,
+		      "a COND_EXEC first in a held segment: PFP_SYNC_ME first");
+		std::vector<uint32_t> later = held;
+		later.insert(later.begin() + static_cast<std::ptrdiff_t>(held.size() - dcb.size()), after.begin(), after.end());
+		const auto rl = m.Translate(later);
+		bool       sl = true;
+		Check(rl.ok && find_cond(rl.ib, &sl) != 0 && !sl, "a title packet between the held wait and the COND_EXEC: as written");
+	}
 
 	// A range the translation lengthens: a GPU wait in it, which an exit guard (COND_EXEC + chain) follows.
 	{
@@ -5546,17 +5594,117 @@ void TestCondExecRecount() {
 	AppendWait(split, wait_b, 1);
 	split.insert(split.end(), after.begin(), after.end());
 	Check(!t.Translate(split).ok, "a segment cut inside the range refuses");
-	Pm4Translator c;
-	TestOracle    oc;
-	c.SetNativeLabels(&oc, kTrackerVa);
-	c.SetAudit(true); // the refusals' reasons
-	c.SetComputeQueue(true);
-	c.SetComputeRing(true);
-	c.SetCondExec(true);
-	std::vector<uint32_t> acb;
-	cond_exec(acb, 5);
+}
+
+// A title's COND_EXEC in an ACB (SetCondExec) goes to MEC as written, plain header and count recomputed (probe condexec
+// 31.10, mecplain 2.11). Exit guards inside its range get one right after it, so none skips past the range's end, and
+// SplitIbAtPackets keeps the range in one IB. No PFP_SYNC_ME on MEC; a register write inside still refuses.
+void TestCondExecMec() {
+	using Libs::Graphics::NativeGpu::SplitIbAtPackets;
+	constexpr uint64_t kAbort = 0x400000fff808ull, kRun = 0x400000fff80cull, kStub = 0x400000ffffe0ull;
+	static uint32_t          flag      = 1;
+	static volatile uint32_t wait_word = 0;
+	static uint32_t          cpu_word  = 0;
+	const uint64_t           fa        = reinterpret_cast<uint64_t>(&flag);
+	const uint64_t           wa        = reinterpret_cast<uint64_t>(&wait_word);
+	const uint64_t           ca        = reinterpret_cast<uint64_t>(&cpu_word);
+	auto translator = [&](TestOracle& o) {
+		auto t = std::make_unique<Pm4Translator>();
+		t->SetNativeLabels(&o, kTrackerVa);
+		t->SetFenceAddress(kFenceVa);
+		t->SetAudit(true); // the refusals' reasons
+		t->SetComputeQueue(true);
+		t->SetComputeRing(true);
+		t->SetCondExec(true);
+		t->SetExitGuard(kAbort, kRun, kStub);
+		return t;
+	};
+	// Before the range a WRITE_DATA the GPU cannot write (a tracker point the COND_EXEC flushes in front of it); in the
+	// range a wait the GPU runs (its guard) and 800 dispatches (a periodic guard); after it one more dispatch.
+	std::vector<uint32_t> range;
+	Append(range, 0x3Cu, {3u | (1u << 4u), static_cast<uint32_t>(wa), static_cast<uint32_t>(wa >> 32u), 0u, 0xffffffffu, 4u}, false);
+	for (uint32_t i = 0; i < 800; i++) {
+		Append(range, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	}
+	const std::vector<uint32_t> after = {Pkt3(IT_DISPATCH_DIRECT, 4, false), 7u, 7u, 7u, 1u};
+	std::vector<uint32_t>       acb;
+	Append(acb, IT_WRITE_DATA, {5u << 8u, static_cast<uint32_t>(ca), static_cast<uint32_t>(ca >> 32u), 1u}, false);
+	Append(acb, IT_COND_EXEC_T, {static_cast<uint32_t>(fa), static_cast<uint32_t>(fa >> 32u), 0u, static_cast<uint32_t>(range.size())}, false);
+	acb.insert(acb.end(), range.begin(), range.end());
 	acb.insert(acb.end(), after.begin(), after.end());
-	Check(!c.Translate(acb).ok, "a title's COND_EXEC on MEC refuses");
+	TestOracle o;
+	o.plan       = LabelOracle::Plan::Native;
+	o.unwritable = ca;
+	auto       t = translator(o);
+	const auto r = t->Translate(acb);
+	size_t     at = 0;
+	for (size_t i = 0; i + 5 <= r.ib.size(); i++) {
+		if ((r.ib[i] & ~2u) == Pkt3(IT_COND_EXEC_T, 4, false) && r.ib[i + 1] == static_cast<uint32_t>(fa)) {
+			at = i;
+		}
+	}
+	Check(r.ok && r.stats.cond_execs == 1 && at != 0 && r.ib[at] == Pkt3(IT_COND_EXEC_T, 4, false), "a title's COND_EXEC on MEC, plain header");
+	const uint32_t count = r.ib[at + 4];
+	const size_t   end   = at + 5 + count;
+	// Right after the range our guard (5 dwords), then the title's next packet.
+	Check(end + 5 + after.size() <= r.ib.size() && r.ib[end] == Pkt3(IT_COND_EXEC_T, 4, true) && r.ib[end + 1] == static_cast<uint32_t>(kRun) &&
+	          std::equal(after.begin(), after.end(), r.ib.begin() + static_cast<std::ptrdiff_t>(end + 5)),
+	      "its count reaches exactly the translated range's end");
+	Check(Count(Decode(r.ib), 0x42u) == 0 && r.stats.pfp_syncs_emitted == 0, "no PFP_SYNC_ME on MEC, though a tracker store moved in front");
+	Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "the ACB passes both compute packet checks");
+	// The guards: some inside the range, one right after it, none inside skipping past its end.
+	uint32_t inside = 0;
+	bool     right_after = false, past = false;
+	for (const auto& seg: r.segments) {
+		for (const uint32_t g: seg.guards) {
+			const size_t header = g - 4u;
+			right_after         = right_after || header == end;
+			if (header > at && header < end) {
+				inside++;
+				past = past || g + 1u + r.ib[g] > end;
+			}
+		}
+	}
+	Check(inside >= 2 && right_after && !past, "exit guards inside the range end at it, a guard right after it");
+	Check(at >= 5 && r.ib[at - 5] == Pkt3(IT_COND_EXEC_T, 4, true) && r.ib[at - 4] == static_cast<uint32_t>(kRun) && at + r.ib[at - 1] == end,
+	      "the guard right before the COND_EXEC skips the whole range");
+	// Cut for slots of 1 Ki dwords up to the whole IB (none at all where a piece cannot fit): no IB ends inside the range,
+	// also where the guard before the COND_EXEC would end its stretch at a guard inside the range.
+	bool cut_in = false;
+	for (size_t max_dw = 1024; max_dw <= r.ib.size() + 8u; max_dw += 7u) {
+		const auto pieces = SplitIbAtPackets(r.ib, max_dw);
+		for (const auto& [off, len]: pieces) {
+			cut_in = cut_in || (off > at && off < end);
+		}
+	}
+	Check(!cut_in, "SplitIbAtPackets keeps the range in one IB");
+
+	// A register write inside the range still refuses on MEC.
+	std::vector<uint32_t> reg;
+	Append(reg, IT_COND_EXEC_T, {static_cast<uint32_t>(fa), static_cast<uint32_t>(fa >> 32u), 0u, 3u}, false);
+	Append(reg, IT_SET_SH_REG, {0x240u, 0x5u}, false);
+	reg.insert(reg.end(), after.begin(), after.end());
+	TestOracle o2;
+	const auto r2 = translator(o2)->Translate(reg);
+	Check(!r2.ok && RefusedFor(r2, RefuseWhy::CondExecForm), "a register write inside the range refuses on MEC");
+	// Without the exit guards: no guard of ours, the plain COND_EXEC alone.
+	TestOracle o3;
+	o3.plan = LabelOracle::Plan::Native;
+	Pm4Translator plain;
+	plain.SetNativeLabels(&o3, kTrackerVa);
+	plain.SetFenceAddress(kFenceVa);
+	plain.SetComputeQueue(true);
+	plain.SetComputeRing(true);
+	plain.SetCondExec(true);
+	std::vector<uint32_t> small;
+	Append(small, IT_COND_EXEC_T, {static_cast<uint32_t>(fa), static_cast<uint32_t>(fa >> 32u), 0u, 5u}, false);
+	Append(small, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	small.insert(small.end(), after.begin(), after.end());
+	const auto r3 = plain.Translate(small);
+	Check(r3.ok && r3.stats.cond_execs == 1 && PassesBothChecks(r3.ib, NativeIbKind::Compute), "a small range without guards");
+	// The title's COND_EXEC is refused with SetCondExec off, on MEC as on the gfx ring.
+	plain.SetCondExec(false);
+	Check(!plain.Translate(small).ok, "with SetCondExec off it refuses on MEC");
 }
 
 // FlattenIndirectBuffers keeps a COND_EXEC's count over what it inlines: a call in the range brings its target's dwords
@@ -5691,7 +5839,8 @@ void TestCopyDataForms() {
 		const auto r = t.Translate(copy(9u | (5u << 8u), 0u, dst + 4u));
 		Check(r.ok && Count(Decode(r.ib), IT_COPY_DATA_T) == 0 && timestamp(r, dst + 4u, 4), "a 32-bit clock off an 8-byte boundary is the tracker's");
 	}
-	// MEC: an immediate and the clock as written with the shader-type bit; no engine bits.
+	// MEC: an immediate and the clock as written, the title's plain header kept (probe mecplain, 2.11); ENGINE_SEL as
+	// written (MEC never reads it).
 	Pm4Translator m;
 	TestOracle    om;
 	m.SetNativeLabels(&om, kTrackerVa);
@@ -5702,11 +5851,165 @@ void TestCopyDataForms() {
 	for (uint32_t control: {5u | (5u << 8u) | (1u << 16u), clock64}) {
 		auto       cb = copy(control, 0x0000000900000008ull, dst);
 		const auto r  = m.Translate(cb);
-		cb[0] |= 2u;
-		Check(as_written(r, cb) && PassesBothChecks(r.ib, NativeIbKind::Compute), "COPY_DATA on MEC as written with the shader-type bit");
+		Check(as_written(r, cb) && PassesBothChecks(r.ib, NativeIbKind::Compute), "COPY_DATA on MEC as written, plain header");
 	}
-	const auto rm = m.Translate(copy(mem_to_mem | (1u << 30u), src, dst));
-	Check(!rm.ok && RefusedFor(rm, RefuseWhy::CopyDataForm), "COPY_DATA on MEC with engine bits refused");
+	{
+		auto       cb = copy(mem_to_mem | (1u << 30u), src, dst);
+		const auto rp = m.Translate(cb);
+		Check(as_written(rp, cb) && PassesBothChecks(rp.ib, NativeIbKind::Compute), "COPY_DATA on MEC with ENGINE_SEL 1 as written");
+	}
+	const auto rm = m.Translate(copy(mem_to_mem | (2u << 30u), src, dst));
+	Check(!rm.ok && RefusedFor(rm, RefuseWhy::CopyDataForm), "COPY_DATA on MEC with ENGINE_SEL 2 refused, as on the gfx ring");
+}
+
+// An integer ATOMIC_MEM on MEC goes as written (probe atomicops and mecplain on compute ring 1, 2.11), and its value is
+// not known when translating: a wait on it in the same ACB is held, not planned as met or given to the GPU.
+void TestAtomicMecLabel() {
+	static volatile uint32_t word = 0;
+	const uint64_t           addr = reinterpret_cast<uint64_t>(&word);
+	const std::vector<uint32_t> add = {0x4fu, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0u, 0u, 0u, 0u};
+	Pm4Translator t;
+	TestOracle    o;
+	o.plan = LabelOracle::Plan::Native; // would send the wait to the GPU, if asked
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	t.SetComputeQueue(true);
+	t.SetComputeRing(true);
+	t.SetAtomicOps(true);
+	std::vector<uint32_t> acb;
+	Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(acb, IT_ATOMIC_MEM_T, add, false);
+	auto r = t.Translate(acb);
+	std::vector<uint32_t> pk = {Pkt3(IT_ATOMIC_MEM_T, 8, false)};
+	pk.insert(pk.end(), add.begin(), add.end());
+	Check(r.ok && r.stats.atomics_mec == 1 && r.stats.atomics_cpu == 0 && std::search(r.ib.begin(), r.ib.end(), pk.begin(), pk.end()) != r.ib.end(),
+	      "an ADD_32 on MEC as written, plain header");
+	Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "and passes both compute packet checks");
+	bool unknown = false;
+	for (const auto& w: r.segments.back().writes) {
+		unknown = unknown || (w.addr == addr && w.gpu && !w.known);
+	}
+	Check(unknown, "its result is recorded as an unknown GPU write");
+	AppendWait(acb, addr, 1);
+	auto rw = t.Translate(acb);
+	Check(rw.ok && rw.segments.size() == 2 && rw.segments[1].held && o.asked == 0, "a wait on it in the same ACB is held");
+	Check(PassesBothChecks(rw.ib, NativeIbKind::Compute), "and the ACB passes both compute packet checks");
+	// A returning compare-swap with COMMAND 1 (the loop) has not run on MEC: the tracker's, as before.
+	std::vector<uint32_t> cas;
+	Append(cas, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(cas, IT_ATOMIC_MEM_T, {0x108u, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 1u, 0u, 0u, 0u, 0u}, false);
+	auto rc = t.Translate(cas);
+	Check(rc.ok && rc.stats.atomics_mec == 0 && rc.stats.atomics_cpu == 1 && Count(Decode(rc.ib), IT_ATOMIC_MEM_T) == 0,
+	      "a COMMAND 1 compare-swap on MEC goes to the tracker");
+}
+
+// Every compare function 1..6 has Kyty's own GPU form (EmitNativeWait; probe waitforms 2.11), 32 and 64 bits, the ME and
+// the PFP; MEC takes them as written.
+void TestWaitFunctionsAll() {
+	static uint64_t label = 0;
+	const uint64_t  addr  = reinterpret_cast<uint64_t>(&label);
+	for (const uint32_t function: {1u, 2u, 6u}) {
+		for (const bool wide: {false, true}) {
+			for (const bool pfp: {false, true}) {
+				// CACHE_POLICY STREAM and poll interval 10: Kyty's form drops both.
+				const uint32_t        control = function | (1u << 4u) | (pfp ? 1u << 8u : 0u) | (1u << 25u);
+				std::vector<uint32_t> d;
+				Append(d, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+				if (wide) {
+					Append(d, 0x93u, {control, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 7u, 0u, 0xffu, 0u, 10u}, false);
+				} else {
+					Append(d, 0x3Cu, {control, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 7u, 0xffu, 10u}, false);
+				}
+				Pm4Translator t;
+				TestOracle    o;
+				o.plan = LabelOracle::Plan::Native;
+				t.SetNativeLabels(&o, kTrackerVa);
+				t.SetFenceAddress(kFenceVa);
+				t.SetWaitsVerbatim(false);
+				const auto r    = t.Translate(d);
+				const auto pkts = Decode(r.ib);
+				const auto* w   = FindFirst(pkts, wide ? 0x93u : 0x3Cu);
+				bool        ours = false;
+				for (const auto& p: pkts) {
+					ours = ours || (p.op == (wide ? 0x93u : 0x3Cu) && p.body[0] == (control & ~(3u << 25u)) && p.body.back() == 4u);
+				}
+				Check(r.ok && r.segments.size() == 1 && r.stats.waits_native == 1 && w != nullptr && ours,
+				      "a LESS, LESS_EQUAL or GREATER wait runs on the GPU in Kyty's form, the title's function, width and engine");
+				Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "and passes both gfx packet checks");
+				// MEC: the title's packet as written, plain header.
+				Pm4Translator c;
+				TestOracle    oc;
+				oc.plan = LabelOracle::Plan::Native;
+				c.SetNativeLabels(&oc, kTrackerVa);
+				c.SetFenceAddress(kFenceVa);
+				c.SetComputeQueue(true);
+				c.SetComputeRing(true);
+				const auto rc = c.Translate(d);
+				Check(rc.ok && rc.stats.waits_native == 1 && std::search(rc.ib.begin(), rc.ib.end(), d.begin() + 5, d.end()) != rc.ib.end() &&
+				          PassesBothChecks(rc.ib, NativeIbKind::Compute),
+				      "on MEC the same wait goes as written and passes both compute packet checks");
+			}
+		}
+	}
+	// ALWAYS keeps its handling: no GPU form of ours, so with the title's waits as written off it is held.
+	std::vector<uint32_t> d;
+	Append(d, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Append(d, 0x3Cu, {0u | (1u << 4u), static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 7u, 0xffu, 4u}, false);
+	Pm4Translator t;
+	TestOracle    o;
+	o.plan = LabelOracle::Plan::Native;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetFenceAddress(kFenceVa);
+	t.SetWaitsVerbatim(false);
+	const auto r = t.Translate(d);
+	Check(r.ok && r.stats.waits_native == 0, "an ALWAYS wait has no GPU form of ours");
+}
+
+// UCONFIG registers probe uconfig-w (2.11) wrote harmlessly on the gfx ring go as written there: GE_USER_VGPR1-3,
+// GE_PC_ALLOC, TA_CS_BC_BASE_ADDR/_HI. The unprobed rest stays dropped. MEC drops all six as before (none ran there).
+void TestUconfigProbed() {
+	for (const uint32_t off: {0x25Cu, 0x25Du, 0x25Eu, 0x260u, 0x380u, 0x381u}) {
+		Check(Pm4Translator::UconfigAllowed(off), "a probed UCONFIG register is allowed");
+	}
+	for (const uint32_t off: {0x035u, 0x03Cu, 0x2BBu, 0x2C4u, 0x2D3u, 0x2E4u, 0x41Du, 0x342u}) {
+		Check(!Pm4Translator::UconfigAllowed(off), "an unprobed UCONFIG register stays dropped");
+	}
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_UCONFIG_REG, {0x25Cu, 1u, 2u, 3u}, false);
+	Append(dcb, IT_SET_UCONFIG_REG, {0x260u, 0x40u}, false);
+	Append(dcb, IT_SET_UCONFIG_REG, {0x380u, 0x1000u, 0x2u}, false);
+	Append(dcb, IT_SET_UCONFIG_REG, {0x2BBu, 0x5u}, false);
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	Pm4Translator t;
+	auto          r = t.Translate(dcb);
+	Check(r.ok && r.stats.uconfig_skipped == 1 && r.skipped_uconfig.count(0x2BBu) == 1 &&
+	          std::search(r.ib.begin(), r.ib.end(), dcb.begin(), dcb.begin() + 12) != r.ib.end(),
+	      "on the gfx ring the three packets as written, 0x2BB dropped");
+	uint32_t bad = 0;
+	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the gfx-ring check");
+
+	Pm4Translator c;
+	c.SetComputeQueue(true);
+	c.SetComputeRing(true);
+	std::vector<uint32_t> bc;
+	Append(bc, IT_SET_UCONFIG_REG, {0x380u, 0x1000u, 0x2u}, true);
+	Append(bc, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rc = c.Translate(bc);
+	Check(rc.ok && rc.unknown_ops.empty() && rc.stats.uconfig_skipped == 1 && rc.skipped_uconfig.count(0x380u) == 1 &&
+	          FindFirst(Decode(rc.ib), IT_SET_UCONFIG_REG) == nullptr,
+	      "on MEC TA_CS_BC_BASE_ADDR is dropped, the ACB still translates");
+	static std::vector<uint32_t> pairs = {0x380u, 0x1000u, 0x381u, 0x2u};
+	std::vector<uint32_t>        table;
+	AppendIndirect(table, IT_SET_UCONFIG_REG_INDIRECT, pairs);
+	Append(table, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rt = c.Translate(table);
+	Check(rt.ok && rt.unknown_ops.empty() && rt.stats.uconfig_skipped == 2, "and in a register table too");
+	std::vector<uint32_t> ge;
+	Append(ge, IT_SET_UCONFIG_REG, {0x260u, 0x40u}, true);
+	Append(ge, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rg = c.Translate(ge);
+	Check(rg.ok && rg.unknown_ops.empty() && rg.stats.uconfig_skipped == 1 && rg.skipped_uconfig.count(0x260u) == 1,
+	      "GE_PC_ALLOC on MEC is dropped as before, the ACB still translates");
 }
 
 // IntegerAtomicOp, op by op: with KYTY_NATIVE_GPU_ATOMIC_OPS=1 exactly gfx10's integer TC_OPs, returning or not, without
@@ -5886,7 +6189,8 @@ void TestMemSemaphoreTranslated() {
 		}
 		Check(written, "the counter's write is recorded as the GPU's, not 0");
 	}
-	// A signal on MEC: our barrier on the compute ring, the add the tracker's (no ATOMIC_MEM to MEC).
+	// A signal on MEC: our barrier on the compute ring, then the ADD_64 on MEC, BYPASS, plain header (probe atomicops and
+	// mecplain on compute ring 1, 2.11), nothing for the tracker.
 	{
 		TestOracle            o;
 		auto                  t = translator(o, true);
@@ -5896,10 +6200,12 @@ void TestMemSemaphoreTranslated() {
 		const auto pkts = Decode(r.ib);
 		bool       cpu  = false;
 		for (const auto& p: AllPoints(r)) {
-			cpu = cpu || (p.kind == TrackerPoint::Kind::Atomic && p.addr == addr && p.data == std::vector<uint32_t>({kAtomic | 0x6fu, 1u, 0u, 0u, 0u}));
+			cpu = cpu || p.kind == TrackerPoint::Kind::Atomic;
 		}
-		Check(r.ok && no_semaphore(r) && Count(pkts, IT_ATOMIC_MEM_T) == 0 && cpu, "a signal on MEC is the tracker's ADD_64");
-		Check(find(pkts, 0, fence_release) < pkts.size(), "after our barrier");
+		const auto rel = find(pkts, 0, fence_release);
+		const auto at  = find(pkts, 0, [&](const Packet& p) { return is_atomic(p, 0x6fu); });
+		Check(r.ok && no_semaphore(r) && Count(pkts, IT_ATOMIC_MEM_T) == 1 && !cpu && r.stats.atomics_mec == 1, "a signal on MEC is MEC's ADD_64");
+		Check(rel < at && at < pkts.size() && !pkts[at].compute, "after our barrier, the plain header");
 		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "a translated signal passes both packet checks on MEC");
 	}
 	// Memory the GPU cannot write on the gfx ring: the tracker's atomics too.
@@ -5934,13 +6240,19 @@ void TestMemSemaphoreTranslated() {
 		Check(r.ok && no_semaphore(r) && sub < pkts.size(), "signal, wait: ADD_64, the wait for != 0, SUB_64 in order");
 		Check(r.segments.size() == 1 && o.asked == 0 && r.stats.waits_native == 1, "the wait on our own signal runs on the GPU");
 		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "signal and wait pass both packet checks");
-		// Without SetWaitsVerbatim there is no native form of a != wait (EmitNativeWait: EQUAL only): held instead.
+		// Without SetWaitsVerbatim the wait is Kyty's form (EmitNativeWait): != is a proven function (probe waitforms),
+		// so the same 64-bit PFP wait runs on the GPU, without the title's CACHE_POLICY.
 		TestOracle o2;
 		auto       t2 = translator(o2, false);
 		auto       r2 = t2->Translate(cb);
-		Check(r2.ok && no_semaphore(r2) && r2.segments.size() == 2 && r2.segments[1].held && r2.segments[1].wait_len == 0,
-		      "without guest-form waits the wait is held on the CPU, not emitted as something else");
-		Check(Count(Decode(r2.ib), 0x93u) == 0 && PassesBothChecks(r2.ib, NativeIbKind::Gfx), "and no WAIT_REG_MEM_64 is emitted for it");
+		const auto p2 = Decode(r2.ib);
+		const auto w2 = find(p2, 0, [&](const Packet& p) {
+			return p.op == 0x93u && p.body == std::vector<uint32_t>({(1u << 8u) | (1u << 4u) | 4u, static_cast<uint32_t>(addr),
+			                                                         static_cast<uint32_t>(addr >> 32u), 0u, 0u, 0xffffffffu, 0xffffffffu, 4u});
+		});
+		Check(r2.ok && no_semaphore(r2) && r2.segments.size() == 1 && r2.stats.waits_native == 1 && w2 < p2.size(),
+		      "without guest-form waits the != wait runs on the GPU in Kyty's form, the title's function, width and engine");
+		Check(Count(p2, 0x42u) == 0 && PassesBothChecks(r2.ib, NativeIbKind::Gfx), "with no PFP_SYNC_ME, and passes both packet checks");
 		// A second wait: the subtract left the counter unknown, so it is held.
 		std::vector<uint32_t> twice = cb;
 		wait(twice);
@@ -5987,7 +6299,7 @@ void TestMemSemaphoreTranslated() {
 		          PassesBothChecks(r3.ib, NativeIbKind::Gfx),
 		      "a wait the oracle sends to the GPU: the guest-form WAIT_REG_MEM_64");
 	}
-	// A wait on MEC the oracle sends to the GPU (a KFD queue): the guest form on the micro engine, the subtract the tracker's.
+	// A wait on MEC the oracle sends to the GPU (a KFD queue): the guest form on the micro engine, then MEC's SUB_64.
 	{
 		TestOracle o;
 		o.plan = LabelOracle::Plan::Native;
@@ -5998,11 +6310,12 @@ void TestMemSemaphoreTranslated() {
 		const auto pkts = Decode(r.ib);
 		bool       cpu  = false;
 		for (const auto& p: AllPoints(r)) {
-			cpu = cpu || (p.kind == TrackerPoint::Kind::Atomic && p.addr == addr && p.data == std::vector<uint32_t>({kAtomic | 0x70u, 1u, 0u, 0u, 0u}));
+			cpu = cpu || p.kind == TrackerPoint::Kind::Atomic;
 		}
-		Check(r.ok && no_semaphore(r) && find(pkts, 0, [&](const Packet& p) { return is_wait(p, 0u); }) < pkts.size() &&
-		          Count(pkts, IT_ATOMIC_MEM_T) == 0 && cpu,
-		      "a wait on MEC: the guest-form wait, the tracker's SUB_64");
+		const auto w   = find(pkts, 0, [&](const Packet& p) { return is_wait(p, 0u); });
+		const auto sub = find(pkts, w, [&](const Packet& p) { return is_atomic(p, 0x70u); });
+		Check(r.ok && no_semaphore(r) && w < pkts.size() && sub < pkts.size() && Count(pkts, IT_ATOMIC_MEM_T) == 1 && !cpu,
+		      "a wait on MEC: the guest-form wait, then MEC's SUB_64");
 		Check(PassesBothChecks(r.ib, NativeIbKind::Compute), "a translated wait passes both packet checks on MEC");
 	}
 	// Forms libSceAgc does not write still refuse when translating.
@@ -6079,11 +6392,11 @@ void TestCondExecThroughFlatten() {
 	const auto r = t->Translate(flat);
 	size_t     at = 0;
 	for (size_t i = 2; i + 5 <= r.ib.size(); i++) {
-		if (r.ib[i] == Pkt3(IT_COND_EXEC_T, 4, false) && r.ib[i + 1] == static_cast<uint32_t>(fa) && r.ib[i - 2] == ((3u << 30u) | (0x42u << 8u))) {
+		if (r.ib[i] == Pkt3(IT_COND_EXEC_T, 4, false) && r.ib[i + 1] == static_cast<uint32_t>(fa) && r.ib[i - 2] != ((3u << 30u) | (0x42u << 8u))) {
 			at = i;
 		}
 	}
-	Check(r.ok && r.stats.cond_execs == 1 && at != 0, "the title's COND_EXEC behind a PFP_SYNC_ME");
+	Check(r.ok && r.stats.cond_execs == 1 && at != 0, "the title's COND_EXEC as written, nothing of Kyty's in front of it");
 	const uint32_t count = r.ib[at + 4];
 	Check(count > flat_count, "the translation lengthened the range (the wait's exit guard)");
 	Check(at + 5 + count + after.size() <= r.ib.size() && std::equal(after.begin(), after.end(), r.ib.begin() + at + 5 + count),
@@ -6155,6 +6468,7 @@ int main() {
 	TestIndirectShComputeBit();
 	TestComputeCuClamp();
 	TestUconfigWhitelist();
+	TestUconfigProbed();
 	TestIndirectTablesVerbatim();
 	TestAgcTagsVerbatim();
 	TestUconfigIndexPassthrough();
@@ -6171,7 +6485,7 @@ int main() {
 	TestGpuRefs();
 	TestContextDefaults();
 	TestDrawIndexOffset();
-	TestFmaskFix();
+	TestFmaskAsWritten();
 	TestComputeQueueDispatchIndirect();
 	TestCpDmaIdle();
 	TestIndirectDraws();
@@ -6182,7 +6496,7 @@ int main() {
 	TestCompactRefs();
 	TestGdsReleaseMem();
 	TestPs5RegOverrides();
-	TestAcquireFull();
+	TestAcquireAsWritten();
 	TestLabelsWriteData();
 	TestLabelsWriteDataBlock();
 	TestDirectRuns();
@@ -6200,6 +6514,7 @@ int main() {
 	TestSonyWorkloads();
 	TestLabelWriteCovers();
 	TestLabelsWait64();
+	TestWaitFunctionsAll();
 	TestValidateNativeIb();
 	TestComputeRingPackets();
 	TestComputeRingPlainHeaders();
@@ -6246,9 +6561,11 @@ int main() {
 	TestResetPixelPipeStat();
 	TestCopyData();
 	TestAtomicOps();
+	TestAtomicMecLabel();
 	TestMemSemaphoreAnd3A();
 	TestMultiInst();
 	TestCondExecRecount();
+	TestCondExecMec();
 	TestFlattenCondExecCount();
 	TestCopyDataForms();
 	TestAtomicOpTable();

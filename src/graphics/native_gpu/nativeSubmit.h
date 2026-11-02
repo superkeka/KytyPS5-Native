@@ -105,15 +105,15 @@ public:
 		}
 		self->CreateCpShadowVram();
 		self->QueryComputeRings();
-		// Opt-in: with the whole GDS, GWS and OA partitions in every submission (so amdgpu reprograms
-		// them for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike, even when
-		// no packet or shader used GDS. KYTY_NATIVE_GPU_GDS=1 asks for the whole partitions,
-		// "gds=<bytes>,gws=<n>,oa=<n>" for chosen sizes (0 or absent: none of that resource).
-		// Native primary mode defaults to the GDS the PS5 kernel gives a title's VMID, 48 KiB from base
-		// 0, with no GWS or OA (those partitions were what hung).
-		const char* opt     = std::getenv("KYTY_NATIVE_GPU_GDS");
-		const char* primary = std::getenv("KYTY_NATIVE_GPU_PRIMARY");
-		if (opt == nullptr && primary != nullptr && primary[0] != '\0' && primary[0] != '0') {
+		// Every job gets the GDS the PS5 kernel gives a title's VMID, 48 KiB from base 0, with no GWS or OA, in
+		// every mode (primary mode has had it since 26.10): GDS data in RELEASE_MEM, DMA_DATA to or from GDS and
+		// shaders that use GDS then run natively. With the whole GDS, GWS and OA partitions in every submission
+		// (so amdgpu reprograms them for each job) the BC-250 hung within ~30 s in Dead Cells and ASTRO BOT alike,
+		// even when no packet or shader used GDS; those partitions were what hung. KYTY_NATIVE_GPU_GDS=0 gives no
+		// partition (such packets and shaders stay on Kyty), =1 the whole partitions, "gds=<bytes>,gws=<n>,oa=<n>"
+		// chosen sizes (0 or absent: none of that resource).
+		const char* opt = std::getenv("KYTY_NATIVE_GPU_GDS");
+		if (opt == nullptr) {
 			opt = "gds=49152,gws=0,oa=0";
 		}
 		if (opt != nullptr && opt[0] != '\0' && opt[0] != '0') {

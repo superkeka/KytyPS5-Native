@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <tuple>
 #include <type_traits>
 #if defined(__linux__)
@@ -185,15 +186,17 @@ void EmitSet(std::vector<uint32_t>& ib, uint32_t op, uint32_t offset, uint32_t v
 	ib.push_back(value);
 }
 
-// UCONFIG writes. On GFX9+ the CP keeps its own copy of VGT_PRIMITIVE_TYPE and VGT_INDEX_TYPE and
-// only updates it from SET_UCONFIG_REG_INDEX with index 1 / 2 (RADV: radeon_set_uconfig_reg_idx);
-// a plain SET_UCONFIG_REG leaves the draw engine with a stale primitive or index type.
 std::atomic<uint64_t> g_tf_ring_base {0};
 std::atomic<uint32_t> g_tf_ring_bytes {0};
 std::atomic<uint32_t> g_hs_offchip_param {0};
 // SetCpShadowValidation: the shadow buffer LOAD_*_REG may name (0: none).
 std::atomic<uint64_t> g_cp_shadow_va {0};
 
+// Kyty's own UCONFIG writes (preambles, expanded tables). The PFP keeps its own copy of VGT_INDEX_TYPE and updates it
+// only from SET_UCONFIG_REG_INDEX with index 2 (microcode: the stock handler is the PS5's; RADV's
+// radeon_set_uconfig_reg_idx), so a replay of the copy's state uses the index forms for VGT_PRIMITIVE_TYPE (1, the
+// plain write's path) and VGT_INDEX_TYPE (2). A title's own SET_UCONFIG_REG goes as written instead: a plain write
+// leaves the PFP's copy alone on the PS5 too.
 void EmitSetUconfig(std::vector<uint32_t>& ib, uint32_t offset, uint32_t value) {
 	switch (offset) {
 		case 0x242: EmitSet(ib, IT_SET_UCONFIG_REG_INDEX, (1u << 28u) | offset, value, false); break;
@@ -229,6 +232,13 @@ bool DmaDataAllowed(uint32_t control, uint32_t command, bool gds) {
 
 // WRITE_DATA DST_SEL values that target memory (1 = memory via GRBM, 2 = TC/L2, 5 = memory).
 // DST_SEL 0 writes a register and is refused, like any non-whitelisted register write.
+// UCONFIG registers Pm4Translator::UconfigAllowed passes on the gfx ring that a compute ring drops instead of refusing
+// the buffer, as it did before they were allowed: probe uconfig-w ran their SETs on the gfx ring only (2.11), so MEC
+// keeps leaving out GE_USER_VGPR1-3 and GE_PC_ALLOC and TA_CS_BC_BASE_ADDR and _HI (compute state an ACB may write).
+bool UconfigComputeDropped(uint32_t off) {
+	return (off >= 0x25Cu && off <= 0x25Eu) || off == 0x260u || off == 0x380u || off == 0x381u;
+}
+
 bool WriteDataToMemory(uint32_t control) {
 	const uint32_t dst_sel = (control >> 8u) & 0xfu;
 	return dst_sel == 1u || dst_sel == 2u || dst_sel == 5u;
@@ -238,8 +248,8 @@ bool WriteDataToMemory(uint32_t control) {
 // packets, with the compute shader-type bit, stopped the gfx ring with "Illegal opcode in command
 // stream"). The barrier's form: RELEASE_MEM with CACHE_FLUSH_AND_INV_TS_EVENT, EVENT_INDEX 5 (end of
 // pipe), GCR_CNTL GLM_WB | GLM_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB, 32-bit data to memory and no
-// interrupt; labels in the guest's event take LabelEventCntl's form instead. WAIT_REG_MEM is EQUAL on
-// memory by the micro engine, poll interval 4.
+// interrupt; labels in the guest's event take LabelEventCntl's form instead. WAIT_REG_MEM is on memory, poll
+// interval 4: the barrier's EQUAL by the micro engine, a guest wait's as EmitNativeWait writes it.
 constexpr uint32_t kFlushEventCntl = 0x14u | (5u << 8u) | (1u << 12u) | (1u << 13u) | (1u << 14u) | (1u << 15u) |
                                      (1u << 20u) | (1u << 21u);
 constexpr uint32_t kData32Cntl     = 1u << 29u;
@@ -249,7 +259,6 @@ constexpr uint32_t kIntSel2        = 2u << 24u; // RELEASE_MEM: interrupt once t
 // 5); Mesa's write-timestamp uses DATA_SEL 3 and ignores the data dwords. The event dword stays
 // the one this board already runs. The data dwords are zero: the clock replaces them.
 constexpr uint32_t kDataTimestampCntl = 3u << 29u;
-constexpr uint32_t kWaitEqualMemMe = 3u | (1u << 4u);
 constexpr uint32_t kWaitPoll       = 4u;
 constexpr uint32_t kFiller         = 0xffff1000u; // the one-dword NOP IBs are padded with
 
@@ -314,16 +323,6 @@ bool ReleasesAsWritten() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_RELEASES_AS_WRITTEN");
 		return v == nullptr || v[0] != '0';
-	}();
-	return on;
-}
-// KYTY_NATIVE_GPU_RELEASE_GLM_WB=1: a release with GL2_WB or GLM_INV but no GLM_WB gets GLM_WB added. On 27.10 such
-// releases as written gave black frames, but those runs also had LRU labels the CPU did not see; as written with
-// labels as written (1.11) ASTRO BOT draws right, so they go as the title wrote them.
-bool ReleaseGlmWriteBack() {
-	static const bool on = [] {
-		const char* v = std::getenv("KYTY_NATIVE_GPU_RELEASE_GLM_WB");
-		return v != nullptr && v[0] == '1';
 	}();
 	return on;
 }
@@ -517,16 +516,6 @@ void EmitClockEop(std::vector<uint32_t>& ib, uint64_t addr) {
 	ib.push_back(0u);
 }
 
-void EmitWaitEqual(std::vector<uint32_t>& ib, uint64_t addr, uint32_t ref, uint32_t mask, bool compute) {
-	ib.push_back(Pkt3(IT_WAIT_REG_MEM, 6, compute));
-	ib.push_back(kWaitEqualMemMe);
-	ib.push_back(static_cast<uint32_t>(addr));
-	ib.push_back(static_cast<uint32_t>(addr >> 32u));
-	ib.push_back(ref);
-	ib.push_back(mask);
-	ib.push_back(kWaitPoll);
-}
-
 // A guest wait's CONTROL the gfx CP runs as the PS5's (probe waitforms): on memory, wait only (OPERATION
 // 0), the micro engine or the prefetch parser, any compare function but the reserved 7.
 // libSceAgc's debug markers write the rest of their string with WRITE_DATA to SQ_THREAD_TRACE_USERDATA_3
@@ -538,6 +527,26 @@ bool TraceUserDataWrite(uint32_t control, uint32_t addr_lo, uint32_t addr_hi) {
 bool GuestWaitControlOk(uint32_t control) {
 	return (control & 0x7u) != 7u && ((control >> 4u) & 0x3u) == 1u && ((control >> 6u) & 0x3u) == 0u &&
 	       ((control >> 8u) & 0x3u) <= 1u;
+}
+
+// The compare functions of the waits Kyty emits itself (EmitNativeWait): LESS, LESS_EQUAL, EQUAL, NOT_EQUAL,
+// GREATER_EQUAL and GREATER (1..6), all of which the gfx CP has run as the PS5's (probe waitforms, 2.11: WAIT_REG_MEM
+// and WAIT_REG_MEM_64, the micro engine and the prefetch parser, 32 and 64 bits, conditions met only in the upper half
+// included, no ring stop). ALWAYS (0) is no wait and 7 is reserved: neither has a GPU form of ours.
+// KYTY_NATIVE_GPU_WAIT_FUNCTIONS=345 keeps Kyty's own waits to EQUAL, NOT_EQUAL and GREATER_EQUAL, the earlier form.
+bool NativeWaitFunctionOk(uint32_t function) {
+	static const bool all = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_WAIT_FUNCTIONS");
+		return v == nullptr || std::strcmp(v, "345") != 0;
+	}();
+	return all ? function >= 1u && function <= 6u : function >= 3u && function <= 5u;
+}
+
+// A WAIT_REG_MEM / WAIT_REG_MEM_64 of Kyty's own (EmitNativeWait, the barrier's EQUAL wait): on memory, the micro
+// engine or the prefetch parser, a proven function, no CACHE_POLICY, poll interval 4. `poll`: its last dword.
+bool NativeWaitControlOk(uint32_t control, uint32_t poll) {
+	return GuestWaitControlOk(control) && NativeWaitFunctionOk(control & 0x7u) && (control & ~(0x7u | 0x30u | 0x300u)) == 0u &&
+	       poll == kWaitPoll;
 }
 
 } // namespace
@@ -556,6 +565,7 @@ const char* RefuseWhyName(RefuseWhy why) {
 	    "register wait",
 	    "DMA_DATA form",
 	    "WRITE_DATA to a register",
+	    "WRITE_DATA DST_SEL 1 on MEC",
 	    "CONTEXT_CONTROL on MEC",
 	    "COND_EXEC form",
 	    "ATOMIC_MEM form",
@@ -633,25 +643,25 @@ uint64_t SatisfyingValue(const WaitCond& w, uint64_t current) {
 
 namespace {
 
-// Emits a guest wait natively, in the proven form: only EQUAL waits, a 64-bit one as the 32-bit wait
-// on its low dword when the high halves of mask and reference are 0 (the same condition), a PFP one as
-// the micro engine's wait and PFP_SYNC_ME. Returns false when that is not possible.
+// Emits a guest wait of Kyty's own (a held segment's, an injected one) as the title wrote it: its compare function,
+// WAIT_REG_MEM_64 for a 64-bit one and its engine, on memory, poll interval 4. The title's CACHE_POLICY is not kept.
+// Every compare function the gfx CP has run as the PS5's (probe waitforms, 2.11): LESS, LESS_EQUAL, EQUAL, NOT_EQUAL,
+// GREATER_EQUAL and GREATER, 32 and 64 bits, the micro engine or the prefetch parser. ALWAYS is no wait and 7 is
+// reserved: those return false, and the wait becomes a barrier or is held on the CPU. MEC ignores ENGINE_SEL in
+// both packets (microcode, stock and the PS5's) and has no prefetch parser, so a PFP wait runs there as the ME's
+// (probe mecplain, 2.11: a PFP wait on compute ring 1 met at once and released by the CPU).
 bool EmitNativeWait(std::vector<uint32_t>& ib, const WaitCond& w, bool compute) {
-	if (w.function != 3) {
+	if (!NativeWaitFunctionOk(w.function)) {
 		return false;
 	}
-	EmitWaitEqual(ib, w.addr, static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.mask), compute);
-	// A 64-bit equality wait (Agc's WaitOnAddress, mask ~0) as one wait per half: the label is written
-	// once before it is waited on, so both halves holding their part is the 64-bit condition.
-	if (w.wide && (w.mask >> 32u) != 0) {
-		EmitWaitEqual(ib, w.addr + 4u, static_cast<uint32_t>(w.ref >> 32u), static_cast<uint32_t>(w.mask >> 32u), compute);
-	} else if (w.wide && (w.ref >> 32u) != 0) {
-		return false; // the high half must match a value the mask leaves out: never true
-	}
-	// MEC has no prefetch parser. PFP_SYNC_ME there is an illegal opcode; the ME wait is the whole sync.
-	if (w.pfp && !compute) {
-		ib.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
-		ib.push_back(0);
+	const uint32_t control = w.function | (1u << 4u) | (w.pfp ? 1u << 8u : 0u);
+	if (w.wide) {
+		ib.insert(ib.end(), {Pkt3(IT_WAIT_REG_MEM_64, 8, compute), control, static_cast<uint32_t>(w.addr), static_cast<uint32_t>(w.addr >> 32u),
+		                     static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.ref >> 32u), static_cast<uint32_t>(w.mask),
+		                     static_cast<uint32_t>(w.mask >> 32u), kWaitPoll});
+	} else {
+		ib.insert(ib.end(), {Pkt3(IT_WAIT_REG_MEM, 6, compute), control, static_cast<uint32_t>(w.addr), static_cast<uint32_t>(w.addr >> 32u),
+		                     static_cast<uint32_t>(w.ref), static_cast<uint32_t>(w.mask), kWaitPoll});
 	}
 	return true;
 }
@@ -882,18 +892,27 @@ uint32_t ClearStateValue(uint32_t off) {
 bool CpShadowLoadsContext(uint32_t off) {
 	return off < RegFile::kDense && off != kPaScShaderControl;
 }
-// PAL never shadows RSRC4/RSRC3 of PS, VS, GS and HS nor COMPUTE_STATIC_THREAD_MGMT_SE0..3 (unverified here: the
-// checker shows it), and SH 0x280 is the guest's NOP.
+// SPI_SHADER_PGM_RSRC3/RSRC4 of PS, VS, GS and HS are LOADed like the rest: PAL never shadows them, but that is PAL's
+// choice, not the CP's. Probe shadow / shadow-restore with SHADOW_REGS=w14 (2.11): with shadowing on, their SETs land
+// in S at their place, and amdgpu's LOAD enables restore them from S, also after another DRM context's job, read back
+// as S masked by the bits the register implements. COMPUTE_STATIC_THREAD_MGMT_SE0..3 land in S too, but their restore
+// was not read back (a compute SH read on the gfx ring stopped the ring once), so they stay SET from the copy; SH 0x280
+// is the guest's NOP. KYTY_NATIVE_GPU_CP_SHADOW_RSRC34=0 SETs RSRC3/RSRC4 from the copy again, as before.
 bool CpShadowLoadsSh(uint32_t off) {
+	static const bool rsrc34 = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_CP_SHADOW_RSRC34");
+		return v == nullptr || v[0] != '0';
+	}();
 	switch (off) {
-		case 0x001:
-		case 0x007:
-		case 0x041:
-		case 0x046:
-		case 0x081:
-		case 0x087:
-		case 0x101:
-		case 0x107:
+		case 0x001: // SPI_SHADER_PGM_RSRC4_PS
+		case 0x007: // SPI_SHADER_PGM_RSRC3_PS
+		case 0x041: // SPI_SHADER_PGM_RSRC4_VS
+		case 0x046: // SPI_SHADER_PGM_RSRC3_VS
+		case 0x081: // SPI_SHADER_PGM_RSRC4_GS
+		case 0x087: // SPI_SHADER_PGM_RSRC3_GS
+		case 0x101: // SPI_SHADER_PGM_RSRC4_HS
+		case 0x107: // SPI_SHADER_PGM_RSRC3_HS
+			return rsrc34;
 		case 0x216:
 		case 0x217:
 		case 0x219:
@@ -915,24 +934,6 @@ uint32_t DccFixSlots(uint32_t off) {
 	}
 	if (off >= kCbColor0BaseExt && off < kCbColor0BaseExt + 8) {
 		return 1u << (off - kCbColor0BaseExt);
-	}
-	return 0u;
-}
-
-// The MRT slots whose FMASK fix reads context register `off` (CB_TARGET_MASK: all of them).
-uint32_t FmaskFixSlots(uint32_t off) {
-	if (off == kCbTargetMask) {
-		return 0xffu;
-	}
-	if (off >= kCbColor0Base && off < kCbColor0Base + 8 * kCbColorStride) {
-		const uint32_t rel = off - kCbColor0Base;
-		return rel % kCbColorStride == 0 || rel % kCbColorStride == kCbColor0Fmask - kCbColor0Base ? 1u << (rel / kCbColorStride) : 0u;
-	}
-	if (off >= kCbColor0BaseExt && off < kCbColor0BaseExt + 8) {
-		return 1u << (off - kCbColor0BaseExt);
-	}
-	if (off >= kCbColor0FmaskExt && off < kCbColor0FmaskExt + 8) {
-		return 1u << (off - kCbColor0FmaskExt);
 	}
 	return 0u;
 }
@@ -1122,7 +1123,11 @@ uint32_t AppendKernelReleases(std::span<const uint32_t> dcb, std::vector<uint32_
 // Opcodes an ACB passes to MEC with the header as the title wrote it, without the shader-type bit the
 // translator set before: libSceAgc does not set it, and the PS5's MEC runs them so. The BC-250's MEC does too
 // for SET_SH_REG, DISPATCH_DIRECT/INDIRECT, ACQUIRE_MEM, DMA_DATA and EVENT_WRITE (probe --danger mecforms;
-// ASTRO BOT plays).
+// ASTRO BOT plays), and for WRITE_DATA (ENGINE_SEL 0, 1 and 2, with and without WR_CONFIRM), COPY_DATA memory to
+// memory, COND_EXEC, WAIT_REG_MEM and WAIT_REG_MEM_64 (ENGINE_SEL PFP, met at once and released by the CPU) and
+// ATOMIC_MEM (probe mecplain on amdgpu's compute ring 1, 2.11: all correct; MEC's handlers of these read body dwords
+// only, never the header's bit, microcode, stock and the PS5's). That ran on a CS compute ring, not on a KFD queue;
+// both are the same MEC microcode.
 // KYTY_NATIVE_GPU_ACB_PLAIN=<opcodes, comma-separated> replaces the list; =0 sets the bit on every packet.
 static bool MecPlainOp(uint32_t op) {
 	static const std::array<bool, 256> plain = [] {
@@ -1132,7 +1137,8 @@ static bool MecPlainOp(uint32_t op) {
 			// RELEASE_MEM: amdgpu's own compute-ring fences are plain RELEASE_MEMs, and libSceAgc writes its ACB ones
 			// plain too.
 			for (uint32_t o: {IT_SET_SH_REG, IT_DISPATCH_DIRECT, IT_DISPATCH_INDIRECT, IT_ACQUIRE_MEM, IT_DMA_DATA, IT_EVENT_WRITE,
-			                  IT_RELEASE_MEM}) {
+			                  IT_RELEASE_MEM, IT_WRITE_DATA, IT_COPY_DATA, IT_WAIT_REG_MEM, IT_WAIT_REG_MEM_64, IT_COND_EXEC,
+			                  IT_ATOMIC_MEM}) {
 				a[o] = true;
 			}
 		}
@@ -1152,8 +1158,9 @@ static bool MecPlainOp(uint32_t op) {
 	return plain[op & 0xffu];
 }
 
-// An ACB's WAIT_REG_MEM / WAIT_REG_MEM_64 go to MEC as written, the micro engine's (MEC has no prefetch parser;
-// ASTRO BOT plays). KYTY_NATIVE_GPU_ACB_WAITS_VERBATIM=0 emits our form.
+// An ACB's WAIT_REG_MEM / WAIT_REG_MEM_64 go to MEC as written (ASTRO BOT plays), ENGINE_SEL PFP included: MEC's
+// handlers of both read the compare function, MEM_SPACE, OPERATION and CACHE_POLICY and never ENGINE_SEL (microcode,
+// stock and the PS5's), so a PFP wait runs there as the ME's. KYTY_NATIVE_GPU_ACB_WAITS_VERBATIM=0 emits our form.
 static bool AcbWaitsVerbatim() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_NATIVE_GPU_ACB_WAITS_VERBATIM");
@@ -1163,7 +1170,27 @@ static bool AcbWaitsVerbatim() {
 }
 
 static bool MecGuestWaitOk(uint32_t control) {
-	return AcbWaitsVerbatim() && GuestWaitControlOk(control) && ((control >> 8u) & 0x3u) == 0u;
+	return AcbWaitsVerbatim() && GuestWaitControlOk(control);
+}
+
+// A title's COND_EXEC in an ACB goes to MEC (SetCondExec; see the translator's COND_EXEC case).
+// KYTY_NATIVE_GPU_ACB_COND_EXEC=0 refuses it there, as before.
+static bool AcbCondExec() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_ACB_COND_EXEC");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
+// An ACB's ATOMIC_MEM on memory the GPU may write goes to MEC as written (probe atomicops and mecplain, 2.11; see the
+// translator's atomic_mem). KYTY_NATIVE_GPU_ACB_ATOMICS=0 has the tracker perform it on the CPU, as before.
+static bool AcbAtomicsOnGpu() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_ACB_ATOMICS");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
 }
 
 namespace {
@@ -1203,7 +1230,10 @@ bool PrivilegedOp(uint32_t op) {
 	}
 }
 
-// What a compute ring (MEC) cannot run: an illegal opcode there stops the ring.
+// What a compute ring (MEC) cannot run. All but INDIRECT_BUFFER have no handler in MEC's microcode, stock or the
+// PS5's: the default handler raises an interrupt and stops the queue, so a title never puts them in an ACB.
+// INDIRECT_BUFFER has a MEC handler in both; a CHAIN on MEC took the board down (probe exitguard), and the translator
+// sends no IB2 on MEC.
 bool GraphicsOnlyOp(uint32_t op) {
 	switch (op) {
 		case IT_CLEAR_STATE:
@@ -1227,7 +1257,7 @@ bool GraphicsOnlyOp(uint32_t op) {
 		case IT_LOAD_UCONFIG_REG:
 		case IT_LOAD_CONTEXT_REG:
 		case IT_LOAD_SH_REG:
-		case IT_INDIRECT_BUFFER: // a chain on MEC took the board down (probe condexec)
+		case IT_INDIRECT_BUFFER: // has a MEC handler; a chain on MEC took the board down (probe exitguard)
 			return true;
 		default: return false;
 	}
@@ -1272,8 +1302,7 @@ bool ValidateNativeIbBlacklist(std::span<const uint32_t> ib, bool lod_stats, uin
 		if (op == IT_MEM_SEMAPHORE && !g_mem_semaphore_asis.load(std::memory_order_relaxed)) {
 			return bad();
 		}
-		// On MEC these need the shader-type bit unless MEC runs their plain form (KYTY_NATIVE_GPU_MEC_PLAIN_OPS); a title's
-		// waits go as written without it (ASTRO BOT plays so).
+		// On MEC these need the shader-type bit unless MEC runs their plain form (MecPlainOp, KYTY_NATIVE_GPU_ACB_PLAIN).
 		switch (op) {
 			case IT_SET_BASE:
 			case IT_DISPATCH_DIRECT:
@@ -1284,6 +1313,11 @@ bool ValidateNativeIbBlacklist(std::span<const uint32_t> ib, bool lod_stats, uin
 			case IT_DMA_DATA:
 			case IT_WRITE_DATA:
 			case IT_RELEASE_MEM:
+			case IT_COPY_DATA:
+			case IT_WAIT_REG_MEM:
+			case IT_WAIT_REG_MEM_64:
+			case IT_COND_EXEC:
+			case IT_ATOMIC_MEM:
 				if (compute && (header & 2u) == 0 && !MecPlainOp(op)) {
 					return bad();
 				}
@@ -1300,9 +1334,9 @@ bool ValidateNativeIbBlacklist(std::span<const uint32_t> ib, bool lod_stats, uin
 					return bad();
 				}
 				break;
-			// The FMASK fix's COND_EXEC over S's tables is the translator's; any other skips no further than the IB.
+			// No COND_EXEC of the translator's reads S, P or the fix tables.
 			case IT_COND_EXEC:
-				if (n < 4 || (s != 0 && in_s(b[0] | (static_cast<uint64_t>(b[1]) << 32u), 4) && !strict_one(dw, std::min<uint32_t>(10u, static_cast<uint32_t>(ib.size()) - dw)))) {
+				if (n < 4 || (s != 0 && in_s(b[0] | (static_cast<uint64_t>(b[1]) << 32u), 4))) {
 					return bad();
 				}
 				break;
@@ -1439,15 +1473,21 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				}
 				return bad();
 			case IT_WAIT_REG_MEM:
-				if (header == Pkt3(IT_WAIT_REG_MEM, 6, compute) && b[0] == kWaitEqualMemMe && b[5] == kWaitPoll) {
-					break; // the translator's own form, on either ring
+				if (header == Pkt3(IT_WAIT_REG_MEM, 6, compute) && NativeWaitControlOk(b[0], b[5])) {
+					break; // the translator's own form (EmitNativeWait, the barrier's), on either ring
 				}
-				if ((compute && !MecGuestWaitOk(b[0])) || size != 7 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
+				// A guest wait as written: plain on the gfx ring; on MEC plain (MecPlainOp) or with the shader-type bit.
+				if ((compute && !MecGuestWaitOk(b[0])) || size != 7 || !GuestWaitControlOk(b[0]) ||
+				    (compute ? (header & 2u) == 0 && !MecPlainOp(IT_WAIT_REG_MEM) : (header & 2u) != 0)) {
 					return bad();
 				}
-				break; // a guest wait as written
+				break;
 			case IT_WAIT_REG_MEM_64:
-				if ((compute && !MecGuestWaitOk(b[0])) || size != 9 || (header & 2u) != 0 || !GuestWaitControlOk(b[0])) {
+				if (header == Pkt3(IT_WAIT_REG_MEM_64, 8, compute) && NativeWaitControlOk(b[0], b[7])) {
+					break; // the translator's own form (EmitNativeWait), on either ring
+				}
+				if ((compute && !MecGuestWaitOk(b[0])) || size != 9 || !GuestWaitControlOk(b[0]) ||
+				    (compute ? (header & 2u) == 0 && !MecPlainOp(IT_WAIT_REG_MEM_64) : (header & 2u) != 0)) {
 					return bad();
 				}
 				break;
@@ -1466,7 +1506,7 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				const uint32_t dst_sel = (b[0] >> 8u) & 0xfu;
 				if (size != 6 || (compute && (header & 2u) == 0 && !MecPlainOp(IT_COPY_DATA)) || !(src_sel == 1u || src_sel == 2u || src_sel == 5u || src_sel == 9u) ||
 				    !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || (b[3] & 3u) != 0u || (b[3] == 0u && b[4] == 0u) ||
-				    (b[0] >> 30u) > (compute ? 0u : 1u)) { // ENGINE_SEL: the micro engine or the prefetch parser
+				    (b[0] >> 30u) > 1u) { // ENGINE_SEL: the micro engine or the prefetch parser (MEC reads neither)
 					return bad();
 				}
 				break;
@@ -1480,33 +1520,24 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				}
 				break;
 			// An exit guard (Pm4Translator::SetExitGuard). On the gfx ring over its chain to the empty IB, 8
-			// dwords; on MEC skipping what follows, no further than kExitGuardMaxSkip.
+			// dwords; on MEC skipping what follows, no further than kExitGuardMaxSkip, within the IB. A title's
+			// (SetCondExec) on either ring, its count within the IB too; on MEC with its plain header (MecPlainOp).
 			case IT_COND_EXEC:
-				if (size != 5 || b[2] != 0u || header != Pkt3(IT_COND_EXEC, 4, compute)) {
+				if (size != 5 || b[2] != 0u ||
+				    (header != Pkt3(IT_COND_EXEC, 4, compute) && !(compute && MecPlainOp(IT_COND_EXEC) && header == Pkt3(IT_COND_EXEC, 4, false)))) {
 					return bad();
 				}
-				// CP shadowing's FMASK fix (Pm4Translator::SetCpShadow, load mode): on a copied value in the fix tables,
-				// over one of their tables, as the translator writes it.
-				if (const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed); !compute && s != 0 && b[3] == 5u) {
-					const uint64_t a   = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
-					const uint64_t fix = s + kCpShadowFixOffset;
-					const uint64_t end = s + kCpShadowDccFixOffset; // the FMASK fix's tables
-					if (a >= fix && a < end && (a - fix) % 8u == 4u && dw + 10u <= ib.size() &&
-					    ib[dw + 5] == Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false)) {
-						const uint64_t t = ib[dw + 6] | (static_cast<uint64_t>(ib[dw + 7]) << 32u);
-						if (t >= fix && t + 16u <= end && (t - fix) % 16u == 0 && ib[dw + 8] == 0x80000000u &&
-						    ib[dw + 9] == 2u) {
-							break;
-						}
-					}
+				// None of the translator's reads CP shadowing's S, P or fix tables.
+				if (const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed);
+				    s != 0 && (b[0] | (static_cast<uint64_t>(b[1]) << 32u)) - s < kCpShadowReserveBytes) {
 					return bad();
 				}
 				if (!compute) {
 					const uint32_t* c = b + 4;
 					if (b[3] != 4u || dw + 9u > ib.size() || c[0] != Pkt3(IT_INDIRECT_BUFFER, 3, false) ||
 					    c[3] != (8u | (1u << 20u) | (1u << 23u))) {
-						// A title's COND_EXEC (SetCondExec) after the translator's PFP_SYNC_ME, its count within the IB.
-						if (dw < 2u || ib[dw - 2u] != ((3u << 30u) | (IT_PFP_SYNC_ME << 8u)) || b[3] > 0x3fffu || dw + size + b[3] > ib.size()) {
+						// A title's COND_EXEC (SetCondExec), its count within the IB.
+						if (b[3] > 0x3fffu || dw + size + b[3] > ib.size()) {
 							return bad();
 						}
 						break;
@@ -1523,20 +1554,22 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					return bad();
 				}
 				break;
-			// A guest WRITE_DATA to memory, write confirmed; on MEC from the micro engine.
+			// A guest WRITE_DATA to memory: on the gfx ring write confirmed, from the micro engine or the prefetch parser; on
+			// MEC as the title wrote it (MEC reads neither ENGINE_SEL nor needs WR_CONFIRM there), but DST_SEL 1, which no
+			// MEC microcode runs.
 			case IT_WRITE_DATA:
 				if (!compute && size >= 5 && TraceUserDataWrite(b[0], b[1], b[2])) {
 					break; // a debug marker's string, on the gfx ring as written
 				}
-				if (size < 5 || !WriteDataToMemory(b[0]) || (b[0] & (1u << 20u)) == 0 ||
-				    (compute && (((header & 2u) == 0 && !MecPlainOp(IT_WRITE_DATA)) || (b[0] >> 30u) != 0))) {
+				if (size < 5 || !WriteDataToMemory(b[0]) || (!compute && ((b[0] & (1u << 20u)) == 0 || (b[0] >> 30u) > 1u)) ||
+				    (compute && (((header & 2u) == 0 && !MecPlainOp(IT_WRITE_DATA)) || ((b[0] >> 8u) & 0xfu) == 1u))) {
 					return bad();
 				}
 				break;
 			// A DMA_DATA that reads or writes CP shadowing's S or its save area P only as the GPU push or pop
-			// (Pm4Translator::SetCpShadowPushPop) or the GPU's FMASK fix: the gfx ring, S's context region to P or
-			// back, or one context register of S (or the zero word) into a value dword of the fix tables, exactly as
-			// the translator writes it. Any other one passes as before.
+			// (Pm4Translator::SetCpShadowPushPop) or the GPU's display-DCC fix: the gfx ring, S's context region to P or
+			// back, or a slot's CB_COLORn_INFO in S into the value dword of one of its fix tables, exactly as the
+			// translator writes it. Any other one passes as before.
 			case IT_DMA_DATA: {
 				const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed);
 				if (s != 0 && size >= 7) {
@@ -1550,11 +1583,11 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					if (touches) {
 						const uint64_t cx   = s + 4ull * kCpShadowContextDw;
 						const uint64_t p    = s + kCpShadowSaveOffset;
-						const uint64_t fix  = s + kCpShadowFixOffset;
+						const uint64_t fix  = s + kCpShadowDccFixOffset;
 						const bool     ours = header == Pkt3(IT_DMA_DATA, 6, false) && b[0] == kCpShadowDmaControl;
-						const bool     word = b[5] == kCpShadowDmaWordCommand &&
-						                  (((src & 3u) == 0 && src >= cx && src < cx + 4ull * RegFile::kDense) || src == s + kCpShadowZeroOffset) &&
-						                  dst >= fix && dst < fix + kCpShadowFixBytes && (dst - fix) % 8u == 4u; // the FMASK fix
+						const bool     word = b[5] == kCpShadowDmaWordCommand && (src & 3u) == 0 && src >= cx &&
+						                  src < cx + 4ull * RegFile::kDense && dst >= fix && dst < fix + kCpShadowFixBytes &&
+						                  (dst - fix) % 8u == 4u; // the display-DCC fix
 						const bool form = ours && ((b[5] == kCpShadowDmaCommand && ((src == cx && dst == p) || (src == p && dst == cx))) || word);
 						if (compute || !form) {
 							return bad();
@@ -1578,14 +1611,20 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					return bad();
 				}
 				break;
-			// libSceAgc's flag swap around a context push or pop (AgcDcbContextStateOp) and its workload swap and AND
-			// (SetWorkloadsActive, SetWorkloadComplete), on the gfx ring.
+			// libSceAgc's flag swap around a context push or pop (AgcDcbContextStateOp), its workload swap and AND
+			// (SetWorkloadsActive, SetWorkloadComplete) and, with SetAtomicOps, the other integer ops: on the gfx ring, and
+			// on MEC plain (MecPlainOp) or with the shader-type bit (probe atomicops and mecplain on compute ring 1, 2.11).
 			case IT_ATOMIC_MEM:
-				if (compute || size != 9) {
+				if (size != 9 || (compute && (header & 2u) == 0 && !MecPlainOp(IT_ATOMIC_MEM))) {
+					return bad();
+				}
+				// None on MEC into CP shadowing's S, P or fix tables (the display-DCC fix is the gfx ring's).
+				if (const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed);
+				    compute && s != 0 && (b[1] | (static_cast<uint64_t>(b[2]) << 32u)) - s < kCpShadowReserveBytes) {
 					return bad();
 				}
 				// CP shadowing's display-DCC fix: an AND that clears DCC_ENABLE in the first table of a slot, as written.
-				if (const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed); s != 0 && b[0] == kCpShadowDccAnd) {
+				if (const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed); !compute && s != 0 && b[0] == kCpShadowDccAnd) {
 					const uint64_t a   = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
 					const uint64_t dcc = s + kCpShadowDccFixOffset;
 					if (a >= dcc && a < dcc + 8u * 16u && (a - dcc) % 16u == 4u && b[3] == ~kCbDccEnable && b[4] == 0u && b[5] == 0u &&
@@ -1653,7 +1692,8 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				}
 				break;
 			}
-			// Graphics-only. An illegal opcode on a compute ring.
+			// Graphics-only: on a compute ring no handler in MEC's microcode (stock or the PS5's), but SET_UCONFIG_REG,
+			// which MEC runs; the translator sends no UCONFIG write there (geometry state, see the case in Translate).
 			case IT_CLEAR_STATE:
 			case IT_SET_PREDICATION:
 			case IT_INDEX_BUFFER_SIZE:
@@ -1661,7 +1701,7 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 			case IT_DRAW_INDEX_INDIRECT:
 			case IT_INDEX_BASE:
 			case IT_DRAW_INDEX_2:
-			case IT_DRAW_INDEX_OFFSET_2: // as written with SetDrawIndexOffsetVerbatim
+			case IT_DRAW_INDEX_OFFSET_2:
 			case IT_DRAW_INDEX_AUTO:
 			case IT_NUM_INSTANCES:
 			case IT_PFP_SYNC_ME:
@@ -1705,6 +1745,73 @@ RingWaitRelease PlanRingWait(int cover, bool value_satisfies, bool gpu_write, bo
 }
 
 namespace {
+// SetFlattenBranchLog / KYTY_NATIVE_GPU_LOG_BRANCHES=1: where LogBranch writes (nullptr: off), and the branches it has
+// written, each once (a title runs the same ones every frame).
+std::atomic<std::FILE*> g_branch_log {nullptr};
+std::mutex              g_branch_log_mutex;
+std::set<std::tuple<uint64_t, uint64_t, uint32_t, uint32_t, uint64_t>> g_branches_logged;
+
+std::FILE* BranchLog() {
+	if (std::FILE* f = g_branch_log.load(std::memory_order_relaxed); f != nullptr) {
+		return f;
+	}
+	static const bool env = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_LOG_BRANCHES");
+		return v != nullptr && v[0] == '1';
+	}();
+	return env ? stderr : nullptr;
+}
+
+// An always-taken AgcCbBranch (COND_INDIRECT_BUFFER) at `dw` of `in` that FlattenInto inlines as a call of its then
+// target (`size` dwords at `target`): the branch, the target and its last packet, and what the parent has after the
+// branch. Inlined as a call, that tail runs after the target. The PS5's CP does not come back from the branch either
+// (its PFP COND_INDIRECT_BUFFER path is the stock one, microcode), so there the tail runs only if the target chains to
+// it: a target that does runs the tail twice here, one that ends otherwise runs it here only. Diagnostics: nothing
+// changes in the flattening.
+void LogBranch(std::FILE* f, std::span<const uint32_t> in, size_t dw, uint32_t len, const uint32_t* target, uint32_t size, int depth) {
+	// The target's last packet, and the buffer it chains to when that is an INDIRECT_BUFFER with CHAIN.
+	uint32_t last_header = 0, last_dw = 0;
+	for (uint32_t t = 0; t < size;) {
+		const uint32_t h = target[t];
+		const uint32_t n = (h >> 30u) == 3u ? PacketSizeDw(h) : 1u;
+		if (t + n > size) {
+			break;
+		}
+		last_header = h;
+		last_dw     = t;
+		t += n;
+	}
+	const uint64_t tail_va  = reinterpret_cast<uint64_t>(in.data() + dw + len);
+	const size_t   tail_dw  = in.size() - (dw + len);
+	const bool     ib_last  = (last_header >> 30u) == 3u && ((last_header >> 8u) & 0xffu) == IT_INDIRECT_BUFFER && PacketSizeDw(last_header) == 4u;
+	const bool     chained  = ib_last && (target[last_dw + 3] & (1u << 20u)) != 0;
+	const uint64_t ib_va    = ib_last ? (static_cast<uint64_t>(target[last_dw + 2] & 0xffffu) << 32u) | (target[last_dw + 1] & ~3u) : 0u;
+	const uint64_t chain_va = chained ? ib_va : 0u;
+	const uint32_t next     = tail_dw != 0 ? in[dw + len] : 0u;
+	{
+		std::lock_guard<std::mutex> lock(g_branch_log_mutex);
+		if (g_branches_logged.size() >= 4096u ||
+		    !g_branches_logged.emplace(reinterpret_cast<uint64_t>(in.data() + dw), reinterpret_cast<uint64_t>(target), size, next, chain_va).second) {
+			return;
+		}
+	}
+	const char* verdict = tail_dw == 0          ? "nothing after it in the parent"
+	                      : !chained            ? "the parent's tail runs after the target here; the PS5 would not run it (no chain at the target's end)"
+	                      : chain_va == tail_va ? "the target chains back to the parent's tail: it runs twice here, once on the PS5"
+	                                            : "the target chains elsewhere: the PS5 goes on there, here the parent's tail runs after it as well";
+	char ib[48] = "";
+	if (ib_last) {
+		std::snprintf(ib, sizeof(ib), ", a %s 0x%llx", chained ? "chain to" : "call of", static_cast<unsigned long long>(ib_va));
+	}
+	std::fprintf(f,
+	             "native flatten: always-taken branch at 0x%llx (depth %d, dw %zu of %zu): then 0x%llx, %u dwords, last packet 0x%08x at dw "
+	             "%u%s; parent after it: %zu dwords from 0x%llx, first 0x%08x; inlined as a call: %s\n",
+	             static_cast<unsigned long long>(reinterpret_cast<uint64_t>(in.data() + dw)), depth, dw, in.size(),
+	             static_cast<unsigned long long>(reinterpret_cast<uint64_t>(target)), size, last_header, last_dw, ib, tail_dw,
+	             static_cast<unsigned long long>(tail_va), next, verdict);
+	std::fflush(f);
+}
+
 // 1: inlined something, 0: nothing to inline, -1: cannot.
 int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int depth, std::string* why,
                 std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
@@ -1799,9 +1906,11 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 		}
 		if ((header >> 30u) == 3u && op == kIndirect) {
 			// libSceAgc's branch (AgcCbBranch, 14 dwords: COND_INDIRECT_BUFFER) with compare function 0 is
-			// always taken: a call of its first target, the way Stray calls nested buffers. The BC-250's CP
-			// takes the branch but does not come back from it (probe --danger condib), so it is inlined like
-			// a call. A branch on memory still refuses the buffer.
+			// always taken: inlined here like a call of its first target, the way Stray calls nested buffers.
+			// The CP takes the branch but does not come back from it (probe --danger condib), and the PS5's does
+			// the same (its PFP COND_INDIRECT_BUFFER path is the stock one, microcode): inlining it as a call is
+			// the translator's choice, which KYTY_NATIVE_GPU_LOG_BRANCHES=1 logs for each branch (LogBranch). A
+			// branch on memory still refuses the buffer.
 			const bool always_branch = len == 14 && ((in[dw + 1] >> 8u) & 0x7u) == 0u && (in[dw + 1] & 0x3u) != 0u;
 			if (len != 4 && !always_branch) {
 				return stop("INDIRECT_BUFFER of another form", dw);
@@ -1850,6 +1959,11 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if (depth >= 16) {
 				return stop("calls nested too deep", dw);
 			}
+			if (always_branch) {
+				if (std::FILE* f = BranchLog(); f != nullptr) {
+					LogBranch(f, in, dw, len, target, size, depth);
+				}
+			}
 			const size_t before = out->size();
 			if (FlattenInto({target, size}, out, depth + 1, why, pieces, nullptr) < 0) {
 				return -1;
@@ -1877,6 +1991,12 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 	return changed;
 }
 } // namespace
+
+void SetFlattenBranchLog(std::FILE* f) {
+	std::lock_guard<std::mutex> lock(g_branch_log_mutex);
+	g_branches_logged.clear();
+	g_branch_log.store(f, std::memory_order_relaxed);
+}
 
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why,
                             std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
@@ -2021,13 +2141,6 @@ uint32_t Pm4Translator::PatchContext(uint32_t offset, uint32_t value) const {
 	    (offset - kCbColor0Info) % kCbColorStride == 0) {
 		value &= ~(1u << 28u);
 	}
-	// CB_COLORn_INFO.FAST_CLEAR (bit 13) off on targets without DCC: CMASK-only fast clear, for the
-	// no-CMASK-clear experiment.
-	if (m_no_cmask_clear && offset >= kCbColor0Info && offset < kCbColor0Info + 8 * kCbColorStride &&
-	    (offset - kCbColor0Info) % kCbColorStride == 0 && (value & (1u << 28u)) == 0 &&
-	    ((m_no_cmask_clear_slots >> ((offset - kCbColor0Info) / kCbColorStride)) & 1u) != 0) {
-		value &= ~(1u << 13u);
-	}
 	if (offset == kCbTargetMask) {
 		value &= m_target_mask;
 	}
@@ -2059,6 +2172,24 @@ bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
 		case 0x262: // GE_USER_VGPR_EN
 			// Per-draw geometry-engine state; radeonsi writes all of these on gfx10 itself.
 			return true;
+		case 0x25C: // GE_USER_VGPR1
+		case 0x25D: // GE_USER_VGPR2
+		case 0x25E: // GE_USER_VGPR3
+		case 0x260: // GE_PC_ALLOC
+		case 0x380: // TA_CS_BC_BASE_ADDR
+		case 0x381: // TA_CS_BC_BASE_ADDR_HI
+		{
+			// Dropped before only for want of a probe. Probe uconfig-w (2.11): a single SET_UCONFIG_REG of each on the gfx
+			// ring is harmless (no ring stop, no reset), so the title's goes as written, as the PS5's CP runs it. The rest
+			// of the dropped offsets (0x35-0x3c, 0x2bb-0x2bf, 0x2c4-0x2d3, 0x2e4-0x2eb, 0x41d-0x41f, and 0x342 on MEC) were
+			// not run and stay dropped. A compute ring drops all six as before (UconfigComputeDropped): the probe ran none on
+			// MEC. KYTY_NATIVE_GPU_UCONFIG_PROBED=0 drops all six on the gfx ring again.
+			static const bool probed = [] {
+				const char* v = std::getenv("KYTY_NATIVE_GPU_UCONFIG_PROBED");
+				return v == nullptr || v[0] != '0';
+			}();
+			return probed;
+		}
 		case 0x248: // VGT_OBJECT_ID
 		case 0x383: // TEXTURE_GRADIENT_FACTORS
 		case 0x384: // TEXTURE_GRADIENT_CONTROL
@@ -2147,8 +2278,9 @@ void Pm4Translator::ResetShadow() {
 void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx,
                                  const RegFile& sh, const RegFile& uc, const Pm4CpDrawState& cp) const {
 	if (m_compute_ring) {
-		// MEC has no graphics context. CONTEXT_CONTROL, CLEAR_STATE, context and UCONFIG writes are
-		// illegal opcodes on a compute ring. SH state is replayed: other jobs share the ring.
+		// MEC has no graphics context: CONTEXT_CONTROL, CLEAR_STATE, SET_CONTEXT_REG, the LOAD_*_REG and the register
+		// tables have no handler in its microcode, stock or the PS5's. SET_UCONFIG_REG has one, but the UCONFIG keys
+		// are geometry state, which a compute ring has no use for. SH state is replayed: other jobs share the ring.
 		for (const auto& [offset, value]: sh) {
 			EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), true);
 			stats.preamble_sh++;
@@ -2224,10 +2356,7 @@ void Pm4Translator::EmitShadowPreamble(std::vector<uint32_t>& ib, Pm4TranslateSt
 std::array<uint32_t, kCpShadowFixBytes / 4u> CpShadowFixTables() {
 	std::array<uint32_t, kCpShadowFixBytes / 4u> t {};
 	for (uint32_t n = 0; n < 8; n++) {
-		uint32_t* e = t.data() + 8u * n;
-		e[0] = e[4] = kCbColor0Fmask + n * kCbColorStride;
-		e[2] = e[6] = kCbColor0FmaskExt + n;
-		uint32_t* d = t.data() + (kCpShadowDccFixOffset - kCpShadowFixOffset) / 4u + 4u * n;
+		uint32_t* d = t.data() + 4u * n;
 		d[0] = d[2] = kCbColor0Info + n * kCbColorStride;
 	}
 	return t;
@@ -2236,8 +2365,8 @@ std::array<uint32_t, kCpShadowFixBytes / 4u> CpShadowFixTables() {
 // The display-DCC fix on the GPU (load mode): where the copy has CB_COLORn_INFO from a verbatim table the CP may hold
 // another INFO, so the CPU cannot write one without DCC; the GPU clears DCC_ENABLE in its own. The CP's INFO from S
 // into the value dwords of the slot's two tables once every shadow write before it has landed (PFP_SYNC_ME; DMA_DATA by
-// the ME with CP_SYNC, as the FMASK fix), ATOMIC_MEM AND on the first, a PFP wait until that word has lost DCC_ENABLE,
-// then the first table sets INFO. The CP shadows that write into S. The second keeps the INFO it had.
+// the ME with CP_SYNC and RAW_WAIT, as the push), ATOMIC_MEM AND on the first, a PFP wait until that word has lost
+// DCC_ENABLE, then the first table sets INFO. The CP shadows that write into S. The second keeps the INFO it had.
 void Pm4Translator::EmitCpShadowDccOff(std::vector<uint32_t>& ib, uint32_t slot) const {
 	const uint64_t from = m_cp_shadow_va + 4ull * (kCpShadowContextDw + kCbColor0Info + slot * kCbColorStride);
 	const uint64_t t    = m_cp_shadow_va + kCpShadowDccFixOffset + 16ull * slot;
@@ -2260,44 +2389,6 @@ void Pm4Translator::EmitCpShadowDccOff(std::vector<uint32_t>& ib, uint32_t slot)
 void Pm4Translator::EmitCpShadowDccRestore(std::vector<uint32_t>& ib, uint32_t slot) const {
 	const uint64_t t = m_cp_shadow_va + kCpShadowDccFixOffset + 16ull * slot + 8u;
 	ib.insert(ib.end(), {Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false), static_cast<uint32_t>(t), static_cast<uint32_t>(t >> 32u), 0x80000000u, 1u});
-}
-
-// fix_fmask on the GPU (load mode), as the CPU does it on the copy (FMASK = BASE when the target has none) but on the
-// values the CP holds: its CB_COLORn_BASE, BASE_EXT, FMASK and FMASK_EXT from S into the value dwords of the slot's
-// two one-register-pair tables, once every shadow write before them has landed (PFP_SYNC_ME; DMA_DATA by the ME
-// with CP_SYNC and RAW_WAIT, as the push), then FMASK = BASE from the first table, and, with `check`, when the CP's
-// FMASK was not 0, the second table puts FMASK and FMASK_EXT back (COND_EXEC on its copied FMASK). The PFP reads
-// the COND_EXEC's word, hence the PFP_SYNC_ME after the copies. A register S has no value for is 0 on the GPU
-// (amdgpu's clear state): the zero word is copied in its place. The CP shadows the tables' writes into S.
-void Pm4Translator::EmitCpShadowFmaskFix(std::vector<uint32_t>& ib, uint32_t slot, bool check,
-                                         const std::bitset<RegFile::kDense>& valid) const {
-	const uint64_t cx   = m_cp_shadow_va + 4ull * kCpShadowContextDw;
-	const uint64_t zero = m_cp_shadow_va + kCpShadowZeroOffset;
-	const uint64_t t    = m_cp_shadow_va + kCpShadowFixOffset + 32ull * slot;
-	auto           copy = [&](uint32_t reg, uint64_t to) {
-		const uint64_t from = valid.test(reg) ? cx + 4ull * reg : zero;
-		ib.insert(ib.end(), {Pkt3(IT_DMA_DATA, 6, false), kCpShadowDmaControl, static_cast<uint32_t>(from), static_cast<uint32_t>(from >> 32u),
-		                     static_cast<uint32_t>(to), static_cast<uint32_t>(to >> 32u), kCpShadowDmaWordCommand});
-	};
-	auto table = [&](uint64_t at) {
-		ib.insert(ib.end(), {Pkt3(IT_SET_CONTEXT_REG_INDIRECT, 4, false), static_cast<uint32_t>(at), static_cast<uint32_t>(at >> 32u),
-		                     0x80000000u, 2u});
-	};
-	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
-	ib.push_back(0u);
-	copy(kCbColor0Base + slot * kCbColorStride, t + 4u);
-	copy(kCbColor0BaseExt + slot, t + 12u);
-	if (check) {
-		copy(kCbColor0Fmask + slot * kCbColorStride, t + 20u);
-		copy(kCbColor0FmaskExt + slot, t + 28u);
-	}
-	ib.push_back(Pkt3(IT_PFP_SYNC_ME, 1, false));
-	ib.push_back(0u);
-	table(t);
-	if (check) {
-		ib.insert(ib.end(), {Pkt3(IT_COND_EXEC, 4, false), static_cast<uint32_t>(t + 20u), static_cast<uint32_t>((t + 20u) >> 32u), 0u, 5u});
-		table(t + 16u);
-	}
 }
 
 // libSceAgc's context push on the GPU (SetCpShadowPushPop): S's context region to P once every shadow write before
@@ -2507,7 +2598,7 @@ Pm4Translator::CpShadowCheck Pm4Translator::CompareCpShadow(std::span<const uint
 		return c;
 	}
 	static const char* const kWriter[] = {"nothing since the seed", "a SET", "a verbatim table", "an expanded table",
-	                                      "an insert of the translator's", "the GPU's FMASK fix"};
+	                                      "an insert of the translator's", "the GPU's display-DCC fix"};
 	auto key = [&](const char* cls, uint32_t region, uint32_t off, uint32_t raw, uint32_t want, uint8_t writer) {
 		c.keys++;
 		const uint32_t got = s[region + off];
@@ -2783,15 +2874,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 		}
 	}
-	uint8_t    fmask_done = 0; // MRT slots the GPU fixed since their registers changed or a preamble ran
-	uint8_t    dcc_done   = 0; // the same for the display-DCC fix
-	auto       writer    = [this, cp_shadow, &wcx, &vcx, &fmask_done, &dcc_done](std::array<uint8_t, RegFile::kDense>& w, uint32_t off,
-	                                                                          RegWriter kind) {
+	uint8_t    dcc_done  = 0; // MRT slots the GPU's display-DCC fix did since their registers changed or a preamble ran
+	auto       writer    = [this, cp_shadow, &wcx, &vcx, &dcc_done](std::array<uint8_t, RegFile::kDense>& w, uint32_t off,
+	                                                              RegWriter kind) {
         if (cp_shadow && off < RegFile::kDense) {
             w[off] = static_cast<uint8_t>(kind);
             if (&w == &wcx) {
                 vcx.set(off);
-                fmask_done &= static_cast<uint8_t>(~FmaskFixSlots(off));
                 dcc_done &= static_cast<uint8_t>(~DccFixSlots(off));
                 const bool info = off >= kCbColor0Base && off < kCbColor0Base + 8 * kCbColorStride &&
                                   (off - kCbColor0Base) % kCbColorStride == kCbColor0Info - kCbColor0Base;
@@ -2805,8 +2894,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// Load mode: the GPU's context registers come from S, so where the copy took a register from a verbatim table
 	// (the CP reads the table when it runs it, which may be after a GPU write the translator never sees) the GPU may
 	// hold another value; a GPU pop gives it back as S had it at the push, and a preamble LOADs it from S. The same
-	// for the FMASK the GPU's own fix set. Decisions the CPU makes on such registers are made on the GPU (the FMASK
-	// fix), left out (display DCC on such an INFO), or not skipped as unchanged (a clear, a CPU pop).
+	// for the INFO the GPU's display-DCC fix set. Decisions the CPU makes on such registers are made on the GPU (display
+	// DCC on such an INFO) or not skipped as unchanged (a clear, a CPU pop).
 	const bool shadow_load = CpShadow() == CpShadowMode::Load;
 	auto       stale       = [&](uint32_t off) {
 		return shadow_load && off < RegFile::kDense &&
@@ -3319,58 +3408,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 
-	// A bound color target without FMASK pointed at its own base (SetFmaskFix, KYTY_NATIVE_GPU_FMASK_FIX=1), as radeonsi
-	// and PAL program it. Up to 28.10 ASTRO BOT's MRT4 with FMASK 0 and a CMASK fast clear hung the gfx ring here
-	// without it ("Illegal register access" in 0x9F, TCP reads of address 0). Since AgcDcbResetQueue in Sony's form,
-	// 0x35 as written and direct memory resident at allocation it runs 524 s in load mode without the fix (1.11), so
-	// the title's FMASK 0 runs as written, as on the PS5.
-	auto fix_fmask = [&]() {
-		if (!m_fmask_fix) {
-			return;
-		}
-		const uint32_t mask = reg(cx, kCbTargetMask) & m_target_mask;
-		for (uint32_t i = 0; i < 8; i++) {
-			const uint32_t step = i * kCbColorStride;
-			// Load mode, a slot some register of which the copy took from a verbatim table (or the GPU's own fix
-			// changed): the GPU may hold other values, so the CP decides on its own, once until they change again. What
-			// the copy knows still rules out a slot: a mask, BASE or FMASK the GPU holds as the copy does.
-			if (stale(kCbTargetMask) || stale(kCbColor0Base + step) || stale(kCbColor0BaseExt + i) || stale(kCbColor0Fmask + step) ||
-			    stale(kCbColor0FmaskExt + i)) {
-				const uint32_t gpu_mask = stale(kCbTargetMask) ? m_target_mask : mask;
-				// A BASE S has no value for is amdgpu's clear state (0) on the GPU: nothing to fix, as on the CPU. An
-				// FMASK S has none for is 0 on the GPU too, as is one the copy holds as 0: set without the check.
-				const bool known_base  = !stale(kCbColor0Base + step);
-				const bool known_fmask = !stale(kCbColor0Fmask + step);
-				if (((gpu_mask >> (4u * i)) & 0xfu) == 0 || (fmask_done & (1u << i)) != 0 || !vcx.test(kCbColor0Base + step) ||
-				    (known_base && reg(cx, kCbColor0Base + step) == 0) || (known_fmask && reg(cx, kCbColor0Fmask + step) != 0)) {
-					continue;
-				}
-				EmitCpShadowFmaskFix(body, i, !known_fmask && vcx.test(kCbColor0Fmask + step), vcx);
-				// The copy keeps its FMASK values, which the GPU may no longer hold: a switch of the context SETs
-				// them again, and a later fix of the slot is the GPU's too.
-				for (const uint32_t off: {kCbColor0Fmask + step, kCbColor0FmaskExt + i}) {
-					wcx[off] = static_cast<uint8_t>(RegWriter::Gpu);
-					vcx.set(off);
-				}
-				fmask_done |= static_cast<uint8_t>(1u << i);
-				stats.cp_shadow_fmask_gpu++;
-				continue;
-			}
-			const uint32_t base = reg(cx, kCbColor0Base + step);
-			if (((mask >> (4u * i)) & 0xfu) == 0 || base == 0 || reg(cx, kCbColor0Fmask + step) != 0) {
-				continue;
-			}
-			const uint32_t ext = reg(cx, kCbColor0BaseExt + i);
-			cx[kCbColor0Fmask + step]  = base;
-			cx[kCbColor0FmaskExt + i] = ext;
-			writer(wcx, kCbColor0Fmask + step, RegWriter::Insert);
-			writer(wcx, kCbColor0FmaskExt + i, RegWriter::Insert);
-			EmitSet(body, IT_SET_CONTEXT_REG, kCbColor0Fmask + step, base, false);
-			EmitSet(body, IT_SET_CONTEXT_REG, kCbColor0FmaskExt + i, ext, false);
-			stats.fmask_fixed++;
-		}
-	};
-
 	// Switches the context registers to `next` (a pop, a clear): the registers that change are set
 	// again, those `next` lacks go back to 0.
 	auto switch_context = [&](const RegFile& next) {
@@ -3435,8 +3472,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		cx  = saved_cx;
 		wcx = saved_wcx;
-		fmask_done = 0; // the CB registers are the pushed ones again
-		dcc_done   = 0;
+		dcc_done = 0; // the CB registers are the pushed ones again
 		// An INFO cleared inside the window is the pushed one again: giving that one's DCC back would put it on
 		// whatever target the pushed INFO belongs to.
 		m_display_dcc_gpu = m_saved_display_dcc_gpu;
@@ -3565,7 +3601,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 	auto skip_draw = [&]() {
-		fix_fmask();
 		fix_display_dcc();
 		const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
 		if (!m_inspect.empty() && m_inspect.count(ps) != 0 && r.inspected.size() < 4) {
@@ -3597,11 +3632,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 
-	// CP DMA runs beside the CP and outlives the IB it was issued in: a DMA_DATA without CP_SYNC may still be
-	// copying when the job's end-of-pipe fence or a tracker release says the job is done (BC5 F41: the next IB
-	// hung). The PS5's contract is that a finished job's writes have landed, so a job end after such a DMA waits
-	// for it with a zero-byte DMA_DATA with CP_SYNC, Mesa's si_cp_dma_wait_for_idle: the DMA engine finds no
-	// work and holds the ME until the copies before it are done. KYTY_NATIVE_GPU_CP_DMA_IDLE=0 leaves it out.
+	// CP DMA runs beside the CP and outlives the IB it was issued in: a DMA_DATA without CP_SYNC is not finished when
+	// the job's end-of-pipe fence or a bottom-of-pipe label after it says the job is done. Probe cpdma-tail (2.11): such
+	// a DMA_DATA as a gfx job's last packet, 1, 32 and 63 MiB, had not landed its last dword when the CPU saw the fence
+	// or the label in 20 runs of 20; it came 70 us to 1.1 ms later. Whether the PS5's DMA_DATA handlers, a little longer
+	// than the stock ones at entry and exit (microcode), wait for the copy themselves is not known; this board's do not,
+	// and the PS5's contract is that a finished job's writes have landed (BC5 F41: the next IB hung without it). So a
+	// job end, or a tracker release, after such a DMA waits for it with a zero-byte DMA_DATA with CP_SYNC, Mesa's
+	// si_cp_dma_wait_for_idle: the DMA engine finds no work and holds the ME until the copies before it are done.
+	// KYTY_NATIVE_GPU_CP_DMA_IDLE=0 leaves it out.
 	bool cp_dma_busy = false;
 	auto cp_dma_idle = [&]() {
 		if (!cp_dma_busy || !m_cp_dma_idle) {
@@ -3808,6 +3847,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	const bool            cs_guards  = m_exit_run_va != 0 && m_compute_ring;
 	std::vector<uint32_t> body_guards;
 	size_t                guard_from = 0;
+	// A compute ring's guard right before a title's COND_EXEC whose range holds guards of ours, and the guard right
+	// after that range (body offsets of their EXEC_COUNT dwords): the first skips to the second, over the whole range,
+	// so no guard's stretch ends inside a range (SplitIbAtPackets keeps a guard with its stretch in one IB).
+	std::vector<std::pair<uint32_t, uint32_t>> guards_over;
 	// `pfp_ahead`: the wait leaves the PFP parsing past it (an ME wait).
 	auto guard_after_wait = [&](bool pfp_ahead) {
 		if (gfx_guards) {
@@ -3821,6 +3864,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			guard_from = body.size();
 		}
 	};
+	// A held segment has begun (split_at_wait) and no title packet has reached the GPU in it since (SetCondExec: a
+	// COND_EXEC there gets PFP_SYNC_ME first).
+	bool held_open = false;
 	// Cuts the IB at a guest wait nobody known satisfies yet: the rest starts held, with its own
 	// preamble, a barrier block and the guest wait (the backend NOPs one of the two).
 	auto split_at_wait = [&](const WaitCond& w) {
@@ -3845,16 +3891,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					vcx.set(off);
 				}
 			}
-			fmask_done = 0;
-			dcc_done   = 0;
+			dcc_done = 0;
 		}
 		s.wait  = w;
-		// No native form (not EQUAL, or a 64-bit wait on both halves), or an address the GPU cannot
-		// reach: only seeing the label in memory releases it. A WAIT_REG_MEM there reads the dummy.
-		// The native form polls one dword. That dword has to be resident; the rest of a 64-bit
-		// wait is not what this packet reads. Built aside: a form that fails halfway leaves nothing behind.
+		// No native form (ALWAYS or the reserved 7), or an address the GPU cannot reach: only seeing the
+		// label in memory releases it. A WAIT_REG_MEM there reads the dummy. The native form is the title's packet
+		// (EmitNativeWait), so what it reads, 4 or 8 bytes, has to be resident. Built aside: a form that fails
+		// halfway leaves nothing behind.
 		std::vector<uint32_t> native;
-		const bool            has_native = label_gpu(w.addr, 4) && EmitNativeWait(native, w, m_compute_ring);
+		const bool            has_native = label_gpu(w.addr, w.wide ? 8u : 4u) && EmitNativeWait(native, w, m_compute_ring);
 		// SetCpShadowWaitOff: the wrap's "off" before the barrier and its "on" after the guard, so neither patch range
 		// (barrier_dw/len, wait_dw/len) holds them: whichever of the two LabelPipeline NOPs, the pair stays.
 		const bool wrap = wait_wrap && (m_fence_va != 0 || has_native);
@@ -3871,10 +3916,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		s.wait_len = has_native ? static_cast<uint32_t>(native.size()) : 0u;
 		guard_from = body.size();
 		if (s.wait_len != 0) {
-			guard_after_wait(!w.pfp); // a PFP wait's native form ends with PFP_SYNC_ME
+			guard_after_wait(!w.pfp); // a PFP wait holds the PFP itself
 		}
 		if (wrap) {
-			// A PFP wait's barrier and native form end with PFP_SYNC_ME, an ME wait's guard has one before it.
+			// A PFP wait's barrier ends with PFP_SYNC_ME and its native form holds the PFP itself; an ME wait's guard has
+			// PFP_SYNC_ME before it.
 			wait_on(!w.pfp && !(gfx_guards && s.wait_len != 0));
 		}
 		seg_effects = true;
@@ -4001,7 +4047,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 	stats.total_dw = static_cast<uint32_t>(dcb.size());
-	// A title's COND_EXEC in any form (SetCondExec), gfx ring: if the dword at its address is 0 the CP skips EXEC_COUNT
+	// A title's COND_EXEC in any form (SetCondExec), on the gfx ring and on MEC: if the dword at its address is 0 the CP skips EXEC_COUNT
 	// dwords, which on the PS5 are the title's own. The translated range differs in length (patched packets, inserted
 	// waits and stores), so the COND_EXEC goes as written with its count set to the translated range once the walk
 	// reaches the range's end. Inside the range nothing may happen outside the GPU's stream: no direct runs (the IB2s
@@ -4019,6 +4065,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		size_t   writes        = 0; // local_writes when it began
 		size_t   seg_writes    = 0; // segs.back().writes when it began
 		uint32_t fence_seq     = 0;
+		size_t   guards        = 0; // body_guards when it began (a compute ring's exit guards), the one before it included
 	} cond;
 	// False when something left the GPU's stream inside the range (see above). A wake that comes anyway is harmless, also
 	// as a tracker store inside the range (the points a GPU wait there flushes first): the tracker passes a point once
@@ -4039,6 +4086,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			return false;
 		}
 		body[cond.count_at] = (body[cond.count_at] & ~0x3fffu) | static_cast<uint32_t>(count);
+		// A compute ring's exit guards skip to the next one: with one inside the range, the next starts right after it, so
+		// none skips past the range's end (where SplitIbAtPackets may end an IB).
+		// The guard right before the COND_EXEC skips to that one, past the range: otherwise its stretch would end at the
+		// first guard inside, and an IB could end there.
+		if (cs_guards && body_guards.size() > cond.guards) {
+			body_guards.push_back(EmitComputeExitGuard(body, m_exit_run_va));
+			guards_over.emplace_back(body_guards[cond.guards - 1u], body_guards.back());
+			guard_from = body.size();
+		}
 		for (size_t i = cond.writes; i < local_writes.size(); i++) {
 			local_writes[i].known   = false;
 			local_writes[i].nonzero = false;
@@ -4105,18 +4161,27 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		const uint32_t* const bptr = pk.data() + 1;
 		gpu                        = false;
 		// libSceAgc's flag swap around a context push or pop, and the workload swap and AND of SetWorkloadsActive and
-		// SetWorkloadComplete (into the driver's workload words): as written on the gfx ring, where the GPU may
-		// write the address. MEC has not run an ATOMIC_MEM on this board, and memory the GPU cannot write must not
-		// get one: with native labels the tracker performs it on the CPU when the GPU gets there. Without native
-		// labels Kyty's command processor runs the whole buffer and performs it, so a compute ring leaves it out.
-		// With KYTY_NATIVE_GPU_ATOMIC_OPS (on by default) every integer op goes the same way (IntegerAtomicOp), the
-		// tracker running it on the CPU with the same TC_OP (CpuAtomicMem).
+		// SetWorkloadComplete (into the driver's workload words): as written where the GPU may write the address, on
+		// the gfx ring and on MEC alike. MEC's ATOMIC_MEM handler decodes the op, COMMAND and CACHE_POLICY as the ME's
+		// does (microcode, stock and the PS5's), and probe atomicops and mecplain on amdgpu's compute ring 1 (2.11) ran
+		// ADD_64, SWAP_64 and SUB_64 with COMMAND 2 and the title's plain header there correctly. Memory the GPU cannot
+		// write must not get one: with native labels the tracker performs it on the CPU when the GPU gets there.
+		// Without native labels Kyty's command processor runs the whole buffer and performs it, so a compute ring
+		// leaves it out. With KYTY_NATIVE_GPU_ATOMIC_OPS (on by default) every integer op goes the same way
+		// (IntegerAtomicOp), the tracker running it on the CPU with the same TC_OP (CpuAtomicMem). The title's
+		// CACHE_POLICY stays, on MEC as on the gfx ring: an LRU or STREAM result on NC memory reaches the CPU only with
+		// the next GL2 write-back (a segment's tracker store), and its value is not known when translating (an integer
+		// op's is recorded as an unknown GPU write), so no wait is planned as met on it before then.
+		// KYTY_NATIVE_GPU_ACB_ATOMICS=0 leaves MEC's to the tracker, as before.
 		if (pk.size() != 9 || !(AgcAtomicOp(bptr[0]) || ((own || m_atomic_ops) && IntegerAtomicOp(bptr[0])))) {
 			return RefuseWhy::AtomicForm;
 		}
 		const uint64_t addr  = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
 		const uint64_t bytes = (bptr[0] & 0x20u) != 0 ? 8u : 4u;
-		if (labels && (m_compute_ring || !label_gpu(addr, bytes))) {
+		// COMMAND 1 (the compare-swap loop) has not run on MEC (probe atomicops on compute ring 1, 2.11: COMMAND 2 only):
+		// the tracker performs it there, as before.
+		const bool mec_cpu = m_compute_ring && (!AcbAtomicsOnGpu() || ((bptr[0] >> 8u) & 0xfu) == 1u);
+		if (labels && (mec_cpu || !label_gpu(addr, bytes))) {
 			TrackerPoint cpu_atomic;
 			cpu_atomic.kind = TrackerPoint::Kind::Atomic;
 			cpu_atomic.addr = addr;
@@ -4126,16 +4191,24 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				note_write({addr, 0, false, false, bytes == 8u});
 			}
 			stats.atomics_cpu++;
-			NoteOnce(24, "ATOMIC_MEM performed by the tracker (compute ring, or memory the GPU cannot write)");
+			NoteOnce(24, "ATOMIC_MEM performed by the tracker (memory the GPU cannot write, or MEC with KYTY_NATIVE_GPU_ACB_ATOMICS=0)");
 			return std::nullopt;
 		}
-		if (m_compute_ring) {
+		if (m_compute_ring && !labels) {
 			return std::nullopt;
 		}
 		if (direct && !own) {
 			in_place = true;
 		} else {
+			const size_t at = body.size();
 			body.insert(body.end(), pk.begin(), pk.end());
+			if (m_compute_ring && !MecPlainOp(IT_ATOMIC_MEM)) {
+				body[at] |= 2u; // KYTY_NATIVE_GPU_ACB_PLAIN without 0x1E: the compute shader-type bit
+			}
+		}
+		if (m_compute_ring) {
+			stats.atomics_mec++;
+			NoteOnce(41, "ATOMIC_MEM on MEC as written (the GPU may write the address)");
 		}
 		if (!labels) {
 			add_ref(addr, bytes, false); // label_gpu has added it otherwise
@@ -4223,10 +4296,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			if (plan == LabelOracle::Plan::Native && !m_native_waits) {
 				plan = LabelOracle::Plan::Met;
 			}
-			// A native wait reads whatever the GPU is mapped at. If that is not this label,
-			// hold the segment: the tracker (or a later CPU write) puts the value in guest
+			// A native wait reads whatever the GPU is mapped at, 4 or 8 bytes. If that is not this
+			// label, hold the segment: the tracker (or a later CPU write) puts the value in guest
 			// memory, and the barrier is the only GPU wait.
-			if (plan == LabelOracle::Plan::Native && !label_gpu(addr, 4)) {
+			if (plan == LabelOracle::Plan::Native && !label_gpu(addr, wide ? 8u : 4u)) {
 				plan = LabelOracle::Plan::Split;
 			}
 			if (plan == LabelOracle::Plan::Native) {
@@ -4241,6 +4314,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			std::vector<uint32_t> wait_pk;
 			if (as_written) {
 				wait_pk.assign(pk.begin(), pk.end());
+				if (m_compute_ring && !MecPlainOp(op)) {
+					wait_pk[0] |= 2u; // KYTY_NATIVE_GPU_ACB_PLAIN without the wait's opcode: the compute shader-type bit
+				}
 			}
 			// SetAudit: the title's CACHE_POLICY, lost unless the GPU runs its own packet (our wait, a barrier, a hold).
 			if (m_audit && !own && ((bptr[0] >> 25u) & 3u) != 0u && !as_written) {
@@ -4374,9 +4450,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			continue;
 		}
 		if (m_compute_ring) {
-			// MEC has no graphics engine. These opcodes hang a compute ring ("Illegal opcode").
-			// SET_UCONFIG_REG / INDEX / INDIRECT are handled below: profiler UCONFIG is dropped,
-			// geometry-engine UCONFIG still refuses the buffer.
+			// MEC has no graphics engine. These opcodes have no handler in its microcode, stock or the PS5's (the
+			// default one stops the queue), so the PS5 would fault on them as well. SET_UCONFIG_REG / INDEX /
+			// INDIRECT are handled below: profiler UCONFIG is dropped, geometry-engine UCONFIG still refuses the buffer.
 			switch (op) {
 				case IT_DRAW_INDIRECT:
 				case IT_DRAW_INDEX_INDIRECT:
@@ -4505,7 +4581,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							r.unknown_op = op;
 							r.unknown_dw = dw;
 						}
-						r.unknown_ops.insert(op); // GDS data without a GDS partition: leave the buffer to Kyty
+						r.unknown_ops.insert(op); // GDS data without a GDS partition (KYTY_NATIVE_GPU_GDS=0): leave the buffer to Kyty
 						note_refusal(op, dw, RefuseWhy::ReleaseGds);
 						break;
 					}
@@ -4517,11 +4593,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// (LabelEventOk). A data label goes as written only where the GPU may write it (label_gpu
 					// below). With KYTY_NATIVE_GPU_RELEASES_AS_WRITTEN=0 (the form before 1.11) only one without
 					// an interrupt whose data goes to memory (DST_SEL 0): libSceAgc's labels to L2 (DST_SEL 1) were
-					// thought to stay there for good, which ReleasesAsWritten's probe disproves.
-					// On this board GL2_WB does not write back the metadata cache, and GLM_INV without GLM_WB
-					// drops it: ASTRO BOT's frames stayed black with its end-of-pipe GL2 write-backs and full
-					// invalidates as written. Mesa never invalidates GLM without writing it back. Such a
-					// release takes the rewritten form, which adds GLM_WB.
+					// thought to stay there for good, which ReleasesAsWritten's probe disproves. Its cache actions go as
+					// written in both forms: a GL2_WB or GLM_INV without GLM_WB is the title's, as on the PS5 (the black
+					// ASTRO BOT frames of 27.10 blamed on them came from LRU labels the CPU did not see; 1.11 draws right).
 					//
 					// With ReleasesAsWritten (the default) the DCB's release goes as the title wrote it, DST_SEL 1 and
 					// 64-bit data included, with one change: the interrupt is cleared from it, raised by the tracker
@@ -4531,18 +4605,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// labelvis LABELVIS_INTSEL; or no address) goes without its DATA_SEL too: its event and cache
 					// actions as written (libSceAgc's CACHE_FLUSH_AND_INV_TS interrupts flush the CB and DB).
 					const uint32_t dst_sel    = (bptr[1] >> 16u) & 0x3u;
-					const bool     glm_ok     = (bptr[0] & (kGcrGl2Wb | kGcrGlmInv)) == 0u || (bptr[0] & kGcrGlmWb) != 0u;
 					const bool     interrupt  = int_sel == 1 || int_sel == 2 || int_sel == 4;
 					const bool     whole      = ReleasesAsWritten();
-					const uint32_t event_run  = whole && !glm_ok && ReleaseGlmWriteBack() ? bptr[0] | kGcrGlmWb : bptr[0];
 					// An ACB's release goes as written too (KYTY_NATIVE_GPU_ACB_RELEASES_AS_WRITTEN=0: rewritten as before),
 					// its header too on MEC (an ACB on the gfx ring loses the compute shader-type bit): MEC runs the events
 					// libSceAgc uses there, and
 					// DST_SEL 1 with BYPASS reaches the CPU from compute as from gfx (probe labelvis on compute).
 					const bool     as_written = LabelsVerbatim(data_sel) && op == IT_RELEASE_MEM && size == 8u &&
 					                        (whole ? (!m_compute_queue || AcbReleasesAsWritten()) && dst_sel <= 1u &&
-					                                     (!interrupt || !m_guest_irq) && LabelEventOk(event_run)
-					                               : !m_compute_queue && int_sel == 0 && glm_ok && LabelEventOk(bptr[0]) &&
+					                                     (!interrupt || !m_guest_irq) && LabelEventOk(bptr[0])
+					                               : !m_compute_queue && int_sel == 0 && LabelEventOk(bptr[0]) &&
 					                                     (data_sel == 0 || (dst != 0 && dst_sel == 0)));
 					// `with_interrupt`: the GPU raises the title's interrupt itself (the EOP log), as written.
 					const bool data_kept = sel == data_sel;
@@ -4558,7 +4630,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							body[at + 5] = 0u; // the GPU clock replaces the data dwords
 							body[at + 6] = 0u;
 						}
-						body[at + 1] = event_run;
 						if (!data_kept) {
 							body[at + 2] &= ~(0x7u << 29u); // no data, as the CP writes none
 						}
@@ -4694,7 +4765,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const bool     irq_on_gpu = interrupt && m_guest_irq && op == IT_RELEASE_MEM && !cpu_point &&
 					                        (guest_ctx != 0 || m_guest_irq_ctx0) && guest_ctx < (1u << 27u);
 					if (irq_on_gpu) {
-						if (!m_compute_queue && size == 8u && int_sel == 1 && data_sel == 0 && glm_ok && LabelEventOk(bptr[0])) {
+						if (!m_compute_queue && size == 8u && int_sel == 1 && data_sel == 0 && LabelEventOk(bptr[0])) {
 							write_as_written(true);
 						} else {
 							EmitRelease32(body, m_tracker_va + 8, 0u, m_compute_ring, LabelEventCntl(bptr[0]));
@@ -4796,8 +4867,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 
 			case IT_SET_SH_REG: {
-				// With direct runs a packet no value of which is patched runs in place, without a copy.
-				bool unchanged = !m_compute_ring;
+				// With direct runs a packet no value of which is patched runs in place, without a copy. On MEC too: its
+				// SET_SH_REG handler is the PS5's (microcode), and there the copy of such a packet is the title's, header
+				// included (MecPlainOp), as long as direct runs stay on the gfx ring.
+				bool unchanged = true;
 				if (body_count >= 1) {
 					const uint32_t base = bptr[0];
 					const uint32_t last = base + body_count - 2;
@@ -4845,7 +4918,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					                                                        : Normalize(bptr[0]);
 					bool graphics = false;
 					for (uint32_t i = 1; i < body_count; i++) {
-						if (UconfigAllowed(base + (i - 1))) {
+						if (UconfigAllowed(base + (i - 1)) && !UconfigComputeDropped(base + (i - 1))) {
 							graphics = true;
 						}
 					}
@@ -4873,7 +4946,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
 					                                                        : Normalize(bptr[0]);
 					for (uint32_t i = 1; i < body_count && allowed; i++) {
-						if (!UconfigAllowed(base + (i - 1))) {
+						if (!UconfigAllowed(base + (i - 1)) || (m_compute_ring && UconfigComputeDropped(base + (i - 1)))) {
 							allowed = false;
 						}
 					}
@@ -4886,10 +4959,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				}
 				if (allowed) {
-					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
-					                                                        : Normalize(bptr[0]);
-					for (uint32_t i = 1; i < body_count; i++) {
-						EmitSetUconfig(body, base + (i - 1), bptr[i]);
+					// As the title wrote it, several registers and the index form included: the PS5's PFP runs it with
+					// the stock handler (a plain VGT_INDEX_TYPE leaves its copy of the index type alone on both).
+					if (direct) {
+						in_place = true;
+					} else {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					}
 					if (op == IT_SET_UCONFIG_REG_INDEX) {
 						stats.set_uconfig_index++;
@@ -5013,7 +5088,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						if (off == kUcNop) {
 							continue;
 						}
-						if (!UconfigAllowed(off)) {
+						if (!UconfigAllowed(off) || (m_compute_ring && UconfigComputeDropped(off))) {
 							stats.uconfig_skipped++;
 							r.skipped_uconfig.insert(off);
 							continue;
@@ -5145,13 +5220,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// As the guest's WRITE_DATA, in order: the micro engine writes it when it gets there, and a
 					// dispatch right after reads it (My First Gran Turismo builds a dispatch's constants with
 					// WRITE_DATA, then dispatches). As end-of-pipe releases the data landed after that dispatch
-					// had read it, and longer writes went to the tracker, after the whole segment. The write is
-					// confirmed before the engine moves on; a compute ring has only the micro engine.
-					// A constant-engine write (ENGINE_SEL 2) is the micro engine's here: the native IB is
-					// not a CE IB, and the ME writes it at its place in the stream, where the tracker would
+					// had read it, and longer writes went to the tracker, after the whole segment. On the gfx ring
+					// the write is confirmed before the engine moves on. On MEC the title's packet goes as written:
+					// MEC's WRITE_DATA reads DST_SEL, ADDR_INCR and WR_CONFIRM, never ENGINE_SEL (microcode, stock and
+					// the PS5's); DST_SEL 1 has no MEC handler in either, so the PS5 would fault on it: refused.
+					// A constant-engine write (ENGINE_SEL 2) on the gfx ring is the micro engine's here: the native IB
+					// is not a CE IB, and the ME writes it at its place in the stream, where the tracker would
 					// only write it after the whole segment. KYTY_NATIVE_GPU_TRACKER_WRITES=1 leaves it to
 					// the tracker as before.
-					const bool gpu = (engine <= 1 || !m_tracker_writes) && label_gpu(dst, bytes);
+					const bool gpu = (engine <= 1 || m_compute_ring || !m_tracker_writes) && label_gpu(dst, bytes);
+					if (gpu && m_compute_ring && ((bptr[0] >> 8u) & 0xfu) == 1u) {
+						return fail(op, dw, RefuseWhy::WriteDataOnMec);
+					}
 					if (gpu && direct && (bptr[0] & (1u << 20u)) != 0 && engine <= 1) {
 						// The title's own packet is what the GPU gets: with direct runs it is not copied (half
 						// of ASTRO BOT's DCB dwords are such blocks), the IB runs it from the title's buffer.
@@ -5159,12 +5239,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					} else if (gpu) {
 						const size_t at = body.size();
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-						body[at + 1] |= 1u << 20u; // WR_CONFIRM
 						if (m_compute_ring) {
-							body[at] |= 2u;                 // SHADER_TYPE compute
-						}
-						if (m_compute_ring || engine > 1) {
-							body[at + 1] &= ~(3u << 30u);   // ENGINE_SEL micro engine
+							body[at] |= 2u; // SHADER_TYPE compute
+						} else {
+							body[at + 1] |= 1u << 20u; // WR_CONFIRM
+							if (engine > 1) {
+								body[at + 1] &= ~(3u << 30u); // ENGINE_SEL micro engine
+							}
 						}
 					}
 					if (gpu) {
@@ -5174,7 +5255,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						seg_effects = true;
 						NoteOnce(6, m_tracker_writes ? "WRITE_DATA label (native WRITE_DATA, mirrored to the CPU)"
 						                             : "WRITE_DATA label (native WRITE_DATA only)");
-						if (engine > 1) {
+						if (engine > 1 && !m_compute_ring) {
 							NoteOnce(11, "WRITE_DATA by the constant engine (run on the micro engine)");
 						}
 					}
@@ -5235,7 +5316,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// != 0, planned like the title's own waits (on the GPU behind a known writer, a barrier when memory already
 				// meets it, else held on the CPU), and then an ATOMIC_MEM subtract. Both atomics are no-return, 64-bit,
 				// COMMAND 2 (wait for the write confirm), on the micro engine: the PFP would run the signal's ahead of the
-				// barrier's ME-side wait. On a compute ring, or memory the GPU cannot write, the tracker performs them on the
+				// barrier's ME-side wait. MEC runs them too (probe atomicops and mecplain on compute ring 1, 2.11). On memory
+				// the GPU cannot write (or on MEC with KYTY_NATIVE_GPU_ACB_ATOMICS=0) the tracker performs them on the
 				// CPU (CpuAtomicMem), each stored right behind its packet (not at the segment's end) so it lands as soon as the
 				// GPU has passed: still a little later than on the PS5, where a later signal is harmless but a later subtract
 				// lets a wait that polls in between (the next buffer of the same queue, another ring) pass on the same signal,
@@ -5440,13 +5522,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const uint64_t src     = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
 				const uint64_t dst     = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
 				// ENGINE_SEL (bits 31:30, gfx ring): libSceAgc's DCB form picks the micro engine or the prefetch parser (bit 30,
-				// AgcDcbCopyData), both of which run it as written; the constant engine (2) is not in a DCB's stream, and MEC
-				// has no engine field (AgcAcbCopyData leaves the bits 0). A 64-bit copy's addresses hold bits 31:3 only
+				// AgcDcbCopyData), both of which run it as written; the constant engine (2) is not in a DCB's stream. MEC's
+				// COPY_DATA never reads bit 30 (microcode, stock and the PS5's), so an ACB's goes as written with either value
+				// (AgcAcbCopyData leaves it 0). A 64-bit copy's addresses hold bits 31:3 only
 				// (DST_64B_ADDR_LO, SRC_64B_ADDR_LO): the CP would write elsewhere than the label bookkeeping and the tracker's
 				// fallbacks assume, so an address not aligned to the copy's size refuses.
 				const uint32_t engine = bptr[0] >> 30u;
 				if (!(src_mem || imm || clock) || !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || dst == 0 || (dst & (bytes - 1u)) != 0 ||
-				    (src_mem && (src == 0 || (src & (bytes - 1u)) != 0)) || engine > (m_compute_ring ? 0u : 1u)) {
+				    (src_mem && (src == 0 || (src & (bytes - 1u)) != 0)) || engine > 1u) {
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]};
 					return fail(op, dw, RefuseWhy::CopyDataForm);
 				}
@@ -5575,29 +5658,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.index_state++;
 				break;
 			case IT_DRAW_INDEX_OFFSET_2: { // MAX_SIZE, INDEX_OFFSET, INDEX_COUNT, DRAW_INITIATOR
-				// As written (SetDrawIndexOffsetVerbatim, the native default): the BC-250's CP draws it once the
-				// queue resets set the index buffer up as libSceAgc's do (AgcDcbResetQueue op 0x10: INDEX_BASE 0,
-				// INDEX_BUFFER_SIZE 0xffffffff). With Kyty's former reset (a CLEAR_STATE) ASTRO BOT was black
-				// with the packet as written, which looked like a firmware gap. Otherwise DRAW_INDEX_2 at the
-				// offset's address, as Kyty's own command processor does.
+				// As written: the BC-250's CP draws it as the PS5's does once the queue resets set the index buffer up
+				// as libSceAgc's do (AgcDcbResetQueue op 0x10: INDEX_BASE 0, INDEX_BUFFER_SIZE 0xffffffff). With
+				// Kyty's former reset (a CLEAR_STATE) ASTRO BOT was black with the packet as written, which looked
+				// like a firmware gap (1.11).
 				if (body_count < 4) {
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				log_draw(op, bptr[2], 0, false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
-				} else if (m_draw_offset_verbatim) {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				} else {
-					const uint32_t index_type  = reg(uc, 0x243u) & 0x3u; // VGT_INDEX_TYPE: 0 16-bit, 1 32-bit, 2 8-bit
-					const uint64_t index_bytes = index_type == 1u ? 4u : (index_type == 2u ? 1u : 2u);
-					const uint64_t addr        = index_base + static_cast<uint64_t>(bptr[1]) * index_bytes;
-					body.push_back(Pkt3(IT_DRAW_INDEX_2, 5, false));
-					body.push_back(bptr[0]);
-					body.push_back(static_cast<uint32_t>(addr));
-					body.push_back(static_cast<uint32_t>(addr >> 32u));
-					body.push_back(bptr[2]);
-					body.push_back(bptr[3]);
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				}
 				stats.draws++;
 				collect_refs();
@@ -5777,23 +5849,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (m_audit) {
 					AuditAcquire(r.sync, std::span<const uint32_t>(bptr, body_count));
 				}
-				if (m_acquire_full && !m_compute_queue) {
-					body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // FLUSH_AND_INV_CB_META, index 0
-					body.push_back(0x2eu);
-					body.push_back((3u << 30u) | (IT_EVENT_WRITE << 8u)); // FLUSH_AND_INV_DB_META, index 0
-					body.push_back(0x2cu);
-				}
+				// As written: the PS5 ME's ACQUIRE_MEM touches only the standard CP_COHER_* and GCR registers, as
+				// the stock one does (microcode, 7.5a).
 				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-				if (m_acquire_full && body_count >= 7) {
-					uint32_t* a = &body[body.size() - size + 1];
-					a[1] = 0xffffffffu; // COHER_SIZE: everything
-					a[2] = 0xffu;       // COHER_SIZE_HI
-					a[3] = 0u;          // COHER_BASE
-					a[4] = 0u;          // COHER_BASE_HI
-					// GCR_CNTL: GLI_INV=1, GLM_WB, GLM_INV, GLK_WB, GLK_INV, GLV_INV, GL1_INV, GL2_INV, GL2_WB.
-					a[6] |= 0x1u | 0x10u | 0x20u | 0x40u | 0x80u | 0x100u | 0x200u | 0x4000u | 0x8000u;
-					a[6] &= ~((0x3u << 2u) | (0x3u << 11u)); // GL1_RANGE, GL2_RANGE = all
-				}
 				if (m_compute_ring) {
 					body[body.size() - size] |= 2u;
 				}
@@ -5865,10 +5923,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				if (m_compute_ring || body_count < 4 || (bptr[3] & 0x3fffu) != 8u || next + 8u > dcb.size() ||
 				    dcb[next] != 0xc0064900u || ((dcb[next + 2] >> 24u) & 0x7u) != 4u || (dcb[next + 7] & 0x08000000u) == 0) {
-					// Any other COND_EXEC (SetCondExec, KYTY_NATIVE_GPU_COND_EXEC=1): as written with its count recomputed,
-					// gfx ring only (a compute IB is cut into several for KFD, and MEC has not run a title's). The PFP decides
-					// a COND_EXEC ahead of the ME, so a PFP_SYNC_ME first lets it see the ME's writes before it, as the PS5's
-					// microcode does.
+					// Any other COND_EXEC (SetCondExec, KYTY_NATIVE_GPU_COND_EXEC=1): as written with its count recomputed.
+					// The PFP decides a COND_EXEC ahead of the ME (probe condexec), on the PS5 as here: its PFP handler is
+					// the stock one (microcode), and the title orders the flag's write itself. So no PFP_SYNC_ME before it,
+					// but where Kyty moved something of its own in front of it: a tracker store the points queued before the
+					// range flush, or the start of a held segment (barrier, Kyty's form of the title's wait), which the title
+					// did not write there. MEC runs a title's too, with its plain header (probe condexec on compute ring 1
+					// and a KFD queue, 31.10; mecplain, 2.11: words 0 and 1), in order (one engine, no PFP_SYNC_ME). A
+					// compute IB too long for one slot goes to KFD as several IBs under one fence, cut at packets only and
+					// never inside a COND_EXEC's range (SplitIbAtPackets), so the range stays in one IB. The exit guards
+					// inside the range (SetExitGuard) get one more right after it, so none of them skips past the range's
+					// end, where the IB may end. KYTY_NATIVE_GPU_ACB_COND_EXEC=0 refuses it on MEC, as before.
 					const uint64_t addr = (bptr[0] & ~3u) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
 					// libSceAgc masks EXEC_COUNT to 14 bits (AgcDcbCondExec); the CP reads more of the dword (probe condexec:
 					// a 20005-dword skip on MEC), so a count with higher bits is not libSceAgc's and its range is not known.
@@ -5878,18 +5943,31 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						uint64_t v = 0;
 						return !w.gpu && w.Covers(addr, false, &v) != 0;
 					});
-					if (!m_cond_exec || m_compute_ring || cond.active || body_count != 4 || addr == 0 || (bptr[3] & ~0x3fffu) != 0 ||
-					    next + bptr[3] > dcb.size() || cpu_flag) {
+					if (!m_cond_exec || (m_compute_ring && !AcbCondExec()) || cond.active || body_count != 4 || addr == 0 ||
+					    (bptr[3] & ~0x3fffu) != 0 || next + bptr[3] > dcb.size() || cpu_flag) {
 						return fail(op, dw, RefuseWhy::CondExecForm);
 					}
 					// The points queued before the range (an interrupt, a store the GPU cannot do) go before it, not inside
 					// where the CP may skip their store.
+					const bool moved = !queued_points.empty() || held_open;
 					flush_points();
-					body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
-					body.push_back(0);
-					stats.pfp_syncs_emitted++;
+					if (moved && !m_compute_ring) {
+						body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
+						body.push_back(0);
+						stats.pfp_syncs_emitted++;
+					}
+					// A compute ring's guard right before it (one there already does): should the range hold guards of
+					// ours, this one skips the whole range (cond_close).
+					if (cs_guards && (body_guards.empty() || body_guards.back() + 1u != body.size())) {
+						body_guards.push_back(EmitComputeExitGuard(body, m_exit_run_va));
+						guard_from = body.size();
+					}
 					cond.count_at = body.size() + 4u;
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (m_compute_ring && !MecPlainOp(IT_COND_EXEC)) {
+						body[cond.count_at - 4u] |= 2u; // KYTY_NATIVE_GPU_ACB_PLAIN without 0x22: the compute shader-type bit
+					}
+					cond.guards     = body_guards.size();
 					add_ref(addr, 4, false);
 					cond.active     = true;
 					cond.dw         = dw;
@@ -5939,8 +6017,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// SETs below give S its values again.
 				if (cp_shadow) {
 					vcx.reset();
-					fmask_done = 0;
-					dcc_done   = 0;
+					dcc_done = 0;
 				}
 				for (const auto& [off, value]: m_cx_defaults) {
 					EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
@@ -5951,13 +6028,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 
 			default:
-				// A raw RELEASE_MEM (0x49) has no case and refuses the DCB below; the title sends its EOP
-				// sync as NOP markers instead. Still record its event control dword if one ever appears.
-				if (op == IT_RELEASE_MEM && body_count >= 1) {
-					stats.event_type[bptr[0] & 0x3fu]++;
-					stats.event_index[(bptr[0] >> 8u) & 0xfu]++;
-				}
-				// Keep walking so one refused DCB names every packet the translator lacks.
+				// A packet with no translation (yet), not a CP limit: the buffer is refused to Kyty's command
+				// processor. Keep walking so one refused DCB names every packet the translator lacks.
 				if (r.unknown_ops.empty()) {
 					r.unknown_op = op;
 					r.unknown_dw = dw;
@@ -5972,8 +6044,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				note_refusal(op, dw, RefuseWhy::Unknown);
 				break;
 		}
-		// MecPlainOp: the title's header (no shader-type bit) where the packet is passed on.
-		if (m_compute_ring && MecPlainOp(op) && body.size() > body_before && (body[body_before] & ~2u) == (header & ~2u)) {
+		// MecPlainOp: the title's header (no shader-type bit) where the packet is passed on. Not a COND_EXEC's: an exit
+		// guard of ours may come first there, and the case keeps the title's header itself.
+		if (m_compute_ring && MecPlainOp(op) && op != IT_COND_EXEC && body.size() > body_before && (body[body_before] & ~2u) == (header & ~2u)) {
 			body[body_before] = header;
 		}
 		if (IsWork(op)) {
@@ -5988,6 +6061,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // a register write the CP may skip
 		}
 		const bool same_seg = segs.size() == segs_before;
+		if (!same_seg && segs.back().held) {
+			held_open = true;
+		} else if (in_place || body.size() != body_before) {
+			held_open = false;
+		}
 		if (in_place && (!same_seg || body.size() != body_before)) {
 			return fail(op, dw, RefuseWhy::InPlace); // a packet run in place has nothing of ours around it
 		}
@@ -6215,6 +6293,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint32_t until = i + 1 < s.guards.size() ? s.guards[i + 1] - 4u : s.end;
 					const uint32_t skip  = until - (s.guards[i] + 1u);
 					r.ib[s.guards[i]]    = skip <= kExitGuardMaxSkip ? skip : 0u;
+				}
+				// A guard before a title's COND_EXEC with guards inside its range skips to the one after the range (at most
+				// the 0x3fff-dword range and a guard: within kExitGuardMaxSkip).
+				for (const auto& [before, after]: guards_over) {
+					if (before >= from && before < to) {
+						r.ib[move(before)] = move(after) - 4u - (move(before) + 1u);
+					}
 				}
 			}
 			r.segments.push_back(std::move(s));

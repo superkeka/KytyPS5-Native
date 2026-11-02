@@ -166,7 +166,6 @@ struct Pm4TranslateStats {
 	uint32_t index_state       = 0; // IT_INDEX_BASE / IT_INDEX_BUFFER_SIZE passed through
 	uint32_t multi_inst        = 0; // IT_DRAW_INDEX_MULTI_INST (0x3A) taken: drawn, or its state alone (no indices)
 	uint32_t draws_skipped     = 0; // draws left out (SetSkippedPixelShaders)
-	uint32_t fmask_fixed       = 0; // CB_COLORn_FMASK set to the target base (was 0) before a draw
 	uint32_t lod_stats_dropped = 0; // GET_LOD_STATS packets left out
 	uint32_t lod_stats_issued  = 0; // GET_LOD_STATS packets run on the GPU (SetLodStats)
 	uint32_t dma_gds_dst       = 0; // DMA_DATA writing GDS (counter resets)
@@ -202,6 +201,7 @@ struct Pm4TranslateStats {
 	uint32_t waits_dropped     = 0; // WAIT_REG_MEM(_64) on memory, dropped in shadow mode
 	uint32_t waits_flip        = 0; // WaitUntilSafeForRendering's WAIT_REG_MEM_64, left to Kyty's CP (its padding NOP)
 	uint32_t atomics_cpu       = 0; // native labels: ATOMIC_MEM the tracker performs on the CPU (TrackerPoint::Kind::Atomic)
+	uint32_t atomics_mec       = 0; // ATOMIC_MEM a compute ring runs as written (the title's or a MEM_SEMAPHORE's)
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
 	uint32_t pfp_syncs_emitted = 0; // PFP_SYNC_ME emitted in place of dropped PFP waits
 	uint32_t eos_nodata_fixed  = 0; // gfx CS_DONE/PS_DONE (EVENT_INDEX 6) releases without data given a scratch store
@@ -224,10 +224,8 @@ struct Pm4TranslateStats {
 	// the save area and back, then a LOAD_CONTEXT_REG.
 	uint32_t cp_shadow_pushes = 0;
 	uint32_t cp_shadow_pops   = 0;
-	// Load mode: FMASK = BASE fixes done on the GPU from S (some of the slot's CB registers came from a verbatim
-	// table, so the GPU may hold other values than the copy), and display-DCC fixes done on the GPU from S (the
-	// copy's CB_COLORn_INFO came from one).
-	uint32_t cp_shadow_fmask_gpu = 0;
+	// Load mode: display-DCC fixes done on the GPU from S (the copy's CB_COLORn_INFO came from a verbatim table, so
+	// the GPU may hold another value than the copy).
 	uint32_t cp_shadow_dcc_gpu   = 0;
 	uint32_t cp_shadow_dcc_back  = 0; // and the DCC given back on the GPU (EmitCpShadowDccRestore)
 	// GPU waits run with shadowing off around them (SetCpShadowWaitOff): 6 dwords each, plus PFP_SYNC_ME where
@@ -320,6 +318,7 @@ enum class RefuseWhy : uint8_t {
 	RegisterWait,
 	DmaForm,
 	WriteDataRegister,
+	WriteDataOnMec, // DST_SEL 1, which no MEC microcode runs (stock or the PS5's)
 	ContextControlOnMec,
 	CondExecForm,
 	AtomicForm,
@@ -360,28 +359,23 @@ constexpr uint64_t kCpShadowBytes = 0x49000;
 // The save area P of a pushed context (SetCpShadowPushPop) right after S: S's context region, 0x000-0x3FF.
 constexpr uint64_t kCpShadowSaveOffset = kCpShadowBytes;
 constexpr uint32_t kCpShadowSaveBytes  = 0x1000;
-// After P, the register tables of the GPU-side FMASK fix (Pm4Translator::SetCpShadow, load mode): per MRT slot n
-// at kCpShadowFixOffset + 32 * n, {CB_COLORn_FMASK, BASE, CB_COLORn_FMASK_EXT, BASE_EXT} and then {.., FMASK, ..,
-// FMASK_EXT}; then those of the GPU-side display-DCC fix, per slot at kCpShadowDccFixOffset + 16 * n,
-// {CB_COLORn_INFO, the CP's INFO without DCC} and {CB_COLORn_INFO, the CP's INFO as it was}. The offsets are
-// seeded once (CpShadowFixTables), the values copied from S by the GPU. Then a zero word, seeded 0 and never
-// written, copied for a register S has no value for (amdgpu's clear state, 0, on the GPU).
-constexpr uint64_t kCpShadowFixOffset    = kCpShadowSaveOffset + kCpShadowSaveBytes;
-constexpr uint64_t kCpShadowDccFixOffset = kCpShadowFixOffset + 0x100;
-constexpr uint32_t kCpShadowFixBytes     = 0x180;
+// After P, the register tables of the GPU-side display-DCC fix (Pm4Translator::SetCpShadow, load mode), per MRT
+// slot n at kCpShadowDccFixOffset + 16 * n: {CB_COLORn_INFO, the CP's INFO without DCC} and {CB_COLORn_INFO, the
+// CP's INFO as it was}. The offsets are seeded once (CpShadowFixTables), the values copied from S by the GPU.
+constexpr uint64_t kCpShadowDccFixOffset = kCpShadowSaveOffset + kCpShadowSaveBytes;
+constexpr uint32_t kCpShadowFixBytes     = 0x80;
 // The display-DCC fix's ATOMIC_MEM: TC_OP_ATOMIC_AND_32, COMMAND 2 as libSceAgc's, which clears DCC_ENABLE in the copied
 // INFO, with ENGINE_SEL the ME, after the ME's copy (libSceAgc's form sets bit 30, the PFP, which runs ahead of the ME:
 // the AND came before the copy). Probes atomicand, atomicand-order.
 constexpr uint32_t kCpShadowDccAnd = (2u << 8u) | 0x55u;
-constexpr uint64_t kCpShadowZeroOffset = kCpShadowFixOffset + kCpShadowFixBytes;
 std::array<uint32_t, kCpShadowFixBytes / 4u> CpShadowFixTables();
-// What the backend reserves for S, P, the fix tables and the zero word, and the packet check guards.
-constexpr uint64_t kCpShadowReserveBytes = kCpShadowZeroOffset + 16u;
+// What the backend reserves for S, P and the fix tables, and the packet check guards.
+constexpr uint64_t kCpShadowReserveBytes = kCpShadowDccFixOffset + kCpShadowFixBytes;
 // The push's and the pop's DMA_DATA: the micro engine, CP_SYNC (the ME waits for the copy), source and
 // destination through L2 (SRC_SEL/DST_SEL 3, as Mesa's CP DMA on GFX9 and up); RAW_WAIT, 4 KiB.
 constexpr uint32_t kCpShadowDmaControl = (1u << 31u) | (3u << 29u) | (3u << 20u);
 constexpr uint32_t kCpShadowDmaCommand = (1u << 30u) | kCpShadowSaveBytes;
-constexpr uint32_t kCpShadowDmaWordCommand = (1u << 30u) | 4u; // one register, for the FMASK fix
+constexpr uint32_t kCpShadowDmaWordCommand = (1u << 30u) | 4u; // one register, for the display-DCC fix
 // CONTEXT_CONTROL load and shadow enables of a shadowing job: update (bit 31), context (1), UCONFIG (15),
 // gfx SH (16) and CS SH (24); no global config, no CE RAM.
 constexpr uint32_t kCpShadowEnables = 0x81018002u;
@@ -683,8 +677,9 @@ void NopOut(std::span<uint32_t> ib, uint32_t dw, uint32_t len);
 std::vector<std::pair<size_t, size_t>> SplitIbAtPackets(std::span<const uint32_t> ib, size_t max_dw);
 
 // Which ring an IB is about to be submitted to. Compute allows the same RELEASE_MEM / WAIT_REG_MEM
-// bodies as the gfx ring, with the shader-type bit set, and rejects graphics-only packets (a draw or
-// PFP_SYNC_ME on MEC is an illegal opcode).
+// bodies as the gfx ring, with the shader-type bit set or, for the opcodes MEC runs so (KYTY_NATIVE_GPU_ACB_PLAIN),
+// the title's plain header, and rejects graphics-only packets (a draw or PFP_SYNC_ME has no handler in MEC's
+// microcode, stock or the PS5's).
 enum class NativeIbKind { Gfx, Compute };
 
 // The packet check before an IB goes to the GPU. By default a blacklist: the packets that take the board down here,
@@ -764,6 +759,10 @@ struct SourcePiece {
 // top level calls or chains to begins and ends (the title's own segments of the command buffer).
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
                             std::vector<SourcePiece>* pieces = nullptr, std::vector<uint32_t>* marks = nullptr);
+// A line in `f` for each always-taken AgcCbBranch (COND_INDIRECT_BUFFER) FlattenIndirectBuffers inlines as a call, once
+// per branch, target and tail: where the target ends (a chain back to the parent's tail, elsewhere, none) and what the
+// parent runs after it. nullptr: KYTY_NATIVE_GPU_LOG_BRANCHES=1 decides (to stderr; off by default). Logging only.
+void SetFlattenBranchLog(std::FILE* f);
 
 // What the backend knows about labels beyond the buffer being translated.
 class LabelOracle {
@@ -988,17 +987,6 @@ public:
 	// Context register overrides the PS5 kernel applies through the CP's RCIU CAM (see PatchContext).
 	void SetPs5RegOverrides(bool on) { m_ps5_reg_overrides = on; }
 
-	// Experiment, off by default: a bound target without FMASK gets CB_COLORn_FMASK = BASE before a draw, as radeonsi
-	// and PAL program it. The guest's FMASK 0 runs as written, as on the PS5.
-	void SetFmaskFix(bool on) { m_fmask_fix = on; }
-
-	// Experiment: targets without DCC lose CB_COLORn_INFO.FAST_CLEAR (no CMASK fast clear).
-	// CMASK fast clear off on targets without DCC in the MRT slots of `slots` (bit n = slot n).
-	void SetNoCmaskClear(bool on, uint32_t slots = 0xffu) {
-		m_no_cmask_clear       = on;
-		m_no_cmask_clear_slots = slots;
-	}
-
 	// Experiment: CB_TARGET_MASK is ANDed with `mask`, e.g. 0xf keeps only MRT0 writable.
 	void SetTargetMask(uint32_t mask) { m_target_mask = mask; }
 
@@ -1097,8 +1085,9 @@ public:
 	};
 	[[nodiscard]] const GpuWaitInfo& GpuWait(uint64_t i) const { return m_time_wait_info[i % m_time_pairs]; }
 
-	// Lets DMA_DATA read or write GDS: only when every submission owns a GDS partition
-	// (NativeSubmitter::HasGds), otherwise such packets are refused.
+	// Lets DMA_DATA read or write GDS and RELEASE_MEM write GDS data: when every submission owns a GDS partition
+	// (NativeSubmitter::HasGds, 48 KiB in every mode unless KYTY_NATIVE_GPU_GDS=0), as the PS5's jobs do; without one
+	// such packets are refused.
 	void SetGdsAvailable(bool available) { m_gds = available; }
 
 	// Draws whose pixel shader (SPI_SHADER_PGM_LO/HI_PS) is in `shaders` are left out of the IB, for
@@ -1128,8 +1117,9 @@ public:
 	// atomic paths; AsIs passes the title's 0x39 on as written (research only: it took the board down on 2.11).
 	enum class MemSemaphore : uint8_t { Refuse, Translate, AsIs };
 	void SetMemSemaphore(MemSemaphore mode) { m_mem_semaphore = mode; }
-	// COND_EXEC in any form (KYTY_NATIVE_GPU_COND_EXEC) on the gfx ring, its EXEC_COUNT recomputed over the translated
-	// dwords; libSceAgc's two context-check forms are taken either way.
+	// COND_EXEC in any form (KYTY_NATIVE_GPU_COND_EXEC) on the gfx ring and on MEC (KYTY_NATIVE_GPU_ACB_COND_EXEC=0
+	// refuses it there), its EXEC_COUNT recomputed over the translated dwords; libSceAgc's two context-check forms are
+	// taken either way.
 	void SetCondExec(bool on) { m_cond_exec = on; }
 	// DRAW_INDEX_MULTI_INST, 0x3A (KYTY_NATIVE_GPU_MULTI_INST), libSceAgc's AgcDcbDrawIndexMultiInstanced: NUM_INSTANCES
 	// with the packet's count and the packet as written with NOT_EOP set, which the stock CP then runs as the PS5's does.
@@ -1151,8 +1141,6 @@ public:
 	void SetNoPreamble(bool on) { m_no_preamble = on; }
 	// Run GET_LOD_STATS on the GPU instead of leaving it out (the hardware texture LOD statistics).
 	void SetLodStats(bool on) { m_lod_stats = on; }
-	// DRAW_INDEX_OFFSET_2 (0x35) as the title wrote it, not as DRAW_INDEX_2 at the offset's address.
-	void SetDrawIndexOffsetVerbatim(bool on) { m_draw_offset_verbatim = on; }
 	// Load mode: the shadow preamble's LOADs load only when amdgpu turns the loads on, after another context's job on the
 	// ring (EmitShadowPreamble). ForceCpShadowLoad: the next preamble loads anyway (a job of ours on the same context
 	// left other state in the CP, as an AGR buffer on the gfx ring does).
@@ -1209,18 +1197,14 @@ public:
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
 	// A zero-byte DMA_DATA with CP_SYNC before a job ends after a DMA_DATA without CP_SYNC (on by default).
 	void SetCpDmaIdle(bool on) { m_cp_dma_idle = on; }
-	// Guest WAIT_REG_MEM / WAIT_REG_MEM_64 on the gfx ring as written: the BC-250's CP runs both, 64-bit
-	// compares, PFP waits and any compare function (probe waitforms). Off: our form (EQUAL on ME, a 64-bit
-	// wait as 32-bit ones, a PFP wait as ME and PFP_SYNC_ME, other functions held on the CPU). Off by
-	// default for now: My First GT stuttered more with it.
+	// Guest WAIT_REG_MEM / WAIT_REG_MEM_64 on the gfx ring as written, CACHE_POLICY and poll interval included: the
+	// BC-250's CP runs both, 64-bit compares and PFP waits as the PS5's (probe waitforms, 2.11: functions 1..6). The
+	// backend turns it on (KYTY_NATIVE_GPU_WAITS_VERBATIM=0 leaves it off). Off: EmitNativeWait's form (the title's
+	// function, width and engine for 1..6; a barrier or a hold on the CPU for ALWAYS).
 	void SetWaitsVerbatim(bool on) { m_waits_verbatim = on; }
 	// DMA_DATA to or from GDS with CP_SYNC, and a CS_PARTIAL_FLUSH before a copy out of GDS, so the
 	// append counters are final and copied before an indirect dispatch reads them (experiment).
 	void SetGdsDmaSync(bool on) { m_gds_dma_sync = on; }
-	// Every guest ACQUIRE_MEM becomes a full-range writeback and invalidate of all cache levels
-	// (GL2, GLM metadata, GLK, GLV, GL1, GLI), preceded on the gfx ring by CB/DB metadata flushes
-	// (experiment: the PS5 ME's ACQUIRE_MEM handler is several times longer than AMD's).
-	void SetAcquireFull(bool on) { m_acquire_full = on; }
 	// WRITE_DATA to memory in the native IB as well (Kyty still performs it): 0 none (default), 1 the
 	// ones carrying more than one dword (data, not a label), 2 all.
 	void SetWriteDataNative(uint32_t mode) { m_write_data_native = mode; }
@@ -1248,12 +1232,12 @@ public:
 	// preamble becomes a shadow preamble: shadowing and loading off, CLEAR_STATE, PFP_SYNC_ME, the enables on,
 	// then LOAD_*_REG of all four classes from S over the copy's keys (a class with none LOADs one anchor
 	// register, so no class runs with shadowing on and no base), then SETs. Record: the copy's replay as before.
-	// Load: only what S cannot restore (VGT_PRIMITIVE_TYPE/INDEX_TYPE, RSRC3/RSRC4, STATIC_THREAD_MGMT, SH 0x280,
+	// Load: only what S cannot restore (VGT_PRIMITIVE_TYPE/INDEX_TYPE, STATIC_THREAD_MGMT, SH 0x280,
 	// PA_SC_SHADER_CONTROL, offsets from 0x400) and the classes left out of `load_classes`, which are replayed;
 	// a buffer's first segment then restores the state where the buffer starts, as a chunk's does. `rearm`: a
 	// CONTEXT_CONTROL with the enables right after a title's CLEAR_STATE 0, in case the clear turns them off.
-	// The keys, and every decision made on the CPU, stay the copy's. A compute ring ignores it (MEC has no
-	// CONTEXT_CONTROL).
+	// The keys, and every decision made on the CPU, stay the copy's. A compute ring ignores it (MEC's microcode, stock or
+	// the PS5's, has no CONTEXT_CONTROL and no LOAD_*_REG).
 	void SetCpShadow(uint64_t va, CpShadowMode mode, uint32_t load_classes = kCpShadowClasses, bool rearm = false) {
 		m_cp_shadow_va      = va;
 		m_cp_shadow_mode    = va != 0 ? mode : CpShadowMode::Off;
@@ -1296,7 +1280,7 @@ public:
 	};
 	CpShadowCheck CompareCpShadow(std::span<const uint32_t> s, std::FILE* report) const;
 	// Who last wrote a register the copy holds (CompareCpShadow; the copy's offsets below 0x400).
-	// Gpu: the GPU-side FMASK fix (load mode) changed it on the GPU, from values the copy may not hold.
+	// Gpu: the GPU-side display-DCC fix (load mode) changed it on the GPU, from values the copy may not hold.
 	enum class RegWriter : uint8_t { Seed = 0, Set, Table, Expanded, Insert, Gpu };
 
 private:
@@ -1312,10 +1296,6 @@ private:
 	// SetCpShadowPushPop: the push's copy of S's context region to P, and the pop back to `target` from `current`
 	// over the context registers `valid` in S.
 	void     EmitCpShadowPush(std::vector<uint32_t>& ib) const;
-	// fix_fmask on the GPU for MRT slot `slot`: FMASK = BASE (and the _EXT halves) from the values the CP holds (S),
-	// not the copy's; with `check` only when the CP's FMASK is not 0. A register S has no value for (`valid`) is
-	// amdgpu's clear state on the GPU, 0: the zero word is copied for it.
-	void     EmitCpShadowFmaskFix(std::vector<uint32_t>& ib, uint32_t slot, bool check, const std::bitset<RegFile::kDense>& valid) const;
 	// The display-DCC fix on the GPU for MRT slot `slot` (its INFO the copy took from a verbatim table): the CP's
 	// CB_COLORn_INFO from S into both of the slot's tables, DCC_ENABLE cleared in the first by an ATOMIC_MEM AND, which
 	// then sets the register; EmitCpShadowDccRestore sets it from the second, the INFO the CP had.
@@ -1342,10 +1322,7 @@ private:
 	uint32_t                     m_saved_display_dcc_gpu = 0;     // m_display_dcc_gpu at the GPU push
 	std::array<uint32_t, 8>      m_display_dcc_info {};           // their guest CB_COLORn_INFO
 	bool                         m_ps5_reg_overrides = false;
-	bool                         m_fmask_fix = false;
 	uint32_t                     m_target_mask = 0xffffffffu;
-	bool                         m_no_cmask_clear = false;
-	uint32_t                     m_no_cmask_clear_slots = 0xffu;
 	bool                         m_compute_queue  = false;
 	bool                         m_compute_ring   = false;
 	bool                         m_preamble_from_start = false; // SetPreambleFromStart
@@ -1386,7 +1363,6 @@ private:
 	bool                         m_compact_refs = false;
 	uint64_t                     m_guess_span   = 32ull << 20u;
 	bool                         m_lod_stats    = false;
-	bool                         m_draw_offset_verbatim = false;
 	bool                         m_cp_shadow_gated      = false;
 	bool                         m_cp_shadow_force_load = false;
 	bool                         m_cp_shadow_wait_off    = true;  // SetCpShadowWaitOff
@@ -1398,7 +1374,6 @@ private:
 	bool                         m_cp_dma_idle       = true;
 	bool                         m_waits_verbatim    = false;
 	bool                         m_gds_dma_sync      = false;
-	bool                         m_acquire_full      = false;
 	uint32_t                     m_write_data_native = 0;
 	bool                         m_collect_refs      = true;
 	bool                         m_draw_log          = false;

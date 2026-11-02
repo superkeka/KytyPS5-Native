@@ -2332,6 +2332,7 @@ static bool DangerMecForms(Device* d, Common* c) {
 // or PFP, any compare function) as written, on the gfx ring: whether the BC-250's CP runs them as the PS5's
 // does, so the translator can pass them through. Each step is one job, the wait then a WRITE_DATA marker;
 // the first one that does not finish stops the run. Memory is UC so a value the CPU writes later is seen.
+// WAITFORMS_STEP=<index> runs one step (0-9 ran on 2.11; 10-23 are LESS, LESS_EQUAL and GREATER, met at once).
 static bool DangerWaitForms(Device* d, Common* c) {
 	printf("== danger waitforms: guest WAIT_REG_MEM / WAIT_REG_MEM_64 forms on the gfx ring\n");
 	Bo  mem;
@@ -2363,6 +2364,27 @@ static bool DangerWaitForms(Device* d, Common* c) {
 	    // The translated MEM_SEMAPHORE wait: 64-bit NOT_EQUAL 0 on the PFP with CACHE_POLICY BYPASS (0x06000114).
 	    {"64-bit NOT_EQUAL 0, PFP, BYPASS, met", true, 0x06000114u, 1, 0, ~0ull, 0},
 	    {"64-bit NOT_EQUAL 0, PFP, BYPASS, met only in the high half", true, 0x06000114u, 0x100000000ull, 0, ~0ull, 0},
+	    // The functions not run yet, LESS (1), LESS_EQUAL (2) and GREATER (6), each met when the CP gets there. The values
+	    // stay below 2^31 (and 2^63) so a signed compare is met too, and the 64-bit ones hold the same in the low half,
+	    // except the last two: those are met only when the CP compares all 64 bits (their low halves, below 2^31, fail
+	    // the compare signed or unsigned).
+	    {"32-bit LESS, ME, met", false, 0x11u, 5, 7, 0xffffffffu, 0},
+	    {"32-bit LESS, PFP, met", false, 0x111u, 5, 7, 0xffffffffu, 0},
+	    {"32-bit LESS_EQUAL, ME, met (equal)", false, 0x12u, 7, 7, 0xffffffffu, 0},
+	    {"32-bit LESS_EQUAL, PFP, met (less)", false, 0x112u, 6, 7, 0xffffffffu, 0},
+	    {"32-bit GREATER, ME, met", false, 0x16u, 9, 7, 0xffffffffu, 0},
+	    {"32-bit GREATER, PFP, met", false, 0x116u, 9, 7, 0xffffffffu, 0},
+	    {"64-bit LESS, ME, met", true, 0x11u, 0x100000005ull, 0x100000007ull, ~0ull, 0},
+	    {"64-bit LESS, PFP, met", true, 0x111u, 0x100000005ull, 0x100000007ull, ~0ull, 0},
+	    {"64-bit LESS_EQUAL, ME, met (equal)", true, 0x12u, 0x100000007ull, 0x100000007ull, ~0ull, 0},
+	    {"64-bit LESS_EQUAL, PFP, met (less)", true, 0x112u, 0x100000006ull, 0x100000007ull, ~0ull, 0},
+	    {"64-bit GREATER, ME, met", true, 0x16u, 0x100000009ull, 0x100000007ull, ~0ull, 0},
+	    {"64-bit GREATER, PFP, met", true, 0x116u, 0x100000009ull, 0x100000007ull, ~0ull, 0},
+	    {"64-bit LESS, ME, met only in 64 bits", true, 0x11u, 9, 0x100000007ull, ~0ull, 0},
+	    {"64-bit GREATER, ME, met only in 64 bits", true, 0x16u, 0x100000005ull, 7, ~0ull, 0},
+	    // Signed or unsigned: met only when the CP compares without sign (0x80000000 > 1 unsigned, < 1 signed).
+	    {"32-bit GREATER, ME, met only unsigned", false, 0x16u, 0x80000000ull, 1, 0xffffffffu, 0},
+	    {"64-bit GREATER, ME, met only unsigned", true, 0x16u, 0x8000000000000000ull, 1, ~0ull, 0},
 	};
 	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
 	Bo*                bos[] = {&mem};
@@ -3296,8 +3318,10 @@ static uint64_t AtomicSource(uint32_t tc_op) {
 // (default: the 26 ops IntegerAtomicOp passes, 32 then 64 bits), ATOMIC_CMD 0 or 2 (default 2, wait for the write
 // confirm, as libSceAgc's own uses; 1, loop until the returned old value equals CMP, only for a returning CMPSWAP, as IntegerAtomicOp passes it),
 // ATOMIC_ENGINE 0 (the ME) or 1 (default, the PFP, as libSceAgc's DCB form sets it). CMPSWAP compares with the old value,
-// so it swaps; a COMMAND 1 compare that never holds would loop. The gfx ring only: the translator never sends an
-// ATOMIC_MEM to MEC (the tracker performs a compute ring's on the CPU), and a stopped MEC can take the board down.
+// so it swaps; a COMMAND 1 compare that never holds would loop. ATOMIC_RING=compute runs the ops on compute ring 1 with
+// the compute shader-type bit (default ops 67,6f,70, ENGINE 0, COMMAND 2 only): the translator still has the tracker
+// perform an ACB's ATOMIC_MEM on the CPU, though the MEC has a full ATOMIC_MEM handler (stock and Sony gen2 decode
+// ATOMIC, COMMAND and CACHE_POLICY as the ME does). A stopped MEC can take the board down: one op per run, last.
 // The translated MEM_SEMAPHORE's counter (ADD_64 0x6f, SWAP_64 0x67, SUB_64 0x70 on guest memory, which is cached GTT
 // mapped NC) has to reach the CPU: ATOMIC_POLICY=<0..3> sets the op's CACHE_POLICY [26:25] (0 LRU, default, 1 STREAM,
 // 2 NOA, 3 BYPASS), ATOMIC_MEM_NC=1 puts the word in a cached GTT buffer with BoBind's default MTYPE (NC) instead of the
@@ -3307,17 +3331,25 @@ static uint64_t AtomicSource(uint32_t tc_op) {
 // back, and prints whether it already holds the result.
 static bool DangerAtomicOps(Device* d, Common* c) {
 	const char*    ring_env = getenv("ATOMIC_RING");
-	const bool     cs       = false;
+	const bool     cs       = ring_env != NULL && strcmp(ring_env, "compute") == 0;
 	const char*    cmd_env  = getenv("ATOMIC_CMD");
 	const uint32_t command  = cmd_env != NULL ? (uint32_t)strtoul(cmd_env, NULL, 0) : 2u;
 	const char*    eng_env  = getenv("ATOMIC_ENGINE");
-	const uint32_t engine   = eng_env != NULL ? (uint32_t)strtoul(eng_env, NULL, 0) : 1u;
-	if (ring_env != NULL && strcmp(ring_env, "gfx") != 0) {
-		printf("  ATOMIC_RING: only gfx; the translator never sends ATOMIC_MEM to MEC\n");
+	const uint32_t engine   = eng_env != NULL ? (uint32_t)strtoul(eng_env, NULL, 0) : cs ? 0u : 1u;
+	const uint32_t ip       = cs ? AMDGPU_HW_IP_COMPUTE : AMDGPU_HW_IP_GFX;
+	const uint32_t ring     = cs ? 1u : 0u;
+	if (ring_env != NULL && !cs && strcmp(ring_env, "gfx") != 0) {
+		printf("  ATOMIC_RING must be gfx (default) or compute (compute ring 1)\n");
 		return false;
 	}
 	if (command > 2u || engine > 1u) {
 		printf("  ATOMIC_CMD must be 0, 1 or 2 and ATOMIC_ENGINE 0 or 1 (the forms IntegerAtomicOp passes)\n");
+		return false;
+	}
+	if (cs && (command != 2u || engine != 0u)) {
+		// A COMMAND 1 loop whose compare never holds would stop MEC, which can take the board down; the compute ring runs
+		// only the translated MEM_SEMAPHORE's form.
+		printf("  the compute ring runs ATOMIC_CMD=2 with ATOMIC_ENGINE=0 only\n");
 		return false;
 	}
 	const char*    pol_env = getenv("ATOMIC_POLICY");
@@ -3341,6 +3373,11 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 			}
 			p = *e == ',' ? e + 1 : e;
 		}
+	} else if (cs) {
+		// The translated MEM_SEMAPHORE's ops: SWAP_64, ADD_64, SUB_64, no return.
+		ops[num_ops++] = 0x67u;
+		ops[num_ops++] = 0x6fu;
+		ops[num_ops++] = 0x70u;
 	} else {
 		static const uint32_t kBases[] = {0x07, 0x08, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19};
 		for (uint32_t w = 0; w < 2; w++) {
@@ -3430,9 +3467,11 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 			*fence = 0;
 			*go    = 0;
 			__sync_synchronize();
-			// The fence: bottom of pipe, 32-bit data to memory (the UC buffer), no GCR action; BYPASS so the CPU sees it.
+			// The fence: bottom of pipe, 32-bit data to memory (the UC buffer), no GCR action; BYPASS so the CPU sees it. On
+			// MEC the event is amdgpu's own compute fence event (CACHE_FLUSH_AND_INV_TS, run there by mecforms), still
+			// without a GCR action.
 			IbPush(&ib, GuestPkt(cs, 0x49u, 7));
-			IbPush(&ib, 0x28u | (5u << 8) | (3u << 25));
+			IbPush(&ib, (cs ? 0x14u : 0x28u) | (5u << 8) | (3u << 25));
 			IbPush(&ib, 1u << 29);
 			IbPush(&ib, (uint32_t)(mem.va + 0x2000u));
 			IbPush(&ib, (uint32_t)((mem.va + 0x2000u) >> 32));
@@ -3455,7 +3494,7 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 		if (vis) {
 			IbPad(&ib);
 			uint64_t seq = 0;
-			int      r   = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, num_bos, &seq);
+			int      r   = SubmitOn(d, ip, ring, &c->ib, &ib, bos, num_bos, &seq);
 			// The CPU looks for the fence for up to 50 ms, reads the word at once, then lets the job go on.
 			const double t0         = NowSec();
 			bool         fenced     = false;
@@ -3469,11 +3508,12 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 			}
 			*go = 1;
 			__sync_synchronize();
-			const int     wt = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+			const int     wt = r == 0 ? WaitOn(d, ip, ring, seq, 1.0) : r;
 			const int64_t st = ContextState(d);
 			printf("  %-44s %s, ctx 0x%" PRIx64 "\n", what, wt == 1 ? "TIMEOUT" : ErrStr(wt), (uint64_t)st);
 			if (wt != 0 || st != 0) {
-				printf("  the step did not finish: the gfx ring is stopped or was reset; exiting without freeing buffers\n");
+				printf("  the step did not finish: the %s ring is stopped or was reset; exiting without freeing buffers\n",
+				       cs ? "compute" : "gfx");
 				PrintGpuvmFault(d, "after the step");
 				_exit(3);
 			}
@@ -3506,6 +3546,428 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 		printf("  %u of %u results seen by the CPU right after the fence (CACHE_POLICY %u, %s word)\n", seen_n, num_ops, policy,
 		       nc ? "NC" : "UC");
 	}
+	return ok;
+}
+
+// An ACB's packets on compute ring 1 (the ring Kyty's ACB translator uses) in the form the title wrote them: libSceAgc
+// leaves the shader-type bit out of ACB headers, and the translator sets it on every packet but SET_SH_REG,
+// DISPATCH_DIRECT/INDIRECT, ACQUIRE_MEM, DMA_DATA, EVENT_WRITE and RELEASE_MEM (MecPlainOp). The MEC handlers of
+// WRITE_DATA, COPY_DATA, WAIT_REG_MEM/_64, COND_EXEC and ATOMIC_MEM decode body dwords only, the same in stock and Sony
+// gen2, and none reads ENGINE_SEL. One packet form per run, MECPLAIN_STEP=<step> (required): "wd" WRITE_DATA (DST_SEL 5,
+// without WR_CONFIRM unless MECPLAIN_CONFIRM=1, ENGINE_SEL MECPLAIN_ENGINE 0..2), "cd" COPY_DATA memory to memory (ENGINE_SEL
+// bit 30 from MECPLAIN_ENGINE 0..1), "wait" / "wait64" WAIT_REG_MEM / _64 with ENGINE_SEL PFP met at once, "waitrel" /
+// "wait64rel" the same released by the CPU after 50 ms (MECPLAIN_FUNC 3 EQUAL, default, or 5 GREATER_EQUAL), "condexec"
+// COND_EXEC over a WRITE_DATA (word MECPLAIN_WORD, default 0: skipped), "atomic" ATOMIC_MEM SWAP_64 COMMAND 2, "sh"
+// SET_SH_REG + DISPATCH_DIRECT of the store shader (run on compute ring 0 by mecforms). MECPLAIN_BIT=1 sets the
+// shader-type bit (the translator's form, the control). Each packet is followed by a marker in the bit form compute ring
+// 1 has run (copydata, condexec). Never SET_BASE (no MEC handler in stock or Sony), never an IB or CHAIN on MEC (a stopped
+// MEC took the board down: exitguard).
+static bool DangerMecPlain(Device* d, Common* c) {
+	const char*    step    = getenv("MECPLAIN_STEP");
+	const bool     bit     = getenv("MECPLAIN_BIT") != NULL && strcmp(getenv("MECPLAIN_BIT"), "1") == 0;
+	const bool     confirm = getenv("MECPLAIN_CONFIRM") != NULL && strcmp(getenv("MECPLAIN_CONFIRM"), "1") == 0;
+	const char*    eng_env = getenv("MECPLAIN_ENGINE");
+	const uint32_t engine  = eng_env != NULL ? (uint32_t)strtoul(eng_env, NULL, 0) : 0u;
+	const char*    fn_env  = getenv("MECPLAIN_FUNC");
+	const uint32_t func    = fn_env != NULL ? (uint32_t)strtoul(fn_env, NULL, 0) : 3u;
+	const char*    wd_env  = getenv("MECPLAIN_WORD");
+	const uint32_t word    = wd_env != NULL ? (uint32_t)strtoul(wd_env, NULL, 0) : 0u;
+	printf("== danger mecplain: an ACB packet %s the shader-type bit on compute ring 1, step %s\n", bit ? "with" : "without",
+	       step != NULL ? step : "(none)");
+	static const char* const kSteps[] = {"wd", "cd", "wait", "wait64", "waitrel", "wait64rel", "condexec", "atomic", "sh"};
+	bool known = false;
+	for (size_t k = 0; k < ARRAY_SIZE(kSteps) && step != NULL; k++) {
+		known = known || strcmp(step, kSteps[k]) == 0;
+	}
+	if (!known) {
+		printf("  MECPLAIN_STEP must be one of wd cd wait wait64 waitrel wait64rel condexec atomic sh (one per run)\n");
+		return false;
+	}
+	if (engine > (strcmp(step, "wd") == 0 ? 2u : 1u) || (func != 3u && func != 5u)) {
+		printf("  MECPLAIN_ENGINE must be 0..2 for wd and 0..1 for cd; MECPLAIN_FUNC 3 or 5\n");
+		return false;
+	}
+	Bo mem;
+	if (!GuestMem(d, &mem, 0x0730000000ull)) {
+		return false;
+	}
+	volatile uint32_t* m      = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[]  = {&mem, &c->code};
+	const uint64_t     marker = mem.va + 0x800;
+	const uint32_t     mark   = 0x3ec10000u;
+	uint32_t (*pkt)(uint32_t, uint32_t) = bit ? Pkt3 : Pkt3Gfx;
+	Ib   ib   = {.n = 0};
+	bool good = false;
+	char what[64];
+	snprintf(what, sizeof(what), "%s (%s):", step, bit ? "bit set" : "plain header");
+	if (strcmp(step, "wd") == 0) {
+		const uint64_t dst = mem.va + 0x100;
+		IbPush(&ib, pkt(0x37u, 4));
+		IbPush(&ib, (5u << 8) | ((confirm ? 1u : 0u) << 20) | (engine << 30));
+		IbPush(&ib, (uint32_t)dst);
+		IbPush(&ib, (uint32_t)(dst >> 32));
+		IbPush(&ib, 0x3ec1d001u);
+		GuestMark(&ib, true, marker, mark);
+		PrintDwords("packet", ib.dw, 5);
+		GuestRun(d, &c->ib, &ib, true, bos, 2, 1.0, what);
+		good = m[0x100 / 4] == 0x3ec1d001u;
+		printf("    WRITE_DATA (ENGINE_SEL %u, WR_CONFIRM %s) %s\n", engine, confirm ? "on" : "off", good ? "landed" : "MISSING");
+	} else if (strcmp(step, "cd") == 0) {
+		const uint64_t src = mem.va + 0x200, dst = mem.va + 0x210;
+		m[0x200 / 4]       = 0x3ec1c0d1u;
+		m[0x210 / 4]       = 0x5e5e5e5eu;
+		m[0x214 / 4]       = 0x5e5e5e5eu;
+		__sync_synchronize();
+		IbPush(&ib, pkt(0x40u, 5));
+		IbPush(&ib, 2u | (2u << 8) | (1u << 20) | (engine << 30));
+		IbPush(&ib, (uint32_t)src);
+		IbPush(&ib, (uint32_t)(src >> 32));
+		IbPush(&ib, (uint32_t)dst);
+		IbPush(&ib, (uint32_t)(dst >> 32));
+		GuestMark(&ib, true, marker, mark);
+		PrintDwords("packet", ib.dw, 6);
+		GuestRun(d, &c->ib, &ib, true, bos, 2, 1.0, what);
+		good = m[0x210 / 4] == 0x3ec1c0d1u && m[0x214 / 4] == 0x5e5e5e5eu;
+		printf("    COPY_DATA (ENGINE_SEL %u): %08x, next %08x: %s\n", engine, m[0x210 / 4], m[0x214 / 4], good ? "as expected" : "NOT as expected");
+	} else if (strncmp(step, "wait", 4) == 0) {
+		const bool         wide    = strncmp(step, "wait64", 6) == 0;
+		const bool         rel     = strstr(step, "rel") != NULL;
+		const uint64_t     label   = mem.va + 0x300;
+		const uint64_t     ref     = wide ? 0x100000007ull : 7u;
+		volatile uint64_t* lv      = (volatile uint64_t*)((uint8_t*)mem.cpu + 0x300);
+		const uint32_t     control = func | (1u << 4) | (1u << 8); // memory, ENGINE_SEL PFP
+		*lv                        = rel ? ref - 1u : ref; // ref - 1: neither EQUAL nor GREATER_EQUAL until the CPU's store
+		__sync_synchronize();
+		if (wide) {
+			IbPush(&ib, pkt(0x93u, 8));
+			IbPush(&ib, control);
+			IbPush(&ib, (uint32_t)label & ~7u);
+			IbPush(&ib, (uint32_t)(label >> 32));
+			IbPush(&ib, (uint32_t)ref);
+			IbPush(&ib, (uint32_t)(ref >> 32));
+			IbPush(&ib, 0xffffffffu);
+			IbPush(&ib, 0xffffffffu);
+			IbPush(&ib, 4u);
+		} else {
+			IbPush(&ib, pkt(0x3cu, 6));
+			IbPush(&ib, control);
+			IbPush(&ib, (uint32_t)label & ~3u);
+			IbPush(&ib, (uint32_t)(label >> 32));
+			IbPush(&ib, (uint32_t)ref);
+			IbPush(&ib, 0xffffffffu);
+			IbPush(&ib, 4u);
+		}
+		GuestMark(&ib, true, marker, mark);
+		PrintDwords("packet", ib.dw, wide ? 9u : 7u);
+		if (rel) {
+			IbPad(&ib);
+			uint64_t     seq = 0;
+			const double t0  = NowSec();
+			int          r   = SubmitOn(d, AMDGPU_HW_IP_COMPUTE, 1, &c->ib, &ib, bos, 2, &seq);
+			bool         early = false;
+			if (r == 0) {
+				usleep(50000);
+				early = m[0x800 / 4] != 0;
+				*lv   = ref;
+				__sync_synchronize();
+			}
+			const int     w  = r == 0 ? WaitOn(d, AMDGPU_HW_IP_COMPUTE, 1, seq, 1.0) : r;
+			const int64_t st = ContextState(d);
+			printf("  %-44s %s after %.2f ms, ctx 0x%" PRIx64 "%s\n", what, w == 1 ? "TIMEOUT" : ErrStr(w), (NowSec() - t0) * 1e3,
+			       (uint64_t)st, early ? ", the marker landed BEFORE the CPU's release" : "");
+			if (w != 0 || st != 0) {
+				printf("  the step did not finish: the compute ring is stopped or was reset; exiting without freeing buffers\n");
+				PrintGpuvmFault(d, "after the step");
+				_exit(3);
+			}
+			good = !early;
+		} else {
+			GuestRun(d, &c->ib, &ib, true, bos, 2, 1.0, what);
+			good = true;
+		}
+		printf("    %u-bit %s, ENGINE_SEL PFP, %s\n", wide ? 64u : 32u, func == 3u ? "EQUAL" : "GREATER_EQUAL",
+		       rel ? "released by the CPU after 50 ms" : "met at once");
+	} else if (strcmp(step, "condexec") == 0) {
+		const uint64_t w = mem.va + 0x400, a = mem.va + 0x404;
+		m[0x400 / 4]     = word;
+		__sync_synchronize();
+		IbPush(&ib, pkt(0x22u, 4));
+		IbPush(&ib, (uint32_t)w);
+		IbPush(&ib, (uint32_t)(w >> 32));
+		IbPush(&ib, 0u);
+		IbPush(&ib, 5u); // EXEC_COUNT: the WRITE_DATA A
+		GuestMark(&ib, true, a, 0x3ec1a000u);
+		GuestMark(&ib, true, marker, mark);
+		PrintDwords("packet", ib.dw, 5);
+		GuestRun(d, &c->ib, &ib, true, bos, 2, 1.0, what);
+		const bool landed = m[0x404 / 4] == 0x3ec1a000u;
+		good              = landed == (word != 0u);
+		printf("    word %u: the guarded WRITE_DATA %s (%s)\n", word, landed ? "landed" : "skipped", good ? "as expected" : "NOT as expected");
+	} else if (strcmp(step, "atomic") == 0) {
+		const uint64_t va  = mem.va + 0x500;
+		const uint64_t old = 0x4a5a5a5afffffff0ull, src = 0x0123456789abcdefull;
+		m[0x500 / 4]       = (uint32_t)old;
+		m[0x504 / 4]       = (uint32_t)(old >> 32);
+		m[0x508 / 4]       = 0x77777777u;
+		__sync_synchronize();
+		IbPush(&ib, pkt(0x1eu, 8));
+		IbPush(&ib, (2u << 8) | 0x67u); // SWAP_64, no return, COMMAND 2, ENGINE 0, CACHE_POLICY LRU
+		IbPush(&ib, (uint32_t)va);
+		IbPush(&ib, (uint32_t)(va >> 32));
+		IbPush(&ib, (uint32_t)src);
+		IbPush(&ib, (uint32_t)(src >> 32));
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 6u);
+		GuestMark(&ib, true, marker, mark);
+		PrintDwords("packet", ib.dw, 9);
+		GuestRun(d, &c->ib, &ib, true, bos, 2, 1.0, what);
+		const uint64_t got = (uint64_t)m[0x500 / 4] | ((uint64_t)m[0x504 / 4] << 32);
+		good               = got == src && m[0x508 / 4] == 0x77777777u;
+		printf("    SWAP_64: 0x%" PRIx64 " (want 0x%" PRIx64 "), neighbour %08x: %s\n", got, src, m[0x508 / 4], good ? "as expected" : "NOT as expected");
+	} else { // sh
+		LoadCode(c, k_store_w64, sizeof(k_store_w64));
+		const uint64_t out   = mem.va + 0x1000;
+		const uint32_t base  = 0x3ec15000u;
+		uint32_t       ud[3] = {(uint32_t)out, (uint32_t)(out >> 32), base};
+		Dispatch       p     = {c->code.va, 64, 8, 3, true, 64, 1, ud};
+		IbDispatch(&ib, &p);
+		for (uint32_t k = 0; k < ib.n;) { // every packet of the dispatch in the chosen header form
+			const uint32_t h = ib.dw[k];
+			ib.dw[k]         = bit ? h | 2u : h & ~2u;
+			k += ((h >> 16) & 0x3fffu) + 2u;
+		}
+		GuestMark(&ib, true, marker, mark);
+		GuestRun(d, &c->ib, &ib, true, bos, 2, 1.0, what);
+		uint32_t n = 0;
+		for (uint32_t i = 0; i < 64; i++) {
+			n += m[0x1000 / 4 + i] == base + i ? 1u : 0u;
+		}
+		good = n == 64;
+		printf("    the store dispatch wrote %u of 64 values\n", n);
+	}
+	const bool landed = m[0x800 / 4] == mark;
+	printf("    marker %s\n  %s\n", landed ? "landed" : "MISSING", good && landed ? "as expected" : "NOT as expected");
+	BoDestroy(d, &mem);
+	return good && landed;
+}
+
+// One SET_UCONFIG_REG on the gfx ring per process, the register and value a title writes, in libSceAgc's DCB form
+// (header 0xC0017904), then a WRITE_DATA marker: does writing that register harm the board, or did the 23.10 uconfig run
+// die of its first step, a COPY_DATA read of a UCONFIG register on the compute ring (such reads stop the ring, 27.10)?
+// Kyty drops every UCONFIG write outside its whitelist (UconfigAllowed), AgcInit's start state too, though the ME's
+// SET_UCONFIG_REG is byte-identical in stock and Sony gen2 (no filter: any harm is the register's, on the PS5 too).
+// UCW_REG=<dword offset>,<value>[,<value after>] (offset from 0xC000, or the full dword address): the optional third
+// value is written after the marker, with a second marker. No register is read on any ring. GRBM_GFX_INDEX (0x200, the
+// kernel's routing of every later register write) is refused. Output is unbuffered; run with --awake 3.
+static bool DangerUconfigWrite(Device* d, Common* c) {
+	const char* spec = getenv("UCW_REG");
+	printf("== danger uconfig-w: one SET_UCONFIG_REG on the gfx ring, then a WRITE_DATA marker (UCW_REG=%s)\n",
+	       spec != NULL ? spec : "unset");
+	uint32_t    v[3] = {0, 0, 0};
+	int         n    = 0;
+	const char* p    = spec;
+	while (p != NULL && *p != '\0' && n < 3) {
+		char* e = NULL;
+		v[n++]  = (uint32_t)strtoul(p, &e, 0);
+		if (e == p || (*e != ',' && *e != '\0')) {
+			n = 0;
+			break;
+		}
+		p = *e == ',' ? e + 1 : e;
+	}
+	if (n < 2 || (p != NULL && *p != '\0')) {
+		printf("  UCW_REG must be <dword offset>,<value>[,<value after>], e.g. UCW_REG=0x24b,0\n");
+		return false;
+	}
+	const uint32_t off = v[0] >= 0xc000u ? v[0] - 0xc000u : v[0];
+	if (off >= 0x4000u) {
+		printf("  0x%x is outside the UCONFIG space (0xC000-0xFFFF)\n", v[0]);
+		return false;
+	}
+	if (off == 0x200u) {
+		printf("  GRBM_GFX_INDEX is the kernel's: not written\n");
+		return false;
+	}
+	if (!g_awake_on) {
+		printf("  note: without --awake (recommended: --awake 3)\n");
+	}
+	Bo mem;
+	if (!GuestMem(d, &mem, 0x0770000000ull)) {
+		return false;
+	}
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	Ib                 ib    = {.n = 0};
+	IbPush(&ib, 0xc0017904u); // SET_UCONFIG_REG, one register
+	IbPush(&ib, off);
+	IbPush(&ib, v[1]);
+	GuestMark(&ib, false, mem.va, 0x0c570001u);
+	if (n == 3) {
+		IbPush(&ib, 0xc0017904u);
+		IbPush(&ib, off);
+		IbPush(&ib, v[2]);
+		GuestMark(&ib, false, mem.va + 4, 0x0c570002u);
+	}
+	char what[64];
+	snprintf(what, sizeof(what), "UCONFIG 0x%04x (0x%05x) = 0x%08x:", 0xc000u + off, 0x30000u + 4u * off, v[1]);
+	PrintDwords("packet", ib.dw, 3);
+	GuestRun(d, &c->ib, &ib, false, bos, 1, 1.0, what);
+	const bool first  = m[0] == 0x0c570001u;
+	const bool second = n < 3 || m[1] == 0x0c570002u;
+	printf("    marker after the write %s\n", first ? "landed" : "MISSING");
+	if (n == 3) {
+		printf("    then 0x%08x, marker after it %s\n", v[2], second ? "landed" : "MISSING");
+	}
+	BoDestroy(d, &mem);
+	return first && second;
+}
+
+// Does a DMA_DATA without CP_SYNC finish before the job that issued it is done? Kyty inserts Mesa's
+// si_cp_dma_wait_for_idle form (a zero-byte DMA_DATA with CP_SYNC) before every job end and tracker release after a
+// title's unsynced DMA_DATA (BC5 F41: the next IB hung); Sony's PFP and ME DMA_DATA handlers have extra blocks at entry
+// and exit that may sync on their own. A DMA_DATA of CPDMA_MIB MiB (default 32, at most 63) from one UC GTT buffer to
+// another (CPDMA_DST=nc: a cached one, the default MTYPE) is the job's last packet, CPDMA_REPEATS times (default 20) per
+// mode in CPDMA_MODE (comma-separated, default sync,label,fence): "sync" sets CP_SYNC (the control: the copy is always
+// there), "label" ends the job with a bottom-of-pipe RELEASE_MEM label (no cache action, BYPASS) the CPU spins on, as a
+// tracker release, "fence" has nothing after the DMA_DATA and the CPU polls the job's fence. Right when the CPU sees the
+// label or the fence it reads the destination's last dword (the source's last dword is new each repeat), then waits for
+// it at most 1 s, so no copy is still running when the next repeat or the end of the case frees what it writes. Each job
+// is bounded by 1 s; a job that does not finish ends the process. If F41 holds here, the job after an unsynced DMA_DATA
+// is the one that stops: run CPDMA_MIB=1 first. Run with --awake 5.
+static bool DangerCpDmaTail(Device* d, Common* c) {
+	const char*    mib_env = getenv("CPDMA_MIB");
+	const uint32_t mib     = mib_env != NULL ? (uint32_t)strtoul(mib_env, NULL, 0) : 32u;
+	const char*    rep_env = getenv("CPDMA_REPEATS");
+	const uint32_t repeats = rep_env != NULL ? (uint32_t)strtoul(rep_env, NULL, 0) : 20u;
+	const char*    modes   = getenv("CPDMA_MODE") != NULL ? getenv("CPDMA_MODE") : "sync,label,fence";
+	const bool     nc      = getenv("CPDMA_DST") != NULL && strcmp(getenv("CPDMA_DST"), "nc") == 0;
+	printf("== danger cpdma-tail: DMA_DATA of %u MiB as a gfx job's last packet, %u repeats per mode (%s), destination %s\n", mib,
+	       repeats, modes, nc ? "cached GTT (NC)" : "UC GTT");
+	if (mib < 1u || mib > 63u || repeats < 1u || repeats > 100u) {
+		printf("  CPDMA_MIB must be 1..63 (BYTE_COUNT has 26 bits) and CPDMA_REPEATS 1..100\n");
+		return false;
+	}
+	if (!g_awake_on) {
+		printf("  note: without --awake (recommended: --awake 5)\n");
+	}
+	const uint64_t size = (uint64_t)mib * MiB;
+	Bo             src = {0}, dst = {0}, mem = {0};
+	int            r   = MemCreate(d, &src, MEM_GTT, size, NULL);
+	if (r == 0) {
+		r = BoBind(d, &src, 0x0790000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r == 0) {
+		r = MemCreate(d, &dst, MEM_GTT, size, NULL);
+	}
+	if (r == 0) {
+		r = BoBind(d, &dst, 0x07a0000000ull, nc ? AMDGPU_VM_MTYPE_DEFAULT : AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+	}
+	if (r != 0 || !GuestMem(d, &mem, 0x07b0000000ull)) {
+		BoDestroy(d, &src);
+		BoDestroy(d, &dst);
+		return false;
+	}
+	volatile uint32_t* sm    = (volatile uint32_t*)src.cpu;
+	volatile uint32_t* dm    = (volatile uint32_t*)dst.cpu;
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	const size_t       last  = size / 4 - 1;
+	Bo*                bos[] = {&src, &dst, &mem};
+	memset(src.cpu, 0x5a, size);
+	memset(dst.cpu, 0, size);
+	__sync_synchronize();
+	bool ok = true;
+	static const char* const kModes[] = {"sync", "label", "fence"};
+	for (size_t mk = 0; mk < ARRAY_SIZE(kModes); mk++) {
+		if (!ListHas(modes, kModes[mk])) {
+			continue;
+		}
+		const bool sync  = mk == 0;
+		const bool label = mk == 1;
+		uint32_t   late = 0, never = 0;
+		double     worst_us = 0, seen_ms = 0;
+		for (uint32_t k = 0; k < repeats; k++) {
+			const uint32_t tag = 0xd3a00000u | ((uint32_t)mk << 12) | k;
+			sm[last]           = tag;
+			sm[0]              = tag ^ 0xffu;
+			dm[last]           = 0;
+			dm[0]              = 0;
+			m[0]               = 0;
+			__sync_synchronize();
+			Ib ib = {.n = 0};
+			IbPush(&ib, Pkt3Gfx(0x50u, 6)); // DMA_DATA memory to memory, ENGINE ME, CP_SYNC only in "sync"
+			IbPush(&ib, sync ? 1u << 31 : 0u);
+			IbPush(&ib, (uint32_t)src.va);
+			IbPush(&ib, (uint32_t)(src.va >> 32));
+			IbPush(&ib, (uint32_t)dst.va);
+			IbPush(&ib, (uint32_t)(dst.va >> 32));
+			IbPush(&ib, (uint32_t)size);
+			if (label) {
+				IbPush(&ib, Pkt3Gfx(0x49u, 7)); // RELEASE_MEM BOTTOM_OF_PIPE_TS, 32-bit data, no GCR action, BYPASS
+				IbPush(&ib, 0x28u | (5u << 8) | (3u << 25));
+				IbPush(&ib, 1u << 29);
+				IbPush(&ib, (uint32_t)mem.va);
+				IbPush(&ib, (uint32_t)(mem.va >> 32));
+				IbPush(&ib, tag);
+				IbPush(&ib, 0u);
+				IbPush(&ib, 0u);
+			}
+			if (k == 0) {
+				PrintDwords("packet", ib.dw, ib.n);
+			}
+			IbPad(&ib);
+			uint64_t     seq  = 0;
+			const double t0   = NowSec();
+			r                 = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 3, &seq);
+			bool         seen = false;
+			uint32_t     at   = 0, first = 0;
+			double       t1   = 0;
+			while (r == 0 && NowSec() - t0 < 1.0) {
+				if (label ? m[0] == tag : WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 0.0) == 0) {
+					at    = dm[last];
+					first = dm[0];
+					t1    = NowSec();
+					seen  = true;
+					break;
+				}
+			}
+			double t2 = t1;
+			while (seen && dm[last] != tag && NowSec() - t1 < 1.0) {
+				t2 = NowSec();
+			}
+			const int     w  = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+			const int64_t st = ContextState(d);
+			if (w != 0 || st != 0 || !seen) {
+				printf("  %s, repeat %u: %s, ctx 0x%" PRIx64 "%s\n", kModes[mk], k, w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st,
+				       seen ? "" : (label ? ", label not seen in 1 s" : ", fence not seen in 1 s"));
+				if (w != 0 || st != 0) {
+					printf("  the job did not finish: the gfx ring is stopped or was reset; exiting without freeing buffers\n");
+					PrintGpuvmFault(d, "after the job");
+					_exit(3);
+				}
+				ok = false;
+				continue;
+			}
+			seen_ms += (t1 - t0) * 1e3;
+			if (at != tag) {
+				late++;
+				never += dm[last] != tag ? 1u : 0u;
+				worst_us = (t2 - t1) * 1e6 > worst_us ? (t2 - t1) * 1e6 : worst_us;
+				printf("    repeat %u: at the %s the last dword is 0x%08x (first 0x%08x), %s\n", k, label ? "label" : "fence", at, first,
+				       dm[last] == tag ? "landed later" : "still missing after 1 s");
+			}
+		}
+		printf("  %-5s: the last dword was not there yet %u of %u times (%u never within 1 s, latest %.0f us later); %s seen %.2f ms "
+		       "after submit on average\n",
+		       kModes[mk], late, repeats, never, worst_us, label ? "label" : "fence", seen_ms / repeats);
+		ok = ok && never == 0 && (!sync || late == 0);
+	}
+	BoDestroy(d, &mem);
+	BoDestroy(d, &dst);
+	BoDestroy(d, &src);
 	return ok;
 }
 
@@ -3897,6 +4359,37 @@ static const ShadowReg k_shadow_regs[] = {
     {"SQ_THREAD_TRACE_USERDATA_2", 0x30d08u, 'u', 's', false, 0}, // on PAL's never-shadowed list
 };
 
+// W14 (SHADOW_REGS=w14 instead of the list above): the SH registers Kyty's shadow preamble SETs from its copy instead of
+// LOADing them (CpShadowLoadsSh: "PAL never shadows" them, unverified): RSRC4 and RSRC3 of PS, VS, GS and HS,
+// COMPUTE_STATIC_THREAD_MGMT_SE0..3 (SE3 by a graphics-type 0x63, as a DCB dispatch may load it) and COMPUTE_PGM_RSRC3.
+// Does the CP shadow them, and does LOAD_SH_REG load them back? `rest` is what goes back into a register the case cannot
+// read (the probe's own dispatch values); the others get back what a first job reads from them.
+static const ShadowReg k_shadow_regs_w14[] = {
+    {"SPI_SHADER_PGM_RSRC4_PS", 0xb004u, 's', 's', true, 0},
+    {"SPI_SHADER_PGM_RSRC3_PS", 0xb01cu, 's', 't', true, 0},
+    {"SPI_SHADER_PGM_RSRC4_VS", 0xb104u, 's', 's', true, 0},
+    {"SPI_SHADER_PGM_RSRC3_VS", 0xb118u, 's', 's', true, 0},
+    {"SPI_SHADER_PGM_RSRC4_GS", 0xb204u, 's', 's', true, 0},
+    {"SPI_SHADER_PGM_RSRC3_GS", 0xb21cu, 's', 'i', true, 0},
+    {"SPI_SHADER_PGM_RSRC4_HS", 0xb404u, 's', 's', true, 0},
+    {"SPI_SHADER_PGM_RSRC3_HS", 0xb41cu, 's', 's', true, 0},
+    {"COMPUTE_STATIC_THREAD_MGMT_SE0", 0xb858u, 'c', 's', true, 0xffffffffu},
+    {"COMPUTE_STATIC_THREAD_MGMT_SE1", 0xb85cu, 'c', 's', true, 0xffffffffu},
+    {"COMPUTE_STATIC_THREAD_MGMT_SE2", 0xb864u, 'c', 's', true, 0xffffffffu},
+    {"COMPUTE_STATIC_THREAD_MGMT_SE3", 0xb868u, 'c', 't', true, 0xffffffffu},
+    {"COMPUTE_PGM_RSRC3", 0xb8a0u, 'c', 's', true, 0},
+};
+
+// The list the shadow cases run (k_shadow_regs unless SHADOW_REGS=w14). With w14 the SH registers get their values back
+// at the end of each job, and the compute SH ones are read from the gfx ring only with SHADOW_READ_CS=1: a COPY_DATA read
+// of a compute SH register from the gfx ring right after a write stopped the ring once (28.10), though the 31.10 shadow
+// runs read COMPUTE_USER_DATA_0..2 so without trouble. Unread, they are judged by S alone.
+static const ShadowReg* g_shadow_regs    = k_shadow_regs;
+static size_t           g_shadow_n       = ARRAY_SIZE(k_shadow_regs);
+static bool             g_shadow_back_on = false;
+static bool             g_shadow_read_cs = true;
+static uint32_t         g_shadow_back[32];
+
 // S, and T (64 KiB): +0x000 the SH registers after the LOADs, +0x080 after the writes, +0x100 markers, +0x200 the
 // register tables (8 bytes per register), +0x400 the IB2s (32 bytes per register), +0x800 shadow-restore's reads
 // (0x80 per job), +0xa00 shadow-pushpop's copies of S.
@@ -3906,9 +4399,9 @@ typedef struct {
 } ShadowBufs;
 
 static const ShadowReg* ShadowRegNamed(const char* name) {
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		if (strcmp(k_shadow_regs[k].name, name) == 0) {
-			return &k_shadow_regs[k];
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		if (strcmp(g_shadow_regs[k].name, name) == 0) {
+			return &g_shadow_regs[k];
 		}
 	}
 	abort();
@@ -3942,6 +4435,11 @@ static bool ShadowIsSh(const ShadowReg* r) {
 	return r->cls == 's' || r->cls == 'c';
 }
 
+// An SH test register the case reads back with COPY_DATA (see g_shadow_read_cs).
+static bool ShadowReadable(const ShadowReg* r) {
+	return ShadowIsSh(r) && (r->cls != 'c' || g_shadow_read_cs);
+}
+
 // Byte offset in S of a register's shadow, in region set 0 or SHADOW_SET_B.
 static uint32_t ShadowAt(const ShadowReg* r, uint32_t set) {
 	return set + ShadowRegion(r->cls) + (r->reg - ShadowSpace(r->cls));
@@ -3964,7 +4462,7 @@ static const char* ShadowHowName(const ShadowReg* r) {
 // The one-pair register table of a test register: {offset in its space, value} at T + 0x200 + 8 * k, and the packet
 // that loads it (libSceAgc's graphics-type header, INDEX 0, offset_and_data).
 static void IbShadowTable(Ib* ib, const ShadowBufs* b, size_t k) {
-	const ShadowReg* r  = &k_shadow_regs[k];
+	const ShadowReg* r  = &g_shadow_regs[k];
 	const uint32_t   at = 0x200u + 8u * (uint32_t)k;
 	uint32_t*        tm = (uint32_t*)b->t.cpu;
 	tm[at / 4]          = (r->reg - ShadowSpace(r->cls)) / 4;
@@ -4015,8 +4513,8 @@ static void IbShadowLoads(Ib* ib, uint64_t s_va, uint32_t set) {
 	for (int o = 0; o < 4; o++) {
 		const char cls = order[o];
 		uint32_t   n   = 0;
-		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-			n += k_shadow_regs[k].cls == cls && k_shadow_regs[k].load;
+		for (size_t k = 0; k < g_shadow_n; k++) {
+			n += g_shadow_regs[k].cls == cls && g_shadow_regs[k].load;
 		}
 		if (n == 0) {
 			continue;
@@ -4026,8 +4524,8 @@ static void IbShadowLoads(Ib* ib, uint64_t s_va, uint32_t set) {
 		IbPush(ib, cls == 'c' ? Pkt3(op, 2 + 2 * n) : Pkt3Gfx(op, 2 + 2 * n));
 		IbPush(ib, (uint32_t)va); // BASE_ADDRESS, dword aligned
 		IbPush(ib, (uint32_t)(va >> 32));
-		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-			const ShadowReg* r = &k_shadow_regs[k];
+		for (size_t k = 0; k < g_shadow_n; k++) {
+			const ShadowReg* r = &g_shadow_regs[k];
 			if (r->cls == cls && r->load) {
 				IbPush(ib, (r->reg - ShadowSpace(cls)) / 4); // REG_OFFSET
 				IbPush(ib, 1u);                              // NUM_DWORDS
@@ -4038,19 +4536,22 @@ static void IbShadowLoads(Ib* ib, uint64_t s_va, uint32_t set) {
 
 // COPY_DATA of every SH test register to T + at. SH reads are safe; context and UCONFIG reads stop the ring.
 static void IbShadowReadSh(Ib* ib, uint64_t t_va, uint32_t at) {
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		if (ShadowIsSh(&k_shadow_regs[k])) {
-			IbCopyRegToMem(ib, k_shadow_regs[k].reg, t_va + at + 4u * k);
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		if (ShadowReadable(&g_shadow_regs[k])) {
+			IbCopyRegToMem(ib, g_shadow_regs[k].reg, t_va + at + 4u * k);
 		}
 	}
 }
 
-// Shadowing and loading off (Kyty's preamble does the same), then the UCONFIG test registers back to Mesa's values.
+// Shadowing and loading off (Kyty's preamble does the same), then the UCONFIG test registers back to Mesa's values and,
+// with SHADOW_REGS=w14, the SH ones back to what they held before the case.
 static void IbShadowOff(Ib* ib) {
 	IbContextControl(ib, CC_UPDATE, CC_UPDATE);
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		if (k_shadow_regs[k].cls == 'u') {
-			IbShadowSet(ib, &k_shadow_regs[k], k_shadow_regs[k].rest);
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		if (g_shadow_regs[k].cls == 'u') {
+			IbShadowSet(ib, &g_shadow_regs[k], g_shadow_regs[k].rest);
+		} else if (g_shadow_back_on && ShadowIsSh(&g_shadow_regs[k])) {
+			IbShadowSet(ib, &g_shadow_regs[k], g_shadow_back[k]);
 		}
 	}
 }
@@ -4076,10 +4577,10 @@ static bool ShadowSetup(Device* d, ShadowBufs* b) {
 	memset(b->s.cpu, 0, SHADOW_SIZE);
 	memset(b->t.cpu, 0, 64 * KiB);
 	uint32_t* s = (uint32_t*)b->s.cpu;
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		if (k_shadow_regs[k].load) {
-			s[ShadowAt(&k_shadow_regs[k], 0) / 4]            = ShadowSentinel(k, 0);
-			s[ShadowAt(&k_shadow_regs[k], SHADOW_SET_B) / 4] = ShadowSentinel(k, 1);
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		if (g_shadow_regs[k].load) {
+			s[ShadowAt(&g_shadow_regs[k], 0) / 4]            = ShadowSentinel(k, 0);
+			s[ShadowAt(&g_shadow_regs[k], SHADOW_SET_B) / 4] = ShadowSentinel(k, 1);
 		}
 	}
 	__sync_synchronize();
@@ -4122,8 +4623,8 @@ static uint32_t ShadowOthers(const ShadowBufs* b) {
 	uint32_t        count = 0;
 	for (uint32_t i = 0; i < SHADOW_SIZE / 4; i++) {
 		bool place = s[i] == 0;
-		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs) && !place; k++) {
-			place = i * 4 == ShadowAt(&k_shadow_regs[k], 0) || i * 4 == ShadowAt(&k_shadow_regs[k], SHADOW_SET_B);
+		for (size_t k = 0; k < g_shadow_n && !place; k++) {
+			place = i * 4 == ShadowAt(&g_shadow_regs[k], 0) || i * 4 == ShadowAt(&g_shadow_regs[k], SHADOW_SET_B);
 		}
 		if (!place) {
 			if (count < 8) {
@@ -4147,9 +4648,9 @@ static uint32_t ShadowOthers(const ShadowBufs* b) {
 static void ShadowIb1(Ib* ib, const ShadowBufs* b, uint32_t classes, bool load_off) {
 	const uint64_t t = b->t.va;
 	IbContextControl(ib, CC_UPDATE, CC_UPDATE);
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		if (ShadowIsSh(&k_shadow_regs[k])) {
-			IbShadowSet(ib, &k_shadow_regs[k], ShadowPre(k));
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		if (ShadowIsSh(&g_shadow_regs[k])) {
+			IbShadowSet(ib, &g_shadow_regs[k], ShadowPre(k));
 		}
 	}
 	IbContextControl(ib, CC_UPDATE | CC_ALL, CC_UPDATE | classes);
@@ -4159,8 +4660,8 @@ static void ShadowIb1(Ib* ib, const ShadowBufs* b, uint32_t classes, bool load_o
 		IbShadowLoads(ib, b->s.va, SHADOW_SET_B);
 	}
 	IbShadowReadSh(ib, t, 0x000);
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		const ShadowReg* r = &k_shadow_regs[k];
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		const ShadowReg* r = &g_shadow_regs[k];
 		if (r->how == 's') {
 			IbShadowSet(ib, r, ShadowMagic(k));
 		} else if (r->how == 't') {
@@ -4205,16 +4706,19 @@ static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
 	       t[0x41] == 0x5ad0e002u ? "landed" : "MISSING");
 	printf("  SH registers after the LOADs (set A: loaded from S%s; unchanged: not loaded), then after the writes:\n",
 	       load_off ? " with loading on, set B: with loading off" : "");
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		if (ShadowIsSh(&k_shadow_regs[k])) {
-			printf("    %-26s 0x%08x %-9s 0x%08x%s\n", k_shadow_regs[k].name, t[k], ShadowLoaded(t[k], k), t[0x20 + k],
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		if (ShadowReadable(&g_shadow_regs[k])) {
+			printf("    %-30s 0x%08x %-9s 0x%08x%s\n", g_shadow_regs[k].name, t[k], ShadowLoaded(t[k], k), t[0x20 + k],
 			       t[0x20 + k] == ShadowMagic(k) ? "" : " (not the written value)");
+		} else if (ShadowIsSh(&g_shadow_regs[k])) {
+			printf("    %-30s not read (a compute SH register on the gfx ring; SHADOW_READ_CS=1 reads it)\n",
+			       g_shadow_regs[k].name);
 		}
 	}
 	bool     all       = t[0x40] == 0x5ad0e001u;
 	uint32_t off_found = 0; // test values of a class with shadowing off found in S
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		const ShadowReg* r     = &k_shadow_regs[k];
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		const ShadowReg* r     = &g_shadow_regs[k];
 		const uint32_t   at    = ShadowAt(r, 0);
 		const uint32_t   at_b  = ShadowAt(r, SHADOW_SET_B);
 		uint32_t         found = 0;
@@ -4240,7 +4744,7 @@ static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
 		const uint32_t bits = r->cls == 'c' && r->how == 't' ? (CC_GFX_SH | CC_CS_SH) : ShadowBit(r->cls);
 		const bool     on   = (classes & bits) == bits;
 		const bool     off  = (classes & bits) == 0;
-		printf("  %-26s %-3s %-8s shadow %-3s: %s\n", r->name, ShadowClassName(r->cls), ShadowHowName(r),
+		printf("  %-30s %-3s %-8s shadow %-3s: %s\n", r->name, ShadowClassName(r->cls), ShadowHowName(r),
 		       on ? "on" : off ? "off" : "mix", where);
 		if (on) {
 			all = all && found == 1 && (first == at || (load_off && first == at_b));
@@ -4250,8 +4754,8 @@ static bool ShadowCheck1(const ShadowBufs* b, uint32_t classes, bool load_off) {
 	}
 	// SETs made with shadowing off: the SH values before the LOADs, the UCONFIG values put back at the end.
 	uint32_t leaked = 0;
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		const ShadowReg* r = &k_shadow_regs[k];
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		const ShadowReg* r = &g_shadow_regs[k];
 		for (uint32_t i = 0; i < SHADOW_SIZE / 4 && ShadowIsSh(r); i++) {
 			leaked += s[i] == ShadowPre(k);
 		}
@@ -4286,9 +4790,9 @@ static void CtxFree(Device* d, uint32_t id) {
 // and shadowing on, the LOADs from S, the SH registers read to T + at, a marker, shadowing off.
 static void ShadowIbRestore(Ib* ib, const ShadowBufs* b, uint32_t load, uint32_t at, uint32_t clobber) {
 	IbContextControl(ib, load, CC_UPDATE);
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		if (ShadowIsSh(&k_shadow_regs[k])) {
-			IbShadowSet(ib, &k_shadow_regs[k], clobber | (uint32_t)k);
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		if (ShadowIsSh(&g_shadow_regs[k])) {
+			IbShadowSet(ib, &g_shadow_regs[k], clobber | (uint32_t)k);
 		}
 	}
 	IbContextControl(ib, load, CC_UPDATE | CC_ALL);
@@ -4307,9 +4811,9 @@ static int ShadowRestored(const ShadowBufs* b, uint32_t at, uint32_t clobber, co
 	uint32_t        same     = 0;
 	uint32_t        kept     = 0;
 	uint32_t        shadowed = 0;
-	for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-		const ShadowReg* r = &k_shadow_regs[k];
-		if (!ShadowIsSh(r)) {
+	for (size_t k = 0; k < g_shadow_n; k++) {
+		const ShadowReg* r = &g_shadow_regs[k];
+		if (!ShadowReadable(r)) {
 			continue;
 		}
 		const uint32_t want = s[ShadowAt(r, 0) / 4];
@@ -4321,10 +4825,10 @@ static int ShadowRestored(const ShadowBufs* b, uint32_t at, uint32_t clobber, co
 	printf("  %s: %u of %u SH registers hold S's value (%u of them written there by the CP), %u not loaded, marker %s\n",
 	       what, same, n, shadowed, kept, t[0x1f] == 0x5ad0e003u ? "landed" : "MISSING");
 	if (same != n && kept != n) {
-		for (size_t k = 0; k < ARRAY_SIZE(k_shadow_regs); k++) {
-			const ShadowReg* r = &k_shadow_regs[k];
-			if (ShadowIsSh(r)) {
-				printf("    %-26s 0x%08x (S 0x%08x)\n", r->name, t[k], s[ShadowAt(r, 0) / 4]);
+		for (size_t k = 0; k < g_shadow_n; k++) {
+			const ShadowReg* r = &g_shadow_regs[k];
+			if (ShadowReadable(r)) {
+				printf("    %-30s 0x%08x (S 0x%08x)\n", r->name, t[k], s[ShadowAt(r, 0) / 4]);
 			}
 		}
 	}
@@ -4372,11 +4876,21 @@ static bool ShadowRestore(Device* d, Common* c, ShadowBufs* b) {
 }
 
 // shadow / shadow-restore. SHADOW_CLASSES (e.g. "ctx,uc"; default "ctx,sh,cs,uc") picks the shadow enables of the
-// first job, SHADOW_LOAD=0 adds its second LOADs with loading off; shadow-restore uses neither.
+// first job, SHADOW_LOAD=0 adds its second LOADs with loading off; shadow-restore uses neither. SHADOW_REGS=w14 runs
+// k_shadow_regs_w14 instead of the 16 registers (SHADOW_READ_CS=1 also reads its compute SH ones back).
 static bool DangerShadow(Device* d, Common* c, bool restore) {
 	const char* cls_env  = getenv("SHADOW_CLASSES");
 	const char* load_env = getenv("SHADOW_LOAD");
+	const char* regs_env = getenv("SHADOW_REGS");
 	uint32_t    classes  = CC_ALL;
+	if (regs_env != NULL && strcmp(regs_env, "w14") == 0) {
+		g_shadow_regs    = k_shadow_regs_w14;
+		g_shadow_n       = ARRAY_SIZE(k_shadow_regs_w14);
+		g_shadow_read_cs = getenv("SHADOW_READ_CS") != NULL && strcmp(getenv("SHADOW_READ_CS"), "1") == 0;
+	} else if (regs_env != NULL) {
+		printf("  SHADOW_REGS: only w14 (the default is the 16-register list)\n");
+		return false;
+	}
 	if (cls_env != NULL && !restore) {
 		classes = (strstr(cls_env, "ctx") != NULL ? CC_CONTEXT : 0u) | (strstr(cls_env, "sh") != NULL ? CC_GFX_SH : 0u) |
 		          (strstr(cls_env, "cs") != NULL ? CC_CS_SH : 0u) | (strstr(cls_env, "uc") != NULL ? CC_UCONFIG : 0u);
@@ -4392,6 +4906,29 @@ static bool DangerShadow(Device* d, Common* c, bool restore) {
 	       SHADOW_SH_AT, SHADOW_CTX_AT, SHADOW_UC_AT, CC_UPDATE | CC_ALL, CC_UPDATE | classes,
 	       load_off ? ", then 0x80000000 (loading off) and LOADs from set B (+1 MiB)" : "");
 	Ib ib = {.n = 0};
+	if (g_shadow_regs == k_shadow_regs_w14) {
+		// These registers shape every later draw and dispatch on the ring: read what they hold now (T + 0xc00), and every
+		// job of the case puts that back when it ends.
+		IbShadowReadSh(&ib, b.t.va, 0xc00);
+		IbWriteData(&ib, b.t.va + 0xc00 + 0x7c, 0x5ad0e004u);
+		IbPad(&ib);
+		ShadowRun(d, c, &b, &ib, "reading the W14 registers");
+		const uint32_t* t = (const uint32_t*)b.t.cpu + 0xc00 / 4;
+		if (t[0x1f] != 0x5ad0e004u) {
+			printf("  the marker after the reads is missing: not going on\n");
+			BoDestroy(d, &b.t);
+			BoDestroy(d, &b.s);
+			return false;
+		}
+		for (size_t k = 0; k < g_shadow_n; k++) {
+			const ShadowReg* r = &g_shadow_regs[k];
+			g_shadow_back[k]   = ShadowReadable(r) ? t[k] : r->rest;
+			printf("    %-30s 0x%08x (%s)\n", r->name, g_shadow_back[k], ShadowReadable(r) ? "read, put back at each job's end"
+			                                                                             : "not read, put back the probe's value");
+		}
+		g_shadow_back_on = true;
+		ib.n             = 0;
+	}
 	ShadowIb1(&ib, &b, classes, load_off);
 	ShadowRun(d, c, &b, &ib, "shadowing job");
 	bool ok = ShadowCheck1(&b, classes, load_off);
@@ -6051,7 +6588,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop multiinst\n");
+	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem mecplain uconfig-w cpdma-tail condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop multiinst\n");
 	printf("PRT cases, in risk order: prt-map prt-split prt-read-compute prt-write-compute prt-kfd-tlb prt-replace-race prt-cp-compute prt-gfx-{copy,dma,write,wait,dispatch}\n");
 }
 
@@ -6163,6 +6700,12 @@ int main(int argc, char** argv) {
 			ok = DangerAtomicAnd(&d, &c);
 		} else if (strcmp(danger, "atomicand-order") == 0) {
 			ok = DangerAtomicAndOrder(&d, &c);
+		} else if (strcmp(danger, "mecplain") == 0) {
+			ok = DangerMecPlain(&d, &c);
+		} else if (strcmp(danger, "uconfig-w") == 0) {
+			ok = DangerUconfigWrite(&d, &c);
+		} else if (strcmp(danger, "cpdma-tail") == 0) {
+			ok = DangerCpDmaTail(&d, &c);
 		} else if (strcmp(danger, "mecforms") == 0) {
 			ok = DangerMecForms(&d, &c);
 		} else if (strcmp(danger, "regindex-shc-nr") == 0) {
