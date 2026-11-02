@@ -274,13 +274,14 @@ public:
 	// KYTY_NATIVE_GPU_PRT_NET: which guest GPU addresses with nothing mapped read zeros and drop writes (PRT) instead of
 	// faulting, which on this board halts the wave and the ring with it (InstallPrtNet). 0 "off": only the holes of the
 	// PRT apertures and what unmaps leave behind, as before; 1 "ps5": the extended (AMM) window as well, where the PS5
-	// drops the writes to pages a title never backs; 2 "all": the whole low window [64 KiB, 1 TiB) too. Off by default
-	// until the board's PRT probes (tools/bc250-native-probe --danger prt-*) pass; the default is this one line.
+	// drops the writes to pages a title never backs; 2 "all": the whole low window [64 KiB, 1 TiB) too, the default since
+	// the board's PRT probes (tools/bc250-native-probe --danger prt-*: shader loads read 0, stores vanish, no VM fault, on
+	// compute and gfx) and six titles ran with it. CP packets on a PRT address still hang their queue (prt-cp-compute).
 	static int PrtNetMode() {
 		static const int mode = [] {
 			const char* v = std::getenv("KYTY_NATIVE_GPU_PRT_NET");
 			if (v == nullptr || v[0] == '\0') {
-				return 0;
+				return 2; // as the PS5: six titles ran with the whole net (2.11.2026)
 			}
 			if (std::strcmp(v, "all") == 0 || std::strcmp(v, "2") == 0) {
 				return 2;
