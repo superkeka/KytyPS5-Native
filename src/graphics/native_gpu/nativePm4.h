@@ -164,6 +164,7 @@ struct Pm4TranslateStats {
 	uint32_t dispatches        = 0; // IT_DISPATCH_DIRECT / IT_DISPATCH_INDIRECT
 	uint32_t num_instances     = 0; // IT_NUM_INSTANCES passed through
 	uint32_t index_state       = 0; // IT_INDEX_BASE / IT_INDEX_BUFFER_SIZE passed through
+	uint32_t multi_inst        = 0; // IT_DRAW_INDEX_MULTI_INST (0x3A) taken: drawn, or its state alone (no indices)
 	uint32_t draws_skipped     = 0; // draws left out (SetSkippedPixelShaders)
 	uint32_t fmask_fixed       = 0; // CB_COLORn_FMASK set to the target base (was 0) before a draw
 	uint32_t lod_stats_dropped = 0; // GET_LOD_STATS packets left out
@@ -1130,6 +1131,9 @@ public:
 	// COND_EXEC in any form (KYTY_NATIVE_GPU_COND_EXEC) on the gfx ring, its EXEC_COUNT recomputed over the translated
 	// dwords; libSceAgc's two context-check forms are taken either way.
 	void SetCondExec(bool on) { m_cond_exec = on; }
+	// DRAW_INDEX_MULTI_INST, 0x3A (KYTY_NATIVE_GPU_MULTI_INST), libSceAgc's AgcDcbDrawIndexMultiInstanced: NUM_INSTANCES
+	// with the packet's count and the packet as written with NOT_EOP set, which the stock CP then runs as the PS5's does.
+	void SetMultiInst(bool on) { m_multi_inst = on; }
 
 	// Compact references (default off): instead of every GpuRef, only the 16 MiB buckets they touch
 	// (ref_buckets); refs then keeps just the index buffers. What residency needs, without sorting a
@@ -1377,6 +1381,7 @@ private:
 	bool                         m_atomic_ops    = false;
 	MemSemaphore                 m_mem_semaphore = MemSemaphore::Refuse;
 	bool                         m_cond_exec     = false;
+	bool                         m_multi_inst    = false;
 	std::set<uint64_t>           m_inspect; // KYTY_NATIVE_GPU_INSPECT_PS: pixel or compute shaders
 	bool                         m_compact_refs = false;
 	uint64_t                     m_guess_span   = 32ull << 20u;

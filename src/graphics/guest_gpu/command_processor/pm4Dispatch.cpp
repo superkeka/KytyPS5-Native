@@ -190,7 +190,7 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_DRAW_INDEX_INDIRECT_MULTI] = CpOpDrawIndirectMulti;
 	g_cp_op_func[Pm4::IT_DRAW_INDEX_2]              = CpOpDrawIndex;
 	g_cp_op_func[Pm4::IT_DRAW_INDEX_OFFSET_2]       = CpOpDrawIndexOffset;
-	g_cp_op_func[Pm4::IT_DISPATCH_DRAW_PREAMBLE]    = CpOpDrawIndex;
+	g_cp_op_func[Pm4::IT_DRAW_INDEX_MULTI_INST]     = CpOpDrawIndexMultiInst;
 	g_cp_op_func[Pm4::IT_PFP_SYNC_ME]               = CpOpPfpSyncMe;
 	g_cp_op_func[Pm4::IT_INDEX_TYPE]                = CpOpIndexType;
 	g_cp_op_func[Pm4::IT_NUM_INSTANCES]             = CpOpNumInstances;

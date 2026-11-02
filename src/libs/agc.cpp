@@ -2921,24 +2921,25 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexGetSize() {
 	return 6u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t index_count,
-                                                      const volatile void* index_addr,
+// DRAW_INDEX_MULTI_INST (0x3A): instance_count draws of index_count indices from index_addr, each with VGT_OBJECT_ID
+// from the next dword of object_ids (instance_count dwords). The body is libSceAgc's: N, the table, MAX_SIZE
+// (index_count, at least 1), the index buffer, index_count, the initiator with UNROLLED_INST. libSceAgc checks none of
+// the arguments; the packet's first dword is the instance count, not an index count.
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t instance_count,
                                                       const volatile void* object_ids,
-                                                      uint32_t instance_count, uint64_t modifier) {
+                                                      const volatile void* index_addr,
+                                                      uint32_t index_count, uint64_t modifier) {
 	PRINT_NAME();
 
-	AgcTrace("\t index_count    = 0x%" PRIx32 "\n"
-	     "\t index_addr     = 0x%016" PRIx64 "\n"
-	     "\t instance_count = 0x%" PRIx32 "\n"
+	AgcTrace("\t instance_count = 0x%" PRIx32 "\n"
 	     "\t object_ids     = 0x%016" PRIx64 "\n"
+	     "\t index_addr     = 0x%016" PRIx64 "\n"
+	     "\t index_count    = 0x%" PRIx32 "\n"
 	     "\t modifier       = 0x%016" PRIx64 "\n",
-	     index_count, reinterpret_cast<uint64_t>(index_addr), instance_count,
-	     reinterpret_cast<uint64_t>(object_ids), modifier);
+	     instance_count, reinterpret_cast<uint64_t>(object_ids), reinterpret_cast<uint64_t>(index_addr),
+	     index_count, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-	EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
-	EXIT_NOT_IMPLEMENTED(object_ids == nullptr);
-	EXIT_NOT_IMPLEMENTED((reinterpret_cast<uint64_t>(index_addr) & 1u) != 0);
 
 	// libSceAgc brackets the packet with internal-data tags (0xc6000006 ... 0xc6000000).
 	auto* start = buf->AllocateDW(AGC_INTERNAL_DATA_PACKET_SIZE_DW + 9u + AGC_INTERNAL_DATA_PACKET_SIZE_DW);
@@ -2948,18 +2949,18 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 	auto* cmd = start + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
 	write_agc_internal_data_packet(cmd + 9u, AGC_DRAW_INDIRECT_MULTI_END_TAG);
 
-	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
 	auto object_vaddr = reinterpret_cast<uint64_t>(object_ids);
+	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
 
-	cmd[0] = KYTY_PM4(9, Pm4::IT_DISPATCH_DRAW_PREAMBLE, 0u);
-	cmd[1] = index_count;
-	cmd[2] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
-	cmd[3] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
-	cmd[4] = (instance_count == 0 ? 1u : instance_count);
-	cmd[5] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
-	cmd[6] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
-	cmd[7] = instance_count;
-	cmd[8] = decode_draw_index_initiator(modifier) | 0x80u;
+	cmd[0] = KYTY_PM4(9, Pm4::IT_DRAW_INDEX_MULTI_INST, 0u);
+	cmd[1] = instance_count;
+	cmd[2] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
+	cmd[3] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
+	cmd[4] = (index_count == 0 ? 1u : index_count);
+	cmd[5] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
+	cmd[6] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
+	cmd[7] = index_count;
+	cmd[8] = decode_draw_index_initiator(modifier) | 0x80u; // UNROLLED_INST
 
 	return start;
 }

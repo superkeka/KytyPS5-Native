@@ -5293,7 +5293,7 @@ void TestAtomicOps() {
 	Check(!CpuAtomicMem(&q, 0x41u, 1, 0), "a float op is not done");
 }
 
-// MEM_SEMAPHORE (SetMemSemaphore) and Sony's 0x3A.
+// MEM_SEMAPHORE (SetMemSemaphore) and DRAW_INDEX_MULTI_INST (0x3A) with its switch off.
 void TestMemSemaphoreAnd3A() {
 	const uint64_t addr = 0x202000600ull;
 	std::vector<uint32_t> cb;
@@ -5319,7 +5319,129 @@ void TestMemSemaphoreAnd3A() {
 
 	std::vector<uint32_t> multi = {0xc0073a00u, 3u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
 	auto r3 = t.Translate(multi);
-	Check(!r3.ok && r3.unknown_op == 0x3Au, "DrawIndexMultiInstanced (0x3A) refused");
+	Check(!r3.ok && r3.unknown_op == 0x3Au, "DrawIndexMultiInstanced (0x3A) refused while the switch is off");
+}
+
+// DRAW_INDEX_MULTI_INST (SetMultiInst, KYTY_NATIVE_GPU_MULTI_INST), AgcDcbDrawIndexMultiInstanced: N, the object-id table,
+// MAX_SIZE, the index buffer, the index count and the initiator. NUM_INSTANCES N and the packet with NOT_EOP on the gfx
+// ring; N 0 is nothing; an index count of 0 leaves the index registers set and draws nothing; never on MEC.
+void TestMultiInst() {
+	constexpr uint32_t IT_MULTI_INST         = 0x3Au;
+	constexpr uint32_t IT_INDEX_BASE_T       = 0x26u;
+	constexpr uint32_t IT_INDEX_BUFFER_SIZE_T = 0x13u;
+	constexpr uint32_t IT_DRAW_INDEX_OFFSET_T = 0x35u;
+	constexpr uint64_t kTable = 0x230000000ull;
+	constexpr uint64_t kIndex = 0x240000000ull;
+	auto multi = [&](uint32_t n, uint32_t index_count, uint32_t initiator) {
+		return std::vector<uint32_t> {0xc0073a00u,
+		                              n,
+		                              static_cast<uint32_t>(kTable),
+		                              static_cast<uint32_t>(kTable >> 32u),
+		                              index_count != 0 ? index_count : 1u,
+		                              static_cast<uint32_t>(kIndex),
+		                              static_cast<uint32_t>(kIndex >> 32u),
+		                              index_count,
+		                              initiator};
+	};
+	// The packet just before `p` in the IB.
+	auto before = [](const std::vector<Packet>& pkts, const Packet* p) -> const Packet* {
+		return p != nullptr && p != pkts.data() ? p - 1 : nullptr;
+	};
+
+	{
+		Pm4Translator         off;
+		std::vector<uint32_t> dcb = multi(3u, 36u, 0x80u);
+		auto                  r   = off.Translate(dcb);
+		Check(!r.ok && r.unknown_op == IT_MULTI_INST, "0x3A refused with the switch off (KYTY_NATIVE_GPU_MULTI_INST=0)");
+	}
+
+	Pm4Translator t;
+	t.SetMultiInst(true);
+	{
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_SET_UCONFIG_REG, {0x243u, 1u}, false); // VGT_INDEX_TYPE = 32-bit
+		const auto pkt = multi(3u, 36u, 0x80u);
+		dcb.insert(dcb.end(), pkt.begin(), pkt.end());
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.draws == 1 && r.stats.multi_inst == 1, "0x3A with N 3 translated");
+		const auto    pkts = Decode(r.ib);
+		const Packet* d    = FindFirst(pkts, IT_MULTI_INST);
+		Check(Count(pkts, IT_MULTI_INST) == 1 && d != nullptr && d->body.size() == 8 &&
+		          std::equal(d->body.begin(), d->body.begin() + 7, pkt.begin() + 1) && d->body[7] == (0x80u | 0x20u),
+		      "the packet as written with NOT_EOP set");
+		const Packet* n = before(pkts, d);
+		Check(n != nullptr && n->op == IT_NUM_INSTANCES && n->body.size() == 1 && n->body[0] == 3u,
+		      "NUM_INSTANCES N right before it, as the PS5's PFP sets it");
+		Check(HasRef(r.refs, kIndex, 36u * 4u, false) && HasRef(r.refs, kTable, 3u * 4u, false),
+		      "the index buffer (MAX_SIZE 32-bit indices) and the object-id table referenced");
+		bool index_ref = false;
+		for (const auto& ref: r.refs) {
+			index_ref = index_ref || (ref.addr == kIndex && ref.index);
+		}
+		Check(index_ref, "the index buffer is referenced as one");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the strict gfx-ring check");
+		Check(!ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "and is refused on a compute ring");
+		using Libs::Graphics::NativeGpu::SetNativeIbValidation;
+		SetNativeIbValidation(false);
+		const bool gfx_ok = ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx);
+		const bool mec_ok = ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute);
+		SetNativeIbValidation(true);
+		Check(gfx_ok && !mec_ok, "the default packet check: gfx ring yes, MEC no");
+		Check(!ValidateNativeIb(std::vector<uint32_t>(pkt.begin(), pkt.end()), false, &bad, NativeIbKind::Gfx),
+		      "the strict check takes the packet only with NOT_EOP, as the translator passes it on");
+
+		// The packet sets VGT_DMA_BASE as INDEX_BASE does: a later DRAW_INDEX_OFFSET_2 draws from that buffer, in this
+		// DCB and the next. A fresh translator, so the base can only come from this DCB's packet.
+		Pm4Translator f;
+		f.SetMultiInst(true);
+		std::vector<uint32_t> later = dcb;
+		Append(later, IT_DRAW_INDEX_OFFSET_T, {0x40u, 5u, 6u, 0u}, false);
+		auto          rl  = f.Translate(later);
+		const auto    pl  = Decode(rl.ib);
+		const Packet* off = nullptr;
+		for (const auto& p: pl) {
+			off = p.op == IT_DRAW_INDEX_2 ? &p : off;
+		}
+		const uint64_t addr = kIndex + 5u * 4u;
+		Check(rl.ok && off != nullptr && off->body[1] == static_cast<uint32_t>(addr) && off->body[2] == static_cast<uint32_t>(addr >> 32u),
+		      "a later DRAW_INDEX_OFFSET_2 sees the packet's index base");
+		std::vector<uint32_t> next;
+		Append(next, IT_DRAW_INDEX_OFFSET_T, {0x40u, 7u, 6u, 0u}, false);
+		auto          rn = f.Translate(next);
+		const auto    pn = Decode(rn.ib);
+		const Packet* dn = FindFirst(pn, IT_DRAW_INDEX_2);
+		Check(rn.ok && dn != nullptr && dn->body[1] == static_cast<uint32_t>(kIndex + 7u * 4u), "and so does one in the next DCB");
+	}
+	{
+		auto r = t.Translate(multi(0u, 36u, 0x80u));
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && r.stats.draws == 0 && r.stats.multi_inst == 0 && Count(pkts, IT_MULTI_INST) == 0 && Count(pkts, IT_NUM_INSTANCES) == 0 &&
+		          Count(pkts, IT_INDEX_BASE_T) == 0 && !HasRef(r.refs, kTable, 0, false) && !HasRef(r.refs, kIndex, 0, false),
+		      "N 0: no draw and no state change");
+	}
+	{
+		Pm4Translator z;
+		z.SetMultiInst(true);
+		auto r = z.Translate(multi(2u, 0u, 0x80u));
+		const auto    pkts = Decode(r.ib);
+		const Packet* n    = FindFirst(pkts, IT_NUM_INSTANCES);
+		const Packet* b    = FindFirst(pkts, IT_INDEX_BASE_T);
+		const Packet* sz   = FindFirst(pkts, IT_INDEX_BUFFER_SIZE_T);
+		Check(r.ok && r.stats.draws == 0 && r.stats.multi_inst == 1 && Count(pkts, IT_MULTI_INST) == 0 && n != nullptr && n->body[0] == 2u &&
+		          b != nullptr && b->body[0] == static_cast<uint32_t>(kIndex) && b->body[1] == static_cast<uint32_t>(kIndex >> 32u) &&
+		          sz != nullptr && sz->body[0] == 1u && !HasRef(r.refs, kTable, 0, false),
+		      "an index count of 0: NUM_INSTANCES, INDEX_BASE and INDEX_BUFFER_SIZE, no draw (the PS5 writes them, the stock CP would not)");
+	}
+	{
+		Pm4Translator c;
+		c.SetComputeQueue(true);
+		c.SetComputeRing(true);
+		c.SetMultiInst(true);
+		c.SetAudit(true);
+		auto r = c.Translate(multi(3u, 36u, 0x80u));
+		Check(!r.ok && r.unknown_op == IT_MULTI_INST && RefusedFor(r, RefuseWhy::GraphicsOnMec), "0x3A on MEC refused");
+	}
 }
 
 // COND_EXEC in any form (SetCondExec, KYTY_NATIVE_GPU_COND_EXEC): on the gfx ring as written behind a PFP_SYNC_ME, its
@@ -6125,6 +6247,7 @@ int main() {
 	TestCopyData();
 	TestAtomicOps();
 	TestMemSemaphoreAnd3A();
+	TestMultiInst();
 	TestCondExecRecount();
 	TestFlattenCondExecCount();
 	TestCopyDataForms();

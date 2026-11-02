@@ -51,7 +51,7 @@ constexpr uint32_t IT_WRITE_DATA               = 0x37;
 constexpr uint32_t IT_PFP_SYNC_ME              = 0x42;
 constexpr uint32_t IT_COND_WRITE               = 0x45;
 constexpr uint32_t IT_MEM_SEMAPHORE            = 0x39;
-constexpr uint32_t IT_DRAW_INDEX_MULTI_INST    = 0x3A; // Sony's (AgcDcbDrawIndexMultiInstanced)
+constexpr uint32_t IT_DRAW_INDEX_MULTI_INST    = 0x3A; // AgcDcbDrawIndexMultiInstanced (Linux nvd.h)
 constexpr uint32_t IT_EVENT_WRITE              = 0x46;
 constexpr uint32_t IT_ACQUIRE_MEM             = 0x58;
 constexpr uint32_t IT_SET_SH_REG_INDIRECT      = 0x63;
@@ -762,6 +762,7 @@ bool IsWork(uint32_t op) {
 		case IT_DRAW_INDIRECT_MULTI:
 		case IT_DRAW_INDEX_INDIRECT_MULTI:
 		case IT_DRAW_INDEX_AUTO:
+		case IT_DRAW_INDEX_MULTI_INST:
 		case IT_DISPATCH_DIRECT:
 		case IT_DISPATCH_INDIRECT:
 		case IT_DMA_DATA:
@@ -1216,6 +1217,7 @@ bool GraphicsOnlyOp(uint32_t op) {
 		case IT_DRAW_INDEX_2:
 		case IT_DRAW_INDEX_OFFSET_2:
 		case IT_DRAW_INDEX_AUTO:
+		case IT_DRAW_INDEX_MULTI_INST:
 		case IT_NUM_INSTANCES:
 		case IT_PFP_SYNC_ME:
 		case IT_CONTEXT_CONTROL:
@@ -1600,6 +1602,12 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 			case IT_DRAW_INDIRECT_MULTI:
 			case IT_DRAW_INDEX_INDIRECT_MULTI:
 				if (compute || size != 10) {
+					return bad();
+				}
+				break;
+			// AgcDcbDrawIndexMultiInstanced as the translator passes it on (NOT_EOP set): the gfx ring only, nine dwords.
+			case IT_DRAW_INDEX_MULTI_INST:
+				if (compute || size != 9 || (b[7] & 0x20u) == 0) {
 					return bad();
 				}
 				break;
@@ -4377,6 +4385,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				case IT_DRAW_INDEX_2:
 				case IT_DRAW_INDEX_OFFSET_2:
 				case IT_DRAW_INDEX_AUTO:
+				case IT_DRAW_INDEX_MULTI_INST:
 				case IT_INDEX_BASE:
 				case IT_INDEX_BUFFER_SIZE:
 				case IT_SET_PREDICATION:
@@ -4410,6 +4419,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				case IT_DRAW_INDEX_2:
 				case IT_DRAW_INDEX_OFFSET_2:
 				case IT_DRAW_INDEX_AUTO:
+				case IT_DRAW_INDEX_MULTI_INST:
 				case IT_DISPATCH_DIRECT:
 				case IT_DISPATCH_INDIRECT:
 				case IT_DMA_DATA:
@@ -5321,18 +5331,88 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			}
 			case IT_DRAW_INDEX_MULTI_INST: {
-				// AgcDcbDrawIndexMultiInstanced (0xC0073A00: initiator | 0x80, an object-id array) is Sony microcode: the
-				// stock ME has no 0x3A it runs, and the per-instance DRAW_INDEX_2 equivalent needs the shader's object-id
-				// user-data slot, still research. Refused; its arguments are logged for when a title calls it.
-				static std::atomic<uint32_t> told {0};
-				if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
-					std::fprintf(stderr, "native shadow: DrawIndexMultiInstanced (0x3A) refused:");
-					for (uint32_t i = 0; i < std::min<uint32_t>(body_count, 8u); i++) {
-						std::fprintf(stderr, " %08x", bptr[i]);
+				// AgcDcbDrawIndexMultiInstanced(buf, instance_count, object_ids, index_addr, index_count, modifier):
+				// 0xC0073A00, then N (the instance count), the object-id table (N dwords), MAX_SIZE (index_count, at least
+				// 1), the index buffer, index_count and the initiator (UNROLLED_INST 0x80, NOT_EOP 0x20 from the modifier).
+				// The PS5's PFP and the stock one (both re-derived from the microcode, 2.11) read the body alike: N 0 is no
+				// draw and no state change; otherwise MAX_SIZE goes to VGT_DMA_MAX_SIZE, the buffer to VGT_DMA_BASE (what
+				// INDEX_BUFFER_SIZE and INDEX_BASE set, so a later DRAW_INDEX_OFFSET_2 draws from it), index_count to
+				// VGT_DMA_SIZE, and the ME draws N times, each time VGT_OBJECT_ID (a fixed-function register, no user-data
+				// slot of the shader) from the table and then VGT_DRAW_INITIATOR, with NOT_EOP cleared on the last draw. Two
+				// differences: the PS5's first sets NUM_INSTANCES to N, which the stock one does not, and the stock one,
+				// unless the initiator has NOT_EOP, splits the draws into chunks of 8 with NOT_EOP off between them; with it
+				// the stock CP takes the PS5's single-chunk path, the same register writes. So NUM_INSTANCES N (exactly the
+				// stock 0x2F: VGT_DMA_NUM_INSTANCES, VGT_NUM_INSTANCES and the CP's shadow) and the packet with NOT_EOP set
+				// run it as the PS5 does. The stock CP also skips everything when index_count is 0, where the PS5's still
+				// writes the index registers (and draws nothing), so that case is NUM_INSTANCES, INDEX_BASE and
+				// INDEX_BUFFER_SIZE alone. The CP reads the table when it runs the packet: it is referenced as the index
+				// buffer is. Probe multiinst (2.11) does not bear the instance count out on the stock board, though: with
+				// UNROLLED_INST the first draw runs one instance and every later one nine, with or without NOT_EOP and
+				// OBJECT_ID_INST_EN (3 + 27 (N - 1) VS invocations for N draws of one triangle, where N instances want 3N),
+				// and an initiator without UNROLLED_INST took the whole board down. Whether the PS5 does the same with a
+				// title's state is not known, so the backend leaves this off (KYTY_NATIVE_GPU_MULTI_INST=1 turns it on) and
+				// the buffer goes to Kyty's command processor, which draws N instances of index_count indices.
+				if (!m_multi_inst) {
+					static std::atomic<uint32_t> told {0};
+					if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+						std::fprintf(stderr, "native shadow: DrawIndexMultiInstanced (0x3A) refused (KYTY_NATIVE_GPU_MULTI_INST):");
+						for (uint32_t i = 0; i < std::min<uint32_t>(body_count, 8u); i++) {
+							std::fprintf(stderr, " %08x", bptr[i]);
+						}
+						std::fprintf(stderr, "\n");
 					}
-					std::fprintf(stderr, "\n");
+					soft_unknown(op, dw);
+					break;
 				}
-				soft_unknown(op, dw);
+				if (body_count != 8) { // libSceAgc's nine dwords only: the header is passed on with the body
+					return fail(op, dw, RefuseWhy::ShortBody);
+				}
+				const uint32_t instances = bptr[0];
+				if (instances == 0) {
+					break; // no draw and no state change, on both CPs
+				}
+				const uint64_t table       = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+				const uint32_t max_size    = bptr[3];
+				const uint32_t index_count = bptr[6];
+				const uint32_t index_type  = reg(uc, 0x243u) & 0x3u; // VGT_INDEX_TYPE: 0 16-bit, 1 32-bit, 2 8-bit
+				const uint64_t stride      = index_type == 1u ? 4u : (index_type == 2u ? 1u : 2u);
+				// What the packet leaves behind, as NUM_INSTANCES, INDEX_BASE and INDEX_BUFFER_SIZE do.
+				log_instances    = instances;
+				cp.num_instances = instances;
+				cp.index_base    = static_cast<uint64_t>(bptr[4]) | (static_cast<uint64_t>(bptr[5]) << 32u);
+				cp.index_size    = max_size;
+				cp.index_set     = true;
+				index_base       = static_cast<uint64_t>(bptr[4]) | (static_cast<uint64_t>(bptr[5] & 0xffffu) << 32u);
+				index_bytes      = static_cast<uint64_t>(max_size) * 4u;
+				stats.num_instances++;
+				stats.multi_inst++;
+				const bool draw = index_count != 0;
+				if (draw) {
+					log_draw(op, index_count, 0, false);
+				}
+				const bool skipped = draw && skip_draw();
+				if (draw && !skipped) {
+					pfp_sync_me(); // the PFP fetches the object-id table as it does an indirect draw's arguments
+				}
+				body.push_back(Pkt3(IT_NUM_INSTANCES, 1, false));
+				body.push_back(instances);
+				if (!draw || skipped) {
+					body.insert(body.end(), {Pkt3(IT_INDEX_BASE, 2, false), bptr[4], bptr[5], Pkt3(IT_INDEX_BUFFER_SIZE, 1, false), max_size});
+					stats.index_state++;
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + 8);
+					body.push_back(bptr[7] | 0x20u); // NOT_EOP: the stock CP's single-chunk path, the PS5's
+				}
+				if (draw) {
+					stats.draws_skipped += skipped ? 1u : 0u;
+					stats.draws++;
+					collect_refs();
+					if (!skipped) {
+						add_ref(table, static_cast<uint64_t>(instances) * 4u, false);
+					}
+				}
+				add_ref(index_base, static_cast<uint64_t>(max_size) * stride, false, true);
+				NoteOnce(36, "DRAW_INDEX_MULTI_INST (NUM_INSTANCES, the packet with NOT_EOP)");
 				break;
 			}
 			case IT_COPY_DATA: {

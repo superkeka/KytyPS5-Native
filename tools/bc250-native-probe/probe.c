@@ -5804,11 +5804,254 @@ static bool DangerPrtGfx(Device* d, Common* c, const char* step) {
 	return PrtFollowUp(d, c) && ok;
 }
 
+// ---------------------------------------------------------------------------------------------
+// multiinst: libSceAgc's DRAW_INDEX_MULTI_INST (0x3A) on the stock gfx CP, the probe's only draw.
+// sceAgcDcbDrawIndexMultiInstanced writes header 0xC0073A00 and the body {N, object-id table lo, hi, index count (1 if
+// 0) as VGT_DMA_MAX_SIZE, index buffer lo, hi, index count, initiator 0x80 (UNROLLED_INST) | the title's NOT_EOP 0x20}.
+// The stock PFP and Sony's gen2 PFP read it alike; the ME draws N times, VGT_OBJECT_ID = table[i] before each, the
+// initiator with GRBM_SKEW_NO_DEC 0x100 (gen2: 0x120) on all but the last draw. Gen2 first sets NUM_INSTANCES = N, the
+// stock microcode does not; without NOT_EOP the stock ME splits the draws into chunks of 8. So the translator sends
+// NUM_INSTANCES N, then the packet with NOT_EOP set. This case draws one triangle of a 32-bit index buffer {2, 0, 1}
+// through a legacy (non-NGG) wave64 VS with rasterization killed (no PS, no render target), and the VS (multiinst.s)
+// logs every invocation's InstanceID and VertexID. The object id itself never reaches the VS (VGT_DRAW_PAYLOAD_CNTL 0;
+// MULTIINST_PAYLOAD sets that register, gfx10.1's OBJECT_ID_INST_EN is bit 2) and is never read back: a COPY_DATA of
+// VGT_OBJECT_ID stopped the ring (regindex). MULTIINST_MODE (comma list, default plain,sony), one job each:
+// plain  NUM_INSTANCES N, DRAW_INDEX_2: the control, a plain instanced draw (N x 3 records, instances 0..N-1);
+// sony   NUM_INSTANCES N, then 0x3A N with NOT_EOP: what the translator will send (N x 3 records, as plain);
+// stale  NUM_INSTANCES N + 2, then 0x3A N with NOT_EOP: what the stock CP does without the prologue;
+// chunk  NUM_INSTANCES N, then 0x3A N without NOT_EOP (N defaults to 10 here): the stock ME's chunks of 8.
+// MULTIINST_N sets N (1..16, default 3). Run stale and chunk alone, after plain and sony. A WRITE_DATA marker follows
+// the draw (the CP went past it) and another follows a VS_PARTIAL_FLUSH (the VS waves ended). Gfx10 register offsets
+// from Linux's gc_10_1_0_offset.h; the values are what radv/radeonsi write for a legacy VS on gfx10.
+#define CTX_REG_BASE        0x28000u
+#define PA_CL_CLIP_CNTL     0x28810u // radv's rasterizer discard: DX_CLIP_SPACE_DEF (19) | DX_RASTERIZATION_KILL (22)
+#define SPI_VS_OUT_CONFIG   0x286c4u // NO_PC_EXPORT (7), VS_EXPORT_COUNT 0: no parameter exports
+#define SPI_SHADER_POS_FORMAT 0x2870cu // POS0_EXPORT_FORMAT 4 (SPI_SHADER_4COMP)
+#define VGT_GS_OUT_PRIM_TYPE 0x28a6cu // radv writes it for every pipeline: TRISTRIP (2) for triangles without a GS
+#define VGT_DRAW_PAYLOAD_CNTL 0x28a98u
+#define VGT_SHADER_STAGES_EN 0x28b54u // legacy VS: no LS/HS/ES/GS, PRIMGEN_EN (NGG) 0, VS_W32_EN 0 (wave64)
+#define SPI_SHADER_PGM_RSRC3_VS 0xb118u // then LATE_ALLOC_VS, PGM_LO/HI_VS, PGM_RSRC1/2_VS, USER_DATA_VS_0/1
+#define VGT_PRIMITIVE_TYPE  0x30908u
+#define VGT_INDEX_TYPE      0x3090cu
+#define VGT_OBJECT_ID       0x30920u
+#define GE_MIN_VTX_INDX     0x30924u // then GE_INDX_OFFSET, GE_MULTI_PRIM_IB_RESET_EN
+#define GE_MAX_VTX_INDX     0x30964u
+#define GE_CNTL             0x3096cu
+#define GE_STEREO_CNTL      0x3097cu
+#define GE_PC_ALLOC         0x30980u
+#define GE_USER_VGPR_EN     0x30988u
+
+// SET_CONTEXT_REG / SET_SH_REG / SET_UCONFIG_REG of consecutive registers, graphics-type header.
+static void IbGfxSet(Ib* ib, uint32_t op, uint32_t space, uint32_t reg, const uint32_t* vals, uint32_t count) {
+	IbPush(ib, Pkt3Gfx(op, count + 1));
+	IbPush(ib, (reg - space) / 4);
+	for (uint32_t i = 0; i < count; i++) {
+		IbPush(ib, vals[i]);
+	}
+}
+
+static void IbGfxSet1(Ib* ib, uint32_t op, uint32_t space, uint32_t reg, uint32_t value) {
+	IbGfxSet(ib, op, space, reg, &value, 1);
+}
+
+// SET_UCONFIG_REG_INDEX (0x7A): Mesa's radeon_set_uconfig_reg_idx on gfx9+, INDEX in bits 31:28 of the offset dword
+// (1 for VGT_PRIMITIVE_TYPE, 2 for VGT_INDEX_TYPE, so the CP keeps its own copy for the index fetch).
+static void IbSetUconfigIndex(Ib* ib, uint32_t reg, uint32_t index, uint32_t value) {
+	IbPush(ib, Pkt3Gfx(0x7au, 2));
+	IbPush(ib, ((reg - UCONFIG_BASE) / 4) | (index << 28));
+	IbPush(ib, value);
+}
+
+// What one legacy-VS draw needs on gfx10, after radv's per-IB preamble (CONTEXT_CONTROL with only the update bits,
+// CLEAR_STATE 0: context registers to the kernel's clear state). SH and UCONFIG registers survive CLEAR_STATE and
+// other processes' jobs, so every one the draw depends on is written.
+static void IbMultiInstState(Ib* ib, uint64_t code_va, uint64_t out_va, uint32_t payload) {
+	IbContextControl(ib, CC_UPDATE, CC_UPDATE);
+	IbClearState(ib, 0);
+	IbGfxSet1(ib, 0x69u, CTX_REG_BASE, PA_CL_CLIP_CNTL, (1u << 19) | (1u << 22));
+	IbGfxSet1(ib, 0x69u, CTX_REG_BASE, SPI_VS_OUT_CONFIG, 1u << 7);
+	IbGfxSet1(ib, 0x69u, CTX_REG_BASE, SPI_SHADER_POS_FORMAT, 4u);
+	IbGfxSet1(ib, 0x69u, CTX_REG_BASE, VGT_GS_OUT_PRIM_TYPE, 2u);
+	IbGfxSet1(ib, 0x69u, CTX_REG_BASE, VGT_DRAW_PAYLOAD_CNTL, payload);
+	IbGfxSet1(ib, 0x69u, CTX_REG_BASE, VGT_SHADER_STAGES_EN, 2u << 15); // radv: MAX_PRIMGRP_IN_WAVE 2 on gfx9+
+	const uint32_t vs[8] = {
+	    0xffffu | (0x3fu << 16),                               // RSRC3_VS: CU_EN all, WAVE_LIMIT 0x3f (radv)
+	    0,                                                     // LATE_ALLOC_VS: none
+	    (uint32_t)(code_va >> 8), (uint32_t)(code_va >> 40),   // PGM_LO_VS, PGM_HI_VS (MEM_BASE)
+	    // RSRC1_VS: 12 VGPRs (wave64), FLOAT_MODE 0xc0, DX10_CLAMP, VGPR_COMP_CNT 3 (v3 = InstanceID), MEM_ORDERED.
+	    2u | (0xc0u << 12) | (1u << 21) | (3u << 24) | (1u << 27),
+	    2u << 1,                                               // RSRC2_VS: USER_SGPR 2, no scratch, no streamout
+	    (uint32_t)out_va, (uint32_t)(out_va >> 32),            // USER_DATA_VS_0/1: s[0:1] = output
+	};
+	IbGfxSet(ib, 0x76u, SH_REG_BASE, SPI_SHADER_PGM_RSRC3_VS, vs, 8);
+	// GE_MIN_VTX_INDX, GE_INDX_OFFSET, GE_MULTI_PRIM_IB_RESET_EN 0 and GE_MAX_VTX_INDX ~0, as radeonsi's gfx10 preamble.
+	const uint32_t ge_idx[3] = {0, 0, 0};
+	IbGfxSet(ib, 0x79u, UCONFIG_BASE, GE_MIN_VTX_INDX, ge_idx, 3);
+	IbGfxSet1(ib, 0x79u, UCONFIG_BASE, GE_MAX_VTX_INDX, ~0u);
+	// radv's gfx10_emit_ge_cntl without tessellation or a GS: PRIM_GRP_SIZE 128, VERT_GRP_SIZE 256 (no vertex grouping).
+	IbGfxSet1(ib, 0x79u, UCONFIG_BASE, GE_CNTL, 128u | (256u << 9));
+	IbGfxSet1(ib, 0x79u, UCONFIG_BASE, GE_STEREO_CNTL, 0);
+	IbGfxSet1(ib, 0x79u, UCONFIG_BASE, GE_PC_ALLOC, 0x3ffu << 1); // radv without late alloc: OVERSUB_EN 0
+	IbGfxSet1(ib, 0x79u, UCONFIG_BASE, GE_USER_VGPR_EN, 0);        // v1-v3 are not user VGPRs: v3 is InstanceID
+	IbSetUconfigIndex(ib, VGT_PRIMITIVE_TYPE, 1, 4u);                // DI_PT_TRILIST
+	IbSetUconfigIndex(ib, VGT_INDEX_TYPE, 2, 1u);                    // VGT_INDEX_32
+}
+
+static void IbNumInstances(Ib* ib, uint32_t n) {
+	IbPush(ib, Pkt3Gfx(0x2fu, 1));
+	IbPush(ib, n);
+}
+
+static bool DangerMultiInst(Device* d, Common* c) {
+	const char*    modes   = getenv("MULTIINST_MODE") != NULL ? getenv("MULTIINST_MODE") : "plain,sony";
+	const char*    n_env   = getenv("MULTIINST_N");
+	const char*    pl_env  = getenv("MULTIINST_PAYLOAD");
+	const uint32_t payload = pl_env != NULL ? (uint32_t)strtoul(pl_env, NULL, 0) : 0u;
+	printf("== danger multiinst: DRAW_INDEX_MULTI_INST (0x3A) on the gfx ring, legacy VS, modes %s, "
+	       "VGT_DRAW_PAYLOAD_CNTL 0x%x\n", modes, payload);
+	Bo mem, out;
+	if (!GuestMem(d, &mem, 0x0760000000ull)) {
+		return false;
+	}
+	int r = MemCreate(d, &out, MEM_GTT, 64 * KiB, NULL); // NC as RunLanes': the VS's atomic counter lives in GL2
+	if (r == 0) {
+		r = BoBind(d, &out, 0x0761000000ull, 0);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &out);
+		BoDestroy(d, &mem);
+		return false;
+	}
+	LoadCode(c, k_multiinst_w64, sizeof(k_multiinst_w64));
+	volatile uint32_t* m       = (volatile uint32_t*)mem.cpu;
+	const uint64_t     idx_va  = mem.va + 0x1000; // 32-bit index buffer {2, 0, 1}
+	const uint64_t     tbl_va  = mem.va + 0x2000; // object-id table {0x100, 0x200, ...}
+	const uint64_t     mark_va = mem.va;          // marker after the draw, marker after VS_PARTIAL_FLUSH
+	m[0x1000 / 4 + 0] = 2;
+	m[0x1000 / 4 + 1] = 0;
+	m[0x1000 / 4 + 2] = 1;
+	for (uint32_t i = 0; i < 16; i++) {
+		m[0x2000 / 4 + i] = 0x100u * (i + 1);
+	}
+	static const char* const k_modes[] = {"plain", "sony", "stale", "chunk"};
+	Bo*                      bos[]     = {&mem, &out, &c->code};
+	bool                     ok        = true;
+	bool                     any       = false;
+	for (uint32_t k = 0; k < ARRAY_SIZE(k_modes); k++) {
+		const char* mode = k_modes[k];
+		if (!ListHas(modes, mode)) {
+			continue;
+		}
+		any                 = true;
+		const bool chunk    = strcmp(mode, "chunk") == 0;
+		uint32_t   n        = n_env != NULL ? (uint32_t)strtoul(n_env, NULL, 0) : (chunk ? 10u : 3u);
+		n                   = n < 1 ? 1 : n > 16 ? 16 : n;
+		const uint32_t inst = strcmp(mode, "stale") == 0 ? n + 2 : n;
+		memset(out.cpu, 0, 64 * KiB);
+		m[0] = m[1] = 0;
+		__sync_synchronize();
+		Ib ib = {.n = 0};
+		IbMultiInstState(&ib, c->code.va, out.va, payload);
+		IbNumInstances(&ib, inst);
+		if (strcmp(mode, "plain") == 0) {
+			IbPush(&ib, Pkt3Gfx(0x27u, 5)); // DRAW_INDEX_2: MAX_SIZE, INDEX_BASE lo/hi, INDEX_COUNT, DI_SRC_SEL_DMA
+			IbPush(&ib, 3u);
+			IbPush(&ib, (uint32_t)idx_va);
+			IbPush(&ib, (uint32_t)(idx_va >> 32));
+			IbPush(&ib, 3u);
+			IbPush(&ib, 0u);
+		} else {
+			const uint32_t at = ib.n;
+			IbPush(&ib, Pkt3Gfx(0x3au, 8)); // 0xC0073A00, libSceAgc's header
+			IbPush(&ib, n);
+			IbPush(&ib, (uint32_t)tbl_va);
+			IbPush(&ib, (uint32_t)(tbl_va >> 32));
+			// MULTIINST_IDX (1..3, default 3) and MULTIINST_INIT (the initiator, default 0xa0 or 0x80 for chunk) find what
+			// the unrolled draws' instance count follows.
+			const char*    ix_env = getenv("MULTIINST_IDX");
+			const char*    in_env = getenv("MULTIINST_INIT");
+			uint32_t       idx    = ix_env != NULL ? (uint32_t)strtoul(ix_env, NULL, 0) : 3u;
+			idx                   = idx < 1 ? 1 : idx > 3 ? 3 : idx;
+			const uint32_t init   = in_env != NULL ? (uint32_t)strtoul(in_env, NULL, 0) & 0xe0u : (chunk ? 0x80u : 0x80u | 0x20u);
+			IbPush(&ib, idx); // VGT_DMA_MAX_SIZE
+			IbPush(&ib, (uint32_t)idx_va);
+			IbPush(&ib, (uint32_t)(idx_va >> 32));
+			IbPush(&ib, idx);  // VGT_DMA_SIZE, VGT_NUM_INDICES
+			IbPush(&ib, init); // UNROLLED_INST, NOT_EOP; DI_SRC_SEL_DMA
+			PrintDwords("DRAW_INDEX_MULTI_INST", ib.dw + at, 9);
+		}
+		GuestMark(&ib, false, mark_va, 0x3a000001u);
+		IbPush(&ib, Pkt3Gfx(0x46u, 1)); // EVENT_WRITE VS_PARTIAL_FLUSH (0x0f), EVENT_INDEX 4, as Mesa
+		IbPush(&ib, 0x0fu | (4u << 8));
+		GuestMark(&ib, false, mark_va + 4, 0x3a000002u);
+		// Linux never writes VGT_OBJECT_ID: leave it as found (0) for the next process; NUM_INSTANCES back to 1.
+		IbGfxSet1(&ib, 0x79u, UCONFIG_BASE, VGT_OBJECT_ID, 0);
+		IbNumInstances(&ib, 1);
+		char what[64];
+		snprintf(what, sizeof(what), "%s: NUM_INSTANCES %u, N %u:", mode, inst, n);
+		IbPad(&ib);
+		uint64_t     seq = 0;
+		const double t0  = NowSec();
+		r                = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 3, &seq);
+		const int     w  = r == 0 ? WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0) : r;
+		const int64_t st = ContextState(d);
+		printf("  %-44s %s after %.2f ms, ctx 0x%" PRIx64 "\n", what, w == 1 ? "TIMEOUT" : ErrStr(w), (NowSec() - t0) * 1e3,
+		       (uint64_t)st);
+		const bool past_draw = m[0] == 0x3a000001u, vs_done = m[1] == 0x3a000002u;
+		printf("    marker after the draw %s, after VS_PARTIAL_FLUSH %s\n", past_draw ? "landed" : "MISSING",
+		       vs_done ? "landed" : "MISSING");
+		if (w != 0 || st != 0) {
+			printf("  the job did not finish: the gfx ring is stopped or was reset; exiting without freeing buffers\n");
+			PrintGpuvmFault(d, "after the job");
+			_exit(3);
+		}
+		// The records: out[0] = invocations, then {InstanceID, VertexID, 0xc0de, slot} from out + 64.
+		const uint32_t* o     = (const uint32_t*)out.cpu;
+		const uint32_t  total = o[0];
+		const uint32_t  shown = total < 60 ? total : 60;
+		uint32_t        seen[16][3];
+		memset(seen, 0, sizeof(seen));
+		uint32_t odd = 0;
+		printf("    %u VS invocations (want %u):", total, n * 3u);
+		for (uint32_t s = 0; s < shown; s++) {
+			const uint32_t* rec = o + 16 + 4 * s;
+			printf("%s (%u,%u)", s % 12 == 0 ? "\n     " : "", rec[0], rec[1]);
+			if (rec[2] != 0xc0deu || rec[3] != s || rec[0] >= 16 || rec[1] >= 3) {
+				odd++;
+			} else {
+				seen[rec[0]][rec[1]]++;
+			}
+		}
+		printf("\n");
+		uint32_t once = 0, extra = 0;
+		for (uint32_t i = 0; i < 16; i++) {
+			for (uint32_t v = 0; v < 3; v++) {
+				once += i < n && seen[i][v] == 1;
+				extra += (i < n && seen[i][v] > 1) || (i >= n && seen[i][v] > 0) ? 1 : 0;
+			}
+		}
+		const bool want = total == n * 3u && once == n * 3u && extra == 0 && odd == 0 && past_draw && vs_done;
+		printf("    (instance, vertex) once each for instances 0..%u: %u of %u; repeated or beyond: %u; malformed: %u: %s\n",
+		       n - 1, once, n * 3u, extra, odd, want ? "as a plain instanced draw" : "NOT as a plain instanced draw");
+		if (strcmp(mode, "plain") == 0 || strcmp(mode, "sony") == 0) {
+			ok = ok && want; // stale and chunk have no fixed expectation: they show what the stock CP does
+		}
+	}
+	if (!any) {
+		printf("  MULTIINST_MODE: plain, sony, stale, chunk (comma list)\n");
+		ok = false;
+	}
+	BoDestroy(d, &out);
+	BoDestroy(d, &mem);
+	return ok;
+}
+
 static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop\n");
+	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop multiinst\n");
 	printf("PRT cases, in risk order: prt-map prt-split prt-read-compute prt-write-compute prt-kfd-tlb prt-replace-race prt-cp-compute prt-gfx-{copy,dma,write,wait,dispatch}\n");
 }
 
@@ -5948,6 +6191,8 @@ int main(int argc, char** argv) {
 			ok = DangerPrtCpCompute(&d, &c);
 		} else if (strncmp(danger, "prt-gfx-", 8) == 0) {
 			ok = DangerPrtGfx(&d, &c, danger + 8);
+		} else if (strcmp(danger, "multiinst") == 0) {
+			ok = DangerMultiInst(&d, &c);
 		} else if (strncmp(danger, "regindex-", 9) == 0) {
 			ok = DangerRegIndex(&d, &c, danger + 9);
 		} else {

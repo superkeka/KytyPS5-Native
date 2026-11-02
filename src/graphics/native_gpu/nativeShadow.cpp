@@ -5507,6 +5507,9 @@ private:
 		// count recomputed). KYTY_NATIVE_GPU_MEM_SEMAPHORE: the stock ME took the whole board down on the first 0x39 (probe
 		// memsem, no kernel line), so by default (translate, or 1) the translator builds it from our barrier, a wait and
 		// ATOMIC_MEM; 0 refuses it, asis passes the title's packet on as written (research only).
+		// KYTY_NATIVE_GPU_MULTI_INST (DRAW_INDEX_MULTI_INST, 0x3A): 1 sends NUM_INSTANCES and the packet with NOT_EOP, the
+		// PS5's register writes (microcode, 2.11); off by default, since probe multiinst saw the stock board run 1 + 9 (N
+		// - 1) instances for N draws instead of N, so the buffer goes to Kyty's command processor.
 		{
 			auto on = [](const char* name, bool def) {
 				const char* v = std::getenv(name);
@@ -5521,18 +5524,20 @@ private:
 			                               : std::strcmp(sem_env, "asis") == 0     ? MemSemaphore::AsIs
 			                               : sem_env[0] == '0'                     ? MemSemaphore::Refuse
 			                                                                       : MemSemaphore::Translate;
-			const bool cond_exec = on("KYTY_NATIVE_GPU_COND_EXEC", true);
+			const bool cond_exec  = on("KYTY_NATIVE_GPU_COND_EXEC", true);
+			const bool multi_inst = on("KYTY_NATIVE_GPU_MULTI_INST", false);
 			for (Pm4Translator* t: {&m_translator, &m_acb_translator}) {
 				t->SetCopyData(copy_data, mec_copy);
 				t->SetAtomicOps(atomics);
 				t->SetMemSemaphore(semaphore);
 				t->SetCondExec(cond_exec);
+				t->SetMultiInst(multi_inst);
 			}
 			SetMemSemaphoreValidation(semaphore == MemSemaphore::AsIs);
-			if (!copy_data || !mec_copy || !atomics || semaphore != MemSemaphore::Translate || !cond_exec) {
-				std::fprintf(stderr, "native shadow: libSceAgc forms (not the defaults): COPY_DATA gfx %d MEC %d, ATOMIC_MEM ops %d, MEM_SEMAPHORE %s, COND_EXEC %d\n",
+			if (!copy_data || !mec_copy || !atomics || semaphore != MemSemaphore::Translate || !cond_exec || !multi_inst) {
+				std::fprintf(stderr, "native shadow: libSceAgc forms (not the defaults): COPY_DATA gfx %d MEC %d, ATOMIC_MEM ops %d, MEM_SEMAPHORE %s, COND_EXEC %d, DRAW_INDEX_MULTI_INST %d\n",
 				             copy_data, mec_copy, atomics, semaphore == MemSemaphore::AsIs ? "asis" : semaphore == MemSemaphore::Refuse ? "refused" : "translated",
-				             cond_exec);
+				             cond_exec, multi_inst);
 			}
 		}
 		// KYTY_NATIVE_GPU_GDS_SHADERS=1 runs draws with GDS shaders natively, =skip leaves just those

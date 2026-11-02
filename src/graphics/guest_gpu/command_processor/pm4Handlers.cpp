@@ -1674,28 +1674,45 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	return 6;
 }
 
+// DRAW_INDEX_MULTI_INST (libSceAgc's AgcDcbDrawIndexMultiInstanced): N, the object-id table (N dwords), MAX_SIZE, the
+// index buffer, the index count, the initiator (UNROLLED_INST, NOT_EOP). The PS5's CP, for N != 0, sets NUM_INSTANCES to
+// N, VGT_DMA_MAX_SIZE and VGT_DMA_BASE (what INDEX_BUFFER_SIZE and INDEX_BASE set) and then draws N times, one unrolled
+// instance each, VGT_OBJECT_ID taken from the table before each draw; N 0 changes nothing. Here the same state, and the
+// N draws as one draw of N instances: the same indices, instance ids 0 to N - 1 as the unrolled draws count them. The
+// object id has no counterpart in Kyty's Vulkan draw (it is a fixed-function register, not a user-data slot the
+// recompiled shaders read), so the table is not read.
+KYTY_CP_OP_PARSER(CpOpDrawIndexMultiInst) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00);
+
+	const uint32_t instance_count = buffer[0];
+	const uint32_t max_size       = buffer[3];
+	const uint64_t index_base     = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
+	const uint32_t index_count    = buffer[6];
+	const uint32_t flags          = buffer[7];
+
+	EXIT_NOT_IMPLEMENTED((flags & ~0xa0u) != 0);
+
+	if (instance_count == 0) {
+		return 8;
+	}
+	cp.SetNumInstances(instance_count);
+	cp.SetIndexBaseAddress(index_base);
+	cp.SetIndexBufferSize(max_size);
+	if (index_count != 0) {
+		cp.DrawIndex({.index_count    = index_count,
+		              .index_addr     = reinterpret_cast<const void*>(index_base),
+		              .instance_count = instance_count});
+	}
+
+	return 8;
+}
+
 KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0073a00 && cmd_id != 0xc0042700);
-
-	if (cmd_id == 0xc0073a00) {
-		uint32_t index_count = buffer[0];
-		auto*    index_addr =
-		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
-		uint32_t max_instance_count = buffer[3];
-		uint32_t instance_count     = buffer[6];
-		uint32_t flags              = buffer[7];
-
-		EXIT_NOT_IMPLEMENTED(instance_count > max_instance_count);
-		EXIT_NOT_IMPLEMENTED((flags & ~0xa0u) != 0);
-
-		cp.DrawIndex({.index_count    = index_count,
-		              .index_addr     = index_addr,
-		              .instance_count = instance_count});
-
-		return 8;
-	}
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0042700);
 
 	if (cmd_id == 0xc0042700) {
 		uint32_t max_index_count = buffer[0];
