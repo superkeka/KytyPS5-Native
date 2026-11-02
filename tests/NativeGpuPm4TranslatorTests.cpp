@@ -5230,8 +5230,8 @@ void TestCopyData() {
 	Check(rc.ok && cp != nullptr && cp->compute && PassesBothChecks(rc.ib, NativeIbKind::Compute), "COPY_DATA on MEC with the shader-type bit");
 }
 
-// ATOMIC_MEM (SetAtomicOps, KYTY_NATIVE_GPU_ATOMIC_OPS): any no-return integer op as written on the gfx ring, on the CPU
-// where the GPU does not run it; returning ops refuse.
+// ATOMIC_MEM (SetAtomicOps, KYTY_NATIVE_GPU_ATOMIC_OPS): any integer op as written on the gfx ring, on the CPU
+// where the GPU does not run it, returning or not; float ops, COMMAND 3 and a loop that cannot end refuse.
 void TestAtomicOps() {
 	const uint64_t addr = 0x202000500ull;
 	auto atomic = [&](uint32_t control, uint64_t src, uint64_t cmp) {
@@ -5248,15 +5248,16 @@ void TestAtomicOps() {
 	t.SetAudit(true); // the refusals' reasons
 	Check(!t.Translate(atomic(0x4fu, 1, 0)).ok, "ATOMIC_MEM ADD_32 refused while the switch is off");
 	t.SetAtomicOps(true);
-	for (uint32_t op: {0x47u, 0x48u, 0x4fu, 0x50u, 0x51u, 0x54u, 0x56u, 0x57u, 0x58u, 0x59u, 0x6fu, 0x78u, 0x79u, 0x268u}) {
+	for (uint32_t op: {0x47u, 0x48u, 0x4fu, 0x50u, 0x51u, 0x54u, 0x56u, 0x57u, 0x58u, 0x59u, 0x6fu, 0x78u, 0x79u, 0x268u, 0x0fu, 0x27u,
+	                   0x108u /* CMPSWAP_RTN_32, COMMAND 1 */, 0x128u}) {
 		const auto cb = atomic(op, 3, 2);
 		auto       r  = t.Translate(cb);
-		Check(r.ok && std::search(r.ib.begin(), r.ib.end(), cb.begin(), cb.end()) != r.ib.end(), "a no-return ATOMIC_MEM op as written");
-		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the no-return ATOMIC_MEM passes both packet checks");
+		Check(r.ok && std::search(r.ib.begin(), r.ib.end(), cb.begin(), cb.end()) != r.ib.end(), "an integer ATOMIC_MEM op as written");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the integer ATOMIC_MEM passes both packet checks");
 	}
-	for (uint32_t op: {0x0fu, 0x27u, 0x41u /* FCMPSWAP */, 0x34fu /* COMMAND 3 */}) {
+	for (uint32_t op: {0x41u /* FCMPSWAP */, 0x34fu /* COMMAND 3 */, 0x148u /* no-return CMPSWAP, COMMAND 1: never ends */, 0x10fu}) {
 		auto r = t.Translate(atomic(op, 3, 2));
-		Check(!r.ok && RefusedFor(r, RefuseWhy::AtomicForm), "returning, float or unknown-command ATOMIC_MEM refused");
+		Check(!r.ok && RefusedFor(r, RefuseWhy::AtomicForm), "float, endless-loop or unknown-command ATOMIC_MEM refused");
 	}
 	Pm4Translator u;
 	TestOracle    ou;
@@ -5585,9 +5586,9 @@ void TestCopyDataForms() {
 	Check(!rm.ok && RefusedFor(rm, RefuseWhy::CopyDataForm), "COPY_DATA on MEC with engine bits refused");
 }
 
-// NoReturnAtomicOp, op by op: with KYTY_NATIVE_GPU_ATOMIC_OPS=1 exactly gfx10's no-return integer TC_OPs (TC_OP_ATOMIC_*_32
-// 0x47-0x59 and *_64 0x67-0x79 without the float ones), COMMAND 0 or 2, or 1 on a compare-swap; libSceAgc's swap and AND
-// (0x67, 0x75) whatever the switch. The returning forms (bit 6 clear) never.
+// IntegerAtomicOp, op by op: with KYTY_NATIVE_GPU_ATOMIC_OPS=1 exactly gfx10's integer TC_OPs, returning or not, without
+// the float ones, COMMAND 0 or 2, or 1 on a returning compare-swap; libSceAgc's swap and AND (0x67, 0x75) whatever the
+// switch.
 void TestAtomicOpTable() {
 	const uint64_t addr = 0x202000500ull;
 	Pm4Translator  on;
@@ -5605,13 +5606,13 @@ void TestAtomicOpTable() {
 				const uint32_t base    = tc_op & 0x1fu;
 				const bool     agc     = tc_op == 0x67u || tc_op == 0x75u;
 				const bool     integer = base == 0x07u || base == 0x08u || (base >= 0x0fu && base <= 0x19u);
-				const bool     want    = agc || ((tc_op & 0x40u) != 0 && integer && (command == 0u || command == 2u));
+				const bool     want    = agc || (integer && (command == 0u || command == 2u || (command == 1u && base == 0x08u && (tc_op & 0x40u) == 0)));
 				std::vector<uint32_t> cb;
 				Append(cb, IT_ATOMIC_MEM_T, {control, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 3u, 0u, 2u, 0u, 0u}, false);
 				const auto r = on.Translate(cb);
 				Check(r.ok == want && (want ? std::search(r.ib.begin(), r.ib.end(), cb.begin(), cb.end()) != r.ib.end()
 				                            : RefusedFor(r, RefuseWhy::AtomicForm)),
-				      "ATOMIC_MEM: exactly the no-return integer ops pass with KYTY_NATIVE_GPU_ATOMIC_OPS=1");
+				      "ATOMIC_MEM: exactly the integer ops pass with KYTY_NATIVE_GPU_ATOMIC_OPS=1");
 				Check(off.Translate(cb).ok == agc, "ATOMIC_MEM: only libSceAgc's swap and AND pass without it");
 			}
 		}

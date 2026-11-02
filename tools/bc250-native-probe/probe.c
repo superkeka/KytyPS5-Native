@@ -3233,7 +3233,7 @@ static bool DangerCopyData(Device* d, Common* c) {
 
 // What a no-return ATOMIC_MEM op leaves in memory, by gfx10's TC_OP (Linux navi10_enum.h): bit 6 no return, bit 5
 // 64 bits, the low five bits the op. INC and DEC wrap at the source as the TC's do. False for an op the translator's
-// NoReturnAtomicOp does not pass.
+// IntegerAtomicOp does not pass.
 static bool AtomicExpect(uint32_t tc_op, uint64_t old, uint64_t src, uint64_t cmp, uint64_t* out) {
 	const bool     wide = (tc_op & 0x20u) != 0;
 	const uint64_t mask = wide ? ~0ull : 0xffffffffull;
@@ -3243,9 +3243,8 @@ static bool AtomicExpect(uint32_t tc_op, uint64_t old, uint64_t src, uint64_t cm
 	src &= mask;
 	cmp &= mask;
 	uint64_t v = 0;
-	if ((tc_op & 0x40u) == 0) {
-		return false;
-	}
+	// A returning op (bit 6 clear) leaves memory as its no-return twin does; only the CP's internal copy of the old value
+	// differs, which COMMAND 1's loop compares with CMP (so a no-return op never ends that loop, on the PS5 too).
 	switch (tc_op & 0x1fu) {
 		case 0x07: v = src; break;
 		case 0x08: v = old == cmp ? src : old; break;
@@ -3291,8 +3290,8 @@ static uint64_t AtomicSource(uint32_t tc_op) {
 // libSceAgc's form (agc_atomic_mem: header 0xC0071E00, CONTROL = ENGINE [31:30] | CACHE_POLICY [26:25] | COMMAND [11:8]
 // | ATOMIC [6:0], address, source, compare, loop interval; the fields as Linux's nvd.h PACKET3_ATOMIC_MEM). One op per job
 // on a word with a known old value, its neighbour dword checked too, a WRITE_DATA marker after it. ATOMIC_OP=<hex>[,..]
-// (default: the 26 ops NoReturnAtomicOp passes, 32 then 64 bits), ATOMIC_CMD 0 or 2 (default 2, wait for the write
-// confirm, as libSceAgc's own uses; 1, loop until the compare holds, only for CMPSWAP, as NoReturnAtomicOp passes it),
+// (default: the 26 ops IntegerAtomicOp passes, 32 then 64 bits), ATOMIC_CMD 0 or 2 (default 2, wait for the write
+// confirm, as libSceAgc's own uses; 1, loop until the returned old value equals CMP, only for a returning CMPSWAP, as IntegerAtomicOp passes it),
 // ATOMIC_ENGINE 0 (the ME) or 1 (default, the PFP, as libSceAgc's DCB form sets it). CMPSWAP compares with the old value,
 // so it swaps; a COMMAND 1 compare that never holds would loop. The gfx ring only: the translator never sends an
 // ATOMIC_MEM to MEC (the tracker performs a compute ring's on the CPU), and a stopped MEC can take the board down.
@@ -3308,7 +3307,7 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 		return false;
 	}
 	if (command > 2u || engine > 1u) {
-		printf("  ATOMIC_CMD must be 0, 1 or 2 and ATOMIC_ENGINE 0 or 1 (the forms NoReturnAtomicOp passes)\n");
+		printf("  ATOMIC_CMD must be 0, 1 or 2 and ATOMIC_ENGINE 0 or 1 (the forms IntegerAtomicOp passes)\n");
 		return false;
 	}
 	uint32_t       ops[64];
@@ -3335,7 +3334,7 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 	printf("== danger atomicops: ATOMIC_MEM no-return TC_OPs, %s ring, COMMAND %u, ENGINE %u, %u ops\n",
 	       cs ? "compute ring 1" : "gfx", command, engine, num_ops);
 	if (command == 1u) {
-		printf("  COMMAND 1 loops until the compare holds: only CMPSWAP with a met compare is safe\n");
+		printf("  COMMAND 1 loops until the returned old value equals CMP: only a returning op (e.g. 08, 28) can end it\n");
 	}
 	Bo mem;
 	if (!GuestMem(d, &mem, 0x0740000000ull)) {
@@ -3354,7 +3353,7 @@ static bool DangerAtomicOps(Device* d, Common* c) {
 		const uint64_t src  = AtomicSource(op);
 		uint64_t       want = 0;
 		if (!AtomicExpect(op, old, src, old, &want)) {
-			printf("  op 0x%02x: not a no-return integer op the translator passes; skipped\n", op);
+			printf("  op 0x%02x: not an integer op the translator passes; skipped\n", op);
 			ok = false;
 			continue;
 		}

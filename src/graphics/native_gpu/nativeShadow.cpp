@@ -7969,7 +7969,7 @@ private:
 				// libSceAgc's ATOMIC_MEM where the GPU does not run it (a compute ring, or memory the GPU cannot write):
 				// its TC_OP on the CPU, atomically, 64-bit with bit 5 set (CpuAtomicMem). A swap (7) stores the source, an
 				// AND (0x15) masks the word with it (SetWorkloadsActive, SetWorkloadComplete); with KYTY_NATIVE_GPU_ATOMIC_OPS=1
-				// any no-return integer op, a compare-swap with the compare value in data[3..4].
+				// any integer op (IntegerAtomicOp), a compare-swap with the compare value in data[3..4].
 				if (p.data.size() < 3 || p.addr == 0) {
 					break;
 				}

@@ -1111,7 +1111,7 @@ public:
 		m_copy_data     = gfx;
 		m_mec_copy_data = mec;
 	}
-	// ATOMIC_MEM (KYTY_NATIVE_GPU_ATOMIC_OPS): every no-return integer TC_OP, not only libSceAgc's swap and AND.
+	// ATOMIC_MEM (KYTY_NATIVE_GPU_ATOMIC_OPS): every integer TC_OP, returning or not, not only libSceAgc's swap and AND.
 	void SetAtomicOps(bool on) { m_atomic_ops = on; }
 	// MEM_SEMAPHORE (KYTY_NATIVE_GPU_MEM_SEMAPHORE): signal and wait as written on the gfx ring.
 	void SetMemSemaphore(bool on) { m_mem_semaphore = on; }

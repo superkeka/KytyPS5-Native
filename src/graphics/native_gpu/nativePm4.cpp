@@ -715,21 +715,23 @@ bool AgcAtomicOp(uint32_t control) {
 	return (control & 0x7fu) == 0x67u || (control & 0x7fu) == 0x75u;
 }
 
-// Every no-return integer ATOMIC_MEM op (SetAtomicOps), by gfx10's TC_OP (Linux navi10_enum.h): bit 6 no return, bit 5
-// 64-bit, the low five bits SWAP 0x07, CMPSWAP 0x08, ADD 0x0f, SUB 0x10, SMIN 0x11, UMIN 0x12, SMAX 0x13, UMAX 0x14, AND
-// 0x15, OR 0x16, XOR 0x17, INC 0x18, DEC 0x19 (TC_OP_ATOMIC_SWAP_32 0x47 ... TC_OP_ATOMIC_DEC_64 0x79). COMMAND (bits
-// 11:8) 0 once, 1 loop until the compare holds, 2 wait for the write confirm. The returning forms (bit 6 clear) send
-// their result to the CP's internal register, which only a COPY_DATA SRC_SEL 6 reads: refused; so are the float ops.
-// COMMAND 1 refuses: probe atomicops (2.11) sent a no-return CMPSWAP_32 with COMMAND 1 whose compare held, and the
-// stock ME never finished it (the gfx ring stopped until amdgpu reset it), so its loop is not the PS5's on this
-// microcode. COMMAND 3 (send and continue) refuses as well. All 26 ops below passed with COMMAND 2 on the ME and PFP.
-bool NoReturnAtomicOp(uint32_t control) {
+// Every integer ATOMIC_MEM op (SetAtomicOps), by gfx10's TC_OP (Linux navi10_enum.h): bit 6 no return, bit 5 64-bit,
+// the low five bits SWAP 0x07, CMPSWAP 0x08, ADD 0x0f, SUB 0x10, SMIN 0x11, UMIN 0x12, SMAX 0x13, UMAX 0x14, AND 0x15,
+// OR 0x16, XOR 0x17, INC 0x18, DEC 0x19; the float ops refuse. A returning form (bit 6 clear) leaves memory as its
+// no-return twin does: its old value only goes to the CP's internal register, which COMMAND 1 compares and only a
+// COPY_DATA SRC_SEL 6 (refused) would read. COMMAND (bits 11:8) 0 once or 2 wait for the write confirm; 1 repeats the
+// atomic until the returned old value equals CMP_DATA, the same code in Sony's ME and the stock one (13.60 microcode),
+// so it passes on a returning compare-swap, the one op the tracker's CPU form (CpuAtomicMem) repeats the same way. A
+// no-return op never refreshes that value and loops forever on both (probe atomicops 2.11: 0x48 with COMMAND 1 stopped
+// the gfx ring, 0x08 and 0x28 finished at once). COMMAND 3 (send and continue) refuses. ENGINE_SEL the ME or the PFP
+// (libSceAgc's DCB form), never the CE. All 26 no-return ops passed with COMMAND 2 on the ME and the PFP.
+bool IntegerAtomicOp(uint32_t control) {
 	const uint32_t tc_op   = control & 0x7fu;
 	const uint32_t base    = tc_op & 0x1fu;
 	const uint32_t command = (control >> 8u) & 0xfu;
-	const uint32_t engine  = control >> 30u; // ENGINE_SEL: the ME or the PFP (libSceAgc's DCB form), never the CE
-	return (tc_op & 0x40u) != 0 && (base == 0x07u || base == 0x08u || (base >= 0x0fu && base <= 0x19u)) &&
-	       (command == 0u || command == 2u) && engine <= 1u;
+	const uint32_t engine  = control >> 30u;
+	const bool     integer = base == 0x07u || base == 0x08u || (base >= 0x0fu && base <= 0x19u);
+	return integer && engine <= 1u && (command == 0u || command == 2u || (command == 1u && base == 0x08u && (tc_op & 0x40u) == 0));
 }
 
 // Packets that make the GPU do something (as opposed to setting state), for dropping an empty first
@@ -1564,7 +1566,7 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					}
 					return bad();
 				}
-				if (!AgcAtomicOp(b[0]) && !NoReturnAtomicOp(b[0])) { // libSceAgc's flag swap, workload swap or AND; the rest
+				if (!AgcAtomicOp(b[0]) && !IntegerAtomicOp(b[0])) { // libSceAgc's flag swap, workload swap or AND; the rest
 					return bad();                                     // of the no-return ops with SetAtomicOps
 				}
 				break;
@@ -5669,9 +5671,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// write the address. MEC has not run an ATOMIC_MEM on this board, and memory the GPU cannot write must not
 				// get one: with native labels the tracker performs it on the CPU when the GPU gets there. Without native
 				// labels Kyty's command processor runs the whole buffer and performs it, so a compute ring leaves it out.
-				// With KYTY_NATIVE_GPU_ATOMIC_OPS=1 every no-return integer op goes the same way (NoReturnAtomicOp), the
+				// With KYTY_NATIVE_GPU_ATOMIC_OPS (on by default) every integer op goes the same way (IntegerAtomicOp), the
 				// tracker running it on the CPU with the same TC_OP (CpuAtomicMem).
-				if (body_count != 8 || !(AgcAtomicOp(bptr[0]) || (m_atomic_ops && NoReturnAtomicOp(bptr[0])))) {
+				if (body_count != 8 || !(AgcAtomicOp(bptr[0]) || (m_atomic_ops && IntegerAtomicOp(bptr[0])))) {
 					return fail(op, dw, RefuseWhy::AtomicForm);
 				}
 				const uint64_t addr  = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
