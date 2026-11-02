@@ -344,6 +344,9 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// The AGC shader_size, code hash and binary type AgcCreateShader registered at `addr` (false, no EXIT, when the
+// address is not a registered shader): the native backend's shader scanner bounds its reads with it.
+bool     ShaderFindMapped(uint64_t addr, uint32_t* code_size_bytes, uint64_t* hash, Prospero::ShaderBinaryType* type);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

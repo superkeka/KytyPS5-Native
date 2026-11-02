@@ -58,6 +58,8 @@ struct AgcStartState {
 AgcStartState AgcStartStateDefaults(uint32_t ver);
 // True for the default context table AgcDcbContextStateOp loads (a clear, a push then clear).
 bool AgcIsDefaultContextTable(const void* table);
+// True for an address inside the SH and UCONFIG default tables AgcDcbResetQueue loads (ops 2, 4 and 0x800).
+bool AgcIsResetTable(const void* table);
 // The version the title passed to AgcInit, UINT32_MAX before it did.
 uint32_t AgcRegisterDefaultsVersion();
 

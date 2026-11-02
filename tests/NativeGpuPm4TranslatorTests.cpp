@@ -620,6 +620,24 @@ void TestUnknownRefused() {
 	Check(t.Translate(dcb2).stats.preamble_cx == 1, "shadow intact after a multi-unknown refusal");
 }
 
+// KYTY_NATIVE_GPU_FORCE_REFUSE: a forced opcode refuses the buffer as an unknown one does (the safety net's test), the
+// rest translates as before.
+void TestForcedRefusal() {
+	Pm4Translator t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, IT_SET_CONTEXT_REG, {0x9u, 0x5u}, false);
+	Append(dcb, IT_EVENT_WRITE, {0x00000407u}, false);
+	Append(dcb, IT_DRAW_INDEX_2, {0, 0, 0, 0}, false);
+	Check(t.Translate(dcb).ok, "forced refusal: the buffer translates without it");
+	t.SetForcedRefusals({IT_EVENT_WRITE});
+	auto r = t.Translate(dcb);
+	Check(!r.ok && r.ib.empty(), "forced refusal: refused");
+	Check(r.unknown_op == IT_EVENT_WRITE && r.unknown_dw == 3 && r.unknown_ops.count(IT_EVENT_WRITE) == 1,
+	      "forced refusal: reported as the unknown opcode");
+	t.SetForcedRefusals({});
+	Check(t.Translate(dcb).ok, "forced refusal: cleared");
+}
+
 } // namespace
 
 bool HasRef(const std::vector<GpuRef>& refs, uint64_t addr, uint64_t min_size, bool pointer) {
@@ -1350,6 +1368,55 @@ void AppendGuestRelease(std::vector<uint32_t>& dcb, uint32_t data_sel, uint32_t 
 	       false);
 }
 
+// KYTY_NATIVE_GPU_EOS_NODATA (default `data`): a CS_DONE or PS_DONE release (EVENT_INDEX 6) that writes no data, which
+// timed out on the BC-250's gfx ring by itself, keeps its event and cache actions and gets a 32-bit store into the
+// scratch dword; with data, on MEC, and other events no-data releases stay as written.
+void TestEndOfShaderNoData() {
+	namespace ng = Libs::Graphics::NativeGpu;
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	const uint32_t cs_done = 0x2fu | (6u << 8u) | (1u << 12u) | (1u << 25u); // GLM_WB, CACHE_POLICY 1
+	std::vector<uint32_t> dcb;
+	AppendGuestRelease(dcb, 0, 0, 0, 0, 1, cs_done);
+	AppendGuestRelease(dcb, 0, 0, 0, 0, 0, 0x30u | (6u << 8u)); // PS_DONE
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.eos_nodata_fixed == 2, "data-less CS_DONE/PS_DONE on gfx fixed");
+	const auto pkts = Decode(r.ib);
+	uint32_t   fixed = 0;
+	for (const auto& p: pkts) {
+		if (p.op == 0x49u && (p.body[0] == cs_done || p.body[0] == (0x30u | (6u << 8u)))) {
+			const uint64_t dst = p.body[2] | (static_cast<uint64_t>(p.body[3]) << 32u);
+			Check(((p.body[1] >> 29u) & 7u) == 1u && ((p.body[1] >> 16u) & 3u) == 0u && dst == kTrackerVa + 8 && p.body[4] == 0u,
+			      "the title's event with a 32-bit store of 0 into the scratch dword");
+			fixed++;
+		}
+	}
+	Check(fixed == 2, "both events kept as the title wrote them");
+	ng::SetNativeIbValidation(false);
+	const bool blacklist = ng::ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx);
+	ng::SetNativeIbValidation(true);
+	Check(blacklist && ng::ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "both packet checks take the fixed form");
+
+	// With data, the release goes as written (no fix); other events without data too.
+	std::vector<uint32_t> with_data;
+	AppendGuestRelease(with_data, 1, 0, 0x202000300ull, 5, 0, 0x2fu | (6u << 8u));
+	AppendGuestRelease(with_data, 0, 0, 0, 0, 0, 0x28u | (5u << 8u));
+	auto rd = t.Translate(with_data);
+	Check(rd.ok && rd.stats.eos_nodata_fixed == 0, "CS_DONE with data and BOTTOM_OF_PIPE_TS without are not touched");
+
+	// MEC completes them without data (ASTRO BOT's ACBs): as written there.
+	Pm4Translator c;
+	TestOracle    oc;
+	c.SetNativeLabels(&oc, kTrackerVa);
+	c.SetComputeQueue(true);
+	c.SetComputeRing(true);
+	std::vector<uint32_t> acb;
+	AppendGuestRelease(acb, 0, 0, 0, 0, 0, 0x2fu | (6u << 8u));
+	auto rc = c.Translate(acb);
+	Check(rc.ok && rc.stats.eos_nodata_fixed == 0, "data-less CS_DONE on MEC as written");
+}
+
 void TestLabelsAsWritten() {
 	Pm4Translator t;
 	TestOracle    o;
@@ -1979,8 +2046,9 @@ void TestSonyWorkloads() {
 		}
 		return out;
 	};
-	const std::vector<uint32_t> swap  = {(1u << 30u) | 0x267u, static_cast<uint32_t>(mask), static_cast<uint32_t>(mask >> 32u)};
-	const std::vector<uint32_t> clear = {(1u << 30u) | 0x275u, ~(1u << 3u), 0xffffffffu};
+	// The tracker's data: control, source low and high, compare low and high.
+	const std::vector<uint32_t> swap  = {(1u << 30u) | 0x267u, static_cast<uint32_t>(mask), static_cast<uint32_t>(mask >> 32u), 0u, 0u};
+	const std::vector<uint32_t> clear = {(1u << 30u) | 0x275u, ~(1u << 3u), 0xffffffffu, 0u, 0u};
 	{
 		Pm4Translator t;
 		TestOracle    o;
@@ -2017,8 +2085,8 @@ void TestSonyWorkloads() {
 		Append(acb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
 		auto r          = t.Translate(acb);
 		const auto pkts = Decode(r.ib);
-		const std::vector<uint32_t> acb_swap  = {0x267u, swap[1], swap[2]};
-		const std::vector<uint32_t> acb_clear = {0x275u, clear[1], clear[2]};
+		const std::vector<uint32_t> acb_swap  = {0x267u, swap[1], swap[2], 0u, 0u};
+		const std::vector<uint32_t> acb_clear = {0x275u, clear[1], clear[2], 0u, 0u};
 		Check(r.ok && r.unknown_ops.empty() && Count(pkts, 0x1Eu) == 0 && atomics(r) == std::vector<std::vector<uint32_t>>({acb_swap, acb_clear}),
 		      "an ACB's on a compute ring: the tracker performs them");
 		Check(FindFirst(pkts, IT_SET_UCONFIG_REG) == nullptr && FindFirst(pkts, IT_WRITE_DATA) == nullptr, "its markers stay off MEC");
@@ -4622,6 +4690,52 @@ void TestAuditRefusalReasons() {
 	      "the GDS release names its packet");
 }
 
+// AgcDcbResetQueue op 0x200: PIXEL_PIPE_STAT_CONTROL as libSceAgc writes it goes to the GPU as written, and its control
+// word (0x07fffc00) is not taken for an address the GPU touches.
+void TestResetPixelPipeStat() {
+	Pm4Translator t;
+	t.SetFenceAddress(kFenceVa);
+	const std::vector<uint32_t> sony = {0xc0024600u, 0x00000138u, 0x07fffc00u, 0u};
+	std::vector<uint32_t>       dcb  = sony;
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	const auto r = t.Translate(dcb);
+	Check(r.ok && std::search(r.ib.begin(), r.ib.end(), sony.begin(), sony.end()) != r.ib.end(), "op 0x200's packet goes as written");
+	bool control_ref = false;
+	for (const auto& ref: r.refs) {
+		control_ref = control_ref || (ref.addr <= 0x07fffc00ull && 0x07fffc00ull < ref.addr + std::max<uint64_t>(ref.size, 1));
+	}
+	Check(!control_ref, "PIXEL_PIPE_STAT_CONTROL's control word is no GPU reference");
+	// The occlusion dump (0x39) still references its counters.
+	std::vector<uint32_t> dump;
+	Append(dump, IT_EVENT_WRITE, {0x139u, 0x10000000u, 0x2u}, false);
+	Check(HasRef(t.Translate(dump).refs, 0x210000000ull, 256, false), "PIXEL_PIPE_STAT_DUMP references its counters");
+}
+
+// marker_nops: a NOP with header bits 7:2 set counts under its marker value; fillers and libSceAgc's padding (bits 7:2
+// clear) do not count.
+void TestAuditMarkerNops() {
+	Pm4Translator t;
+	t.SetAudit(true);
+	t.SetFenceAddress(kFenceVa);
+	std::vector<uint32_t> dcb;
+	dcb.push_back(0xffff1000u); // AgcCbNop's one-dword filler
+	Append(dcb, IT_NOP, {0u, 0u}, false);
+	Append(dcb, IT_NOP, {0x1234u}, false, 0x0Bu); // R_PUSH_MARKER
+	Append(dcb, IT_NOP, {0x1234u}, false, 0x0Bu);
+	Append(dcb, IT_NOP, {0u}, false, 0x09u); // R_DISPATCH_RESET
+	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+	const auto r = t.Translate(dcb);
+	uint32_t   total = 0;
+	for (uint32_t c: r.sync.marker_nops) {
+		total += c;
+	}
+	Check(r.ok && r.sync.marker_nops[0x0B] == 2 && r.sync.marker_nops[0x09] == 1 && total == 3,
+	      "marker NOPs counted by marker value, fillers not");
+	Pm4Translator q;
+	q.SetFenceAddress(kFenceVa);
+	Check(q.Translate(dcb).sync.marker_nops[0x0B] == 0, "marker NOPs counted only with the audit on");
+}
+
 // With the audit on, the GPU gets the same IB, segments and points, and the same buffers are refused.
 void TestAuditIbUnchanged() {
 	static uint32_t labels[4] = {0u, 1u, 0u, 0u};
@@ -4680,6 +4794,348 @@ void TestAuditIbUnchanged() {
 	}
 }
 
+namespace {
+
+using Libs::Graphics::NativeGpu::CpuAtomicMem;
+using Libs::Graphics::NativeGpu::RefuseWhy;
+
+constexpr uint32_t IT_COND_EXEC_T     = 0x22;
+constexpr uint32_t IT_ATOMIC_MEM_T    = 0x1E;
+constexpr uint32_t IT_COPY_DATA_T     = 0x40;
+constexpr uint32_t IT_MEM_SEMAPHORE_T = 0x39;
+
+bool RefusedFor(const Pm4TranslateResult& r, RefuseWhy why) {
+	for (const auto& f: r.refusals) {
+		if (f.why == why) {
+			return true;
+		}
+	}
+	return false;
+}
+
+std::vector<TrackerPoint> AllPoints(const Pm4TranslateResult& r) {
+	std::vector<TrackerPoint> out;
+	for (const auto& seg: r.segments) {
+		out.insert(out.end(), seg.points.begin(), seg.points.end());
+	}
+	return out;
+}
+
+// COPY_DATA (SetCopyData, KYTY_NATIVE_GPU_COPY_DATA): refused unless on; then memory, an immediate or the GPU clock into
+// memory as written, an immediate into memory the GPU cannot write as the tracker's store, the rest refused by form.
+void TestCopyData() {
+	static uint32_t src_word = 5;
+	const uint64_t  src      = reinterpret_cast<uint64_t>(&src_word);
+	const uint64_t  dst      = 0x202000400ull;
+	auto copy = [](uint32_t control, uint64_t from, uint64_t to) {
+		std::vector<uint32_t> cb;
+		Append(cb, IT_COPY_DATA_T,
+		       {control, static_cast<uint32_t>(from), static_cast<uint32_t>(from >> 32u), static_cast<uint32_t>(to), static_cast<uint32_t>(to >> 32u)},
+		       false);
+		return cb;
+	};
+	const uint32_t mem_to_mem = 1u | (5u << 8u) | (1u << 20u);              // SRC_SEL memory, DST_SEL memory, WR_CONFIRM
+	const uint32_t imm_to_mem = 5u | (5u << 8u) | (1u << 16u) | (1u << 20u); // a 64-bit immediate
+	const uint32_t clock      = 9u | (5u << 8u) | (1u << 16u);
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetAudit(true); // the refusals' reasons
+		auto r = t.Translate(copy(mem_to_mem, src, dst));
+		Check(!r.ok && r.unknown_op == IT_COPY_DATA_T && RefusedFor(r, RefuseWhy::Unknown), "COPY_DATA refused while its switch is off");
+	}
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetAudit(true); // the refusals' reasons
+	t.SetCopyData(true, false);
+	for (uint32_t control: {mem_to_mem, imm_to_mem, clock}) {
+		const auto cb = copy(control, control == imm_to_mem ? 0x0000000900000008ull : src, dst);
+		auto       r  = t.Translate(cb);
+		Check(r.ok && std::search(r.ib.begin(), r.ib.end(), cb.begin(), cb.end()) != r.ib.end(), "COPY_DATA as the title wrote it");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "COPY_DATA passes both packet checks");
+		if (control == mem_to_mem) {
+			Check(HasRef(r.refs, src, 4, false), "a memory source is made resident");
+		}
+	}
+	// A register source (SRC_SEL 0), GDS (3), perf counters (4) or an atomic result (6) refuse.
+	for (uint32_t sel: {0u, 3u, 4u, 6u}) {
+		auto r = t.Translate(copy(sel | (5u << 8u), src, dst));
+		Check(!r.ok && RefusedFor(r, RefuseWhy::CopyDataForm), "COPY_DATA from registers, GDS, counters or atomics refused");
+	}
+	auto rr = t.Translate(copy(1u | (0u << 8u), src, 0x1234u));
+	Check(!rr.ok && RefusedFor(rr, RefuseWhy::CopyDataForm), "COPY_DATA to a register refused");
+	// Memory the GPU cannot write: an immediate is the tracker's store, memory to memory refuses.
+	Pm4Translator u;
+	TestOracle    ou;
+	ou.unwritable = dst;
+	u.SetNativeLabels(&ou, kTrackerVa);
+	u.SetAudit(true); // the refusals' reasons
+	u.SetCopyData(true, false);
+	auto ri = u.Translate(copy(5u | (5u << 8u), 0x77u, dst));
+	bool cpu_store = false;
+	for (const auto& p: AllPoints(ri)) {
+		cpu_store = cpu_store || (p.kind == TrackerPoint::Kind::CpuWrite && p.addr == dst && p.data == std::vector<uint32_t>({0x77u}));
+	}
+	Check(ri.ok && Count(Decode(ri.ib), IT_COPY_DATA_T) == 0 && cpu_store, "an immediate into unwritable memory is the tracker's store");
+	auto rm = u.Translate(copy(mem_to_mem, src, dst));
+	Check(!rm.ok && RefusedFor(rm, RefuseWhy::CopyDataForm), "memory to unwritable memory refused");
+	// MEC: only with its own switch, with the shader-type bit.
+	Pm4Translator c;
+	TestOracle    oc;
+	c.SetNativeLabels(&oc, kTrackerVa);
+	c.SetAudit(true); // the refusals' reasons
+	c.SetComputeQueue(true);
+	c.SetComputeRing(true);
+	c.SetCopyData(true, false);
+	Check(!c.Translate(copy(mem_to_mem, src, dst)).ok, "COPY_DATA on MEC refused without KYTY_NATIVE_GPU_MEC_COPY_DATA");
+	c.SetCopyData(true, true);
+	auto rc = c.Translate(copy(mem_to_mem, src, dst));
+	const auto pc = Decode(rc.ib);
+	const auto* cp = FindFirst(pc, IT_COPY_DATA_T);
+	Check(rc.ok && cp != nullptr && cp->compute && PassesBothChecks(rc.ib, NativeIbKind::Compute), "COPY_DATA on MEC with the shader-type bit");
+}
+
+// ATOMIC_MEM (SetAtomicOps, KYTY_NATIVE_GPU_ATOMIC_OPS): any no-return integer op as written on the gfx ring, on the CPU
+// where the GPU does not run it; returning ops refuse.
+void TestAtomicOps() {
+	const uint64_t addr = 0x202000500ull;
+	auto atomic = [&](uint32_t control, uint64_t src, uint64_t cmp) {
+		std::vector<uint32_t> cb;
+		Append(cb, IT_ATOMIC_MEM_T,
+		       {control, static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), static_cast<uint32_t>(src), static_cast<uint32_t>(src >> 32u),
+		        static_cast<uint32_t>(cmp), static_cast<uint32_t>(cmp >> 32u), 0u},
+		       false);
+		return cb;
+	};
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetAudit(true); // the refusals' reasons
+	Check(!t.Translate(atomic(0x4fu, 1, 0)).ok, "ATOMIC_MEM ADD_32 refused while the switch is off");
+	t.SetAtomicOps(true);
+	for (uint32_t op: {0x47u, 0x48u, 0x4fu, 0x50u, 0x51u, 0x54u, 0x56u, 0x57u, 0x58u, 0x59u, 0x6fu, 0x78u, 0x79u, 0x268u}) {
+		const auto cb = atomic(op, 3, 2);
+		auto       r  = t.Translate(cb);
+		Check(r.ok && std::search(r.ib.begin(), r.ib.end(), cb.begin(), cb.end()) != r.ib.end(), "a no-return ATOMIC_MEM op as written");
+		Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the no-return ATOMIC_MEM passes both packet checks");
+	}
+	for (uint32_t op: {0x0fu, 0x27u, 0x41u /* FCMPSWAP */, 0x34fu /* COMMAND 3 */}) {
+		auto r = t.Translate(atomic(op, 3, 2));
+		Check(!r.ok && RefusedFor(r, RefuseWhy::AtomicForm), "returning, float or unknown-command ATOMIC_MEM refused");
+	}
+	Pm4Translator u;
+	TestOracle    ou;
+	ou.unwritable = addr;
+	u.SetNativeLabels(&ou, kTrackerVa);
+	u.SetAudit(true); // the refusals' reasons
+	u.SetAtomicOps(true);
+	auto ru = u.Translate(atomic(0x48u, 9, 4));
+	bool cpu = false;
+	for (const auto& p: AllPoints(ru)) {
+		cpu = cpu || (p.kind == TrackerPoint::Kind::Atomic && p.addr == addr && p.data == std::vector<uint32_t>({0x48u, 9u, 0u, 4u, 0u}));
+	}
+	Check(ru.ok && Count(Decode(ru.ib), IT_ATOMIC_MEM_T) == 0 && cpu, "the tracker gets the op, source and compare");
+
+	// The tracker's CPU side, by TC_OP.
+	uint32_t w = 10;
+	Check(CpuAtomicMem(&w, 0x4fu, 5, 0) && w == 15, "ADD_32");
+	Check(CpuAtomicMem(&w, 0x50u, 20, 0) && w == 0xfffffffbu, "SUB_32 wraps");
+	Check(CpuAtomicMem(&w, 0x51u, 3, 0) && w == 0xfffffffbu, "SMIN_32 keeps the negative");
+	Check(CpuAtomicMem(&w, 0x52u, 3, 0) && w == 3u, "UMIN_32");
+	Check(CpuAtomicMem(&w, 0x53u, 7, 0) && w == 7u, "SMAX_32");
+	Check(CpuAtomicMem(&w, 0x58u, 7, 0) && w == 0u, "INC_32 wraps to 0 at the source");
+	Check(CpuAtomicMem(&w, 0x58u, 7, 0) && w == 1u, "INC_32");
+	Check(CpuAtomicMem(&w, 0x59u, 7, 0) && w == 0u && CpuAtomicMem(&w, 0x59u, 7, 0) && w == 7u, "DEC_32 wraps to the source below 0");
+	Check(CpuAtomicMem(&w, 0x48u, 42, 7) && w == 42u, "CMPSWAP_32 when the compare holds");
+	Check(CpuAtomicMem(&w, 0x48u, 1, 6) && w == 42u, "CMPSWAP_32 leaves it otherwise");
+	Check(!CpuAtomicMem(&w, 0x148u, 1, 6) && w == 42u, "a looping CMPSWAP whose compare never holds gives up");
+	Check(CpuAtomicMem(&w, 0x56u, 0x100, 0) && w == 0x12au && CpuAtomicMem(&w, 0x57u, 0x2u, 0) && w == 0x128u, "OR_32, XOR_32");
+	uint64_t q = 1;
+	Check(CpuAtomicMem(&q, 0x6fu, 0x100000000ull, 0) && q == 0x100000001ull, "ADD_64");
+	Check(CpuAtomicMem(&q, 0x67u, 5, 0) && q == 5u && CpuAtomicMem(&q, 0x75u, 4, 0) && q == 4u, "SWAP_64, AND_64 (libSceAgc's)");
+	Check(!CpuAtomicMem(&q, 0x41u, 1, 0), "a float op is not done");
+}
+
+// MEM_SEMAPHORE (SetMemSemaphore) and Sony's 0x3A.
+void TestMemSemaphoreAnd3A() {
+	const uint64_t addr = 0x202000600ull;
+	std::vector<uint32_t> cb;
+	Append(cb, IT_MEM_SEMAPHORE_T, {static_cast<uint32_t>(addr), static_cast<uint32_t>(addr >> 32u), 6u << 29u}, false);
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetAudit(true); // the refusals' reasons
+	auto off = t.Translate(cb);
+	Check(!off.ok && off.unknown_op == IT_MEM_SEMAPHORE_T, "MEM_SEMAPHORE refused while the switch is off");
+	t.SetMemSemaphore(true);
+	auto on = t.Translate(cb);
+	Check(on.ok && std::search(on.ib.begin(), on.ib.end(), cb.begin(), cb.end()) != on.ib.end(), "MEM_SEMAPHORE as written with the switch");
+	Pm4Translator c;
+	TestOracle    oc;
+	c.SetNativeLabels(&oc, kTrackerVa);
+	c.SetAudit(true); // the refusals' reasons
+	c.SetComputeQueue(true);
+	c.SetComputeRing(true);
+	c.SetMemSemaphore(true);
+	auto rc = c.Translate(cb);
+	Check(!rc.ok && RefusedFor(rc, RefuseWhy::SemaphoreForm), "MEM_SEMAPHORE on MEC refused");
+
+	std::vector<uint32_t> multi = {0xc0073a00u, 3u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+	auto r3 = t.Translate(multi);
+	Check(!r3.ok && r3.unknown_op == 0x3Au, "DrawIndexMultiInstanced (0x3A) refused");
+}
+
+// COND_EXEC in any form (SetCondExec, KYTY_NATIVE_GPU_COND_EXEC): on the gfx ring as written behind a PFP_SYNC_ME, its
+// count the translated range; what would leave the GPU's stream inside the range refuses.
+void TestCondExecRecount() {
+	// The translator reads a wait's word from host memory: the waits below wait on these, not on made-up addresses.
+	static volatile uint32_t wait_word_a = 0;
+	static volatile uint32_t wait_word_b = 0;
+	const uint64_t           wait_a      = reinterpret_cast<uint64_t>(&wait_word_a);
+	const uint64_t           wait_b      = reinterpret_cast<uint64_t>(&wait_word_b);
+	static uint32_t flag = 1;
+	const uint64_t  fa   = reinterpret_cast<uint64_t>(&flag);
+	auto cond_exec = [&](std::vector<uint32_t>& cb, uint32_t count) {
+		Append(cb, IT_COND_EXEC_T, {static_cast<uint32_t>(fa), static_cast<uint32_t>(fa >> 32u), 0u, count}, false);
+	};
+	const std::vector<uint32_t> after = {Pkt3(IT_DISPATCH_DIRECT, 4, false), 7u, 7u, 7u, 1u};
+	std::vector<uint32_t>       range;
+	Append(range, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+	Append(range, IT_WRITE_DATA, {(5u << 8u), 0x02020700u, 0x2u, 9u}, false); // a label, WR_CONFIRM added
+	Append(range, IT_EVENT_WRITE, {0x00000407u}, false);
+	std::vector<uint32_t> dcb;
+	cond_exec(dcb, static_cast<uint32_t>(range.size()));
+	dcb.insert(dcb.end(), range.begin(), range.end());
+	dcb.insert(dcb.end(), after.begin(), after.end());
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetAudit(true); // the refusals' reasons
+		auto r = t.Translate(dcb);
+		Check(!r.ok && RefusedFor(r, RefuseWhy::CondExecForm), "a title's COND_EXEC refused while the switch is off");
+	}
+	Pm4Translator t;
+	TestOracle    o;
+	t.SetNativeLabels(&o, kTrackerVa);
+	t.SetAudit(true); // the refusals' reasons
+	t.SetCondExec(true);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.cond_execs == 1, "a title's COND_EXEC translated");
+	size_t at = 0;
+	for (size_t i = 2; i + 5 <= r.ib.size(); i++) {
+		if (r.ib[i] == Pkt3(IT_COND_EXEC_T, 4, false) && r.ib[i + 1] == static_cast<uint32_t>(fa) &&
+		    r.ib[i - 2] == ((3u << 30u) | (0x42u << 8u))) {
+			at = i;
+		}
+	}
+	Check(at != 0, "the COND_EXEC behind a PFP_SYNC_ME");
+	const uint32_t count = r.ib[at + 4];
+	Check(at + 5 + count + after.size() <= r.ib.size() && std::equal(after.begin(), after.end(), r.ib.begin() + at + 5 + count),
+	      "its count reaches exactly the translated range's end");
+	Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the COND_EXEC passes both packet checks");
+	bool unknown = false;
+	for (const auto& seg: r.segments) {
+		for (const auto& w: seg.writes) {
+			unknown = unknown || (w.addr == 0x202020700ull && !w.known);
+		}
+	}
+	Check(unknown, "a label written in the range is unknown afterwards");
+
+	// A range the translation lengthens: a GPU wait in it, which an exit guard (COND_EXEC + chain) follows.
+	{
+		constexpr uint64_t kAbort = 0x400000fff808ull, kRun = 0x400000fff80cull, kStub = 0x400000ffffe0ull;
+		Pm4Translator g;
+		TestOracle    og;
+		og.plan = LabelOracle::Plan::Native;
+		g.SetNativeLabels(&og, kTrackerVa);
+		g.SetWaitsVerbatim(true);
+		g.SetFenceAddress(kFenceVa);
+		g.SetExitGuard(kAbort, kRun, kStub);
+		g.SetCondExec(true);
+		std::vector<uint32_t> waits;
+		std::vector<uint32_t> in_range;
+		Append(in_range, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
+		AppendWait(in_range, wait_a, 1);
+		cond_exec(waits, static_cast<uint32_t>(in_range.size()));
+		waits.insert(waits.end(), in_range.begin(), in_range.end());
+		waits.insert(waits.end(), after.begin(), after.end());
+		auto rg = g.Translate(waits);
+		size_t gat = 0;
+		for (size_t i = 2; i + 5 <= rg.ib.size(); i++) {
+			if (rg.ib[i] == Pkt3(IT_COND_EXEC_T, 4, false) && rg.ib[i + 1] == static_cast<uint32_t>(fa)) {
+				gat = i;
+			}
+		}
+		Check(rg.ok && gat != 0 && rg.ib[gat + 4] > in_range.size() && gat + 5 + rg.ib[gat + 4] + after.size() <= rg.ib.size() &&
+		          std::equal(after.begin(), after.end(), rg.ib.begin() + gat + 5 + rg.ib[gat + 4]),
+		      "a range the translation lengthens gets the longer count");
+	}
+
+	// A register write, or a range past the buffer, refuses; so does MEC.
+	std::vector<uint32_t> reg;
+	cond_exec(reg, 3);
+	Append(reg, IT_SET_CONTEXT_REG, {0x9u, 0x5u}, false);
+	reg.insert(reg.end(), after.begin(), after.end());
+	Check(!t.Translate(reg).ok, "a register write inside the range refuses");
+	std::vector<uint32_t> past;
+	cond_exec(past, 100);
+	past.insert(past.end(), after.begin(), after.end());
+	Check(!t.Translate(past).ok, "a range past the buffer refuses");
+	std::vector<uint32_t> split; // a wait no write satisfies: the IB would be cut inside the range
+	cond_exec(split, 7);
+	AppendWait(split, wait_b, 1);
+	split.insert(split.end(), after.begin(), after.end());
+	Check(!t.Translate(split).ok, "a segment cut inside the range refuses");
+	Pm4Translator c;
+	TestOracle    oc;
+	c.SetNativeLabels(&oc, kTrackerVa);
+	c.SetAudit(true); // the refusals' reasons
+	c.SetComputeQueue(true);
+	c.SetComputeRing(true);
+	c.SetCondExec(true);
+	std::vector<uint32_t> acb;
+	cond_exec(acb, 5);
+	acb.insert(acb.end(), after.begin(), after.end());
+	Check(!c.Translate(acb).ok, "a title's COND_EXEC on MEC refuses");
+}
+
+// FlattenIndirectBuffers keeps a COND_EXEC's count over what it inlines: a call in the range brings its target's dwords
+// instead of its 4, a dropped REWIND takes 2; a chain inside a range stops it.
+void TestFlattenCondExecCount() {
+	static const std::vector<uint32_t> called = {0xc0001000u, 0x1111u, 0xc0001000u, 0x2222u}; // 4 dwords for a 4-dword call
+	static const std::vector<uint32_t> small  = {0xc0001000u, 0x3333u};
+	auto call = [](const std::vector<uint32_t>& target, bool chain) {
+		const auto va = reinterpret_cast<uint64_t>(target.data());
+		return std::vector<uint32_t> {0xc0023f00u, static_cast<uint32_t>(va), static_cast<uint32_t>(va >> 32u),
+		                              static_cast<uint32_t>(target.size()) | (chain ? (1u << 20u) : 0u) | 0x0f200000u};
+	};
+	std::vector<uint32_t> buf = {Pkt3(IT_COND_EXEC_T, 4, false), 0x1000u, 0u, 0u, 4u + 2u + 4u + 2u};
+	const auto c1 = call(called, false);
+	const auto c2 = call(small, false);
+	buf.insert(buf.end(), c1.begin(), c1.end());
+	buf.insert(buf.end(), {0xc0005900u, 0x80000000u}); // a valid REWIND
+	buf.insert(buf.end(), c2.begin(), c2.end());
+	buf.insert(buf.end(), {0xc0001000u, 0xaaaau});     // the last packet of the range
+	buf.insert(buf.end(), {0xc0001000u, 0xbbbbu});     // after it
+	std::vector<uint32_t> out;
+	Check(FlattenIndirectBuffers(buf, &out), "a COND_EXEC over calls and a REWIND flattens");
+	Check(out.size() == 5u + 4u + 2u + 2u + 2u && out[4] == 4u + 2u + 2u, "its count follows the inlined dwords");
+	Check(out[5 + out[4]] == 0xc0001000u && out[6 + out[4]] == 0xbbbbu, "and still ends where the title's range ended");
+
+	std::vector<uint32_t> chained = {Pkt3(IT_COND_EXEC_T, 4, false), 0x1000u, 0u, 0u, 4u};
+	const auto c3 = call(small, true);
+	chained.insert(chained.end(), c3.begin(), c3.end());
+	std::string why;
+	out.clear();
+	Check(!FlattenIndirectBuffers(chained, &out, &why) && why.find("chain inside a COND_EXEC") != std::string::npos,
+	      "a chain inside a COND_EXEC stops the flattening");
+}
+
+} // namespace
+
 int main() {
 	// The cases count the packets a DCB turns into; the preamble's start values (PIXEL_PIPE_STAT_CONTROL,
 	// the CP draw state) are board settings with their own switches, left out here.
@@ -4706,6 +5162,7 @@ int main() {
 	TestDmaData();
 	TestPassthroughPackets();
 	TestUnknownRefused();
+	TestForcedRefusal();
 	TestGpuRefs();
 	TestContextDefaults();
 	TestDrawIndexOffset();
@@ -4727,6 +5184,7 @@ int main() {
 	TestDirectRunsWriteData();
 	TestLabelsReleaseMem();
 	TestLabelsAsWritten();
+	TestEndOfShaderNoData();
 	TestGuestInterruptsOnGpu();
 	TestLabelsLocalWait();
 	TestLabelsSplit();
@@ -4777,6 +5235,13 @@ int main() {
 	TestAuditPolicyLost();
 	TestAuditWaitsRecorded();
 	TestAuditRefusalReasons();
+	TestAuditMarkerNops();
+	TestResetPixelPipeStat();
+	TestCopyData();
+	TestAtomicOps();
+	TestMemSemaphoreAnd3A();
+	TestCondExecRecount();
+	TestFlattenCondExecCount();
 	TestAuditIbUnchanged();
 	std::puts("NativeGpuPm4TranslatorTests: all passed");
 	return 0;

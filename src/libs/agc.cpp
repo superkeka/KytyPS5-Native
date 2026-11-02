@@ -2350,6 +2350,14 @@ struct ResetTables {
 };
 static constexpr uint32_t RESET_TABLE_PAIRS = 0x400u;
 static constexpr uint32_t RESET_UC_TAIL     = 8u;
+static std::atomic<const uint32_t*> g_reset_tables {nullptr};
+
+bool AgcIsResetTable(const void* table) {
+	// Op 0x800 points into the UCONFIG table (its last 8 pairs), so any address inside the block counts.
+	const auto* base = g_reset_tables.load(std::memory_order_acquire);
+	const auto* p    = static_cast<const uint32_t*>(table);
+	return base != nullptr && p >= base && p < base + 4u * RESET_TABLE_PAIRS;
+}
 
 static ResetTables* reset_tables() {
 	static std::mutex           mutex;
@@ -2361,6 +2369,7 @@ static ResetTables* reset_tables() {
 		EXIT_NOT_IMPLEMENTED(addr == 0);
 		t.sh = reinterpret_cast<uint32_t*>(addr);
 		t.uc = t.sh + 2u * RESET_TABLE_PAIRS;
+		g_reset_tables.store(t.sh, std::memory_order_release);
 	}
 	const uint32_t ver = AgcRegisterDefaultsVersion();
 	if (t.version != ver) {
@@ -2451,11 +2460,20 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 	const uint32_t* uc_table = (op & 0x804u) == 0x800u ? t->uc + 2u * (t->uc_count - uc) : t->uc;
 	const uint64_t  flags    = reinterpret_cast<uint64_t>(ctx->flags);
 	const uint32_t  marker   = reset_marker(op);
+	// Op 0x200 is PIXEL_PIPE_STAT_CONTROL (EVENT_WRITE 0x38, index 1) as libSceAgc writes it: 0x07fffc00 is the gfx10
+	// control word (COUNTER_ID 0, STRIDE 2, INSTANCE_EN_LO 0xffff for the 16 RBs), not an address, and the high dword
+	// INSTANCE_EN_HI 0. It is the exact packet the translator's preamble sends before every IB, and Kyty's CP ignores
+	// it. KYTY_AGC_RESET_PIXEL_STAT=0 leaves it out, as before.
+	static const bool pixel_stat = [] {
+		const char* v = std::getenv("KYTY_AGC_RESET_PIXEL_STAT");
+		return v == nullptr || v[0] != '0';
+	}();
+	const bool pixel_stat_op = (op & 0x200u) != 0 && pixel_stat;
 
 	const uint32_t size = 1u + 4u + ((op & 0x80u) != 0 ? 2u : 0u) + ((op & 0x100u) != 0 ? 2u : 0u) + ((op & 0x400u) != 0 ? 16u : 0u) +
 	                      ((op & 0x1u) != 0 ? 5u : 0u) + ((op & 0x2u) != 0 ? 5u : 0u) + ((op & 0x804u) != 0 ? 5u : 0u) +
 	                      ((op & 0x8u) != 0 ? 2u : 0u) + ((op & 0x10u) != 0 ? 8u : 0u) + ((op & 0x20u) != 0 ? 8u : 0u) +
-	                      ((op & 0x40u) != 0 ? 12u : 0u) + 3u;
+	                      ((op & 0x40u) != 0 ? 12u : 0u) + (pixel_stat_op ? 4u : 0u) + 3u;
 	auto* first = buf->AllocateDW(size);
 	EXIT_NOT_IMPLEMENTED(first == nullptr);
 	auto* cmd = first;
@@ -2507,12 +2525,14 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 			*cmd++ = v;
 		}
 	}
-	if ((op & 0x200u) != 0) {
-		// libSceAgc writes event 0x38 (index 1) with address 0x07fffc00, a page nothing maps here: a GPU write there would be
-		// a VM fault, which stops the ring on this board.
+	if (pixel_stat_op) { // PIXEL_PIPE_STAT_CONTROL: all 16 RB instances, stride 2
+		for (uint32_t v: {0xc0024600u, 0x00000138u, 0x07fffc00u, 0u}) {
+			*cmd++ = v;
+		}
+	} else if ((op & 0x200u) != 0) {
 		static std::atomic<bool> told {false};
 		if (!told.exchange(true)) {
-			std::fprintf(stderr, "agc: AgcDcbResetQueue op 0x200 (event 0x38 at 0x07fffc00) is left out\n");
+			std::fprintf(stderr, "agc: AgcDcbResetQueue op 0x200 (PIXEL_PIPE_STAT_CONTROL) is left out (KYTY_AGC_RESET_PIXEL_STAT=0)\n");
 		}
 	}
 	*cmd++ = 0xc0017904u;
@@ -3292,6 +3312,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 			const char* e = std::getenv("KYTY_NATIVE_GPU_ZPASS_DUMP");
 			return e != nullptr && e[0] == '1';
 		}();
+		// For PIXEL_PIPE_STAT_CONTROL (0x38) the "address" is the control word (COUNTER_ID, STRIDE, INSTANCE_EN), which
+		// libSceAgc masks the same way.
 		const uint8_t type = event_type == 0x39u && zpass_dump && Libs::Graphics::NativeGpu::PrimaryRendering() ? 0x15u : event_type;
 		cmd[1] = 0x100u | type;
 		cmd[2] = static_cast<uint32_t>(addr) & 0xfffffff8u;

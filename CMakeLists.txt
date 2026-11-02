@@ -625,6 +625,8 @@ add_custom_command(
 target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
+add_kyty_full_emulator_test(agc_reset_table_cp_tests "${KYTY_TESTS_DIR}/AgcResetTableCpTests.cpp")
+
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
@@ -694,6 +696,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME agc_reset_table_cp COMMAND $<TARGET_FILE:agc_reset_table_cp_tests>)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
@@ -761,6 +764,7 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
+		agc_reset_table_cp_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests

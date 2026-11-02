@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
 #if defined(__linux__)
 #include <sys/uio.h>
 #include <unistd.h>
@@ -48,6 +49,8 @@ constexpr uint32_t IT_DMA_DATA                 = 0x50;
 constexpr uint32_t IT_WRITE_DATA               = 0x37;
 constexpr uint32_t IT_PFP_SYNC_ME              = 0x42;
 constexpr uint32_t IT_COND_WRITE               = 0x45;
+constexpr uint32_t IT_MEM_SEMAPHORE            = 0x39;
+constexpr uint32_t IT_DRAW_INDEX_MULTI_INST    = 0x3A; // Sony's (AgcDcbDrawIndexMultiInstanced)
 constexpr uint32_t IT_EVENT_WRITE              = 0x46;
 constexpr uint32_t IT_ACQUIRE_MEM             = 0x58;
 constexpr uint32_t IT_SET_SH_REG_INDIRECT      = 0x63;
@@ -355,6 +358,31 @@ bool FullLabelFlush() {
 // KYTY_NATIVE_GPU_LABEL_FLUSH=full: the barrier's form here too.
 uint32_t TrackerEventCntl() { return FullLabelFlush() ? kFlushEventCntl : kTrackerWbEventCntl; }
 
+// A RELEASE_MEM of CS_DONE or PS_DONE (EVENT_INDEX 6, end of shader) that writes no data timed out on the BC-250's gfx
+// ring by itself (BC5, experiment 0016 run 40); PAL sends these events only with data, and on MEC (ASTRO BOT's ACBs,
+// 140k a run) they complete without. On the PS5 the CP completes them either way. KYTY_NATIVE_GPU_EOS_NODATA picks the
+// gfx form: `data` (the default) keeps the title's event, cache actions and policy and adds a 32-bit store of 0 into
+// Kyty's scratch dword, PAL's form, which changes nothing the title sees; `bop` makes it BOTTOM_OF_PIPE_TS (EVENT_INDEX
+// 5) with the same cache actions, as BC5 does; `asis` sends it as written.
+enum class EosNoData { Data, Bop, AsIs };
+EosNoData EosNoDataMode() {
+	static const EosNoData mode = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_EOS_NODATA");
+		if (v != nullptr && std::strcmp(v, "bop") == 0) {
+			return EosNoData::Bop;
+		}
+		if (v != nullptr && std::strcmp(v, "asis") == 0) {
+			return EosNoData::AsIs;
+		}
+		return EosNoData::Data;
+	}();
+	return mode;
+}
+bool EndOfShaderEvent(uint32_t event) {
+	const uint32_t type = event & 0x3fu;
+	return (type == 0x2fu || type == 0x30u) && ((event >> 8u) & 0xfu) == 6u;
+}
+
 uint32_t LabelEventCntl(uint32_t guest_event) {
 	const uint32_t event =
 	    (guest_event & (0x3fu | 0xf00u | kReleaseGcrMask | kReleasePolicy)) | (LabelWriteBack() ? kGcrGlmWb | kGcrGl2Wb : 0u);
@@ -530,6 +558,8 @@ const char* RefuseWhyName(RefuseWhy why) {
 	    "CONTEXT_CONTROL on MEC",
 	    "COND_EXEC form",
 	    "ATOMIC_MEM form",
+	    "COPY_DATA form",
+	    "MEM_SEMAPHORE form",
 	    "run in place with ours around it",
 	    "packet check",
 	    "packet check of the resume",
@@ -537,6 +567,55 @@ const char* RefuseWhyName(RefuseWhy why) {
 	    "GDS shader skip learning",
 	};
 	return why < RefuseWhy::Count ? kNames[static_cast<size_t>(why)] : "?";
+}
+
+namespace {
+template <typename T>
+bool CpuAtomic(T* p, uint32_t op, T src, T cmp, bool loop) {
+	using S = std::make_signed_t<T>;
+	auto rmw = [&](auto next) {
+		T old = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+		while (!__atomic_compare_exchange_n(p, &old, next(old), false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+		}
+		return true;
+	};
+	switch (op) {
+		case 0x07u: __atomic_store_n(p, src, __ATOMIC_SEQ_CST); return true;
+		case 0x08u:
+			// The CP retries a looping compare-swap until it succeeds; the tracker's thread gives up after a bound.
+			for (uint32_t i = 0; i < (loop ? (1u << 20u) : 1u); i++) {
+				T expected = cmp;
+				if (__atomic_compare_exchange_n(p, &expected, src, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+					return true;
+				}
+			}
+			return !loop;
+		case 0x0fu: __atomic_fetch_add(p, src, __ATOMIC_SEQ_CST); return true;
+		case 0x10u: __atomic_fetch_sub(p, src, __ATOMIC_SEQ_CST); return true;
+		case 0x11u: return rmw([&](T v) { return static_cast<S>(src) < static_cast<S>(v) ? src : v; });
+		case 0x12u: return rmw([&](T v) { return src < v ? src : v; });
+		case 0x13u: return rmw([&](T v) { return static_cast<S>(src) > static_cast<S>(v) ? src : v; });
+		case 0x14u: return rmw([&](T v) { return src > v ? src : v; });
+		case 0x15u: __atomic_fetch_and(p, src, __ATOMIC_SEQ_CST); return true;
+		case 0x16u: __atomic_fetch_or(p, src, __ATOMIC_SEQ_CST); return true;
+		case 0x17u: __atomic_fetch_xor(p, src, __ATOMIC_SEQ_CST); return true;
+		case 0x18u: return rmw([&](T v) { return v >= src ? T(0) : T(v + 1); });          // wraps to 0 past src
+		case 0x19u: return rmw([&](T v) { return v == 0 || v > src ? src : T(v - 1); }); // wraps to src below 0
+		default: return false;
+	}
+}
+} // namespace
+
+bool CpuAtomicMem(void* addr, uint32_t control, uint64_t src, uint64_t cmp) {
+	if (addr == nullptr) {
+		return false;
+	}
+	const uint32_t op   = control & 0x1fu;
+	const bool     loop = ((control >> 8u) & 0xfu) == 1u;
+	if ((control & 0x20u) != 0) {
+		return CpuAtomic(static_cast<uint64_t*>(addr), op, src, cmp, loop);
+	}
+	return CpuAtomic(static_cast<uint32_t*>(addr), op, static_cast<uint32_t>(src), static_cast<uint32_t>(cmp), loop);
 }
 
 uint64_t SatisfyingValue(const WaitCond& w, uint64_t current) {
@@ -634,6 +713,18 @@ uint32_t NextWaitFlipToken() {
 // 64-bit swap (TC_OP 0x67), SetWorkloadComplete's 64-bit AND (0x75).
 bool AgcAtomicOp(uint32_t control) {
 	return (control & 0x7fu) == 0x67u || (control & 0x7fu) == 0x75u;
+}
+
+// Every no-return integer ATOMIC_MEM op (SetAtomicOps), by gfx10's TC_OP (Linux navi10_enum.h): bit 6 no return, bit 5
+// 64-bit, the low five bits SWAP 0x07, CMPSWAP 0x08, ADD 0x0f, SUB 0x10, SMIN 0x11, UMIN 0x12, SMAX 0x13, UMAX 0x14, AND
+// 0x15, OR 0x16, XOR 0x17, INC 0x18, DEC 0x19 (TC_OP_ATOMIC_SWAP_32 0x47 ... TC_OP_ATOMIC_DEC_64 0x79). COMMAND (bits
+// 11:8) 0 once, 1 loop until the compare holds, 2 wait for the write confirm. The returning forms (bit 6 clear) send
+// their result to the CP's internal register, which only a COPY_DATA SRC_SEL 6 reads: refused; so are the float ops.
+bool NoReturnAtomicOp(uint32_t control) {
+	const uint32_t tc_op   = control & 0x7fu;
+	const uint32_t base    = tc_op & 0x1fu;
+	const uint32_t command = (control >> 8u) & 0xfu;
+	return (tc_op & 0x40u) != 0 && (base == 0x07u || base == 0x08u || (base >= 0x0fu && base <= 0x19u)) && command <= 2u;
 }
 
 // Packets that make the GPU do something (as opposed to setting state), for dropping an empty first
@@ -1330,12 +1421,20 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					return bad();
 				}
 				break;
-			// GPU timing (SetGpuTimes): the GPU clock to memory, on the gfx ring.
-			case IT_COPY_DATA:
-				if (compute || size != 6 || b[0] != kClockCopyCntl || (b[3] & 7u) != 0u) {
+			// GPU timing (SetGpuTimes): the GPU clock to memory, on the gfx ring. A title's COPY_DATA as written
+			// (SetCopyData): memory, an immediate or the GPU clock into memory, the shader-type bit on MEC.
+			case IT_COPY_DATA: {
+				if (size == 6 && !compute && b[0] == kClockCopyCntl && (b[3] & 7u) == 0u) {
+					break;
+				}
+				const uint32_t src_sel = b[0] & 0xfu;
+				const uint32_t dst_sel = (b[0] >> 8u) & 0xfu;
+				if (size != 6 || (compute && (header & 2u) == 0) || !(src_sel == 1u || src_sel == 2u || src_sel == 5u || src_sel == 9u) ||
+				    !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || (b[3] & 3u) != 0u || (b[3] == 0u && b[4] == 0u)) {
 					return bad();
 				}
 				break;
+			}
 			// The translator's IB2 into the guest's buffer (SetDirectRuns): a call, not a chain, on the gfx
 			// ring. Its packets are the ones the translator passed on as written. A chain only as an exit
 			// guard's, which the COND_EXEC case takes with it.
@@ -1370,7 +1469,11 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					const uint32_t* c = b + 4;
 					if (b[3] != 4u || dw + 9u > ib.size() || c[0] != Pkt3(IT_INDIRECT_BUFFER, 3, false) ||
 					    c[3] != (8u | (1u << 20u) | (1u << 23u))) {
-						return bad();
+						// A title's COND_EXEC (SetCondExec) after the translator's PFP_SYNC_ME, its count within the IB.
+						if (dw < 2u || ib[dw - 2u] != ((3u << 30u) | (IT_PFP_SYNC_ME << 8u)) || b[3] > 0x3fffu || dw + size + b[3] > ib.size()) {
+							return bad();
+						}
+						break;
 					}
 					dw += 4u; // the chain
 				} else if (b[3] > kExitGuardMaxSkip || dw + size + b[3] > ib.size()) {
@@ -1448,8 +1551,8 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 					}
 					return bad();
 				}
-				if (!AgcAtomicOp(b[0])) { // libSceAgc's flag swap, workload swap or workload AND
-					return bad();
+				if (!AgcAtomicOp(b[0]) && !NoReturnAtomicOp(b[0])) { // libSceAgc's flag swap, workload swap or AND; the rest
+					return bad();                                     // of the no-return ops with SetAtomicOps
 				}
 				break;
 			// AgcDcbDraw[Index]IndirectMulti as written: the gfx ring only, ten dwords.
@@ -1566,6 +1669,26 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 	constexpr size_t   kMaxDwords = 4u << 20u;
 	int                changed    = 0;
 	uint32_t           hops       = 0; // chains taken: a chain replaces the buffer, it does not nest
+	// A COND_EXEC skips EXEC_COUNT dwords of the buffer it is in, as the CP fetches them. An inlined call inside the
+	// range brings the target's dwords instead of its 4 (or 14), a dropped REWIND takes 2 out, so the count in `out`
+	// moves by as much. A chain inside a range, or a range past the end of a called buffer, has no such count: stop.
+	struct CondRange {
+		size_t count_at; // the EXEC_COUNT dword in `out`
+		size_t end;      // the range's end, a dword of `in`
+	};
+	std::vector<CondRange> conds;
+	auto                   cond_delta = [&](size_t dw, int64_t delta) {
+		for (const CondRange& c: conds) {
+			if (dw < c.end) {
+				const int64_t count = static_cast<int64_t>((*out)[c.count_at] & 0x3fffu) + delta;
+				if (count < 0 || count > 0x3fff) {
+					return false;
+				}
+				(*out)[c.count_at] = ((*out)[c.count_at] & ~0x3fffu) | static_cast<uint32_t>(count);
+			}
+		}
+		return true;
+	};
 	// Packets go to `out` a run at a time, up to the next REWIND or INDIRECT_BUFFER; a top-level buffer
 	// without either is never copied (nothing to inline).
 	size_t run   = 0;
@@ -1598,12 +1721,19 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			return stop("packet past the end", dw);
 		}
 		const uint32_t op = (header >> 8u) & 0xffu;
+		conds.erase(std::remove_if(conds.begin(), conds.end(), [&](const CondRange& c) { return dw >= c.end; }), conds.end());
+		if ((header >> 30u) == 3u && op == IT_COND_EXEC && len == 5) {
+			conds.push_back({out->size() + (dw - run) + 4u, dw + len + (in[dw + 4] & 0x3fffu)});
+		}
 		if ((header >> 30u) == 3u && op == kRewind && len == 2) {
 			if ((in[dw + 1] & 0x80000000u) == 0) {
 				return stop("REWIND not valid yet", dw);
 			}
 			if (!flush(dw)) {
 				return stop("too large", dw);
+			}
+			if (!cond_delta(dw, -2)) {
+				return stop("COND_EXEC count out of range", dw);
 			}
 			changed = 1;
 			dw += len;
@@ -1632,8 +1762,14 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			const bool      chain   = !always_branch && (control & (1u << 20u)) != 0;
 			changed                = 1;
 			if (size == 0) {
+				if (chain && !conds.empty()) {
+					return stop("chain inside a COND_EXEC", dw);
+				}
 				if (chain) {
 					return changed;
+				}
+				if (!cond_delta(dw, -static_cast<int64_t>(len))) { // an empty call is left out
+					return stop("COND_EXEC count out of range", dw);
 				}
 				dw += len;
 				run = dw;
@@ -1646,6 +1782,9 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 				if (++hops > 65536u) {
 					return stop("chain too long", dw);
 				}
+				if (!conds.empty()) {
+					return stop("chain inside a COND_EXEC", dw);
+				}
 				in  = {target, size};
 				dw  = 0;
 				run = 0;
@@ -1654,8 +1793,12 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			if (depth >= 16) {
 				return stop("calls nested too deep", dw);
 			}
+			const size_t before = out->size();
 			if (FlattenInto({target, size}, out, depth + 1, why, pieces, nullptr) < 0) {
 				return -1;
+			}
+			if (!cond_delta(dw, static_cast<int64_t>(out->size() - before) - static_cast<int64_t>(len))) {
+				return stop("COND_EXEC count out of range", dw);
 			}
 			if (marks != nullptr && depth == 0) {
 				marks->push_back(static_cast<uint32_t>(out->size()));
@@ -1668,6 +1811,11 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 	}
 	if ((changed != 0 || depth > 0) && !flush(in.size())) {
 		return stop("too large", in.size());
+	}
+	for (const CondRange& c: conds) {
+		if (depth > 0 && c.end > in.size()) {
+			return stop("COND_EXEC past the end of a called buffer", in.size());
+		}
 	}
 	return changed;
 }
@@ -3666,6 +3814,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		r.stats = stats;
 		return r;
 	};
+	// A packet with no translation (yet): the walk goes on, so one refused buffer names every such packet, and the
+	// buffer is refused at its end.
+	auto soft_unknown = [&](uint32_t op, uint32_t dw) {
+		if (r.unknown_ops.empty()) {
+			r.unknown_op = op;
+			r.unknown_dw = dw;
+		}
+		r.unknown_ops.insert(op);
+		note_refusal(op, dw, RefuseWhy::Unknown);
+	};
 
 	uint32_t dw = 0;
 	uint32_t verbatim_run = 0;
@@ -3691,7 +3849,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	std::vector<DirectRun>         direct_runs;
 	DirectRun                      direct_cur;
-	const bool direct = m_direct_min_dw != 0 && !m_compute_ring && !source.empty();
+	const bool direct_base = m_direct_min_dw != 0 && !m_compute_ring && !source.empty();
+	bool       direct      = direct_base; // off inside a title's COND_EXEC range (SetCondExec): its count is over our dwords
 	// The GPU VA of buffer dword `at`, and how many dwords from there sit contiguously; 0 when unknown.
 	auto source_va = [&](uint32_t at, uint32_t* left) -> uint64_t {
 		auto it = std::upper_bound(source.begin(), source.end(), at,
@@ -3741,7 +3900,59 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 	stats.total_dw = static_cast<uint32_t>(dcb.size());
+	// A title's COND_EXEC in any form (SetCondExec), gfx ring: if the dword at its address is 0 the CP skips EXEC_COUNT
+	// dwords, which on the PS5 are the title's own. The translated range differs in length (patched packets, inserted
+	// waits and stores), so the COND_EXEC goes as written with its count set to the translated range once the walk
+	// reaches the range's end. Inside the range nothing may happen outside the GPU's stream: no direct runs (the IB2s
+	// change the length again), no segment cut, no tracker store or CPU-tail packet, no barrier on our fence, and no
+	// register write (the shadow copy would take it as done when the CP may skip it). Label writes in it are recorded as
+	// unknown once the range ends: the CP may have skipped them.
+	struct CondExecRange {
+		bool     active        = false;
+		uint32_t dw            = 0; // the COND_EXEC in the buffer
+		uint32_t end           = 0; // the buffer dword its range ends at
+		size_t   count_at      = 0; // its EXEC_COUNT dword in body
+		size_t   segs          = 0;
+		size_t   seg_points    = 0;
+		size_t   queued        = 0;
+		size_t   tail          = 0;
+		size_t   writes        = 0; // local_writes when it began
+		size_t   seg_writes    = 0; // segs.back().writes when it began
+		uint32_t fence_seq     = 0;
+	} cond;
+	// False when something left the GPU's stream inside the range (see above).
+	auto cond_clean = [&]() {
+		if (segs.size() != cond.segs || segs.back().points.size() != cond.seg_points || r.cpu_tail.size() != cond.tail ||
+		    m_fence_seq != cond.fence_seq || queued_points.size() < cond.queued) {
+			return false;
+		}
+		for (size_t i = cond.queued; i < queued_points.size(); i++) {
+			if (queued_points[i].kind != TrackerPoint::Kind::Wake) { // a wake that comes anyway is harmless
+				return false;
+			}
+		}
+		return true;
+	};
+	auto cond_close = [&]() {
+		const size_t count = body.size() - (cond.count_at + 1u);
+		if (count > 0x3fffu) {
+			return false;
+		}
+		body[cond.count_at] = (body[cond.count_at] & ~0x3fffu) | static_cast<uint32_t>(count);
+		for (size_t i = cond.writes; i < local_writes.size(); i++) {
+			local_writes[i].known = false;
+		}
+		for (size_t i = cond.seg_writes; i < segs.back().writes.size(); i++) {
+			segs.back().writes[i].known = false;
+		}
+		cond.active = false;
+		direct      = direct_base;
+		return true;
+	};
 	while (dw < dcb.size()) {
+		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
+			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
+		}
 		// A compute ring's guards skip a few thousand dwords at most: one more before the next packet.
 		if (cs_guards && body.size() - guard_from > 3000u) {
 			body_guards.push_back(EmitComputeExitGuard(body, m_exit_run_va));
@@ -3788,6 +3999,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 
 		if (m_skip_ops.count(op) != 0) {
 			stats.packets_skipped++;
+			dw += size;
+			continue;
+		}
+		if (!m_force_refuse.empty() && m_force_refuse.count(op) != 0) {
+			soft_unknown(op, dw);
 			dw += size;
 			continue;
 		}
@@ -3850,6 +4066,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_NOP: {
 				stats.nops += op == IT_NOP ? 1 : 0;
 				const uint32_t marker = op == IT_RELEASE_MEM ? R_RELEASE_MEM : (header >> 2u) & 0x3fu;
+				if (m_audit && op == IT_NOP && marker != R_ZERO) {
+					r.sync.marker_nops[marker]++;
+				}
 				if (m_audit && marker == R_RELEASE_MEM && body_count >= 2) {
 					AuditRelease(r.sync, op == IT_NOP, bptr[0], bptr[1]);
 				}
@@ -3978,6 +4197,24 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						if (!with_interrupt) {
 							body[at + 2] &= ~(0x7u << 24u); // the interrupt is the tracker's (as_written holds none otherwise)
 							body[at + 7] = 0u;              // and so is its context id
+						}
+						// CS_DONE/PS_DONE without data on the gfx ring (EosNoDataMode): the scratch store, or BOTTOM_OF_PIPE_TS.
+						if (!m_compute_ring && ((body[at + 2] >> 29u) & 0x7u) == 0u && EndOfShaderEvent(body[at + 1]) &&
+						    EosNoDataMode() != EosNoData::AsIs) {
+							if (EosNoDataMode() == EosNoData::Data) {
+								const uint64_t scratch = m_tracker_va + 8;
+								body[at + 2] = (body[at + 2] & ~(0x3u << 16u)) | kData32Cntl; // DST_SEL 0 (memory), DATA_SEL 1
+								if (((body[at + 2] >> 24u) & 0x7u) == 1u) {
+									body[at + 2] = (body[at + 2] & ~(0x7u << 24u)) | kIntSel2; // the interrupt once the store is done
+								}
+								body[at + 3] = static_cast<uint32_t>(scratch);
+								body[at + 4] = static_cast<uint32_t>(scratch >> 32u);
+								body[at + 5] = 0u;
+								body[at + 6] = 0u;
+							} else {
+								body[at + 1] = (body[at + 1] & ~0xf3fu) | 0x28u | (5u << 8u);
+							}
+							stats.eos_nodata_fixed++;
 						}
 					};
 					TrackerPoint cpu;
@@ -4762,6 +4999,143 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.write_data_native++;
 				}
 				break;
+			case IT_MEM_SEMAPHORE: {
+				// libSceAgc's AgcDcbMemSemaphore / AgcAcbMemSemaphore: a signal (SEM_SEL 6) increments the mailbox counter at
+				// the address, a wait (7) blocks until it is not 0 and decrements it. Whether the BC-250's stock microcode
+				// runs 0x39 at all is not known (Mesa sends it only on SI/CIK), and a wait whose signal comes from another
+				// ring or the CPU is invisible to the label pipeline; there is no exactly equivalent GPU form (a wait for
+				// >= 1 and an ATOMIC_MEM SUB are not atomic against a second waiter). So it refuses the buffer unless
+				// KYTY_NATIVE_GPU_MEM_SEMAPHORE=1 (after probe memsem), which passes it as written on the gfx ring.
+				if (!m_mem_semaphore || body_count < 3) {
+					static std::atomic<uint32_t> told {0};
+					if (body_count >= 3 && told.fetch_add(1, std::memory_order_relaxed) < 8) {
+						std::fprintf(stderr, "native shadow: MEM_SEMAPHORE %08x %08x %08x refused (KYTY_NATIVE_GPU_MEM_SEMAPHORE)\n", bptr[0],
+						             bptr[1], bptr[2]);
+					}
+					soft_unknown(op, dw);
+					break;
+				}
+				const uint64_t addr = (bptr[0] & ~7u) | (static_cast<uint64_t>(bptr[1]) << 32u);
+				if (m_compute_ring || !labels || !label_gpu(addr, 8)) {
+					r.unknown_detail = {bptr[0], bptr[1], bptr[2]};
+					return fail(op, dw, RefuseWhy::SemaphoreForm);
+				}
+				if (direct) {
+					in_place = true;
+				} else {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				}
+				note_gpu_written(addr, addr + 8);
+				note_write({addr, 0, false, true, true}); // the counter, both a signal and a wait change it
+				seg_effects = true;
+				NoteOnce(33, "MEM_SEMAPHORE as the title wrote it");
+				break;
+			}
+			case IT_DRAW_INDEX_MULTI_INST: {
+				// AgcDcbDrawIndexMultiInstanced (0xC0073A00: initiator | 0x80, an object-id array) is Sony microcode: the
+				// stock ME has no 0x3A it runs, and the per-instance DRAW_INDEX_2 equivalent needs the shader's object-id
+				// user-data slot, still research. Refused; its arguments are logged for when a title calls it.
+				static std::atomic<uint32_t> told {0};
+				if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+					std::fprintf(stderr, "native shadow: DrawIndexMultiInstanced (0x3A) refused:");
+					for (uint32_t i = 0; i < std::min<uint32_t>(body_count, 8u); i++) {
+						std::fprintf(stderr, " %08x", bptr[i]);
+					}
+					std::fprintf(stderr, "\n");
+				}
+				soft_unknown(op, dw);
+				break;
+			}
+			case IT_COPY_DATA: {
+				// libSceAgc's AgcDcbCopyData / AgcAcbCopyData: memory (SRC_SEL 1, 2), an immediate (5) or the GPU clock (9)
+				// into memory (DST_SEL 1, 2, 5), 32 or 64 bits (COUNT_SEL). As written where the GPU may write the
+				// destination, as the PS5's CP runs it; an immediate into memory it cannot write is the tracker's CPU store,
+				// the clock the tracker's CPU timestamp as for a RELEASE_MEM (KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1 too). Register,
+				// GDS and perf-counter selects and the atomic return data refuse: the first stop the ring from a user IB
+				// (probe: COPY_DATA of UCONFIG/context), the last needs the CP's internal register. Only with
+				// KYTY_NATIVE_GPU_COPY_DATA=1 (MEC: KYTY_NATIVE_GPU_MEC_COPY_DATA=1) until probe copydata has run it.
+				if (!labels || (m_compute_ring ? !m_mec_copy_data : !m_copy_data)) {
+					soft_unknown(op, dw);
+					break;
+				}
+				if (body_count < 5) {
+					return fail(op, dw, RefuseWhy::ShortBody);
+				}
+				const uint32_t src_sel = bptr[0] & 0xfu;
+				const uint32_t dst_sel = (bptr[0] >> 8u) & 0xfu;
+				const bool     wide    = ((bptr[0] >> 16u) & 1u) != 0;
+				const uint64_t bytes   = wide ? 8u : 4u;
+				const bool     src_mem = src_sel == 1u || src_sel == 2u;
+				const bool     imm     = src_sel == 5u;
+				const bool     clock   = src_sel == 9u;
+				const uint64_t src     = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+				const uint64_t dst     = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
+				if (!(src_mem || imm || clock) || !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || dst == 0 || (dst & 3u) != 0 ||
+				    (src_mem && src == 0)) {
+					r.unknown_detail = {bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]};
+					return fail(op, dw, RefuseWhy::CopyDataForm);
+				}
+				const uint64_t value = imm ? (wide ? src : (src & 0xffffffffull)) : 0u;
+				if (clock && (m_cpu_timestamps || (dst & 7u) != 0 || !label_gpu(dst, 8))) {
+					TrackerPoint cpu;
+					cpu.kind = TrackerPoint::Kind::Timestamp;
+					cpu.addr = dst;
+					cpu.size = static_cast<uint32_t>(bytes);
+					tracker_point(std::move(cpu));
+					note_write({dst, 0, false, false, wide});
+					stats.timestamps++;
+					NoteOnce(30, "COPY_DATA of the GPU clock written by the tracker (CPU clock)");
+					break;
+				}
+				const bool gpu = label_gpu(dst, bytes);
+				if (!gpu && imm) {
+					TrackerPoint cpu;
+					cpu.kind = TrackerPoint::Kind::CpuWrite;
+					cpu.addr = dst;
+					cpu.data = wide ? std::vector<uint32_t> {bptr[1], bptr[2]} : std::vector<uint32_t> {bptr[1]};
+					tracker_point(std::move(cpu));
+					note_write({dst, value, true, false, wide});
+					stats.labels_cpu++;
+					NoteOnce(31, "COPY_DATA immediate written by the tracker (GPU cannot reach it)");
+					break;
+				}
+				if (!gpu) {
+					// Memory to memory the GPU cannot write: the tracker would read the source before the GPU work ahead
+					// of the copy has written it.
+					r.unknown_detail = {bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]};
+					return fail(op, dw, RefuseWhy::CopyDataForm);
+				}
+				if (direct && !m_compute_ring) {
+					in_place = true;
+				} else {
+					const size_t at = body.size();
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					if (m_compute_ring) {
+						body[at] |= 2u; // SHADER_TYPE compute
+					}
+				}
+				if (src_mem) {
+					add_ref(src, bytes, false);
+				}
+				note_gpu_written(dst, dst + bytes);
+				note_write({dst, value, imm, true, wide});
+				if (imm) {
+					mirror_store(dst, std::span<const uint32_t>(bptr + 1, wide ? 2u : 1u), false);
+				} else {
+					TrackerPoint wake; // a guest asleep on the label is woken once the GPU has written it
+					wake.kind = TrackerPoint::Kind::Wake;
+					wake.addr = dst;
+					tracker_point(std::move(wake));
+				}
+				if (clock) {
+					stats.timestamps_native++;
+				}
+				stats.labels_native++;
+				seg_effects = true;
+				r.label_writes.emplace_back(dst, value);
+				NoteOnce(32, "COPY_DATA as the title wrote it");
+				break;
+			}
 			case IT_DRAW_INDEX_2:
 				log_draw(op, body_count >= 4 ? bptr[3] : 0, 0, false);
 				if (skip_draw()) {
@@ -5075,8 +5449,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (body_count >= 3 && ((bptr[0] & 0x3fu) == 0x39u || (bptr[0] & 0x3fu) == 0x15u)) {
 					log_draw(op, bptr[0] & 0x3fu, (static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), false);
 				}
-				// Events with an address (ZPASS_DONE occlusion counters, 16 DBs x begin/end) write there.
-				if (body_count >= 3) {
+				// Events with an address (ZPASS_DONE occlusion counters, 16 DBs x begin/end) write there. For
+				// PIXEL_PIPE_STAT_CONTROL (0x38, libSceAgc's DcbResetQueue op 0x200 and the preamble) dwords 1-2 are the
+				// control word (COUNTER_ID, STRIDE, INSTANCE_EN), and PIXEL_PIPE_STAT_RESET (0x3a) writes nothing either.
+				if (body_count >= 3 && (bptr[0] & 0x3fu) != 0x38u && (bptr[0] & 0x3fu) != 0x3au) {
 					add_ref((static_cast<uint64_t>(bptr[1]) & ~7ull) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u), 256, false);
 				}
 				// The CP only forwards EVENT_TYPE to VGT_EVENT_INITIATOR; CB/DB do the actual CMASK/FMASK/
@@ -5112,7 +5488,37 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				if (m_compute_ring || body_count < 4 || (bptr[3] & 0x3fffu) != 8u || next + 8u > dcb.size() ||
 				    dcb[next] != 0xc0064900u || ((dcb[next + 2] >> 24u) & 0x7u) != 4u || (dcb[next + 7] & 0x08000000u) == 0) {
-					return fail(op, dw, RefuseWhy::CondExecForm);
+					// Any other COND_EXEC (SetCondExec, KYTY_NATIVE_GPU_COND_EXEC=1): as written with its count recomputed,
+					// gfx ring only (a compute IB is cut into several for KFD, and MEC has not run a title's). The PFP decides
+					// a COND_EXEC ahead of the ME, so a PFP_SYNC_ME first lets it see the ME's writes before it, as the PS5's
+					// microcode does.
+					const uint64_t addr = (bptr[0] & ~3u) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
+					if (!m_cond_exec || m_compute_ring || cond.active || body_count != 4 || addr == 0 ||
+					    next + (bptr[3] & 0x3fffu) > dcb.size()) {
+						return fail(op, dw, RefuseWhy::CondExecForm);
+					}
+					if (irq_pending) {
+						flush_points(); // an interrupt queued before the range fires before it, not inside
+					}
+					body.push_back((3u << 30u) | (IT_PFP_SYNC_ME << 8u));
+					body.push_back(0);
+					stats.pfp_syncs_emitted++;
+					cond.count_at = body.size() + 4u;
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					add_ref(addr, 4, false);
+					cond.active     = true;
+					cond.dw         = dw;
+					cond.end        = next + (bptr[3] & 0x3fffu);
+					cond.segs       = segs.size();
+					cond.seg_points = segs.back().points.size();
+					cond.queued     = queued_points.size();
+					cond.tail       = r.cpu_tail.size();
+					cond.writes     = local_writes.size();
+					cond.seg_writes = segs.back().writes.size();
+					cond.fence_seq  = m_fence_seq;
+					direct          = false;
+					stats.cond_execs++;
+					break;
 				}
 				stats.context_checks++;
 				dw += 8u; // the RELEASE_MEM
@@ -5124,17 +5530,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// write the address. MEC has not run an ATOMIC_MEM on this board, and memory the GPU cannot write must not
 				// get one: with native labels the tracker performs it on the CPU when the GPU gets there. Without native
 				// labels Kyty's command processor runs the whole buffer and performs it, so a compute ring leaves it out.
-				if (body_count != 8 || !AgcAtomicOp(bptr[0])) {
+				// With KYTY_NATIVE_GPU_ATOMIC_OPS=1 every no-return integer op goes the same way (NoReturnAtomicOp), the
+				// tracker running it on the CPU with the same TC_OP (CpuAtomicMem).
+				if (body_count != 8 || !(AgcAtomicOp(bptr[0]) || (m_atomic_ops && NoReturnAtomicOp(bptr[0])))) {
 					return fail(op, dw, RefuseWhy::AtomicForm);
 				}
-				const uint64_t addr = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
-				if (labels && (m_compute_ring || !label_gpu(addr, 8))) {
+				const uint64_t addr  = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+				const uint64_t bytes = (bptr[0] & 0x20u) != 0 ? 8u : 4u;
+				if (labels && (m_compute_ring || !label_gpu(addr, bytes))) {
 					TrackerPoint cpu_atomic;
 					cpu_atomic.kind = TrackerPoint::Kind::Atomic;
 					cpu_atomic.addr = addr;
-					cpu_atomic.data = {bptr[0], bptr[3], bptr[4]};
+					cpu_atomic.data = {bptr[0], bptr[3], bptr[4], bptr[5], bptr[6]};
 					tracker_point(std::move(cpu_atomic));
-					note_write({addr, 0, false, false, true});
+					note_write({addr, 0, false, false, bytes == 8u});
 					stats.atomics_cpu++;
 					NoteOnce(24, "ATOMIC_MEM performed by the tracker (compute ring, or memory the GPU cannot write)");
 					break;
@@ -5148,9 +5557,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				}
 				if (!labels) {
-					add_ref(addr, 8, false); // label_gpu has added it otherwise
+					add_ref(addr, bytes, false); // label_gpu has added it otherwise
 				}
-				note_gpu_written(addr, addr + 8);
+				note_gpu_written(addr, addr + bytes);
+				if (labels && !AgcAtomicOp(bptr[0])) {
+					note_write({addr, 0, false, true, bytes == 8u}); // a value the GPU computes
+				}
 				break;
 			}
 			case IT_CLEAR_STATE:
@@ -5222,6 +5634,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (cp_shadow && reg_write) {
 			seg_effects = true;
 		}
+		if (cond.active && dw != cond.dw && reg_write) {
+			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // a register write the CP may skip
+		}
 		const bool same_seg = segs.size() == segs_before;
 		if (in_place && (!same_seg || body.size() != body_before)) {
 			return fail(op, dw, RefuseWhy::InPlace); // a packet run in place has nothing of ours around it
@@ -5262,6 +5677,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 
 		dw += size;
+	}
+	if (cond.active && (!cond_clean() || dw != cond.end || !cond_close())) {
+		return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // the range runs past the buffer
 	}
 	end_run();
 	end_cut_run();

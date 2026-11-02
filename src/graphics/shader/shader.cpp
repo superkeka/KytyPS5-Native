@@ -74,6 +74,21 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = {mapped, hash};
 }
 
+bool ShaderFindMapped(uint64_t addr, uint32_t* code_size_bytes, uint64_t* hash, Prospero::ShaderBinaryType* type) {
+	if (g_shader_map == nullptr) {
+		return false;
+	}
+	std::scoped_lock lock(g_shader_map_mutex);
+	auto             iter = g_shader_map->find(addr);
+	if (iter == g_shader_map->end()) {
+		return false;
+	}
+	*code_size_bytes = iter->second.data.code_size_bytes;
+	*hash            = iter->second.hash;
+	*type            = iter->second.data.type;
+	return true;
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 

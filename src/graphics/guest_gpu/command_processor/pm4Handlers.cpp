@@ -66,6 +66,38 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
+// Kyty's CP is the native backend's safety net: a buffer the translator refuses comes here. libSceAgc's reset
+// defaults (AgcDcbResetQueue ops 2, 4 and 0x800) hold every SH and UCONFIG register's PS5 default, many of them state
+// this CP does not model (CU masks, power and GDS registers), so an unknown register in those tables is skipped with
+// a log once per offset instead of ending the process. KYTY_CP_STRICT_REGS=1 ends it on any unknown register again.
+bool CpStrictRegs() {
+	static const bool strict = [] {
+		const char* v = std::getenv("KYTY_CP_STRICT_REGS");
+		return v != nullptr && v[0] == '1';
+	}();
+	return strict;
+}
+
+bool CpSkipResetTableRegister(const char* space, const void* table, uint32_t offset, uint32_t value) {
+	if (CpStrictRegs() || !Gen5::AgcIsResetTable(table)) {
+		return false;
+	}
+	static std::bitset<0x8000> logged;
+	static std::atomic_flag    lock = ATOMIC_FLAG_INIT;
+	const uint32_t             key  = (space[0] == 'u' ? 0x4000u : 0u) | (offset & 0x3fffu);
+	while (lock.test_and_set(std::memory_order_acquire)) {
+	}
+	const bool first = !logged.test(key);
+	logged.set(key);
+	lock.clear(std::memory_order_release);
+	if (first) {
+		Log::WriteToConsoleAndLog(fmt::sprintf("\t cp: skipping %s register 0x%03x = 0x%08x of libSceAgc's reset defaults "
+		                                       "(not modelled)\n",
+		                                       space, offset, value));
+	}
+	return true;
+}
+
 } // namespace
 
 static HW::BlendControl DecodeBlendControl(uint32_t value) {
@@ -2089,6 +2121,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
 
+		if (pfunc == nullptr && CpSkipResetTableRegister("sh", reinterpret_cast<const void*>(indirect_address),
+		                                                 cmd_offset, value)) {
+			continue;
+		}
 		if (pfunc == nullptr) {
 			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
 			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
@@ -2147,6 +2183,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
+		if (pfunc == nullptr && CpSkipResetTableRegister("uc", indirect_buffer - i * 2, cmd_offset, value)) {
+			continue;
+		}
 		if (pfunc == nullptr) {
 			auto* dump_regs = indirect_buffer - i * 2;
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
@@ -3563,6 +3602,11 @@ void GraphicsInitJmpTablesShIndirect() {
 			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
 		    };
 	}
+	// SPI_SHADER_PGM_RSRC4_PS (CU mask and wave limits of the PS stage) heads libSceAgc's sorted SH defaults that
+	// AgcDcbResetQueue op 2 loads; RSRC4_GS and RSRC4_HS are ignored the same way, as Vulkan picks the CUs itself.
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		HwShIgnoreShaderRegister(cmd_offset, value);
+	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};

@@ -3,6 +3,7 @@
 #include "graphics/native_gpu/nativePm4.h"
 #include "graphics/native_gpu/nativeSubmit.h" // KYTY_GEM_BACKING_SUPPORTED + NativeSubmitter
 #include "graphics/native_gpu/shaderPatcher.h"
+#include "graphics/native_gpu/shaderScan.h"
 
 #include "common/threads.h"
 #include "kernel/memory.h"
@@ -4764,6 +4765,49 @@ private:
 			m_acb_translator.SetSkippedOpcodes(skip);
 			std::fprintf(stderr, "native shadow: leaving %zu packet type(s) out of the IB: %s\n", skip.size(), ops);
 		}
+		// KYTY_NATIVE_GPU_FORCE_REFUSE=<op,op> (test only): buffers holding these opcodes are refused as unknown, so the
+		// refused-buffer path (Kyty's command processor) runs on the board without a title that needs it.
+		if (const char* ops = std::getenv("KYTY_NATIVE_GPU_FORCE_REFUSE"); ops != nullptr && ops[0] != '\0') {
+			std::set<uint32_t> refuse;
+			for (const char* p = ops; *p != '\0';) {
+				char*      end = nullptr;
+				const auto v   = std::strtoul(p, &end, 0);
+				if (end == p) {
+					break;
+				}
+				refuse.insert(static_cast<uint32_t>(v) & 0xffu);
+				p = (*end == ',') ? end + 1 : end;
+			}
+			m_translator.SetForcedRefusals(refuse);
+			m_acb_translator.SetForcedRefusals(refuse);
+			std::fprintf(stderr, "native shadow: refusing buffers with %zu packet type(s) (test): %s\n", refuse.size(), ops);
+		}
+		// libSceAgc's packets refused until their probes have run on the board, each off (refused, the buffer to Kyty's
+		// command processor) unless its switch is 1: KYTY_NATIVE_GPU_COPY_DATA (COPY_DATA on the gfx ring),
+		// KYTY_NATIVE_GPU_MEC_COPY_DATA (on MEC), KYTY_NATIVE_GPU_ATOMIC_OPS (every no-return ATOMIC_MEM op),
+		// KYTY_NATIVE_GPU_MEM_SEMAPHORE (0x39 as written) and KYTY_NATIVE_GPU_COND_EXEC (any COND_EXEC, its count
+		// recomputed).
+		{
+			auto on = [](const char* name) {
+				const char* v = std::getenv(name);
+				return v != nullptr && v[0] == '1';
+			};
+			const bool copy_data = on("KYTY_NATIVE_GPU_COPY_DATA");
+			const bool mec_copy  = on("KYTY_NATIVE_GPU_MEC_COPY_DATA");
+			const bool atomics   = on("KYTY_NATIVE_GPU_ATOMIC_OPS");
+			const bool semaphore = on("KYTY_NATIVE_GPU_MEM_SEMAPHORE");
+			const bool cond_exec = on("KYTY_NATIVE_GPU_COND_EXEC");
+			for (Pm4Translator* t: {&m_translator, &m_acb_translator}) {
+				t->SetCopyData(copy_data, mec_copy);
+				t->SetAtomicOps(atomics);
+				t->SetMemSemaphore(semaphore);
+				t->SetCondExec(cond_exec);
+			}
+			if (copy_data || mec_copy || atomics || semaphore || cond_exec) {
+				std::fprintf(stderr, "native shadow: refused forms on: COPY_DATA gfx %d MEC %d, ATOMIC_MEM ops %d, MEM_SEMAPHORE %d, COND_EXEC %d\n",
+				             copy_data, mec_copy, atomics, semaphore, cond_exec);
+			}
+		}
 		// KYTY_NATIVE_GPU_GDS_SHADERS=1 runs draws with GDS shaders natively, =skip leaves just those
 		// draws out of the IB (the rest of their DCB runs natively); unset leaves whole DCBs to Kyty.
 		if (const char* g = std::getenv("KYTY_NATIVE_GPU_GDS_SHADERS"); g != nullptr) {
@@ -5026,6 +5070,22 @@ private:
 			m_shaders_scanned++;
 			m_dot2c_sites += scan.sites;
 			m_dot_ops += scan.dot_ops;
+			// KYTY_NATIVE_GPU_SHADER_SCAN (default 1, report only): what in this shader the BC-250 may run
+			// differently than the PS5 (opcodes outside gfx1013, hwregs, messages, traps), once per code hash,
+			// following branches past the first s_endpgm. It reads only and changes nothing: the GDS policy and
+			// the logs above keep CountDot2c's sweep. Where PatchDot2c would go when a title has v_dot2c sites:
+			// AgcCreateShader (copy, patch, redirect PGM_LO/HI to a shader arena next to the IB BO); nothing does
+			// yet, as 9,996 shaders of six titles hold none. Past CountDot2c's sweep, only pages mapped for
+			// the GPU are read.
+			{
+				std::function<bool(uint64_t)> readable;
+#if KYTY_GEM_BACKING_SUPPORTED
+				if (GemBacking* gem = m_gem; gem != nullptr) {
+					readable = [gem](uint64_t addr) { return gem->IsGpuMapped(addr); };
+				}
+#endif
+				ShaderScanDetect(va, scan.dwords, readable);
+			}
 			if (m_audit) {
 				AuditShaderLocked(va, scan);
 			}
@@ -5086,6 +5146,7 @@ private:
 		if (result.ok) {
 			m_audit_cp_dma_idle[k] += result.stats.cp_dma_idle;
 			m_audit_pfp_syncs[k] += result.stats.pfp_syncs_emitted;
+			m_audit_eos_nodata[k] += result.stats.eos_nodata_fixed;
 		}
 		m_audit_sync[k][result.ok ? 0 : 1].Add(result.sync);
 		for (const Pm4Refusal& f: result.refusals) {
@@ -5236,9 +5297,28 @@ private:
 		             "packet check and GDS shaders refuse after it, those count as translated\n",
 		             n(m_audit_buffers[0][0]), n(m_audit_buffers[0][1]), n(m_audit_buffers[1][0]), n(m_audit_buffers[1][1]),
 		             n(m_audit_buffers[2][0]), n(m_audit_buffers[2][1]));
-		std::fprintf(stderr, "native audit: added syncs (dcb/acb/agr): CP DMA idle waits at job ends %llu/%llu/%llu, PFP_SYNC_ME %llu/%llu/%llu\n",
+		std::fprintf(stderr,
+		             "native audit: added syncs (dcb/acb/agr): CP DMA idle waits at job ends %llu/%llu/%llu, PFP_SYNC_ME %llu/%llu/%llu, "
+		             "data-less CS_DONE/PS_DONE given a store on gfx %llu/%llu/%llu\n",
 		             n(m_audit_cp_dma_idle[0]), n(m_audit_cp_dma_idle[1]), n(m_audit_cp_dma_idle[2]), n(m_audit_pfp_syncs[0]),
-		             n(m_audit_pfp_syncs[1]), n(m_audit_pfp_syncs[2]));
+		             n(m_audit_pfp_syncs[1]), n(m_audit_pfp_syncs[2]), n(m_audit_eos_nodata[0]), n(m_audit_eos_nodata[1]),
+		             n(m_audit_eos_nodata[2]));
+		// Kyty's old marker NOPs (header bits 7:2 set) by marker value; 0 with libSceAgc's own packets.
+		std::string marker_nops;
+		for (int k = 0; k < 3; k++) {
+			uint64_t total = 0;
+			for (int r = 0; r < 2; r++) {
+				for (uint64_t c: m_audit_sync[k][r].marker_nops) {
+					total += c;
+				}
+			}
+			marker_nops += std::string(k == 0 ? "" : ", ") + kKind[k] + " " + std::to_string(total);
+			if (total != 0) {
+				marker_nops += " (" + AuditCounts(m_audit_sync[k][0].marker_nops, nullptr, true) + "; refused " +
+				               AuditCounts(m_audit_sync[k][1].marker_nops, nullptr, true) + ")";
+			}
+		}
+		std::fprintf(stderr, "native audit: marker NOPs (header bits 7:2 set; expected 0): %s\n", marker_nops.c_str());
 		for (int k = 0; k < 3; k++) {
 			for (int r = 0; r < 2; r++) {
 				const SyncAuditT<uint64_t>& s  = m_audit_sync[k][r];
@@ -5636,6 +5716,7 @@ private:
 	uint64_t                                                   m_audit_buffers[3][2] {};
 	uint64_t                                                   m_audit_cp_dma_idle[3] {}; // translated buffers' Pm4TranslateStats sums
 	uint64_t                                                   m_audit_pfp_syncs[3] {};
+	uint64_t                                                   m_audit_eos_nodata[3] {};
 	std::map<std::tuple<int, uint8_t, uint32_t>, AuditRefusal> m_audit_refusals;
 	uint64_t                                                   m_audit_refusals_more = 0;
 	std::array<std::array<uint64_t, 2>, 64>                    m_audit_getreg {}; // by hwreg id: instructions, shaders
@@ -7106,26 +7187,20 @@ private:
 				break;
 			case TrackerPoint::Kind::Atomic: {
 				// libSceAgc's ATOMIC_MEM where the GPU does not run it (a compute ring, or memory the GPU cannot write):
-				// its TC_OP on the CPU, atomically, 64-bit with bit 5 set. A swap (7) stores the source, an AND (0x15)
-				// masks the word with it (SetWorkloadsActive, SetWorkloadComplete).
+				// its TC_OP on the CPU, atomically, 64-bit with bit 5 set (CpuAtomicMem). A swap (7) stores the source, an
+				// AND (0x15) masks the word with it (SetWorkloadsActive, SetWorkloadComplete); with KYTY_NATIVE_GPU_ATOMIC_OPS=1
+				// any no-return integer op, a compare-swap with the compare value in data[3..4].
 				if (p.data.size() < 3 || p.addr == 0) {
 					break;
 				}
-				const uint32_t tc_op = p.data[0] & 0x1fu;
-				const uint64_t src   = p.data[1] | (static_cast<uint64_t>(p.data[2]) << 32u);
-				if ((p.data[0] & 0x20u) != 0) {
-					auto* dst = reinterpret_cast<uint64_t*>(p.addr);
-					if (tc_op == 0x07u) {
-						__atomic_store_n(dst, src, __ATOMIC_SEQ_CST);
-					} else if (tc_op == 0x15u) {
-						__atomic_fetch_and(dst, src, __ATOMIC_SEQ_CST);
-					}
-				} else {
-					auto* dst = reinterpret_cast<uint32_t*>(p.addr);
-					if (tc_op == 0x07u) {
-						__atomic_store_n(dst, static_cast<uint32_t>(src), __ATOMIC_SEQ_CST);
-					} else if (tc_op == 0x15u) {
-						__atomic_fetch_and(dst, static_cast<uint32_t>(src), __ATOMIC_SEQ_CST);
+				const uint64_t src = p.data[1] | (static_cast<uint64_t>(p.data[2]) << 32u);
+				const uint64_t cmp = p.data.size() >= 5 ? p.data[3] | (static_cast<uint64_t>(p.data[4]) << 32u) : 0u;
+				if (!CpuAtomicMem(reinterpret_cast<void*>(p.addr), p.data[0], src, cmp)) {
+					static std::atomic<uint32_t> told {0};
+					if (told.fetch_add(1) < 8) {
+						std::fprintf(stderr, "native labels: ATOMIC_MEM 0x%08x at 0x%llx not done on the CPU (unknown op, or the compare "
+						                     "of a looping compare-swap never held)\n",
+						             p.data[0], static_cast<unsigned long long>(p.addr));
 					}
 				}
 				break;

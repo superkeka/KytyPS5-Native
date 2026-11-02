@@ -704,6 +704,7 @@ constexpr uint32_t CX_NUM = 0x3FF + 1;
 
 /* Shader registers */
 
+constexpr uint32_t SPI_SHADER_PGM_RSRC4_PS         = 0x1;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_PS = 0x2;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_PS = 0x3;
 constexpr uint32_t SPI_SHADER_PACE_ID_PS            = 0x6;

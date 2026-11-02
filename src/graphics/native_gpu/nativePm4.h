@@ -203,8 +203,11 @@ struct Pm4TranslateStats {
 	uint32_t atomics_cpu       = 0; // native labels: ATOMIC_MEM the tracker performs on the CPU (TrackerPoint::Kind::Atomic)
 	uint32_t waits_unmet       = 0; // of those, condition not yet true when the DCB was translated
 	uint32_t pfp_syncs_emitted = 0; // PFP_SYNC_ME emitted in place of dropped PFP waits
+	uint32_t eos_nodata_fixed  = 0; // gfx CS_DONE/PS_DONE (EVENT_INDEX 6) releases without data given a scratch store
+	                                // (KYTY_NATIVE_GPU_EOS_NODATA)
 	uint32_t clear_state       = 0; // IT_CLEAR_STATE
 	uint32_t context_checks    = 0; // libSceAgc's COND_EXEC + RELEASE_MEM around a context push/pop, left out
+	uint32_t cond_execs        = 0; // a title's COND_EXEC passed on with its count recomputed (SetCondExec)
 	uint32_t uconfig_skipped   = 0; // non-whitelisted UCONFIG writes dropped for board safety
 	uint32_t preamble_cx       = 0; // context registers emitted in the IB preamble
 	uint32_t preamble_sh       = 0; // SH registers emitted in the IB preamble
@@ -251,6 +254,9 @@ struct SyncAuditT {
 	T                                    write_confirm = 0;
 	T                                    write_markers = 0; // libSceAgc's debug-marker strings, not in the WRITE_DATA counts
 	std::array<T, 19>                    acquire_gcr {};    // GCR_CNTL (body dword 6) bit i
+	// NOPs with header bits 7:2 set, by that value: Kyty's old marker NOPs. libSceAgc writes none (its NOPs are fillers
+	// and padding with bits 7:2 clear, as the PS5's CP skips any NOP), so 0 says every NOP may run in place.
+	std::array<T, 64>                    marker_nops {};
 	std::array<uint32_t, kForms>         odd_bits {};       // those bits, ORed (a release's event dword)
 	std::array<uint32_t, 2>              release_select_odd {}; // and a release's select dword
 
@@ -273,6 +279,7 @@ struct SyncAuditT {
 		Sum(write_confirm, o.write_confirm);
 		Sum(write_markers, o.write_markers);
 		Sum(acquire_gcr, o.acquire_gcr);
+		Sum(marker_nops, o.marker_nops);
 		for (size_t i = 0; i < kForms; i++) {
 			odd_bits[i] |= o.odd_bits[i];
 		}
@@ -312,6 +319,8 @@ enum class RefuseWhy : uint8_t {
 	ContextControlOnMec,
 	CondExecForm,
 	AtomicForm,
+	CopyDataForm,  // COPY_DATA from or to registers, GDS, perf counters or atomic results; or into memory the GPU cannot write
+	SemaphoreForm, // MEM_SEMAPHORE on MEC, or on memory the GPU cannot reach
 	InPlace,
 	Validate,
 	ValidateResume,
@@ -704,6 +713,11 @@ void SetTessellationRings(uint64_t tf_ring_base, uint32_t tf_ring_bytes, uint32_
 // 70005 do not).
 constexpr uint32_t kExitGuardMaxSkip = 20000;
 
+// An ATOMIC_MEM's no-return TC_OP (control dword bits 6:0, COMMAND in 11:8) on the CPU, atomically, as the tracker runs it
+// where the GPU does not (TrackerPoint::Kind::Atomic): 64-bit with bit 5 set; `src` the source data, `cmp` the compare
+// value of a compare-swap. False for an op it does not know, or a looping compare-swap whose compare never held.
+bool CpuAtomicMem(void* addr, uint32_t control, uint64_t src, uint64_t cmp);
+
 // A value that satisfies `w`, given the label's `current` value (only the masked bits change).
 uint64_t SatisfyingValue(const WaitCond& w, uint64_t current);
 
@@ -1067,6 +1081,26 @@ public:
 	// Packets of these opcodes are left out of the IB (bisecting a hang down to a packet type).
 	void SetSkippedOpcodes(std::set<uint32_t> ops) { m_skip_ops = std::move(ops); }
 
+	// Test only (KYTY_NATIVE_GPU_FORCE_REFUSE=<op,op>): packets of these opcodes refuse the buffer as unknown ones do,
+	// so the safety net (the buffer handed to Kyty's command processor) can be exercised without a broken title.
+	void SetForcedRefusals(std::set<uint32_t> ops) { m_force_refuse = std::move(ops); }
+
+	// libSceAgc's packets the translator refused so far, each behind its switch until a probe has run it on the board
+	// (off: refused as before, the buffer goes to Kyty's command processor). Native labels only.
+	// COPY_DATA (KYTY_NATIVE_GPU_COPY_DATA, KYTY_NATIVE_GPU_MEC_COPY_DATA): memory, immediate or GPU clock to memory, as
+	// written where the GPU may write the destination.
+	void SetCopyData(bool gfx, bool mec) {
+		m_copy_data     = gfx;
+		m_mec_copy_data = mec;
+	}
+	// ATOMIC_MEM (KYTY_NATIVE_GPU_ATOMIC_OPS): every no-return integer TC_OP, not only libSceAgc's swap and AND.
+	void SetAtomicOps(bool on) { m_atomic_ops = on; }
+	// MEM_SEMAPHORE (KYTY_NATIVE_GPU_MEM_SEMAPHORE): signal and wait as written on the gfx ring.
+	void SetMemSemaphore(bool on) { m_mem_semaphore = on; }
+	// COND_EXEC in any form (KYTY_NATIVE_GPU_COND_EXEC) on the gfx ring, its EXEC_COUNT recomputed over the translated
+	// dwords; libSceAgc's two context-check forms are taken either way.
+	void SetCondExec(bool on) { m_cond_exec = on; }
+
 	// Compact references (default off): instead of every GpuRef, only the 16 MiB buckets they touch
 	// (ref_buckets); refs then keeps just the index buffers. What residency needs, without sorting a
 	// list that grows with every draw.
@@ -1281,6 +1315,12 @@ private:
 	uint32_t                     m_fence_seq      = 0;
 	std::set<uint64_t>           m_skip_ps;
 	std::set<uint32_t>           m_skip_ops;
+	std::set<uint32_t>           m_force_refuse;
+	bool                         m_copy_data     = false;
+	bool                         m_mec_copy_data = false;
+	bool                         m_atomic_ops    = false;
+	bool                         m_mem_semaphore = false;
+	bool                         m_cond_exec     = false;
 	std::set<uint64_t>           m_inspect; // KYTY_NATIVE_GPU_INSPECT_PS: pixel or compute shaders
 	bool                         m_compact_refs = false;
 	uint64_t                     m_guess_span   = 32ull << 20u;
