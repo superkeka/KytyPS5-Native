@@ -15,6 +15,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <vector>
@@ -55,6 +56,9 @@ struct OutputClock {
 		return deadline;
 	}
 };
+
+// Said once: the output device fell behind the game's audio or ran ahead of it.
+static std::atomic_bool g_device_restart_logged {false};
 
 static bool audio_out_port_type_is_valid(int type) {
 	return (type >= AUDIO_OUT_PORT_TYPE_MAIN && type <= AUDIO_OUT_PORT_TYPE_PADSPK) ||
@@ -124,9 +128,12 @@ private:
 		uint32_t    freq        = 0;
 		Format      format      = Format::Unknown;
 		OutputClock clock;
-		bool        queue_primed = false;
-		int         channels_num = 0;
-		int         volume[12]   = {};
+		bool        queue_primed    = false;
+		int         channels_num    = 0;
+		int         volume[12]      = {};
+		double      device_period_s = 1024.0 / 48000.0; // the frames the device takes at once
+		int         after_put       = 0; // queued bytes before the last put, plus what it put
+		uint64_t    taken_time      = 0; // when the device was last seen taking audio
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
@@ -287,6 +294,14 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		return false;
 	}
 
+	int           device_frames = 0;
+	SDL_AudioSpec device_spec {};
+	if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(port->stream), &device_spec,
+	                             &device_frames) &&
+	    device_frames > 0 && device_spec.freq > 0) {
+		port->device_period_s = static_cast<double>(device_frames) / device_spec.freq;
+	}
+
 	LOGF("AudioOut: opened SDL stream (%d Hz, %d ch, format 0x%04x)\n", desired.freq,
 	     desired.channels, static_cast<unsigned>(desired.format));
 	return true;
@@ -385,25 +400,62 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
 	uint32_t min_queued_size = 0;
-	if (blocking) {
-		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
+	int      queued          = -1;
+	if (port->samples_num != 0 && port->freq != 0) {
+		const auto buffer_us = (1000000ULL * port->samples_num) / port->freq;
 		const auto buffers =
 		    buffer_us != 0
 		        ? static_cast<uint32_t>((AUDIO_OUT_TARGET_LATENCY_US + buffer_us - 1) / buffer_us)
 		        : 2u;
-		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
-		const auto wait_start      = LibKernel::KernelGetProcessTime();
-		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
-		while (queued > static_cast<int>(min_queued_size)) {
-			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
-				SDL_ClearAudioStream(port->stream);
-				port->queue_primed = false;
-				break;
-			}
-			Common::Thread::SleepMicro(1000);
-			queued = SDL_GetAudioStreamQueued(port->stream);
+		// The cushion also holds a whole pull of the device and the blocks around it, or its pulls
+		// would empty the queue.
+		const auto period_frames = static_cast<uint32_t>(port->device_period_s * port->freq);
+		const auto period_blocks = (period_frames + port->samples_num - 1) / port->samples_num + 2;
+		min_queued_size = prepared_size * std::max(std::clamp(buffers, 2u, 16u), period_blocks);
+
+		// The guest is paced by OutputClock alone (AudioOutOutputs), as the PS5's audio hardware
+		// runs on its own 48 kHz clock whatever plays it: the queue never makes the guest wait, so
+		// a device that runs slow (BC-250 DisplayPort audio did, ~14%, on kernels with a wrong
+		// audio clock) or takes audio in large pulls does not set the game's pace.
+		const auto now       = LibKernel::KernelGetProcessTime();
+		const auto period_us = static_cast<uint64_t>(port->device_period_s * 1e6);
+		const auto margin =
+		    static_cast<int>(static_cast<double>(prepared_size) * port->freq / port->samples_num *
+		                     (2 * port->device_period_s + 0.03));
+		queued = SDL_GetAudioStreamQueued(port->stream);
+		if (port->taken_time == 0 || queued < port->after_put) {
+			port->taken_time = now;
 		}
-		if (queued < static_cast<int>(prepared_size)) {
+		const auto idle = now - port->taken_time;
+		const bool late = port->clock.next_time != 0 && now > port->clock.next_time + 1000;
+		// A device that took nothing for a while has stopped. One slower than its rate leaves a
+		// backlog (dropped once it takes audio again, not while it pauses), and one faster runs the
+		// queue dry under a guest that is on time. Either way the queue starts over at its cushion,
+		// in silence, and the guest keeps its clock; a late guest's own underrun primes as before.
+		const bool stalled = queued > 0 && idle > std::max<uint64_t>(200000, 2 * period_us);
+		const bool backlog =
+		    idle <= period_us * 27 / 10 && queued > static_cast<int>(min_queued_size) + margin;
+		const bool dry =
+		    blocking && port->queue_primed && !late && queued < static_cast<int>(prepared_size);
+		if (((port->queue_primed || !blocking) && (stalled || backlog)) || dry) {
+			SDL_ClearAudioStream(port->stream);
+			queued = 0;
+			if (blocking) {
+				const std::vector<uint8_t> silence(min_queued_size - prepared_size, 0);
+				if (SDL_PutAudioStreamData(port->stream, silence.data(),
+				                           static_cast<int>(silence.size()))) {
+					queued = static_cast<int>(silence.size());
+				}
+			}
+			port->taken_time = now;
+			if (!stalled && !g_device_restart_logged.exchange(true)) {
+				Log::WriteToConsoleAndLog(
+				    fmt::sprintf("AudioOut: the output device %s the game's %u Hz audio; its queue "
+				                 "starts over in silence then, and the game keeps its pace\n",
+				                 dry ? "ran ahead of" : "fell behind", port->freq));
+			}
+		}
+		if (blocking && queued < static_cast<int>(prepared_size)) {
 			if (port->queue_primed) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
 			}
@@ -414,12 +466,15 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		port->queue_primed = false;
+		port->after_put    = queued;
 		return false;
 	}
 	// Unpaced priming must not advance the playback deadline into the future.
 	if (!port->queue_primed) {
 		port->clock = {};
 	}
+	// What the device takes while the block goes in counts too: the queue it would hold without it.
+	port->after_put = queued + static_cast<int>(prepared_size);
 	if (blocking && !port->queue_primed &&
 	    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
 		port->queue_primed = true;

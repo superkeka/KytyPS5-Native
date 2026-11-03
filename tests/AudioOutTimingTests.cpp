@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,9 +26,13 @@ struct Stream {
 	uint64_t      frames = 0; // Millionths of a frame retain exact simulated consumption.
 	uint64_t      updated;
 	std::vector<uint8_t> pcm;
+	uint64_t             opened = 0;
+	double               pulled = 0; // Device frames taken so far, whole periods if it has one.
 };
 
-uint64_t                             now       = 1000000;
+uint64_t                             now           = 1000000;
+double                               device_speed  = 1.0; // Its real rate over its nominal one.
+uint32_t                             device_period = 0;   // Frames it takes at once (0: smoothly).
 uint32_t                             oversleep = 0, processing = 0;
 std::vector<uint32_t>                sleeps;
 std::vector<std::unique_ptr<Stream>> streams;
@@ -42,10 +47,20 @@ Stream& GetStream(SDL_AudioStream* stream) {
 }
 
 void Drain(Stream& stream) {
-	if (!stalled) {
+	// Device frames since the stream opened.
+	const double device =
+	    static_cast<double>(now - stream.opened) * stream.spec.freq * device_speed / 1e6;
+	const double due =
+	    device_period != 0 ? std::floor(device / device_period) * device_period : device;
+	if (!stalled && device_speed == 1.0 && device_period == 0) {
+		// Exact in millionths of a frame at the nominal rate.
 		const auto consumed = (now - stream.updated) * stream.spec.freq;
 		stream.frames -= std::min(stream.frames, consumed);
+	} else if (!stalled && due > stream.pulled) {
+		const auto consumed = static_cast<uint64_t>((due - stream.pulled) * 1e6);
+		stream.frames -= std::min(stream.frames, consumed);
 	}
+	stream.pulled  = std::max(stream.pulled, due);
 	stream.updated = now;
 }
 } // namespace
@@ -65,7 +80,7 @@ SDL_AudioStream* OpenAudioDeviceStream(SDL_AudioDeviceID, const SDL_AudioSpec* s
 		return nullptr;
 	}
 
-	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now, {}}));
+	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now, {}, now}));
 	return reinterpret_cast<SDL_AudioStream*>(streams.back().get());
 }
 
@@ -98,6 +113,16 @@ bool PutAudioStreamData(SDL_AudioStream* stream, const void* data, int bytes) {
 	return true;
 }
 
+SDL_AudioDeviceID GetAudioStreamDevice(SDL_AudioStream*) {
+	return 1;
+}
+
+bool GetAudioDeviceFormat(SDL_AudioDeviceID, SDL_AudioSpec* spec, int* sample_frames) {
+	*spec          = {SDL_AUDIO_F32, 2, 48000};
+	*sample_frames = device_period != 0 ? static_cast<int>(device_period) : 1024;
+	return true;
+}
+
 bool ClearAudioStream(SDL_AudioStream* stream) {
 	auto& state   = GetStream(stream);
 	state.frames  = 0;
@@ -126,6 +151,8 @@ public:
 #define SDL_GetAudioStreamQueued    Fake::GetAudioStreamQueued
 #define SDL_PutAudioStreamData      Fake::PutAudioStreamData
 #define SDL_ClearAudioStream        Fake::ClearAudioStream
+#define SDL_GetAudioStreamDevice    Fake::GetAudioStreamDevice
+#define SDL_GetAudioDeviceFormat    Fake::GetAudioDeviceFormat
 #include "libs/audio.cpp"
 #undef Thread
 #undef SDL_InitSubSystem
@@ -136,6 +163,8 @@ public:
 #undef SDL_GetAudioStreamQueued
 #undef SDL_PutAudioStreamData
 #undef SDL_ClearAudioStream
+#undef SDL_GetAudioStreamDevice
+#undef SDL_GetAudioDeviceFormat
 
 namespace Libs::Controller {
 int GetActiveControllerId() {
@@ -189,6 +218,9 @@ struct Fixture {
 		pad_connected = pad_bluetooth = false;
 		pad_queue_us = 0;
 		queued_pad_gains = nullptr;
+		device_speed                         = 1.0;
+		device_period                        = 0;
+		Libs::Audio::g_device_restart_logged = false;
 		sleeps.clear();
 	}
 
@@ -204,8 +236,11 @@ struct Fixture {
 	}
 
 	void Prime(Audio::Id port) {
-		const auto start = now;
-		for (int i = 0; i < 8; i++) {
+		// The cushion: 40 ms of blocks, or the device's period and two blocks if that is more.
+		const auto period = device_period != 0 ? device_period : 1024u;
+		const int  blocks = std::max<int>(8, static_cast<int>((period + 255) / 256) + 2);
+		const auto start  = now;
+		for (int i = 0; i < blocks; i++) {
 			Output(port);
 		}
 		Check(now == start, "priming was paced before the 40 ms cushion filled");
@@ -213,7 +248,9 @@ struct Fixture {
 		Check(now - start >= 5333 && now - start <= 5334,
 		      "priming accumulated a multi-block deadline");
 		Drain(*streams.front());
-		Check(streams.front()->frames >= uint64_t {7 * 256} * 1000000,
+		// One block was due by then, or one whole pull of a device that takes them.
+		const uint64_t due = device_period != 0 ? device_period : 256;
+		Check(streams.front()->frames >= (uint64_t(blocks) * 256 - due) * 1000000,
 		      "first paced output consumed the priming cushion");
 	}
 };
@@ -242,21 +279,114 @@ void TestUnderrunAndStalledQueueRecovery() {
 	now += 1000000;
 	f.Prime(port);
 
-	// A stopped device must clear its stale queue and restart priming, not catch up old deadlines.
-	stalled = true;
-	for (int i = 0; i < 3 && clears == 0; i++) {
+	// A stopped device's stale queue is cleared and starts over at its cushion, in silence; the
+	// guest keeps its 48 kHz cadence throughout instead of waiting on the queue or priming ahead of
+	// it.
+	stalled                = true;
+	const auto stall_start = now;
+	for (int i = 0; i < 60 && clears == 0; i++) {
 		f.Output(port);
 	}
 	Check(clears == 1, "stalled playback queue was not cleared");
-	stalled          = false;
+	Check(now - stall_start >= 200000 && now - stall_start <= 211000,
+	      "stalled device was not cleared after 200 ms, or the guest waited on it");
 	const auto start = now;
-	for (int i = 0; i < 7; i++) {
+	for (int i = 0; i < 375; i++) { // 2 s more of the stall, then 2 s of a healthy device
 		f.Output(port);
 	}
-	Check(now == start, "queue clear did not restart unpaced priming");
-	f.Output(port);
-	Check(now - start >= 5333 && now - start <= 5334,
-	      "queue clear retained an old pacing deadline");
+	stalled = false;
+	for (int i = 0; i < 375; i++) {
+		f.Output(port);
+	}
+	Check(now - start >= 3999999 && now - start <= 4000001,
+	      "a stalled device changed the guest's cadence");
+}
+
+// Outputs `blocks` 256-frame blocks after `work` us of the guest's own work each; how long they
+// took and the most the queue held.
+struct DeviceRun {
+	uint64_t elapsed = 0, queued_max = 0;
+};
+DeviceRun RunDevice(Fixture& f, Audio::Id port, int blocks, uint32_t work = 0) {
+	DeviceRun  run;
+	const auto start = now;
+	for (int i = 0; i < blocks; i++) {
+		now += work;
+		f.Output(port);
+		Drain(*streams.front());
+		run.queued_max = std::max(run.queued_max, streams.front()->frames / 1000000);
+	}
+	run.elapsed = now - start;
+	return run;
+}
+
+// A device that plays slower or faster than its nominal rate (BC-250 DisplayPort audio ran ~14%
+// slow with a wrong audio clock), or takes audio in large pulls, must not set the guest's pace: the
+// 48 kHz clock does. A slow one's backlog is dropped and a fast one's dry queue starts over in
+// silence; a device at its rate is never restarted.
+void TestDriftingDeviceDoesNotPaceGuest() {
+	for (const double speed: {0.857, 0.95, 0.999, 1.0, 1.0001, 1.05}) {
+		for (const uint32_t period: {0u, 1024u, 4096u}) {
+			Fixture f;
+			device_speed    = speed;
+			device_period   = period;
+			const auto port = f.Open();
+			f.Prime(port);
+			const auto run = RunDevice(f, port, 5625); // 30 s
+			if (getenv("AUDIO_TEST_VERBOSE") != nullptr) {
+				std::fprintf(stderr,
+				             "speed %.4f period %u: 30 s took %llu us, clears %d, queue max %llu\n",
+				             speed, period, static_cast<unsigned long long>(run.elapsed), clears,
+				             static_cast<unsigned long long>(run.queued_max));
+			}
+			Check(run.elapsed >= 29999999 && run.elapsed <= 30000001,
+			      "a drifting device changed the guest's 48 kHz cadence");
+			// The cushion, the backlog margin (two pulls and 30 ms) and a pull in flight.
+			const uint64_t pull = std::max(period, 1024u);
+			const uint64_t most = std::max<uint64_t>(8 * 256, (pull + 255) / 256 * 256 + 512) +
+			                      2 * pull + 1440 + pull + 256;
+			Check(run.queued_max <= most, "a drifting device's queue grew past its backlog margin");
+			if (std::abs(speed - 1.0) < 0.002) {
+				Check(clears == 0, "a device near its rate had its queue restarted");
+			} else {
+				Check(clears > 0 && Libs::Audio::g_device_restart_logged,
+				      "a drifting device's queue was never restarted, or not reported");
+			}
+		}
+	}
+}
+
+// A device that skips pulls for 100 ms (an xrun) leaves a backlog: it is dropped once, not kept as
+// latency, and the guest's cadence does not change.
+void TestDeviceGapIsDropped() {
+	Fixture f;
+	device_period   = 1024;
+	const auto port = f.Open();
+	f.Prime(port);
+	RunDevice(f, port, 1875);
+	stalled = true;
+	RunDevice(f, port, 19); // ~100 ms
+	stalled        = false;
+	const auto run = RunDevice(f, port, 3750);
+	Check(run.elapsed >= 19999999 && run.elapsed <= 20000001,
+	      "a device gap changed the guest's cadence");
+	Check(clears == 1, "a device gap's backlog was not dropped, or more than once");
+}
+
+// A guest that produces audio late underruns and primes again, as before: its queue is not
+// restarted and the device is not reported. Work within a block's time is not lateness: the clock
+// sleeps less.
+void TestLateGuestUnderruns() {
+	Fixture f;
+	device_period   = 1024;
+	const auto port = f.Open();
+	f.Prime(port);
+	const auto run = RunDevice(f, port, 1875, 4000);
+	Check(run.elapsed >= 9999999 && run.elapsed <= 10000001,
+	      "work within a block's time changed the cadence");
+	RunDevice(f, port, 3750, 5600); // longer than the 5333 us block: 95% of real time
+	Check(clears == 0 && !Libs::Audio::g_device_restart_logged,
+	      "a late guest's underruns were taken for a fast device");
 }
 
 void TestFallbackClockAndLongGap() {
@@ -461,6 +591,9 @@ void TestChannelGains() {
 int main() {
 	TestPrimingAndSteadyCadence();
 	TestUnderrunAndStalledQueueRecovery();
+	TestDriftingDeviceDoesNotPaceGuest();
+	TestDeviceGapIsDropped();
+	TestLateGuestUnderruns();
 	TestFallbackClockAndLongGap();
 	TestAsyncDoesNotAccumulateDeadlines();
 	TestSynchronizedBatchAndInactivePorts();
