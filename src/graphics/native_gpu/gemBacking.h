@@ -142,8 +142,12 @@ public:
 	// per-draw references, no CPU-write scan before each submission) while every such block got
 	// resident (MapComplete). That is within a budget: the PS5's game memory is its own, here the
 	// system and Steam share it (ASTRO BOT maps 12.5 GiB of 15). A block that would leave less than
-	// KYTY_NATIVE_GPU_MAP_RESERVE_MIB (default 1536) of available RAM stays out, and from then on
-	// submissions make blocks resident as they reference them. KYTY_NATIVE_GPU_RESIDENCY=partial:
+	// KYTY_NATIVE_GPU_MAP_RESERVE_MIB (default 512) of available RAM and free swap stays out (MapBudgetAllows), and from then on
+	// submissions make blocks resident as they reference them, which costs the translator per-draw
+	// references for the whole game. The default was 1536 until 3.11: Demon's Souls (12688 MiB with its
+	// direct memory, Steam unloaded) then stopped at 12320 MiB and ran on references, its frames 18 ms
+	// median and 28% over 20 ms while moving; with 512 every block is resident and the same replay holds
+	// 16.6 ms, 2% over 20 ms, the system's own pages going to swap, which the budget now counts as room. KYTY_NATIVE_GPU_RESIDENCY=partial:
 	// always that way.
 	static bool ResidencyAtMap() {
 		static const bool on = [] {
@@ -2362,23 +2366,37 @@ private:
 	static uint64_t MapReserve() {
 		static const uint64_t reserve = [] {
 			const char* v = std::getenv("KYTY_NATIVE_GPU_MAP_RESERVE_MIB");
-			return (v != nullptr ? std::strtoull(v, nullptr, 0) : 1536ull) << 20u;
+			return (v != nullptr ? std::strtoull(v, nullptr, 0) : 512ull) << 20u;
 		}();
 		return reserve;
 	}
 
-	// True when `bytes` more of resident memory still leave MapReserve() of MemAvailable.
+	// True when `bytes` more of resident memory still leave MapReserve() of MemAvailable plus SwapFree. On the PS5 a game's
+	// memory is its own and always resident; here the system shares the RAM, and its own pages (Steam's helpers,
+	// gamescope, the desktop) can go to swap where the game's cannot, so free swap counts as room: a game falls back to
+	// per-reference residency (the translator's per-draw references, for the rest of the game) only when RAM and swap
+	// together run out, or when amdgpu refuses the buffer (the GTT limit). With MemAvailable alone, Demon's Souls stopped
+	// at 12320 of 12688 MiB on 3.11 and ran on references, 28% of its frames over 20 ms while moving.
 	static bool MapBudgetAllows(uint64_t bytes) {
 		FILE* f = std::fopen("/proc/meminfo", "re");
 		if (f == nullptr) {
 			return true;
 		}
 		char               line[128];
-		unsigned long long kib = 0;
-		while (std::fgets(line, sizeof(line), f) != nullptr && std::sscanf(line, "MemAvailable: %llu kB", &kib) != 1) {
+		unsigned long long avail = 0;
+		unsigned long long swap  = 0;
+		bool               have  = false;
+		while (std::fgets(line, sizeof(line), f) != nullptr) {
+			unsigned long long v = 0;
+			if (std::sscanf(line, "MemAvailable: %llu kB", &v) == 1) {
+				avail = v;
+				have  = true;
+			} else if (std::sscanf(line, "SwapFree: %llu kB", &v) == 1) {
+				swap = v;
+			}
 		}
 		std::fclose(f);
-		return kib == 0 || (kib << 10u) >= bytes + MapReserve();
+		return !have || ((avail + swap) << 10u) >= bytes + MapReserve();
 	}
 
 	// Moves block `index` into a new buffer: from the memfd, or, for a resident block, from its old
