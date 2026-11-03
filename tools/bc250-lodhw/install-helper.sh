@@ -24,5 +24,7 @@ dir=${KYTY_HELPER_FILES:-$(dirname "$(readlink -f "$0")")}
 install -Dm755 "$dir/kyty-lodhw" "$bin/kyty-lodhw"
 sed "s|@GID@|${SUDO_GID:-$(id -g)}|; s|@BIN@|$bin|" "$dir/kyty-lodhw.service" > "$unit"
 systemctl daemon-reload
-systemctl enable --now kyty-lodhw.service
+# An update replaces the binary under a running helper: restart it, or the old one keeps serving until a reboot.
+systemctl enable kyty-lodhw.service
+systemctl restart kyty-lodhw.service
 systemctl --no-pager --lines=0 status kyty-lodhw.service
