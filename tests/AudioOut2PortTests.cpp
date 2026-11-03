@@ -670,6 +670,33 @@ void TestPcmCopiedBeforeScratchBufferReuse() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestAdvancedGrainsPlayOldestFirst() {
+	// As on the console: each Advance copies the ports' PCM as one grain, each Push plays the
+	// oldest copy, and the queue level counts the grains advanced and not yet pushed.
+	const auto context = CreateContext();
+	const auto port    = CreatePort(context, MakeParam());
+	g_process_time_frozen = true;
+	const std::vector<float> first(512 * 2, 0.25f);
+	const std::vector<float> second(512 * 2, -0.5f);
+	SetPcm(port, first.data());
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "first advance failed");
+	SetPcm(port, second.data());
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "second advance failed");
+	uint32_t queued    = 0;
+	uint32_t available = 0;
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK,
+	      "queue-level query failed");
+	Check(queued == 2 && available == 2, "queue level did not count the advanced grains");
+	const auto pcm_bytes = first.size() * sizeof(float);
+	CheckSamples(PushPcm(context, pcm_bytes).at(0), {0.25f}, "push did not play the oldest grain");
+	CheckSamples(PushPcm(context, pcm_bytes).at(0), {-0.5f}, "push did not play the next grain");
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK,
+	      "queue-level query failed");
+	Check(queued == 2 && available == 2, "pushed grains left the queue level");
+	g_process_time_frozen = false;
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 void TestPortGainAndValidation() {
 	const auto context = CreateContext();
 	const auto port = CreatePort(context, MakeParam());
@@ -743,6 +770,7 @@ void TestObjectGainAndAmbisonics() {
 		std::fill(integer.begin(), integer.end(), 0);
 		SetAttribute(object, 1, 0.0f);
 		SetAttribute(object, 8, 65u);
+		Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "context advance failed");
 		const auto output = PushPcm(context, output_bytes);
 		Check(output.size() == 1, "object-only push did not output exactly once");
 		CheckSamples(output[0], {0.5f * half_power, 0.5f * half_power},
@@ -750,23 +778,23 @@ void TestObjectGainAndAmbisonics() {
 		std::fill(floating.begin(), floating.end(), 0.5f);
 		std::fill(integer.begin(), integer.end(), 16384);
 		for (const auto& test: cases) {
-			Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "context advance failed");
 			const Pcm input {pcm};
 			const float gain = 0.5f;
 			const Attribute attributes[] {{0, 0, &input, sizeof(input)}, {1, 0, &gain, sizeof(gain)},
 			                              {8, 0, &test.channel, sizeof(test.channel)}};
 			Check(AudioOut2::AudioOut2PortSetAttributes(object, AsAttribute(attributes), 3) == OK,
 			      "object attributes could not be set atomically with PCM first");
+			Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "context advance failed");
 			CheckSamples(PushPcm(context, output_bytes).at(0), {0.25f * test.left, 0.25f * test.right},
 			             "object gain or ambisonics decoded incorrectly or accumulated across pushes");
 		}
-		AudioOut2::AudioOut2ContextAdvance(context);
 		SetAttribute(object, 8, UINT32_MAX);
 		SetAttribute(object, 1, 0.0f);
 		SetPcm(object, pcm);
-		CheckSamples(PushPcm(context, output_bytes).at(0), {0.0f}, "zero gain did not mute object");
 		AudioOut2::AudioOut2ContextAdvance(context);
+		CheckSamples(PushPcm(context, output_bytes).at(0), {0.0f}, "zero gain did not mute object");
 		SetPcm(object, pcm);
+		AudioOut2::AudioOut2ContextAdvance(context);
 		CheckSamples(PushPcm(context, output_bytes).at(0), {0.0f}, "object gain did not persist");
 		AudioOut2::AudioOut2ContextDestroy(context);
 		Check(LiveDeviceCount() == 0, "object context leaked its output device");
@@ -938,6 +966,7 @@ int main() {
 	TestPushConsumesPcm();
 	TestQueueDrainsAtExactGrainRate();
 	TestPcmCopiedBeforeScratchBufferReuse();
+	TestAdvancedGrainsPlayOldestFirst();
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
