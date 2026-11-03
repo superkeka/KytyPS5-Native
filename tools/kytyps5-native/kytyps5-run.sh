@@ -6,7 +6,8 @@
 # big PS5 game needs (Gran Turismo 7 uses ~12.6 of 14.8 GB). It comes back on any exit. --keep-steam
 # leaves Steam running (enough for smaller games; its overlay and menu stay).
 # ~/.config/KytyPS5-Native/boot.webm plays before the game and exit.webm when the game is left from the
-# in-game menu (PS button). A missing file plays nothing.
+# in-game menu (PS button). A missing file plays nothing. ~/.config/KytyPS5-Native/hdr (the plugin's HDR
+# toggle) lets the game run in HDR when gamescope outputs it.
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -133,11 +134,13 @@ done
 	notice "KytyPS5-Native update available" "$(head -1 "$CONFIG/update-available"): update it in the Decky plugin"
 [ -n "$NOTICE_TITLES" ] && export KYTY_NOTICE_TITLE="$NOTICE_TITLES" KYTY_NOTICE_TEXT="$NOTICE_TEXTS"
 
-# HDR: when gamescope outputs HDR (Steam's display setting), Kyty gets an HDR10 swapchain. With Steam
-# stopped, the gamescope WSI layer (which offers the HDR10 formats) is asked for here; Kyty falls back
-# to SDR when the surface offers no HDR10 format.
+# HDR, when the Decky plugin's HDR toggle is on ($CONFIG/hdr; off by default: ASTRO BOT looks washed out
+# in HDR, issue #7): when gamescope outputs HDR (Steam's display setting), Kyty gets an HDR10 swapchain.
+# With Steam stopped, the gamescope WSI layer (which offers the HDR10 formats) is asked for here; Kyty
+# falls back to SDR when the surface offers no HDR10 format.
 HDR_ARGS=
-if [ "$(DISPLAY=$ROOT_DISPLAY xprop -root GAMESCOPE_DISPLAY_HDR_ENABLED 2>/dev/null | awk '{print $NF}')" = 1 ]; then
+if [ -e "$CONFIG/hdr" ] &&
+	[ "$(DISPLAY=$ROOT_DISPLAY xprop -root GAMESCOPE_DISPLAY_HDR_ENABLED 2>/dev/null | awk '{print $NF}')" = 1 ]; then
 	# The layer talks to gamescope over its own Wayland socket: Steam gives a game its name, this
 	# unit (Steam stopped) reads it where gamescope-session leaves its environment.
 	: "${GAMESCOPE_WAYLAND_DISPLAY:=$(sed -n 's/^GAMESCOPE_WAYLAND_DISPLAY=//p' \

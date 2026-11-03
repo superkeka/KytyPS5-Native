@@ -39,6 +39,7 @@ interface State {
   games: Game[];
   gone: Record<string, { appid: number }>;
   videos: Record<string, boolean>;
+  hdr: boolean;
   kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "limine" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
   game_running: boolean;
 }
@@ -64,6 +65,7 @@ const kernelRevert = callable<[], Result>("kernel_revert");
 const reboot = callable<[], void>("reboot");
 const setGamesDir = callable<[path: string], void>("set_games_dir");
 const setVideo = callable<[kind: string, on: boolean], Result>("set_video");
+const setHdr = callable<[on: boolean], Result>("set_hdr");
 const setArtVersion = callable<[version: number], void>("set_art_version");
 
 const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({ title, body });
@@ -313,6 +315,23 @@ function Content() {
                   : state.games.length
                     ? `Synced to the Non-Steam library on their own. Total ${(state.games.reduce((sum, g) => sum + g.size, 0) / 1e9).toFixed(1)} GB`
                     : "No games found: a game is a folder with sce_sys/param.json in it"
+            }
+          />
+        </PanelSectionRow>
+      </PanelSection>
+
+      <PanelSection title="Display">
+        <PanelSectionRow>
+          <ToggleField
+            label="HDR"
+            description="HDR10 when Steam's display outputs HDR. Applies from the next game start"
+            checked={state.hdr}
+            disabled={!!busy}
+            onChange={(on) =>
+              run("HDR", async () => {
+                const r = await setHdr(on);
+                if (!r.ok) toast(r.log || "failed");
+              })
             }
           />
         </PanelSectionRow>
