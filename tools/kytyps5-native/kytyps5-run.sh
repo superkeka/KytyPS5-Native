@@ -117,7 +117,8 @@ for dev in /sys/class/drm/card*/device; do
 	0x1002:0x13fe | 0x1002:0x13da)
 		param() { cat "/sys/module/amdgpu/parameters/$1" 2>/dev/null; }
 		off=""
-		grep -q 'ttm.pages_limit=3670016' /proc/cmdline || off="$off, GTT 14 GiB"
+		# The limit ttm runs with: a command line can hold ttm.pages_limit twice and the last one wins.
+		[ "$(cat /sys/module/ttm/parameters/pages_limit 2>/dev/null)" = 3670016 ] || off="$off, GTT 14 GiB"
 		[ "$(param sched_policy)" = 2 ] || off="$off, sched_policy=2"
 		if [ ! -e /sys/module/amdgpu/parameters/bc250_gfx_queues ]; then
 			[ "$(param vm_update_mode)" = 0 ] || off="$off, vm_update_mode=0"

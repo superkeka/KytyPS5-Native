@@ -204,7 +204,7 @@ function Content() {
                     () =>
                       run("Kernel", async () => {
                         const r = await kernelApply();
-                        toast(r.ok ? "Applied, reboot to use it" : r.log || "failed");
+                        toast(r.ok ? ["Applied, reboot to use it", r.log].filter(Boolean).join(". ") : r.log || "failed");
                       }),
                   )
                 }
@@ -220,7 +220,7 @@ function Content() {
                   confirm("Revert", "Remove the kernel options this plugin added (only those)? Takes effect after a reboot.", "Revert", () =>
                     run("Kernel", async () => {
                       const r = await kernelRevert();
-                      toast(r.ok ? "Reverted, reboot to finish" : r.log || "failed");
+                      toast(r.ok ? ["Reverted, reboot to finish", r.log].filter(Boolean).join(". ") : r.log || "failed");
                     }),
                   )
                 }

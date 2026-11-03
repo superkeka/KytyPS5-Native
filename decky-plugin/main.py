@@ -150,11 +150,14 @@ def _game_running():
 # --- kernel ---------------------------------------------------------------------------------------
 
 
-def _grub_lines():
-    text = ""
-    for p in ["/etc/default/grub"] + sorted(glob.glob("/etc/default/grub.d/*")):
-        text += _read(p) + "\n"
-    return text
+def _grub_cmdline():
+    """The kernel command line grub-mkconfig makes, read the way it reads it: /etc/default/grub,
+    grub.d/*.cfg, then SteamOS's grub-steamos, and GRUB_CMDLINE_LINUX before GRUB_CMDLINE_LINUX_DEFAULT
+    (a ttm.pages_limit later on wins over ours). stderr stays out: a broken line's error names its text."""
+    code, out = _run("sh", "-c", "exec 2>/dev/null; d=/etc/default; [ -f $d/grub ] && . $d/grub; "
+                     'for f in $d/grub.d/*.cfg; do [ -e "$f" ] && . "$f"; done; [ -f $d/grub-steamos ] && . $d/grub-steamos; '
+                     'printf "%s %s" "$GRUB_CMDLINE_LINUX" "$GRUB_CMDLINE_LINUX_DEFAULT"')
+    return out if code == 0 else ""
 
 
 def _modprobe_options():
@@ -232,14 +235,17 @@ def _kernel_status():
         kargs = _ostree_kargs(_rpm_ostree())
     elif method == "limine":
         kargs = _limine_kargs() or {}
-    cmdline = _read("/proc/cmdline")
-    m = re.search(r"ttm\.pages_limit=(\d+)", cmdline)
-    gtt_active = m.group(1) if m else ""
+    # The limit ttm runs with: a command line can hold the argument twice (bc250-toolkit sets its own in
+    # /etc/default/limine) and the last one wins, so a first match would read the wrong one.
+    gtt_active = _read("/sys/module/ttm/parameters/pages_limit")
+    if gtt_active in ("", "0"):
+        m = re.findall(r"ttm\.pages_limit=(\d+)", _read("/proc/cmdline"))
+        gtt_active = m[-1] if m else ""
     if kargs is not None:
         gtt_conf = kargs.get("ttm.pages_limit", "")
     else:
-        g = re.search(r"ttm\.pages_limit=(\d+)", _grub_lines())
-        gtt_conf = g.group(1) if g else ""
+        g = re.findall(r"ttm\.pages_limit=(\d+)", _grub_cmdline())
+        gtt_conf = g[-1] if g else ""
     items = [{
         "key": "gtt", "label": "GTT 14 GiB", "want": GTT_PAGES,
         "active": gtt_active, "configured": gtt_conf,
@@ -290,6 +296,35 @@ def _update_boot():
     return 1, "no update-grub or grub-mkconfig: add ttm.pages_limit=%s to the kernel command line" % GTT_PAGES
 
 
+def _boot_entries():
+    """The firmware's BootOrder and each entry's line (with its loader path)."""
+    code, out = _run("efibootmgr", "-v") if shutil.which("efibootmgr") else (1, "")
+    if code != 0:
+        return [], {}
+    m = re.search(r"^BootOrder:[ \t]*(\S+)", out, re.M)
+    lines = {e[4:8]: e for e in out.splitlines() if re.match(r"Boot[0-9A-Fa-f]{4}", e)}
+    return (m.group(1).split(",") if m else []), lines
+
+
+def _limine_update():
+    """limine-update, with the firmware's first boot entry kept first. When limine-update registers its
+    entry again (after an NVRAM reset, or with an older limine-entry-tool) it puts it in front, and an
+    entry another tool keeps first would then never run: bc250-toolkit's CoreUnlock, which unlocks the
+    CPU cores before the bootloader. The \\EFI\\BOOT fallback is not put back in front of a fresh entry."""
+    before, lines = _boot_entries()
+    code, out = _run("limine-update")
+    after, _ = _boot_entries()
+    first = before[0] if before else ""
+    note = ""
+    if first and after and after[0] != first and first in after and \
+            not re.search(r"\\EFI\\BOOT\\BOOTX64\.EFI", lines.get(first, ""), re.I):
+        c, _ = _run("efibootmgr", "-o", ",".join([first] + [b for b in after if b != first]))
+        name = lines.get(first, "")[8:].lstrip("* ").split("\t")[0].strip() or f"Boot{first}"
+        note = f"limine-update moved {name} down the boot order: put first again" if c == 0 else \
+            f"limine-update moved {name} down the boot order and efibootmgr -o could not put it back"
+    return code, out, note
+
+
 def _limine_apply(st):
     """The arguments still missing go into the plugin's limine-entry-tool drop-in (with the ones it
     holds already); limine-update then writes the boot entries and initramfs. A value set otherwise
@@ -308,6 +343,15 @@ def _limine_apply(st):
     before = _limine_kargs()
     if before is None:
         return {"ok": False, "log": "limine-entry-tool --get-cmdline failed"}
+    # On a failure the drop-in goes back to what it was, so arguments that already worked stay.
+    prev = _read(LIMINE_CONF) if os.path.exists(LIMINE_CONF) else None
+
+    def restore():
+        if prev is None:
+            os.remove(LIMINE_CONF)
+        else:
+            with open(LIMINE_CONF, "w") as f:
+                f.write(prev + "\n")
     os.makedirs(os.path.dirname(LIMINE_CONF), exist_ok=True)
     with open(LIMINE_CONF, "w") as f:
         f.write("# KytyPS5-Native (Decky plugin): GTT 14 GiB and KFD queues for PS5 games.\n"
@@ -318,19 +362,21 @@ def _limine_apply(st):
     lost = [k for k in before if k not in after and f"{k}={before[k]}" not in ours]
     missing = [a for a in add if a.split("=", 1)[0] not in after]
     if lost or missing:
-        os.remove(LIMINE_CONF)
+        restore()
         return {"ok": False, "log": "limine-entry-tool would " +
                 (f"drop {' '.join(lost)}" if lost else f"not take {' '.join(missing)}") +
                 ": add the arguments to KERNEL_CMDLINE in /etc/default/limine by hand (README)"}
-    code, out = _run("limine-update")
+    code, out, note = _limine_update()
     if code != 0:
-        os.remove(LIMINE_CONF)
-        _run("limine-update")
-        return {"ok": False, "log": out[-400:]}
+        restore()
+        code2, _, note2 = _limine_update()
+        out = "\n".join(x for x in [out[-400:], note or note2,
+                                    code2 != 0 and "limine-update failed again with the previous drop-in: the boot entries may be stale"] if x)
+        return {"ok": False, "log": out}
     s = _load()
     s.pop("reverted_boot", None)
     _save(s)
-    return {"ok": True, "log": "\n".join(log)}
+    return {"ok": True, "log": "\n".join(x for x in log + [note] if x)}
 
 
 # --- games ----------------------------------------------------------------------------------------
@@ -658,16 +704,17 @@ class Plugin:
             if st["method"] == "limine":
                 return _limine_apply(st)
             gtt = st["items"][0]
-            if gtt["configured"] != GTT_PAGES and not gtt["ok"]:
+            if gtt["configured"] and gtt["configured"] != GTT_PAGES:
+                log.append(f"ttm.pages_limit={gtt['configured']} is set in the GRUB config: left as it is")
+            elif gtt["configured"] != GTT_PAGES and not gtt["ok"]:
                 # Stock SteamOS has no grub.d; its grub-mkconfig reads grub.d/*.cfg all the same.
                 os.makedirs(os.path.dirname(GRUB_CFG), exist_ok=True)
                 with open(GRUB_CFG, "w") as f:
                     f.write("# KytyPS5-Native (Decky plugin): GTT 14 GiB for PS5 games.\n"
                             f'GRUB_CMDLINE_LINUX="${{GRUB_CMDLINE_LINUX}} ttm.pages_limit={GTT_PAGES}"\n')
                 code, out = _update_boot()
-                log.append(out[-300:])
                 if code != 0:
-                    return {"ok": False, "log": "\n".join(log)}
+                    return {"ok": False, "log": "\n".join(log + [out[-300:]])}
             mine = {}
             for it in st["items"][1:]:
                 if it["configured"] and it["configured"] != it["want"] and it.get("file") != MODPROBE_CONF:
@@ -703,13 +750,23 @@ class Plugin:
                 s["ostree_kargs"] = []
                 _save(s)
             elif os.path.exists(LIMINE_CONF):
+                prev = _read(LIMINE_CONF)
                 os.remove(LIMINE_CONF)
-                code, out = _run("limine-update")
+                code, out, note = _limine_update()
                 if code != 0:
-                    return {"ok": False, "log": out[-400:]}
+                    # Back as it was, boot entries included.
+                    with open(LIMINE_CONF, "w") as f:
+                        f.write(prev + "\n")
+                    code2, _, note2 = _limine_update()
+                    out = "\n".join(x for x in [out[-400:], note or note2,
+                                                code2 != 0 and "limine-update failed again with the drop-in back: the boot entries may be stale"] if x)
+                    return {"ok": False, "log": out}
+                log.append(note)
             elif os.path.exists(GRUB_CFG):
                 os.remove(GRUB_CFG)
-                log.append(_update_boot()[1][-300:])
+                code, out = _update_boot()
+                if code != 0:
+                    log.append(out[-300:])
             s = _load()
             s["reverted_boot"] = _read("/proc/sys/kernel/random/boot_id")
             _save(s)
