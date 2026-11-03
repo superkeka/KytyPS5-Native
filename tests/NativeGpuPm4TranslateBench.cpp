@@ -6,6 +6,16 @@
 // Build and run (Mac or Linux):
 //   clang++ -std=c++20 -O2 -g -Wall -Wextra -Isrc src/graphics/native_gpu/nativePm4.cpp tests/NativeGpuPm4TranslateBench.cpp -o t
 //   ./t [flips] [--digest] [--dump FILE] [--cx N] [--sh N] [--uc N] [--ud PERCENT] [--chunks N] [--variant norefs|nodirect|noshadow|nolabels|fullrefs]
+//       [--acbs N] [--views N] [--churn K] [--seen N] [--cold MIB]
+// What the board shows and a warm loop over one DCB does not (all off by default, the digest is the DCB's alone):
+//   --acbs N   N ACBs a flip (Demon's Souls: 18, 26k dwords), translated between the chunks by a compute-ring translator
+//              as the backend's ACB translator is set up, and timed apart;
+//   --views N  MakeResident with GemBacking's N views in a std::map: when the views' generation changes it copies the
+//              merged ranges again, forgets which 16 MiB buckets it promoted and asks for each again (PromoteGuestRange:
+//              a lock and a map lookup); --churn K: the generation changes every K chunks (default 1);
+//   --seen N   DetectShaders' set holds N shaders already, as after a few minutes of play;
+//   --cold MIB before each chunk and ACB, MIB of other memory are written: the title writes its DCB and tables on
+//              other cores, so on the board they are not in this core's caches.
 // The digest covers everything Translate returns that the backend uses (IB, resume, references, shaders, segments, points,
 // CPU tail): an optimization must leave it unchanged. Tables, labels and the DCB live in an arena at a fixed address so the
 // digest does not depend on where the allocator puts them.
@@ -21,6 +31,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <span>
 #include <string>
@@ -112,6 +125,7 @@ struct Mix {
 	uint32_t sh_pairs   = 12;
 	uint32_t uc_pairs   = 3;
 	uint32_t chunks     = 22;
+	uint32_t acbs       = 0;  // ACBs a flip (--acbs)
 };
 
 // Guest-like addresses user data and tables point at: 256 buffers spread over ~40 16 MiB buckets.
@@ -121,6 +135,7 @@ uint64_t GuestShader(uint32_t i) { return 0x300000000ull + static_cast<uint64_t>
 struct Flip {
 	std::span<uint32_t>                        dcb;
 	std::vector<std::pair<uint32_t, uint32_t>> chunks; // [begin, end) at packet boundaries
+	std::vector<std::span<uint32_t>>           acbs;
 };
 
 Flip Generate(Arena& arena, const Mix& m) {
@@ -337,6 +352,49 @@ Flip Generate(Arena& arena, const Mix& m) {
 		}
 	}
 	f.chunks.emplace_back(begin, static_cast<uint32_t>(dcb.size()));
+	// ACBs (after the DCB in the arena and from their own generator, so the DCB stays as it was): compute work as
+	// libSceAgc records it, about 1.5k dwords each: a wait for a label, then dispatches with their program table and
+	// user data, a cache flush every few, and the release of a label at the end.
+	Rng acb_rng;
+	acb_rng.s ^= 0x5bd1e995ull;
+	for (uint32_t a = 0; a < m.acbs; a++) {
+		std::vector<uint32_t> acb;
+		auto put = [&](uint32_t op, std::initializer_list<uint32_t> body) {
+			acb.push_back(Pkt3(op, static_cast<uint32_t>(body.size()), true));
+			acb.insert(acb.end(), body.begin(), body.end());
+		};
+		{
+			const uint32_t l   = acb_rng.Below(64);
+			const uint64_t dst = reinterpret_cast<uint64_t>(&labels[l]);
+			put(IT_WAIT_REG_MEM, {3u | 0x10u, static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u),
+			                      static_cast<uint32_t>(labels[l]), 0xffffffffu, 4u});
+		}
+		for (uint32_t d = 0; acb.size() < 1400u; d++) {
+			const uint32_t* t   = sh_pool[(10u * acb_rng.Below(60) + acb_rng.Below(3)) % sh_pool.size()];
+			const auto      tva = reinterpret_cast<uint64_t>(t);
+			put(IT_SET_SH_REG_INDIRECT, {static_cast<uint32_t>(tva), static_cast<uint32_t>(tva >> 32u), 0x80000000u, m.sh_pairs});
+			const uint32_t n = 2u + 2u * acb_rng.Below(6);
+			acb.push_back(Pkt3(IT_SET_SH_REG, n + 1u, true));
+			acb.push_back(0x240u);
+			for (uint32_t i = 0; i < n; i++) {
+				acb.push_back((i & 1u) == 0u ? static_cast<uint32_t>(GuestBuffer(acb_rng.Below(256))) : 0x2u | (16u << 16u));
+			}
+			put(IT_DISPATCH_DIRECT, {1u + acb_rng.Below(64), 1u + acb_rng.Below(8), 1u, 1u});
+			if (d % 6u == 5u) {
+				put(0x58u /* ACQUIRE_MEM */, {0u, 0xffffffffu, 0xffffffu, 0u, 0u, 0xau, 0x0u});
+			}
+		}
+		{
+			const uint32_t l   = label_seq % 64u;
+			const uint64_t dst = reinterpret_cast<uint64_t>(&labels[l]);
+			put(IT_RELEASE_MEM, {0x28u | (5u << 8u), 1u << 29u, static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u), label_seq,
+			                     0u, 0u});
+			label_seq++;
+		}
+		uint32_t* p = arena.Dwords(acb.size());
+		std::memcpy(p, acb.data(), acb.size() * 4u);
+		f.acbs.emplace_back(p, acb.size());
+	}
 	return f;
 }
 
@@ -367,6 +425,18 @@ void Configure(Pm4Translator& t, BenchOracle& o) {
 	} else if (g_variant == "fullrefs") {
 		t.SetCompactRefs(false);
 	}
+}
+
+// As the backend sets up its ACB translator for compute rings (Shadow: SetComputeRing, SetComputeQueue, compact references).
+void ConfigureAcb(Pm4Translator& t, BenchOracle& o) {
+	t.SetNativeLabels(&o, kTrackerVa + 16u);
+	t.SetFenceAddress(kFenceVa + 8u);
+	t.SetExitGuard(kScratchVa + 0x100, kScratchVa + 0x108, kScratchVa + 0x110);
+	t.SetComputeRing(true);
+	t.SetComputeQueue(true);
+	t.SetCompactRefs(true);
+	t.SetCollectRefs(true);
+	t.SetWaitsVerbatim(true);
 }
 
 struct Digest {
@@ -435,14 +505,149 @@ double NowMs() {
 
 volatile uint64_t g_sink = 0;
 
+// DetectShaders' set of scanned shaders as nativeShadow.cpp keeps it (Shadow::SeenShaders): open addressing.
+struct SeenShaders {
+	std::vector<uint64_t> slots = std::vector<uint64_t>(4096);
+	size_t                count = 0;
+	bool                  Insert(uint64_t va) {
+        if (2 * (count + 1) > slots.size()) {
+            std::vector<uint64_t> old = std::move(slots);
+            slots.assign(old.size() * 2, 0);
+            for (uint64_t v: old) {
+                if (v != 0) {
+                    Place(v);
+                }
+            }
+        }
+        if (!Place(va)) {
+            return false;
+        }
+        count++;
+        return true;
+	}
+	bool Place(uint64_t va) {
+		const size_t mask = slots.size() - 1;
+		for (size_t i = static_cast<size_t>((va >> 8u) * 0x9e3779b97f4a7c15ull >> 32u) & mask;; i = (i + 1) & mask) {
+			if (slots[i] == va) {
+				return false;
+			}
+			if (slots[i] == 0) {
+				slots[i] = va;
+				return true;
+			}
+		}
+	}
+};
+
 // What Shadow::Submit does around Translate for each chunk (nativeShadow.cpp), as far as it can run here: the second
 // FlattenIndirectBuffers (Submit inlines the already flat chunk again), the packet check of the IB and the resume,
 // MakeResident's bucket set and DetectShaders' set.
 struct SubmitSide {
 	std::set<uint64_t>           resident_buckets;
-	std::unordered_set<uint64_t> seen_shaders;
+	std::unordered_set<uint64_t> seen_shaders; // the set DetectShaders had before 3.11
+	SeenShaders                  seen_flat;
 	std::vector<uint64_t>        resident_bits = std::vector<uint64_t>((1ull << 16u) / 64u); // the same, a bit per bucket below 1 TiB
-	double                       flatten_ms = 0, validate_ms = 0, shaders_ms = 0, resident_ms = 0, resident_bits_ms = 0;
+	double                       flatten_ms = 0, validate_ms = 0, shaders_ms = 0, shaders_flat_ms = 0, resident_ms = 0, resident_bits_ms = 0;
+	// --views: GemBacking's views (vaddr -> size, backing offset) and what MakeResident keeps of them.
+	std::map<uint64_t, std::pair<uint64_t, uint64_t>> views;
+	std::vector<std::pair<uint64_t, uint64_t>>        view_ranges;
+	std::vector<uint64_t>                             view_buckets = std::vector<uint64_t>((1ull << 20u) / 64u); // 128 KiB, as on the board
+	std::mutex                                        view_lock;
+	uint32_t                                          churn = 1, submits = 0, refreshes = 0;
+	uint64_t                                          promote_calls = 0;
+	double                                            views_ms = 0;
+	std::vector<uint8_t>                              cold; // --cold
+	double                                            cold_ms = 0;
+
+	// Views of 64 KiB to 2 MiB tiling the guest memory the flip references (and more past it), inserted in a scattered
+	// order between other allocations, as a long-lived map's nodes are.
+	void MakeViews(uint32_t n) {
+		Rng                                       rng;
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		const uint64_t                            bases[] = {0x200000000ull, 0x300000000ull, kArenaVa, 0x400000000ull};
+		uint64_t                                  at[4]   = {bases[0], bases[1], bases[2], bases[3]};
+		for (uint32_t i = 0; i < n; i++) {
+			const uint32_t w    = i % 4u;
+			const uint64_t size = (1ull + rng.Below(32)) << 16u;
+			spans.emplace_back(at[w], size);
+			at[w] += size;
+		}
+		for (size_t i = spans.size(); i > 1; i--) {
+			std::swap(spans[i - 1], spans[rng.Below(static_cast<uint32_t>(i))]);
+		}
+		std::vector<std::unique_ptr<uint64_t[]>> noise;
+		uint64_t                                 offset = 0;
+		for (const auto& [va, size]: spans) {
+			views[va] = {size, offset};
+			offset += size;
+			noise.emplace_back(new uint64_t[1u + rng.Below(16)]);
+		}
+	}
+	void Evict() {
+		if (cold.empty()) {
+			return;
+		}
+		const double t0 = NowMs();
+		for (size_t i = 0; i < cold.size(); i += 64) {
+			cold[i]++;
+		}
+		cold_ms += NowMs() - t0;
+	}
+	// MakeResident's part that depends on the views (nativeShadow.cpp), without the ioctls.
+	void ResidentViews(const Pm4TranslateResult& r) {
+		const double t0 = NowMs();
+		if (submits++ % churn == 0) {
+			std::lock_guard<std::mutex> lock(view_lock);
+			std::vector<std::pair<uint64_t, uint64_t>> ranges;
+			for (const auto& [va, v]: views) {
+				if (!ranges.empty() && ranges.back().second == va) {
+					ranges.back().second += v.first;
+				} else {
+					ranges.emplace_back(va, va + v.first);
+				}
+			}
+			view_ranges = std::move(ranges);
+			std::fill(view_buckets.begin(), view_buckets.end(), 0ull);
+			refreshes++;
+		}
+		auto backed = [&](uint64_t addr) {
+			auto it = std::upper_bound(view_ranges.begin(), view_ranges.end(), std::make_pair(addr, ~0ull));
+			return it != view_ranges.begin() && addr < std::prev(it)->second;
+		};
+		auto promote = [&](uint64_t addr, uint64_t size) {
+			for (uint64_t b = addr >> 24u; b <= (addr + size - 1) >> 24u && b < (1ull << 20u); b++) {
+				uint64_t& w = view_buckets[b / 64u];
+				if ((w >> (b % 64u) & 1u) != 0) {
+					continue;
+				}
+				w |= 1ull << (b % 64u);
+				// PromoteGuestRange: the backing's lock and the views overlapping the bucket.
+				std::lock_guard<std::mutex> lock(view_lock);
+				auto it = views.upper_bound(b << 24u);
+				if (it != views.begin()) {
+					--it;
+				}
+				for (; it != views.end() && it->first < (b + 1u) << 24u; ++it) {
+					g_sink += it->second.second;
+				}
+				promote_calls++;
+			}
+		};
+		for (uint64_t addr: r.shader_addrs) {
+			if (backed(addr)) {
+				promote(addr, 64u * 1024u);
+			}
+		}
+		for (uint32_t b: r.ref_buckets) {
+			promote(static_cast<uint64_t>(b) << 24u, 1ull << 24u);
+		}
+		for (const auto& ref: r.refs) {
+			if (backed(ref.addr)) {
+				promote(ref.addr, ref.size != 0 ? ref.size : 4096u);
+			}
+		}
+		views_ms += NowMs() - t0;
+	}
 
 	void Before(std::span<const uint32_t> chunk) {
 		const double          t0 = NowMs();
@@ -453,11 +658,19 @@ struct SubmitSide {
 		flatten_ms += NowMs() - t0;
 	}
 	void After(const Pm4TranslateResult& r) {
+		if (!views.empty()) {
+			ResidentViews(r);
+		}
 		double t0 = NowMs();
 		for (uint64_t va: r.shader_addrs) {
 			(void)seen_shaders.insert(va);
 		}
 		shaders_ms += NowMs() - t0;
+		t0 = NowMs();
+		for (uint64_t va: r.shader_addrs) {
+			(void)seen_flat.Insert(va);
+		}
+		shaders_flat_ms += NowMs() - t0;
 		t0 = NowMs();
 		auto promote = [&](uint64_t addr, uint64_t size) {
 			for (uint64_t b = addr >> 24u; b <= (addr + size - 1) >> 24u; b++) {
@@ -518,6 +731,7 @@ int main(int argc, char** argv) {
 	int         flips  = 40;
 	bool        digest = false;
 	const char* dump   = nullptr;
+	uint32_t    views = 0, churn = 1, seen = 0, cold_mib = 0;
 	for (int i = 1; i < argc; i++) {
 		const std::string a = argv[i];
 		if (a == "--digest") {
@@ -536,6 +750,16 @@ int main(int argc, char** argv) {
 			m.sh_pairs = static_cast<uint32_t>(std::atoi(argv[++i]));
 		} else if (a == "--uc" && i + 1 < argc) {
 			m.uc_pairs = static_cast<uint32_t>(std::atoi(argv[++i]));
+		} else if (a == "--acbs" && i + 1 < argc) {
+			m.acbs = static_cast<uint32_t>(std::atoi(argv[++i]));
+		} else if (a == "--views" && i + 1 < argc) {
+			views = static_cast<uint32_t>(std::atoi(argv[++i]));
+		} else if (a == "--churn" && i + 1 < argc) {
+			churn = static_cast<uint32_t>(std::max(1, std::atoi(argv[++i])));
+		} else if (a == "--seen" && i + 1 < argc) {
+			seen = static_cast<uint32_t>(std::atoi(argv[++i]));
+		} else if (a == "--cold" && i + 1 < argc) {
+			cold_mib = static_cast<uint32_t>(std::atoi(argv[++i]));
 		} else {
 			flips = std::max(1, std::atoi(argv[i]));
 		}
@@ -567,7 +791,20 @@ int main(int argc, char** argv) {
 	BenchOracle   o;
 	Pm4Translator t;
 	Configure(t, o);
+	Pm4Translator acb_t;
+	ConfigureAcb(acb_t, o);
 	SubmitSide            side;
+	side.churn = churn;
+	if (views != 0) {
+		side.MakeViews(views);
+	}
+	for (uint32_t i = 0; i < seen; i++) {
+		side.seen_shaders.insert(0x500000000ull + 0x100ull * i); // shaders of other scenes
+		side.seen_flat.Insert(0x500000000ull + 0x100ull * i);
+	}
+	side.cold.resize(static_cast<size_t>(cold_mib) << 20u);
+	double                acb_ms = 0;
+	uint32_t              acb_refused = 0;
 	std::vector<double>   per_flip;
 	Digest                d;
 	std::FILE*            dump_file = dump != nullptr ? std::fopen(dump, "wb") : nullptr;
@@ -577,6 +814,7 @@ int main(int argc, char** argv) {
 		for (size_t c = 0; c < f.chunks.size(); c++) {
 			const auto [cb, ce] = f.chunks[c];
 			const auto chunk    = std::span<const uint32_t>(f.dcb.data() + cb, ce - cb);
+			side.Evict();
 			side.Before(chunk);
 			t.SetPreambleFromStart(true);
 			t.SetNoPreamble(c > 0);
@@ -591,6 +829,20 @@ int main(int argc, char** argv) {
 				return 1;
 			}
 			side.After(r);
+			// The ACBs the title submits meanwhile, spread over the chunks.
+			for (size_t a = c * f.acbs.size() / f.chunks.size(); a < (c + 1) * f.acbs.size() / f.chunks.size(); a++) {
+				side.Evict();
+				const double             a0 = NowMs();
+				const Pm4TranslateResult ar = acb_t.Translate(f.acbs[a]);
+				acb_ms += NowMs() - a0;
+				if (!ar.ok) {
+					if (acb_refused++ == 0) {
+						std::fprintf(stderr, "bench: ACB %zu refused: op 0x%02x at dw %u\n", a, ar.unknown_op, ar.unknown_dw);
+					}
+					continue;
+				}
+				side.After(ar);
+			}
 			if (k == 0) {
 				DigestResult(d, r, dump_file);
 				ib_dw += r.ib.size();
@@ -617,9 +869,25 @@ int main(int argc, char** argv) {
 	            static_cast<unsigned long long>(refs), static_cast<unsigned long long>(buckets), static_cast<unsigned long long>(shaders),
 	            static_cast<unsigned long long>(targets));
 	std::printf("Translate per flip: min %.3f ms, median %.3f ms (%d flips)\n", sorted.front(), sorted[sorted.size() / 2], flips);
-	std::printf("Submit around it per flip: flatten again %.3f ms, packet check %.3f ms, DetectShaders' set %.3f ms, MakeResident's "
-	            "std::set %.3f ms (as a bitset %.3f ms)\n",
-	            side.flatten_ms / n, side.validate_ms / n, side.shaders_ms / n, side.resident_ms / n, side.resident_bits_ms / n);
+	if (!f.acbs.empty()) {
+		size_t acb_dw = 0;
+		for (const auto& a: f.acbs) {
+			acb_dw += a.size();
+		}
+		std::printf("ACBs per flip: %zu of %zu dwords in all, translated in %.3f ms (%u refused)\n", f.acbs.size(), acb_dw, acb_ms / n,
+		            acb_refused);
+	}
+	if (!side.views.empty()) {
+		std::printf("MakeResident with %zu views: %.3f ms per flip (the ranges copied again %u times, %llu buckets asked for again)\n",
+		            side.views.size(), side.views_ms / n, side.refreshes, static_cast<unsigned long long>(side.promote_calls));
+	}
+	if (!side.cold.empty()) {
+		std::printf("evicting %u MiB before each buffer took %.3f ms per flip (not in the times above)\n", cold_mib, side.cold_ms / n);
+	}
+	std::printf("Submit around it per flip: flatten again %.3f ms, packet check %.3f ms, DetectShaders' set %.3f ms (std::unordered_set "
+	            "%.3f ms), MakeResident's std::set %.3f ms (as a bitset %.3f ms)\n",
+	            side.flatten_ms / n, side.validate_ms / n, side.shaders_flat_ms / n, side.shaders_ms / n, side.resident_ms / n,
+	            side.resident_bits_ms / n);
 	{
 		// What one Translate call costs whatever the buffer holds (state copies, setup, assembly): a chunk of one draw,
 		// with the shadow as the flips left it.

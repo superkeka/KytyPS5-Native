@@ -154,7 +154,7 @@ constexpr bool IsUserDataRegister(uint32_t off) {
 	return (in_stage >= 0x0Cu && in_stage <= 0x2Bu) || in_stage == 0x02u || in_stage == 0x03u;
 }
 
-bool IsShaderPgmLo(uint32_t sh_offset) {
+constexpr bool IsShaderPgmLo(uint32_t sh_offset) {
 	switch (sh_offset) {
 		case 0x8:   // SPI_SHADER_PGM_LO_PS
 		case 0x88:  // SPI_SHADER_PGM_LO_GS
@@ -946,6 +946,7 @@ constexpr uint8_t kCxRenderTarget = 1u;
 constexpr uint8_t kCxColorInfo    = 2u;
 constexpr uint8_t kCxDccFix       = 4u;
 constexpr uint8_t kCxTargetValue  = 8u;
+constexpr uint8_t kCxPatched      = 16u; // PatchContext may change its value in some mode (CB_COLORn_INFO's has kCxColorInfo)
 constexpr std::array<uint64_t, RegFile::kDense / 64> kShUserDataBits = [] {
 	std::array<uint64_t, RegFile::kDense / 64> bits {};
 	for (uint32_t off = 0; off < RegFile::kDense; off++) {
@@ -960,9 +961,36 @@ constexpr std::array<uint8_t, RegFile::kDense> kCxFlags = [] {
 		const bool attrib3 = off >= kCbColor0Attrib3 && off < kCbColor0Attrib3 + 8;
 		flags[off]         = static_cast<uint8_t>((IsRenderTargetRegister(off) ? kCxRenderTarget | kCxTargetValue : 0u) |
 		                                          (attrib3 ? kCxTargetValue : 0u) | (info ? kCxColorInfo : 0u) |
-		                                          (DccFixSlots(off) != 0 ? kCxDccFix : 0u));
+		                                          (DccFixSlots(off) != 0 ? kCxDccFix : 0u) |
+		                                          (off == kCbTargetMask || off == kPaScShaderControl || off == kDbRenderOverride ||
+		                                                   off == kDbZInfo || off == kDbStencilInfo
+		                                               ? kCxPatched
+		                                               : 0u));
 	}
 	return flags;
+}();
+
+// The same for SH registers: user data (mark_sh), a program address's LO or HI (note_shader), and the ones a walk must
+// not take as plain (the guest's NOP, which is never stored, and COMPUTE_STATIC_THREAD_MGMT_SE*, which PatchSh may change).
+constexpr uint8_t kShUserData = 1u;
+constexpr uint8_t kShProgram  = 2u;
+constexpr uint8_t kShSpecial  = 4u;
+constexpr std::array<uint8_t, RegFile::kDense> kShFlags = [] {
+	std::array<uint8_t, RegFile::kDense> flags {};
+	for (uint32_t off = 0; off < RegFile::kDense; off++) {
+		flags[off] = static_cast<uint8_t>((IsUserDataRegister(off) ? kShUserData : 0u) |
+		                                  (IsShaderPgmLo(off) || (off > 0 && IsShaderPgmLo(off - 1)) ? kShProgram : 0u) |
+		                                  (off == kShNop || (off >= 0x216u && off <= 0x21au) ? kShSpecial : 0u));
+	}
+	return flags;
+}();
+// The program LO/HI registers as bits: whether a SET_SH_REG range touches any.
+constexpr std::array<uint64_t, RegFile::kDense / 64> kShProgramBits = [] {
+	std::array<uint64_t, RegFile::kDense / 64> bits {};
+	for (uint32_t off = 0; off < RegFile::kDense; off++) {
+		bits[off / 64] |= static_cast<uint64_t>((kShFlags[off] & kShProgram) != 0) << (off % 64);
+	}
+	return bits;
 }();
 
 // A predicate over the dense offsets as bits, built once (the predicates' environment switches are read once too).
@@ -977,6 +1005,21 @@ const RegBits& PredicateBits() {
 		return b;
 	}();
 	return bits;
+}
+
+// Calls f(off, value) for each register of `regs` that `loads` leaves out (or every one when `all`): the dense ones not
+// in it, then every one at kDense and up (no LOAD takes those), in offset order, as a walk over `regs` would.
+template <typename F>
+void ForEachNotLoaded(const RegFile& regs, const RegBits& loads, bool all, F&& f) {
+	for (uint32_t w = 0; w < RegFile::kDense / 64; w++) {
+		for (uint64_t bits = regs.PresentBits(w) & (all ? ~0ull : ~loads[w]); bits != 0; bits &= bits - 1) {
+			const uint32_t off = w * 64 + static_cast<uint32_t>(std::countr_zero(bits));
+			f(off, *regs.Find(off));
+		}
+	}
+	for (const auto& [off, value]: regs.Overflow()) {
+		f(off, value);
+	}
 }
 
 // LOAD_*_REG from S's region at `base` of the keys of `regs` in [lo, hi) that `loads` takes, in runs. A class
@@ -1006,15 +1049,19 @@ void EmitCpShadowLoad(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, uint3
 		if (word * 64 + 64 > hi) {
 			bits &= ~0ull >> (word * 64 + 64 - hi);
 		}
-		for (; bits != 0; bits &= bits - 1) {
-			const uint32_t off = word * 64 + static_cast<uint32_t>(std::countr_zero(bits));
+		// A run of set bits at a time (a LOAD's runs are long: whole register blocks).
+		while (bits != 0) {
+			const uint32_t first = static_cast<uint32_t>(std::countr_zero(bits));
+			const uint32_t len   = static_cast<uint32_t>(std::countr_one(bits >> first));
+			const uint32_t off   = word * 64 + first;
+			bits                 = first + len < 64 ? bits & (~0ull << (first + len)) : 0u;
 			if (run_len != 0 && run_off + run_len == off) {
-				run_len++;
+				run_len += len;
 				continue;
 			}
 			flush();
 			run_off = off;
-			run_len = 1;
+			run_len = len;
 		}
 	}
 	flush();
@@ -2497,16 +2544,14 @@ void Pm4Translator::EmitCpShadowPop(std::vector<uint32_t>& ib, const RegFile& ta
 		}
 	}
 	ib[at] = Pkt3(IT_LOAD_CONTEXT_REG, static_cast<uint32_t>(ib.size() - at - 1), false);
-	for (const auto& [off, value]: target) {
-		if (!CpShadowLoadsContext(off)) {
-			EmitSet(ib, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
-		}
-	}
-	for (const auto& [off, value]: current) {
-		if (!CpShadowLoadsContext(off) && target.count(off) == 0 && value != 0) {
+	const RegBits& loads = PredicateBits<CpShadowLoadsContext>();
+	ForEachNotLoaded(target, loads, false,
+	                 [&](uint32_t off, uint32_t value) { EmitSet(ib, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false); });
+	ForEachNotLoaded(current, loads, false, [&](uint32_t off, uint32_t value) {
+		if (target.count(off) == 0 && value != 0) {
 			EmitSet(ib, IT_SET_CONTEXT_REG, off, PatchContext(off, 0), false);
 		}
-	}
+	});
 	if (m_ps5_reg_overrides && target.count(kPaScShaderControl) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kPaScShaderControl, PatchContext(kPaScShaderControl, 0), false);
 	}
@@ -2573,31 +2618,32 @@ void Pm4Translator::EmitPreambleState(std::vector<uint32_t>& ib, const RegFile& 
 
 void Pm4Translator::EmitRegisterSets(std::vector<uint32_t>& ib, Pm4TranslateStats& stats, const RegFile& cx, const RegFile& sh,
                                      const RegFile& uc, uint32_t replay) const {
-	for (const auto& [offset, value]: cx) {
-		if ((replay & kCpShadowContext) != 0 || !CpShadowLoadsContext(offset)) {
-			EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
-			stats.preamble_cx++;
-		}
-	}
+	ForEachNotLoaded(cx, PredicateBits<CpShadowLoadsContext>(), (replay & kCpShadowContext) != 0, [&](uint32_t offset, uint32_t value) {
+		EmitSet(ib, IT_SET_CONTEXT_REG, offset, PatchContext(offset, value), false);
+		stats.preamble_cx++;
+	});
 	if (m_ps5_reg_overrides && cx.count(kPaScShaderControl) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kPaScShaderControl, PatchContext(kPaScShaderControl, 0), false);
 	}
 	if (m_depth_mode == DepthDebugMode::HizOff && cx.count(kDbRenderOverride) == 0) {
 		EmitSet(ib, IT_SET_CONTEXT_REG, kDbRenderOverride, PatchContext(kDbRenderOverride, 0), false);
 	}
-	for (const auto& [offset, value]: sh) {
-		const uint32_t cls = offset >= kShComputeBase ? kCpShadowCsSh : kCpShadowGfxSh;
-		if ((replay & cls) != 0 || !CpShadowLoadsSh(offset)) {
-			EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), offset >= kShComputeBase);
-			stats.preamble_sh++;
+	// SH: graphics below kShComputeBase, compute from there (the overflow included), each class replayed whole or not.
+	static_assert(kShComputeBase % 64 == 0);
+	RegBits sh_skip = PredicateBits<CpShadowLoadsSh>();
+	for (uint32_t w = 0; w < RegFile::kDense / 64; w++) {
+		if ((replay & (w * 64 >= kShComputeBase ? kCpShadowCsSh : kCpShadowGfxSh)) != 0) {
+			sh_skip[w] = 0;
 		}
 	}
-	for (const auto& [offset, value]: uc) {
-		if ((replay & kCpShadowUconfig) != 0 || !CpShadowLoadsUconfig(offset)) {
-			EmitSetUconfig(ib, offset, value);
-			stats.preamble_uc++;
-		}
-	}
+	ForEachNotLoaded(sh, sh_skip, false, [&](uint32_t offset, uint32_t value) {
+		EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), offset >= kShComputeBase);
+		stats.preamble_sh++;
+	});
+	ForEachNotLoaded(uc, PredicateBits<CpShadowLoadsUconfig>(), (replay & kCpShadowUconfig) != 0, [&](uint32_t offset, uint32_t value) {
+		EmitSetUconfig(ib, offset, value);
+		stats.preamble_uc++;
+	});
 }
 
 void Pm4Translator::WriteCpShadowImage(std::span<uint32_t> s, std::span<uint32_t> save) {
@@ -2944,6 +2990,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
             }
         }
 	};
+	// UconfigAllowed as bits for the dense offsets (asked once or twice per UCONFIG write).
+	const RegBits& uc_allowed_bits = PredicateBits<UconfigAllowed>();
+	auto           uc_allowed      = [&uc_allowed_bits](uint32_t off) {
+        return off < RegFile::kDense ? ((uc_allowed_bits[off / 64] >> (off % 64)) & 1u) != 0 : UconfigAllowed(off);
+	};
 	const bool gpu_pushpop = CpShadowGpuPushPop();
 	// Load mode: the GPU's context registers come from S, so where the copy took a register from a verbatim table
 	// (the CP reads the table when it runs it, which may be after a GPU write the translator never sees) the GPU may
@@ -3012,7 +3063,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// The value each user-data register had when collect_refs last took its references, within
 	// this DCB. Titles rewrite the same user data before every draw; an unchanged value names the
 	// same buckets, and a changed neighbour takes the pair itself.
-	std::array<uint32_t, RegFile::kDense> ud_seen_value {};
+	std::array<uint32_t, RegFile::kDense> ud_seen_value; // read only where ud_seen has the bit, which is set with it
 	std::array<uint64_t, RegFile::kDense / 64> ud_seen {};
 	auto mark_sh = [&](uint32_t off, uint32_t value) { // `value`: what the copy now holds there
 		const uint64_t bit = 1ull << (off % 64);
@@ -3377,8 +3428,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			find_refs();
 		}
 		if (all_sh_dirty) {
-			for (const auto& [off, value]: sh) {
-				mark_sh(off, value);
+			for (uint32_t w = 0; m_collect_refs && w < RegFile::kDense / 64; w++) { // mark_sh takes only dense user data
+				for (uint64_t bits = sh.PresentBits(w) & kShUserDataBits[w]; bits != 0; bits &= bits - 1) {
+					const uint32_t off = w * 64 + static_cast<uint32_t>(std::countr_zero(bits));
+					mark_sh(off, *sh.Find(off));
+				}
 			}
 			all_sh_dirty = false;
 		}
@@ -4106,6 +4160,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		uint32_t len      = 0;
 		bool     in_place = false;
 		bool     ib2      = false; // runs from the title's buffer (else copied from the translated one)
+		bool     passed   = false; // holds a packet pass_on ran in place, which was copied to body before
+		uint32_t seg      = 0;     // the segment it is in
 	};
 	std::vector<DirectRun>         direct_runs;
 	DirectRun                      direct_cur;
@@ -4160,6 +4216,16 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 	};
 	stats.total_dw = static_cast<uint32_t>(dcb.size());
+	// The packet at dw as written: in place with direct runs when nothing of ours came before it, else copied to body.
+	bool passed_on = false; // pass_on ran this packet in place
+	auto pass_on   = [&](uint32_t at, uint32_t len, size_t body_before, size_t segs_before, bool& in_place) {
+		if (direct && body.size() == body_before && segs.size() == segs_before) {
+			in_place  = true;
+			passed_on = true;
+		} else {
+			body.insert(body.end(), dcb.begin() + at, dcb.begin() + at + len);
+		}
+	};
 	// A title's COND_EXEC in any form (SetCondExec), on the gfx ring and on MEC: if the dword at its address is 0 the CP skips EXEC_COUNT
 	// dwords, which on the PS5 are the title's own. The translated range differs in length (patched packets, inserted
 	// waits and stores), so the COND_EXEC goes as written with its count set to the translated range once the walk
@@ -4996,9 +5062,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						unchanged = unchanged && PatchSh(base + (i - 1), bptr[i]) == bptr[i];
 					}
 					reg_write = body_count >= 2;
-					// A shader address needs its PGM_LO and PGM_HI: once per range that touches either.
+					// A shader address needs its PGM_LO and PGM_HI: once per range that touches either (most ranges are user
+					// data and touch none: one word of kShProgramBits says so).
+					const bool program = base >= RegFile::kDense || last >= RegFile::kDense || last < base || base / 64 != last / 64 ||
+					                     ((kShProgramBits[base / 64] >> (base % 64)) & (~0ull >> (63 - (last - base)))) != 0;
 					for (uint32_t lo: {0x8u, 0x88u, 0xC8u, 0x108u, 0x148u, 0x20Cu}) {
-						if (lo + 1 >= base && lo <= last) {
+						if (program && lo + 1 >= base && lo <= last) {
 							note_shader(lo);
 						}
 					}
@@ -5033,7 +5102,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					                                                        : Normalize(bptr[0]);
 					bool graphics = false;
 					for (uint32_t i = 1; i < body_count; i++) {
-						if (UconfigAllowed(base + (i - 1)) && !UconfigComputeDropped(base + (i - 1))) {
+						if (uc_allowed(base + (i - 1)) && !UconfigComputeDropped(base + (i - 1))) {
 							graphics = true;
 						}
 					}
@@ -5061,7 +5130,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					const uint32_t base = (op == IT_SET_UCONFIG_REG_INDEX) ? (bptr[0] & 0x0fffffffu)
 					                                                        : Normalize(bptr[0]);
 					for (uint32_t i = 1; i < body_count && allowed; i++) {
-						if (!UconfigAllowed(base + (i - 1)) || (m_compute_ring && UconfigComputeDropped(base + (i - 1)))) {
+						if (!uc_allowed(base + (i - 1)) || (m_compute_ring && UconfigComputeDropped(base + (i - 1)))) {
 							allowed = false;
 						}
 					}
@@ -5141,10 +5210,21 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// that has to be expanded gets its SETs, and its writers, from a second walk over what is now cached.
 				bool verbatim = tables_verbatim && !m_compute_ring && bptr[2] == 0x80000000u && (bptr[0] & 3u) == 0;
 				if (op == IT_SET_CONTEXT_REG_INDIRECT) {
+					uint32_t loaded = 0;
 					for (uint32_t i = 0; i < num; i++) {
 						const uint32_t raw   = pairs[2 * i];
 						const uint32_t value = pairs[2 * i + 1];
 						const uint32_t off   = Normalize(raw);
+						// Most registers have no side effect and no patch: the copy, the writer and S's valid bit.
+						if (raw < RegFile::kDense && kCxFlags[raw] == 0) {
+							cx[raw] = value;
+							if (cp_shadow) {
+								wcx[raw] = static_cast<uint8_t>(RegWriter::Table);
+								vcx.set(raw);
+							}
+							loaded++;
+							continue;
+						}
 						verbatim             = verbatim && raw == off && PatchContext(off, value) == value; // a stub is no offset
 						if (raw == kSentinelOffset) {
 							continue;
@@ -5154,12 +5234,26 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						slot               = value;
 						mark_cx(off, changed);
 						writer(wcx, off, RegWriter::Table);
-						stats.loaded_cx_regs++;
+						loaded++;
 					}
+					stats.loaded_cx_regs += loaded;
 				} else if (op == IT_SET_SH_REG_INDIRECT) {
+					uint32_t loaded = 0;
 					for (uint32_t i = 0; i < num; i++) {
 						const uint32_t raw   = pairs[2 * i];
 						const uint32_t value = pairs[2 * i + 1];
+						// No program address, no NOP and no patch (user data mostly): the copy, mark_sh, the writer.
+						if (raw < RegFile::kDense && (kShFlags[raw] & (kShProgram | kShSpecial)) == 0) {
+							sh[raw] = value;
+							if ((kShFlags[raw] & kShUserData) != 0) {
+								mark_sh(raw, value);
+							}
+							if (cp_shadow) {
+								wsh[raw] = static_cast<uint8_t>(RegWriter::Table);
+							}
+							loaded++;
+							continue;
+						}
 						const uint32_t off   = Normalize(raw);
 						verbatim             = verbatim && raw == off && off != kShNop && PatchSh(off, value) == value;
 						if (raw == kSentinelOffset || off == kShNop) {
@@ -5171,19 +5265,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							note_shader(off);
 						}
 						writer(wsh, off, RegWriter::Table);
-						stats.loaded_sh_regs++;
+						loaded++;
 					}
+					stats.loaded_sh_regs += loaded;
 				} else {
 					for (uint32_t i = 0; i < num; i++) {
 						const uint32_t raw   = pairs[2 * i];
 						const uint32_t value = pairs[2 * i + 1];
 						const uint32_t off   = Normalize(raw);
 						verbatim = verbatim && raw == off && off != kUcNop && (tables_prim || (off != 0x242u && off != 0x243u)) &&
-						           UconfigAllowed(off);
+						           uc_allowed(off);
 						if (raw == kSentinelOffset || off == kUcNop) {
 							continue;
 						}
-						if (!UconfigAllowed(off) || (m_compute_ring && UconfigComputeDropped(off))) {
+						if (!uc_allowed(off) || (m_compute_ring && UconfigComputeDropped(off))) {
 							stats.uconfig_skipped++;
 							r.skipped_uconfig.insert(off);
 							continue;
@@ -5203,7 +5298,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 				}
 				if (verbatim) {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					pass_on(dw, size, body_before, segs_before, in_place);
 					add_ref(addr, 8ull * num, false); // the CP reads the table
 					stats.loads_verbatim++;
 				}
@@ -5238,7 +5333,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							writer(wsh, off, RegWriter::Expanded);
 							EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, value), off >= kShComputeBase);
 						}
-					} else if (off != kUcNop && UconfigAllowed(off) && !m_compute_ring) {
+					} else if (off != kUcNop && uc_allowed(off) && !m_compute_ring) {
 						writer(wuc, off, RegWriter::Expanded);
 						EmitSetUconfig(body, off, value);
 					}
@@ -5773,7 +5868,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (body_count < 2) {
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+				pass_on(dw, size, body_before, segs_before, in_place);
 				index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u);
 				cp.index_base = static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1]) << 32u);
 				cp.index_set  = true;
@@ -5816,7 +5911,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.draws_skipped++;
 				} else {
 					pfp_sync_me();
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					pass_on(dw, size, body_before, segs_before, in_place);
 				}
 				stats.draws++;
 				collect_refs();
@@ -5896,9 +5991,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (body_count < 3) {
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				if (m_compute_ring) {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					body[body.size() - size] |= 2u;
+				} else {
+					pass_on(dw, size, body_before, segs_before, in_place);
 				}
 				add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u),
 				        kMetadataSpan, false);
@@ -5971,9 +6068,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					r.inspected.push_back(snap);
 				}
-				body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				if (m_compute_ring) {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					body[body.size() - size] |= 2u;
+				} else {
+					pass_on(dw, size, body_before, segs_before, in_place);
 				}
 				stats.dispatches++;
 				collect_refs();
@@ -6214,15 +6313,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			stats.changed_ops[op]++;
 		}
 		const uint32_t copied = in_place ? 0u : size;
+		const bool     passed = passed_on;
+		passed_on             = false;
 		if (direct && same && direct_cur.len != 0 && direct_cur.body + direct_cur.body_len == body_before &&
 		    direct_cur.dw + direct_cur.len == dw) {
 			direct_cur.len += size;
 			direct_cur.body_len += copied;
 			direct_cur.in_place |= in_place;
+			direct_cur.passed |= passed;
 		} else if (direct) {
 			end_direct();
 			if (same) {
-				direct_cur = {static_cast<uint32_t>(body_before), copied, dw, size, in_place};
+				direct_cur = {static_cast<uint32_t>(body_before), copied, dw, size, in_place, false, passed, static_cast<uint32_t>(segs.size() - 1)};
 			}
 		}
 		if (same || (op == IT_NOP && same_seg && body.size() == body_before)) {
@@ -6266,6 +6368,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// starts (the keys there, the values S holds when it runs), as on the PS5; in record mode, like the replay,
 	// from the state SetPreambleFromStart picks. With SetNoPreamble it is the resume the backend may put in front.
 	std::vector<uint32_t> cp_head;
+	cp_head.reserve(512); // its LOADs and SETs, without growing the vector step by step
 	Pm4TranslateStats     resume_stats;
 	Pm4TranslateStats&    head_stats      = m_no_preamble && labels ? resume_stats : stats;
 	const bool            head_from_start = CpShadow() == CpShadowMode::Load || m_preamble_from_start;
@@ -6307,10 +6410,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// Copies body[from, to) to the IB, each direct run in it as IB2s into the guest's buffer. Returns,
 	// per run, (body offset where it ends, dwords removed up to there) to move later body offsets.
 	size_t direct_next = 0;
-	auto   append_body = [&](uint32_t from, uint32_t to, bool last) {
+	auto   append_body = [&](uint32_t from, uint32_t to, bool last, uint32_t seg) {
 		std::vector<std::pair<uint32_t, int64_t>> removed;
 		int64_t                                   gone = 0;
 		uint32_t                                  at   = from;
+		// The runs of a dropped segment go with it. One that ends it with nothing in body after it starts where the next
+		// segment does; a packet pass_on ran in place at or after it (in body when it was copied) still drops it.
+		for (size_t i = direct_next; i < direct_runs.size() && direct_runs[i].seg < seg; i++) {
+			if (direct_runs[i].passed) {
+				direct_next = i + 1;
+			}
+		}
 		while (direct_next < direct_runs.size() && direct_runs[direct_next].body < from) {
 			direct_next++; // in a dropped segment
 		}
@@ -6336,7 +6446,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			stats.direct_dw += run.ib2 ? run.len : 0u;
 			gone += static_cast<int64_t>(run.body_len) - emitted;
-			removed.emplace_back(run.body + run.body_len, gone);
+			// An offset where a run starts is before it, also when pass_on left it no dwords in body (as when it was copied).
+			removed.emplace_back(run.body + std::max<uint32_t>(run.body_len, run.passed ? 1u : 0u), gone);
 			at = run.body + run.body_len;
 		}
 		r.ib.insert(r.ib.end(), body.begin() + at, body.begin() + to);
@@ -6367,7 +6478,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (m_no_preamble) {
 					if (cp_shadow) {
 						// Whole 8-dword units, as every piece it is put in front of.
-						r.cp_shadow_resume = cp_head;
+						r.cp_shadow_resume = std::move(cp_head); // not used again: k is 0 once
 						while ((r.cp_shadow_resume.size() & 7u) != 0) {
 							r.cp_shadow_resume.push_back(kFiller);
 						}
@@ -6386,7 +6497,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			const uint32_t from  = seg_body[k];
 			const uint32_t to    = k + 1 < segs.size() ? seg_body[k + 1] : static_cast<uint32_t>(body.size());
 			const int64_t  shift   = static_cast<int64_t>(r.ib.size()) - static_cast<int64_t>(from);
-			const auto     removed = append_body(from, to, k + 1 == segs.size());
+			const auto     removed = append_body(from, to, k + 1 == segs.size(), static_cast<uint32_t>(k));
 			while ((r.ib.size() & 7u) != 0) {
 				r.ib.push_back(0xffff1000u);
 			}
@@ -6445,7 +6556,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		} else {
 			EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
 		}
-		append_body(0, static_cast<uint32_t>(body.size()), true);
+		append_body(0, static_cast<uint32_t>(body.size()), true, 0);
 
 		// The CP fetches IBs in 32-byte (8-dword) units; pad with filler NOPs.
 		while ((r.ib.size() & 7u) != 0) {
@@ -6473,6 +6584,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 		}
 	}
+	r.render_targets.reserve(targets.size());
 	for (auto& [addr, t]: targets) {
 		r.render_targets.push_back(t);
 	}

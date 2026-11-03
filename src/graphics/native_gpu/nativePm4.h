@@ -109,6 +109,8 @@ public:
 	[[nodiscard]] size_t   size() const { return m_count; }
 	// The registers held among offsets [64 * word, 64 * word + 64), a bit each.
 	[[nodiscard]] uint64_t PresentBits(uint32_t word) const { return m_present[word]; }
+	// The registers held at offsets kDense and up, in offset order.
+	[[nodiscard]] const std::map<uint32_t, uint32_t>& Overflow() const { return m_overflow; }
 	[[nodiscard]] Iterator begin() const { return {this, 0, m_overflow.begin()}; }
 	[[nodiscard]] Iterator end() const { return {this, kDense, m_overflow.end()}; }
 

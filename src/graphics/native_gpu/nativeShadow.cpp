@@ -5794,7 +5794,7 @@ private:
 
 	void DetectShaders(const std::vector<uint64_t>& addrs) {
 		for (uint64_t va: addrs) {
-			if (va == 0 || !m_seen_shaders.insert(va).second) {
+			if (va == 0 || !m_seen_shaders.Insert(va)) {
 				continue;
 			}
 			// Guest VA == host VA in Kyty, so the ISA is readable through the pointer.
@@ -6598,7 +6598,42 @@ private:
 	uint32_t      m_dot2c_sites    = 0;
 	uint32_t      m_dot_ops = 0; // dot instructions other than v_dot2c_f32_f16 in scanned shaders
 	uint32_t      m_decode_stops   = 0;
-	std::unordered_set<uint64_t> m_seen_shaders;
+	// Shaders DetectShaders has scanned, in open addressing: it asks for every shader of every buffer again, and a
+	// std::unordered_set's nodes were a cache miss per lookup (4.5% of the translation thread in Demon's Souls).
+	struct SeenShaders {
+		std::vector<uint64_t> slots = std::vector<uint64_t>(4096); // 0: empty (DetectShaders skips address 0)
+		size_t                count = 0;
+		// True when `va` was not in the set yet.
+		bool Insert(uint64_t va) {
+			if (2 * (count + 1) > slots.size()) {
+				std::vector<uint64_t> old = std::move(slots);
+				slots.assign(old.size() * 2, 0);
+				for (uint64_t v: old) {
+					if (v != 0) {
+						Place(v);
+					}
+				}
+			}
+			if (!Place(va)) {
+				return false;
+			}
+			count++;
+			return true;
+		}
+		bool Place(uint64_t va) {
+			const size_t mask = slots.size() - 1;
+			for (size_t i = static_cast<size_t>((va >> 8u) * 0x9e3779b97f4a7c15ull >> 32u) & mask;; i = (i + 1) & mask) {
+				if (slots[i] == va) {
+					return false;
+				}
+				if (slots[i] == 0) {
+					slots[i] = va;
+					return true;
+				}
+			}
+		}
+	};
+	SeenShaders m_seen_shaders;
 	std::set<uint32_t> m_skipped_uconfig;
 #if KYTY_GEM_BACKING_SUPPORTED
 	GemBacking*      m_gem       = nullptr;
@@ -7131,7 +7166,7 @@ private:
 		PushPieces(r, done, queue);
 	}
 
-	// A translated buffer as pieces, one per segment; `done` (when given) on the last.
+	// A translated buffer as pieces, one per segment; `done` (when given) on the last. Takes r's IB.
 	void PushPieces(Pm4TranslateResult& r, const std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
 		for (size_t k = 0; k < r.segments.size(); k++) {
 			Piece p;
@@ -7141,7 +7176,11 @@ private:
 				p.cp_resume = std::move(r.cp_shadow_resume);
 			}
 			p.seg = std::move(r.segments[k]);
-			p.ib.assign(r.ib.begin() + p.seg.begin, r.ib.begin() + p.seg.end);
+			if (k + 1 == r.segments.size() && p.seg.begin == 0 && p.seg.end == r.ib.size()) {
+				p.ib = std::move(r.ib); // the whole IB, needed no more: no copy
+			} else {
+				p.ib.assign(r.ib.begin() + p.seg.begin, r.ib.begin() + p.seg.end);
+			}
 			for (auto& point: p.seg.points) {
 				point.dw -= p.seg.begin;
 			}
