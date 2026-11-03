@@ -82,16 +82,10 @@ public:
 	};
 
 	uint32_t& operator[](uint32_t off) {
-		if (off >= kDense) {
-			m_count += m_overflow.count(off) == 0 ? 1 : 0;
-			return m_overflow[off];
+		if (off < kDense && Has(off)) {
+			return m_values[off];
 		}
-		if (!Has(off)) {
-			m_present[off / 64] |= 1ull << (off % 64);
-			m_values[off] = 0;
-			m_count++;
-		}
-		return m_values[off];
+		return Add(off);
 	}
 	// nullptr when the register was never written.
 	[[nodiscard]] const uint32_t* Find(uint32_t off) const {
@@ -113,11 +107,24 @@ public:
 		m_count = 0;
 	}
 	[[nodiscard]] size_t   size() const { return m_count; }
+	// The registers held among offsets [64 * word, 64 * word + 64), a bit each.
+	[[nodiscard]] uint64_t PresentBits(uint32_t word) const { return m_present[word]; }
 	[[nodiscard]] Iterator begin() const { return {this, 0, m_overflow.begin()}; }
 	[[nodiscard]] Iterator end() const { return {this, kDense, m_overflow.end()}; }
 
 private:
 	[[nodiscard]] bool Has(uint32_t off) const { return ((m_present[off / 64] >> (off % 64)) & 1u) != 0; }
+	// operator[] for a register not held yet (kept out of line, so the common case inlines).
+	[[gnu::noinline]] uint32_t& Add(uint32_t off) {
+		if (off >= kDense) {
+			m_count += m_overflow.count(off) == 0 ? 1 : 0;
+			return m_overflow[off];
+		}
+		m_present[off / 64] |= 1ull << (off % 64);
+		m_values[off] = 0;
+		m_count++;
+		return m_values[off];
+	}
 
 	std::array<uint32_t, kDense>      m_values {};
 	std::array<uint64_t, kDense / 64> m_present {};
@@ -964,6 +971,9 @@ public:
 	void SetComputeCuClamp(const std::array<uint32_t, 4>& masks) { m_cu_clamp = masks; }
 	[[nodiscard]] uint32_t PatchSh(uint32_t offset, uint32_t value) const {
 		static constexpr uint32_t kSe[4] = {0x216, 0x217, 0x219, 0x21a};
+		if (offset < kSe[0] || offset > kSe[3]) {
+			return value; // every other SH register: one compare per write
+		}
 		for (uint32_t i = 0; i < 4; i++) {
 			if (offset == kSe[i] && m_cu_clamp[i] != 0) {
 				return value & m_cu_clamp[i];
@@ -1386,6 +1396,8 @@ private:
 	std::unordered_set<uint64_t> m_lod_tables;       // tables already read for m_lod_cur
 	std::unordered_set<uint64_t> m_lod_stages;       // user-data blocks already scanned for m_lod_cur (hashes)
 	std::vector<uint64_t>        m_bucket_bits;      // compact refs: one bit per 16 MiB bucket below 1 TiB
+	size_t                       m_bucket_lo = 0;    // the words of m_bucket_bits the last translation set: [lo, hi)
+	size_t                       m_bucket_hi = 0;
 	uint64_t                     m_find_lo    = 0;
 	uint64_t                     m_find_hi    = 0;
 	uint64_t                     m_cp_shadow_va      = 0; // SetCpShadow

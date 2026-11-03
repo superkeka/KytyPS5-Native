@@ -53,6 +53,7 @@
 #include <fmt/format.h>
 #include <pthread_time.h>
 #elif !defined(__APPLE__)
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -379,6 +380,7 @@ struct PthreadAttrPrivate {
 	size_t         stack_map_size;
 	int            policy;
 	int            guest_priority;
+	bool           affinity_set; // the title set the mask (Kyty's default 0x7f is not applied to host threads)
 	int            inherit_sched;
 	int            solosched;
 	bool           detached;
@@ -1166,6 +1168,9 @@ static int PthreadAttrCopy(PthreadAttr* dst, const PthreadAttr* src) {
 	result = (result == 0 ? PthreadAttrGetstacksize(src, &stack_size) : result);
 
 	result = (result == 0 ? PthreadAttrSetaffinity(dst, mask) : result);
+	if (result == 0) {
+		(*dst)->affinity_set = (*src)->affinity_set;
+	}
 	result = (result == 0 ? PthreadAttrSetdetachstate(dst, state) : result);
 	result = (result == 0 ? PthreadAttrSetguardsize(dst, guard_size) : result);
 	result = (result == 0 ? PthreadAttrSetinheritsched(dst, inherit_sched) : result);
@@ -1179,6 +1184,52 @@ static int PthreadAttrCopy(PthreadAttr* dst, const PthreadAttr* src) {
 		result = (result == 0 ? PthreadAttrSetstacksize(dst, stack_size) : result);
 	}
 	return result;
+}
+
+// KYTY_LOG_THREADS=1: each guest thread's name, PS5 priority (256 highest .. 767 lowest), policy and CPU mask when it is
+// created and when the title changes them, to compare with how the host schedules it.
+static bool LogThreads() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_LOG_THREADS");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+// The title's CPU masks, applied as the PS5 kernel applies them, with KYTY_THREAD_AFFINITY=1 (off by default: without the
+// PS5's strict priorities the masks alone cost Demon's Souls 19 -> 26.5 ms a frame on 3.11, its HighGraphics thread,
+// priority 699, then sharing CPUs 9 and 11 with job workers of priority 700 that spin, where the PS5 runs it first). The BC-250 with its CPU unlocked has the PS5's 16 logical CPUs in the same SMT pairs, so
+// guest CPU n is host CPU n: a title's job workers, pinned one per CPU (Demon's Souls: "BPE JobWorkerThread CPU0..12",
+// masks 1 << n), each keep a CPU of their own, and a worker that spins does not take the time of the one that records
+// and submits the frame, which on 3.11 got about half a CPU and doubled the submission's wall time. CPUs 13-15, which
+// the PS5 keeps for the system, stay for Kyty's own threads. Bits past the host's CPUs are left out; a mask with none
+// left is not applied.
+static void ApplyGuestAffinity(pthread_t p, KernelCpumask mask) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_THREAD_AFFINITY");
+		return v != nullptr && v[0] == '1';
+	}();
+	static const long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (!on || mask == 0) {
+		return;
+	}
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	int n = 0;
+	for (long i = 0; i < 64 && i < cpus && i < CPU_SETSIZE; i++) {
+		if (((mask >> static_cast<uint64_t>(i)) & 1u) != 0) {
+			CPU_SET(i, &set);
+			n++;
+		}
+	}
+	if (n != 0) {
+		pthread_setaffinity_np(p, sizeof(set), &set);
+	}
+#else
+	(void)p;
+	(void)mask;
+#endif
 }
 
 static void PthreadAttrDbgPrint(const PthreadAttr* src) {
@@ -2130,7 +2181,8 @@ int KYTY_SYSV_ABI PthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask) 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	attr_value->affinity = mask;
+	attr_value->affinity     = mask;
+	attr_value->affinity_set = true;
 
 	return OK;
 }
@@ -3282,6 +3334,14 @@ static void* RunThread(void* arg) {
 #endif
 	}
 #endif
+	if (thread->attr->affinity_set) {
+		ApplyGuestAffinity(pthread_self(), thread->attr->affinity);
+	}
+	if (LogThreads()) {
+		std::fprintf(stderr, "thread: run \"%s\" (guest %d) host tid %llu priority %d mask 0x%llx%s\n", thread->name.c_str(),
+		             thread->guest.thread_id, static_cast<unsigned long long>(os_thread_id), thread->attr->guest_priority,
+		             static_cast<unsigned long long>(thread->attr->affinity), thread->attr->affinity_set ? "" : " (default, not applied)");
+	}
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
@@ -3367,6 +3427,12 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 
 	LOGF("\tthread create: %s, id = %d, %d\n", created_thread->name.c_str(),
 	     created_thread->unique_id, result);
+	if (LogThreads() && result == 0) {
+		std::fprintf(stderr, "thread: create \"%s\" (guest %d) priority %d policy %d mask 0x%llx inherit %d\n",
+		             created_thread->name.c_str(), created_thread->guest.thread_id, created_thread->attr->guest_priority,
+		             created_thread->attr->policy, static_cast<unsigned long long>(created_thread->attr->affinity),
+		             created_thread->attr->inherit_sched);
+	}
 
 	PthreadAttrDbgPrint(&created_thread->attr);
 
@@ -3460,6 +3526,13 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 	}
 
 	auto result = PthreadAttrSetaffinity(&thread->attr, mask);
+	if (result == OK && !thread->free && thread->host_thread_id != 0) {
+		ApplyGuestAffinity(thread->p, mask);
+	}
+	if (LogThreads()) {
+		std::fprintf(stderr, "thread: \"%s\" (guest %d) mask 0x%llx\n", thread->name.c_str(), thread->guest.thread_id,
+		             static_cast<unsigned long long>(mask));
+	}
 
 	return result;
 }
@@ -3590,6 +3663,9 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 
 	thread->attr->guest_priority = prio;
 	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
+	if (LogThreads()) {
+		std::fprintf(stderr, "thread: \"%s\" (guest %d) priority %d\n", thread->name.c_str(), thread->guest.thread_id, prio);
+	}
 	return OK;
 }
 
@@ -3684,6 +3760,10 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 		return OK;
 	}
 
+	if (LogThreads()) {
+		std::fprintf(stderr, "thread: \"%s\" (guest %d) renamed \"%s\", priority %d mask 0x%llx\n", thread->name.c_str(),
+		             thread->guest.thread_id, name, thread->attr->guest_priority, static_cast<unsigned long long>(thread->attr->affinity));
+	}
 	thread->name = std::string(name);
 
 	return OK;

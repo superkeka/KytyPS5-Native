@@ -1395,12 +1395,13 @@ public:
 		SetStage(Stage::Translate, frame);
 		const double       t_translate = NowSecShadow();
 		// Command buffers written in chunks (INDIRECT_BUFFER chains, REWIND) are translated as the CP
-		// fetches them.
+		// fetches them. A buffer with `source` comes from TranslateChunks, which inlined it already: a second
+		// pass would only walk it to find nothing to inline.
 		std::vector<uint32_t>    flat;
 		std::string              flat_why;
 		std::vector<SourcePiece> pieces;
 		const bool               direct = m_direct_min_dw != 0 && !acb;
-		if (!FlattenIndirectBuffers(dcb, &flat, &flat_why, direct ? &pieces : nullptr) && !flat_why.empty() &&
+		if (source == nullptr && !FlattenIndirectBuffers(dcb, &flat, &flat_why, direct ? &pieces : nullptr) && !flat_why.empty() &&
 		    m_flatten_failed++ < 8) {
 			std::fprintf(stderr, "native shadow: %s %llu not inlined: %s\n", kind, static_cast<unsigned long long>(frame),
 			             flat_why.c_str());
@@ -5057,17 +5058,28 @@ private:
 		if (const uint64_t gen = m_gem->ViewsGeneration(); gen != m_views_generation) {
 			m_view_ranges      = m_gem->ViewRanges();
 			m_views_generation = gen;
-			m_resident_buckets.clear();
+			m_resident_buckets.Clear();
 		}
-		auto backed = [&](uint64_t addr) {
+		// Consecutive addresses mostly fall in the same view: the last range found is asked first, while it is still
+		// the last one starting at or below the address (what the search finds).
+		size_t last_view = m_view_ranges.size();
+		auto   backed    = [&](uint64_t addr) {
+			if (last_view < m_view_ranges.size() && m_view_ranges[last_view].first <= addr && addr < m_view_ranges[last_view].second &&
+			    (last_view + 1 == m_view_ranges.size() || m_view_ranges[last_view + 1].first > addr)) {
+				return true;
+			}
 			auto it = std::upper_bound(m_view_ranges.begin(), m_view_ranges.end(),
 			                           std::make_pair(addr, ~0ull));
-			return it != m_view_ranges.begin() && addr < std::prev(it)->second;
+			if (it != m_view_ranges.begin() && addr < std::prev(it)->second) {
+				last_view = static_cast<size_t>(std::prev(it) - m_view_ranges.begin());
+				return true;
+			}
+			return false;
 		};
 		// `kind` counts which reference made blocks resident (m_promoted_by, logged with the averages).
 		auto promote = [&](uint64_t addr, uint64_t size, int kind) {
 			for (uint64_t b = addr >> kBucketShift; b <= (addr + size - 1) >> kBucketShift; b++) {
-				if (m_resident_buckets.insert(b).second) {
+				if (m_resident_buckets.Insert(b)) {
 					m_promoted_by[kind] += m_gem->PromoteGuestRange(b << kBucketShift, 1ull << kBucketShift);
 				}
 			}
@@ -6542,7 +6554,30 @@ private:
 #if KYTY_GEM_BACKING_SUPPORTED
 	uint64_t                                   m_views_generation = ~0ull;
 	std::vector<std::pair<uint64_t, uint64_t>> m_view_ranges;
-	std::set<uint64_t>                         m_resident_buckets; // 16 MiB guest buckets already promoted
+	// 16 MiB guest buckets already promoted: a bit each below 16 TiB (both guest windows; MakeResident asks for every
+	// bucket of every buffer, and a std::set of them was 6% of the translation thread in Demon's Souls), a set above.
+	struct ResidentBuckets {
+		static constexpr uint64_t kBits = 1ull << 20u;
+		std::vector<uint64_t>     bits = std::vector<uint64_t>(kBits / 64u);
+		std::set<uint64_t>        far;
+		// True when `b` was not in the set yet.
+		bool Insert(uint64_t b) {
+			if (b >= kBits) {
+				return far.insert(b).second;
+			}
+			const uint64_t bit = 1ull << (b % 64u);
+			if ((bits[b / 64u] & bit) != 0) {
+				return false;
+			}
+			bits[b / 64u] |= bit;
+			return true;
+		}
+		void Clear() {
+			std::fill(bits.begin(), bits.end(), 0ull);
+			far.clear();
+		}
+	};
+	ResidentBuckets                            m_resident_buckets;
 #endif
 	uint32_t      m_dummy_writes       = 0;
 	uint32_t      m_unmapped_logged    = 0;
