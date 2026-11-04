@@ -53,6 +53,9 @@
 #endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <sys/resource.h>
+#if !defined(__APPLE__)
+#include <sched.h>
+#endif
 #endif
 
 namespace Libs {
@@ -480,6 +483,70 @@ static KYTY_SYSV_ABI int sigprocmask(int /*how*/, const void* /*set*/, void* /*o
 	// LOGF("\t oset = %016" PRIx64 "\n", reinterpret_cast<uint64_t>(oset));
 
 	return 0;
+}
+
+struct GuestSigaction {
+	void*    handler;
+	int      flags;
+	uint32_t mask[4];
+};
+static_assert(sizeof(GuestSigaction) == 32);
+
+static Common::Mutex  g_guest_sigactions_mutex;
+static GuestSigaction g_guest_sigactions[129] = {};
+
+// What a title sets is kept and handed back. Faults and raised exceptions reach it through the
+// exception handlers (KernelInstallExceptionHandler), nothing delivers these.
+static int KYTY_SYSV_ABI GuestSigactionSet(int signum, const GuestSigaction* act, GuestSigaction* oact) {
+	if (signum < 1 || signum > 128 || signum == 32) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	Common::LockGuard lock(g_guest_sigactions_mutex);
+	const auto        previous = g_guest_sigactions[signum];
+	if (act != nullptr) {
+		g_guest_sigactions[signum] = *act;
+	}
+	if (oact != nullptr) {
+		*oact = previous;
+	}
+	return 0;
+}
+
+// sigaction with SA_RESTART: the previous handler, or SIG_ERR.
+static void* KYTY_SYSV_ABI GuestSignal(int signum, void* handler) {
+	constexpr int GUEST_SA_RESTART = 2;
+
+	GuestSigaction act {handler, GUEST_SA_RESTART, {}};
+	GuestSigaction old {};
+	if (GuestSigactionSet(signum, &act, &old) < 0) {
+		return reinterpret_cast<void*>(intptr_t {-1});
+	}
+	return old.handler;
+}
+
+// libkernel's code is in this program.
+static int KYTY_SYSV_ABI KernelGetLibkernelTextLocation(void** address, uint64_t* size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	extern char __executable_start;
+	extern char etext;
+	*address = &__executable_start;
+	*size    = static_cast<uint64_t>(&etext - &__executable_start);
+#else
+	*address = nullptr;
+	*size    = 0;
+#endif
+	return OK;
+}
+
+struct KernelModuleSegmentInfo {
+	void*    address;
+	uint64_t size;
+};
+
+static int KYTY_SYSV_ABI KernelInternalMemoryGetModuleSegmentInfo(KernelModuleSegmentInfo* info) {
+	KernelGetLibkernelTextLocation(&info->address, &info->size);
+	return OK;
 }
 
 static bool IsAllowedExceptionSignal(int signum) {
@@ -1215,8 +1282,9 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 
 	LOGF("\tmodule_file_name = %s\n", module_file_name);
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -1250,8 +1318,6 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 	int result = rt->StartModule(program, args, argp, nullptr);
 
 	LOGF("\tmodule_start() result = %d\n", result);
-
-	EXIT_NOT_IMPLEMENTED(result < 0);
 
 	if (res != nullptr) {
 		*res = result;
@@ -1362,6 +1428,12 @@ static int KYTY_SYSV_ABI KernelChmod(const char* path, uint16_t /*mode*/) {
 
 	FileSystem::FileStat sb {};
 	return FileSystem::KernelStat(path, &sb);
+}
+
+static int KYTY_SYSV_ABI KernelFchmod(int /*fd*/, uint16_t /*mode*/) {
+	PRINT_NAME();
+
+	return OK;
 }
 
 static int KYTY_SYSV_ABI KernelUtimes(const char* path, const void* /*times*/) {
@@ -1808,10 +1880,15 @@ static uint64_t KYTY_SYSV_ABI KernelGetAvailableCpumask() {
 	return 0x1fff;
 }
 
+// The CPU the thread is on. A title sees the 13 CPUs of its mask and can size per-CPU tables by that,
+// so a guest thread the host has put on one of the PS5's 3 system CPUs reports one of the 13.
 static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
-	PRINT_NAME();
-
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	const int cpu = sched_getcpu();
+	return cpu < 0 ? 0 : cpu % 13;
+#else
 	return 0;
+#endif
 }
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
@@ -2195,36 +2272,25 @@ uint64_t KYTY_SYSV_ABI cfwBSQyr5Ys(uint64_t a1, uint64_t a2, uint64_t a3, uint64
 	return 0;
 }
 
-static void LogExperimentalSyncOnAddress(std::atomic_bool& logged, const char* function_name) {
-	if (!logged.exchange(true, std::memory_order_relaxed)) {
-		::printf("WARNING: %s is experimental\n", function_name);
-		LOGF("WARNING: %s is experimental\n", function_name);
-	}
+int KYTY_SYSV_ABI KernelSyncOnAddressWait8(volatile uint8_t* address, uint8_t expected, uint32_t* timeout_micros) {
+	LibKernel::LongWait long_wait("sync_on_address8", const_cast<const uint8_t*>(address), __builtin_return_address(0), expected);
+	return LibKernel::SyncOnAddress::Wait8(address, expected, timeout_micros, LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
-int KYTY_SYSV_ABI KernelSyncOnAddressWait(volatile uint32_t* address, uint32_t expected,
-                                          const uint32_t* timeout_micros) {
-	LibKernel::LongWait long_wait("sync_on_address", const_cast<const uint32_t*>(address), __builtin_return_address(0), expected);
-	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
-	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+int KYTY_SYSV_ABI KernelSyncOnAddressWait16(volatile uint16_t* address, uint16_t expected, uint32_t* timeout_micros) {
+	LibKernel::LongWait long_wait("sync_on_address16", const_cast<const uint16_t*>(address), __builtin_return_address(0), expected);
+	return LibKernel::SyncOnAddress::Wait16(address, expected, timeout_micros, LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
-int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected,
-                                            const uint32_t* timeout_micros) {
+int KYTY_SYSV_ABI KernelSyncOnAddressWait32(volatile uint32_t* address, uint32_t expected, uint32_t* timeout_micros) {
 	LibKernel::LongWait long_wait("sync_on_address32", const_cast<const uint32_t*>(address), __builtin_return_address(0), expected);
-	static std::atomic_bool logged {false};
-	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait32");
-	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros,
-	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+	return LibKernel::SyncOnAddress::Wait32(address, expected, timeout_micros, LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
-int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t expected,
-                                            const uint32_t* timeout_micros) {
+// The unsuffixed wait is the 64-bit one.
+int KYTY_SYSV_ABI KernelSyncOnAddressWait64(volatile uint64_t* address, uint64_t expected, uint32_t* timeout_micros) {
 	LibKernel::LongWait long_wait("sync_on_address64", const_cast<const uint64_t*>(address), __builtin_return_address(0), expected);
-	static std::atomic_bool logged {false};
-	LogExperimentalSyncOnAddress(logged, "sceKernelSyncOnAddressWait64");
-	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros,
-	                                        LibKernel::KernelDispatchPendingSignalForCurrentThread);
+	return LibKernel::SyncOnAddress::Wait64(address, expected, timeout_micros, LibKernel::KernelDispatchPendingSignalForCurrentThread);
 }
 
 int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count) {
@@ -2259,7 +2325,10 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 			    static_cast<volatile uint64_t*>(address), value, nullptr,
 			    LibKernel::KernelDispatchPendingSignalForCurrentThread));
 		case UMTX_OP_WAKE:
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
+			{
+				const int woken = LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value));
+				return POSIX_CALL(woken < 0 ? woken : OK);
+			}
 		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);
 	}
 }
@@ -2296,7 +2365,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("FIs3-UQT9sg", Posix::pthread_getschedparam);
 	LIB_FUNC("P41kTWUS3EI", Posix::pthread_getschedparam);
 	LIB_FUNC("Xs9hdiD7sAA", Posix::pthread_setschedparam);
-	LIB_FUNC("oIRFTjoILbg", Posix::pthread_setschedparam);
+	LIB_FUNC("oIRFTjoILbg", LibKernel::PthreadSetschedparam);
 	LIB_FUNC("B5GmVDKwpn0", Posix::pthread_yield);
 	LIB_FUNC("h9CcP3J0oVM", Posix::pthread_join);
 	LIB_FUNC("wtkt-teR1so", Posix::pthread_attr_init);
@@ -3479,6 +3548,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
 	LIB_FUNC("hHlZQUnlxSM", Posix::getrusage);
 	LIB_FUNC("fgIsQ10xYVA", LibKernel::KernelChmod);
+	LIB_FUNC("UtszJWHrDcA", LibKernel::KernelFchmod);
 	LIB_FUNC("0Cq8ipKr9n0", LibKernel::KernelUtimes);
 	LIB_FUNC("3k6kx-zOOSQ", LibKernel::KernelMlock);
 }
@@ -3568,11 +3638,18 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("WkwEd3N7w0Y", LibKernel::KernelInstallExceptionHandler);
 	LIB_FUNC("La9uyZv4Kvw", LibKernel::KernelGetAvailableCpumask);
 	LIB_FUNC("g0VTBxfJyu0", LibKernel::KernelGetCurrentCpu);
+	LIB_FUNC("KiJEPEWRyUY", LibKernel::GuestSigactionSet);
+	LIB_FUNC("UDCI-WazohQ", LibKernel::GuestSigactionSet);
+	LIB_FUNC("VADc3MNQ3cM", LibKernel::GuestSignal);
+	LIB_FUNC("AmJ0mn2l4lM", LibKernel::KernelGetLibkernelTextLocation);
+	LIB_FUNC("-YTW+qXc3CQ", LibKernel::KernelInternalMemoryGetModuleSegmentInfo);
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
 	LIB_FUNC("Xjoosiw+XPI", ::Libs::LibKernel::OnHostStack<&LibKernel::KernelUuidCreate>::Call);
 	LIB_FUNC("DLORcroUqbc", LibKernel::KernelGetOpenPsId);
 	LIB_FUNC("zE-wXIZjLoM", LibKernel::KernelDebugRaiseExceptionOnReleaseMode);
-	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressWait);
+	LIB_FUNC("dFym5b41JLU", Posix::KernelSyncOnAddressWait8);
+	LIB_FUNC("XgVs4jRehcY", Posix::KernelSyncOnAddressWait16);
+	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressWait64);
 	LIB_FUNC("B2n8aDorSH4", Posix::KernelSyncOnAddressWait32);
 	LIB_FUNC("PZQhiiLXRFs", Posix::KernelSyncOnAddressWait64);
 	LIB_FUNC("q2y-wDIVWZA", Posix::KernelSyncOnAddressWake);

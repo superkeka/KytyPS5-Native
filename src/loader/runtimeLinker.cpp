@@ -1757,6 +1757,7 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 
 		auto* tcb = reinterpret_cast<uint64_t*>(tls.ptr + tcb_offset);
 		tcb[0]    = reinterpret_cast<uint64_t>(tcb);
+		tcb[7]    = reinterpret_cast<uint64_t>(tcb);
 	}
 
 	return tls.ptr;

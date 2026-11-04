@@ -49,11 +49,71 @@ void TestInvalidAddress() {
   Check(Wait64(reinterpret_cast<uint64_t *>(bytes + 4), 0, &timeout) ==
             Libs::LibKernel::KERNEL_ERROR_EINVAL,
         "wait64 rejects a misaligned address");
-  Check(Wake(misaligned, 1) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
-        "wake rejects a misaligned address");
+  Check(Wake(misaligned, 1) == 0, "wake takes any address: a byte wait's may be odd");
   uint64_t aligned = 0;
   Check(Wake(&aligned, -1) == Libs::LibKernel::KERNEL_ERROR_EINVAL,
         "wake rejects a negative count");
+}
+
+void TestByteAndHalfwordWaits() {
+  alignas(uint64_t) uint8_t bytes[8] = {};
+  uint32_t timeout = 20000;
+  Check(Libs::LibKernel::SyncOnAddress::Wait8(bytes + 1, 0, &timeout) == Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+        "a byte wait on an odd address times out");
+  timeout = 1000;
+  Check(Libs::LibKernel::SyncOnAddress::Wait8(bytes + 1, 1, &timeout) == OK, "a mismatched byte returns at once");
+  auto* half = reinterpret_cast<uint16_t*>(bytes + 2);
+  timeout    = 1000;
+  Check(Libs::LibKernel::SyncOnAddress::Wait16(half + 1, 1, &timeout) == OK, "a mismatched halfword returns at once");
+  Check(Libs::LibKernel::SyncOnAddress::Wait16(reinterpret_cast<uint16_t*>(bytes + 1), 0, &timeout) ==
+            Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "a misaligned halfword is rejected");
+
+  // A store to a neighbour in the futex word does not end the wait; the wake of the waited byte does.
+  std::atomic<int> result {1};
+  std::atomic_bool finished {false};
+  std::thread      waiter([&] {
+    uint32_t long_timeout = 5000000;
+    result.store(Libs::LibKernel::SyncOnAddress::Wait8(bytes + 1, 0, &long_timeout));
+    finished.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  __atomic_store_n(bytes, 9, __ATOMIC_RELEASE);
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  Check(!finished.load(), "a neighbour's store does not end a byte wait");
+  __atomic_store_n(bytes + 1, 1, __ATOMIC_RELEASE);
+  (void)Wake(bytes + 1, INT_MAX);
+  waiter.join();
+  Check(result.load() == OK, "the byte wait ends with OK");
+}
+
+void TestWakeCountsWaiters() {
+  uint32_t         word = 0;
+  std::atomic<int> sleeping {0};
+  std::thread      waiters[3];
+  for (auto& t: waiters) {
+    t = std::thread([&] {
+      sleeping.fetch_add(1);
+      uint32_t timeout = 5000000;
+      (void)Wait32(&word, 0, &timeout);
+    });
+  }
+  while (sleeping.load() != 3) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(55));
+  // The value stays, so a waiter ends only by a wake: the counts add up to the waiters. One between
+  // two slices of its sleep is counted by the next wake.
+  int        woken    = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  while (woken < 3 && std::chrono::steady_clock::now() < deadline) {
+    woken += Wake(&word, INT_MAX);
+  }
+  Check(woken == 3, "wake says how many it woke");
+  for (auto& t: waiters) {
+    t.join();
+  }
+  Check(Wake(&word, INT_MAX) == 0, "nobody to wake");
 }
 
 void TestMismatchReturnsImmediately() {
@@ -87,8 +147,15 @@ void TestTimeout() {
   Check(Wait32(&word, 0, &timeout) == Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
         "zero timeout polls a matching value");
   word = 1;
-  Check(Wait32(&word, 0, &timeout) == OK,
-        "zero timeout succeeds for a mismatched value");
+  Check(Wait32(&word, 0, &timeout) == Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+        "zero timeout does not look at the value");
+
+  timeout = 20000;
+  Check(Wait32(&word, 1, &timeout) == Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT && timeout == 0,
+        "a timeout leaves nothing of it");
+  timeout = 5000000;
+  Check(Wait32(&word, 0, &timeout) == OK && timeout > 4000000 && timeout <= 5000000,
+        "a mismatched value leaves what is left of the timeout");
 }
 
 void TestValueChangeAndWake() {
@@ -105,7 +172,7 @@ void TestValueChangeAndWake() {
     std::this_thread::yield();
   }
   Store(&word, UINT64_C(0x100000000));
-  Check(Wake(&word, 1) == OK, "wake-one succeeds");
+  Check(Wake(&word, 1) >= 0, "wake-one succeeds");
   waiter.join();
   Check(result == OK, "a value change plus wake releases the waiter");
 }
@@ -125,21 +192,16 @@ void TestNanosecondTimeout() {
         "zero timespec succeeds on mismatch");
 
   g_signal_poll_count.store(0, std::memory_order_relaxed);
-  std::atomic<bool> returned{false};
   std::thread waker([&] {
-    while (g_signal_poll_count.load(std::memory_order_relaxed) < 2 &&
-           !returned.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(35));
     Store(&word, UINT64_C(0x100000000));
-    Check(Wake(&word, 1) == OK, "wake releases a long timespec wait");
+    Check(Wake(&word, 1) >= 0, "wake releases a long timespec wait");
   });
   const int result = Wait64(&word, 0, std::chrono::nanoseconds::max(), CountSignalPoll);
-  returned.store(true, std::memory_order_release);
   waker.join();
   Check(result == OK, "long timespec wait does not overflow its deadline");
-  Check(g_signal_poll_count.load(std::memory_order_relaxed) > 1,
-        "timespec wait continues polling guest signals");
+  Check(g_signal_poll_count.load(std::memory_order_relaxed) >= 1,
+        "a wait ends at a guest signal safe-point");
 }
 
 void TestWakeOneThenAll() {
@@ -161,8 +223,8 @@ void TestWakeOneThenAll() {
   while (ready.load(std::memory_order_acquire) != WAITER_COUNT) {
     std::this_thread::yield();
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  Check(Wake(&word, 1) == OK, "wake-one succeeds with multiple waiters");
+  std::this_thread::sleep_for(std::chrono::milliseconds(55));
+  Check(Wake(&word, 1) >= 0, "wake-one succeeds with multiple waiters");
   const auto one_deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (returned.load(std::memory_order_acquire) == 0 &&
@@ -172,7 +234,7 @@ void TestWakeOneThenAll() {
   Check(returned.load(std::memory_order_acquire) == 1,
         "wake-one releases exactly one waiter");
 
-  Check(Wake(&word, 2) == OK, "wake-two succeeds");
+  Check(Wake(&word, 2) >= 0, "wake-two succeeds");
   const auto two_deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (returned.load(std::memory_order_acquire) < 3 &&
@@ -182,7 +244,7 @@ void TestWakeOneThenAll() {
   Check(returned.load(std::memory_order_acquire) == 3,
         "wake-two releases exactly two more waiters");
 
-  Check(Wake(&word, INT_MAX) == OK, "wake-all succeeds");
+  Check(Wake(&word, INT_MAX) >= 0, "wake-all succeeds");
   for (auto &waiter : waiters) {
     waiter.join();
   }
@@ -217,14 +279,14 @@ void TestAddressesAreIsolated() {
   while (ready.load(std::memory_order_acquire) != 2) {
     std::this_thread::yield();
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  Check(Wake(&first, 1) == OK, "first address wakes");
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  std::this_thread::sleep_for(std::chrono::milliseconds(55));
+  Check(Wake(&first, 1) >= 0, "first address wakes");
+  std::this_thread::sleep_for(std::chrono::milliseconds(55));
   Check(first_returned.load(std::memory_order_acquire),
         "first address waiter returned");
   Check(!second_returned.load(std::memory_order_acquire),
         "waking one address does not release another address");
-  Check(Wake(&second, 1) == OK, "second address wakes");
+  Check(Wake(&second, 1) >= 0, "second address wakes");
 
   first_waiter.join();
   second_waiter.join();
@@ -271,12 +333,12 @@ void TestWakeZeroIsNoOp() {
   while (ready.load(std::memory_order_acquire) != WAITER_COUNT) {
     std::this_thread::yield();
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  Check(Wake(&word, 0) == OK, "zero-count wake succeeds");
+  std::this_thread::sleep_for(std::chrono::milliseconds(55));
+  Check(Wake(&word, 0) >= 0, "zero-count wake succeeds");
   std::this_thread::sleep_for(std::chrono::milliseconds(20));
   Check(returned.load(std::memory_order_acquire) == 0,
         "zero-count wake releases no waiters");
-  Check(Wake(&word, INT_MAX) == OK, "wake-all succeeds after zero-count wake");
+  Check(Wake(&word, INT_MAX) >= 0, "wake-all succeeds after zero-count wake");
   for (auto &waiter : waiters) {
     waiter.join();
   }
@@ -291,6 +353,8 @@ int main() {
   TestInvalidAddress();
   TestMismatchReturnsImmediately();
   TestTimeout();
+  TestByteAndHalfwordWaits();
+  TestWakeCountsWaiters();
   TestValueChangeAndWake();
   TestNanosecondTimeout();
   TestWakeOneThenAll();

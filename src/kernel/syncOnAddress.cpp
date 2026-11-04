@@ -33,9 +33,9 @@ template <typename T>
 	return address != nullptr && (reinterpret_cast<uintptr_t>(address) & (alignof(T) - 1u)) == 0;
 }
 
-[[nodiscard]] bool IsValidWakeAddress(const volatile void* address) {
-	return address != nullptr &&
-	       (reinterpret_cast<uintptr_t>(address) & (alignof(uint32_t) - 1u)) == 0;
+// The top four address bits carry the wait's width in the console's system call.
+[[nodiscard]] bool IsWaitAddressInRange(const volatile void* address) {
+	return (reinterpret_cast<uintptr_t>(address) >> 60u) == 0;
 }
 
 template <typename T>
@@ -52,13 +52,6 @@ struct WaitDeadline {
 	const auto now = Clock::now();
 	const auto remaining = Clock::time_point::max() - now;
 	return {true, timeout >= remaining ? Clock::time_point::max() : now + timeout};
-}
-
-[[nodiscard]] WaitDeadline MakeDeadline(const uint32_t* timeout_micros) {
-	if (timeout_micros == nullptr) {
-		return {};
-	}
-	return MakeDeadline(std::chrono::microseconds(*timeout_micros));
 }
 
 [[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait) {
@@ -101,56 +94,66 @@ struct CountedWaiter {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 
+// The compare and the sleep are one step in the futex, so no wake is lost, and a raised exception comes
+// as a host signal, which ends the sleep: it sleeps the whole wait, not in slices that would leave gaps a
+// wake of an unchanged value could fall into.
 template <typename T>
 int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
               signal_poll_func_t signal_poll) {
 	const CountedWaiter counted(address);
-	bool                first_wait = true;
+
+	// A futex is a 32-bit word: a 64-bit wait sleeps on its low half, a byte or halfword wait on the word
+	// holding it.
+	auto* word = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(address) & ~uintptr_t {3});
 
 	for (;;) {
+		const uint32_t word_value = sizeof(T) >= sizeof(uint32_t) ? static_cast<uint32_t>(expected)
+		                                                          : __atomic_load_n(word, __ATOMIC_ACQUIRE);
 		if (ReadWord(address) != expected) {
 			return OK;
 		}
-		const auto slice_micros = GetWaitSliceMicros(deadline, first_wait);
-		if (slice_micros == UINT32_MAX) {
-			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
-		}
-		const timespec timeout = {
-		    .tv_sec  = static_cast<time_t>(slice_micros / 1000000u),
-		    .tv_nsec = static_cast<long>(slice_micros % 1000000u) * 1000L,
-		};
 
-		long result     = 0;
-		int  wait_error = 0;
-		result          = syscall(SYS_futex, const_cast<T*>(address), FUTEX_WAIT_PRIVATE,
-		                          static_cast<uint32_t>(expected), &timeout, nullptr, 0);
-		if (result != 0) {
-			wait_error = errno;
+		timespec  remaining {};
+		timespec* timeout = nullptr;
+		if (deadline.finite) {
+			const auto now = Clock::now();
+			if (now >= deadline.end) {
+				return KERNEL_ERROR_ETIMEDOUT;
+			}
+			const auto nanos  = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.end - now).count();
+			remaining.tv_sec  = static_cast<time_t>(nanos / 1000000000);
+			remaining.tv_nsec = static_cast<long>(nanos % 1000000000);
+			timeout           = &remaining;
 		}
-		if (result == 0 || wait_error == EAGAIN) {
+
+		const long result = syscall(SYS_futex, word, FUTEX_WAIT_PRIVATE, word_value, timeout, nullptr, 0);
+		if (result == 0) {
 			return OK;
+		}
+		const int wait_error = errno;
+		if (wait_error == EAGAIN) {
+			if constexpr (sizeof(T) >= sizeof(uint32_t)) {
+				return OK;
+			}
+			// The word changed: it may be a neighbour of the waited byte or halfword.
+			continue;
 		}
 		if (wait_error != ETIMEDOUT && wait_error != EINTR) {
 			return KERNEL_ERROR_EINVAL;
 		}
-
 		PollSignals(signal_poll);
-		if (deadline.finite && Clock::now() >= deadline.end) {
-			return ReadWord(address) == expected ? KERNEL_ERROR_ETIMEDOUT : OK;
-		}
-		first_wait = false;
 	}
 }
 
 int WakeLinux(volatile void* address, int32_t count) {
 	// The legacy FUTEX_WAKE path may wake one waiter when count is zero.
 	if (count == 0) {
-		return OK;
+		return 0;
 	}
 
-	const auto result = syscall(SYS_futex, const_cast<void*>(address), FUTEX_WAKE_PRIVATE, count,
-	                            nullptr, nullptr, 0);
-	return result < 0 ? KERNEL_ERROR_EINVAL : OK;
+	const auto result = syscall(SYS_futex, reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(address) & ~uintptr_t {3}),
+	                            FUTEX_WAKE_PRIVATE, count, nullptr, nullptr, 0);
+	return result < 0 ? KERNEL_ERROR_EINVAL : static_cast<int>(result);
 }
 
 #endif
@@ -246,30 +249,30 @@ int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
 
 int WakePortable(volatile void* address, int32_t count) {
 	if (count == 0) {
-		return OK;
+		return 0;
 	}
 	auto&            registry = GetPortableRegistry();
 	std::unique_lock registry_lock(registry.mutex);
 	const auto       it = registry.entries.find(reinterpret_cast<uintptr_t>(address));
 	if (it == registry.entries.end()) {
-		return OK;
+		return 0;
 	}
 	auto entry = it->second;
 	entry->mutex.Lock();
 	registry_lock.unlock();
 
-	int32_t remaining = count;
+	int32_t woken = 0;
 	for (auto* waiter: entry->waiters) {
 		if (!waiter->wake_requested) {
 			waiter->wake_requested = true;
 			waiter->condition.Signal();
-			if (remaining != INT_MAX && --remaining == 0) {
+			if (++woken == count) {
 				break;
 			}
 		}
 	}
 	entry->mutex.Unlock();
-	return OK;
+	return woken;
 }
 
 template <typename T>
@@ -277,6 +280,9 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
              signal_poll_func_t signal_poll) {
 	if (!IsValidWaitAddress(address)) {
 		return KERNEL_ERROR_EINVAL;
+	}
+	if (!IsWaitAddressInRange(address)) {
+		return KERNEL_ERROR_EFAULT;
 	}
 
 	int result = OK;
@@ -289,16 +295,49 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 	return result;
 }
 
-} // namespace
-
-int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros,
-           signal_poll_func_t signal_poll) {
-	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
+// The timeout goes in and out: what is left of it after a wake, 0 after a timeout. A timeout of 0 has
+// already passed: the wait times out without looking at the value.
+template <typename T>
+int WaitMicros(volatile T* address, T expected, uint32_t* timeout_micros, signal_poll_func_t signal_poll) {
+	if (timeout_micros == nullptr) {
+		return WaitImpl(address, expected, WaitDeadline {}, signal_poll);
+	}
+	if (!IsValidWaitAddress(address)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (!IsWaitAddressInRange(address)) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (*timeout_micros == 0) {
+		return KERNEL_ERROR_ETIMEDOUT;
+	}
+	const auto start  = Clock::now();
+	const int  result = WaitImpl(address, expected, MakeDeadline(std::chrono::microseconds(*timeout_micros)), signal_poll);
+	if (result == KERNEL_ERROR_ETIMEDOUT) {
+		*timeout_micros = 0;
+	} else if (result == OK) {
+		const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
+		*timeout_micros    = elapsed >= *timeout_micros ? 0u : *timeout_micros - static_cast<uint32_t>(elapsed);
+	}
+	return result;
 }
 
-int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeout_micros,
-           signal_poll_func_t signal_poll) {
-	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
+} // namespace
+
+int Wait8(volatile uint8_t* address, uint8_t expected, uint32_t* timeout_micros, signal_poll_func_t signal_poll) {
+	return WaitMicros(address, expected, timeout_micros, signal_poll);
+}
+
+int Wait16(volatile uint16_t* address, uint16_t expected, uint32_t* timeout_micros, signal_poll_func_t signal_poll) {
+	return WaitMicros(address, expected, timeout_micros, signal_poll);
+}
+
+int Wait32(volatile uint32_t* address, uint32_t expected, uint32_t* timeout_micros, signal_poll_func_t signal_poll) {
+	return WaitMicros(address, expected, timeout_micros, signal_poll);
+}
+
+int Wait64(volatile uint64_t* address, uint64_t expected, uint32_t* timeout_micros, signal_poll_func_t signal_poll) {
+	return WaitMicros(address, expected, timeout_micros, signal_poll);
 }
 
 int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout,
@@ -312,8 +351,11 @@ bool HasWaiters(volatile void* address) {
 }
 
 int Wake(volatile void* address, int32_t count) {
-	if (!IsValidWakeAddress(address) || count < 0) {
+	if (address == nullptr || count < 0) {
 		return KERNEL_ERROR_EINVAL;
+	}
+	if ((reinterpret_cast<uintptr_t>(address) >> 63u) != 0) {
+		return 0;
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)

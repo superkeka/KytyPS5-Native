@@ -512,6 +512,22 @@ void PthreadWakeForSignal(Pthread thread) {
 
 void KernelDispatchPendingSignalForCurrentThread();
 
+// FIFO and round robin, the only policies a title can set, with their priorities: a smaller number is
+// more important.
+constexpr int GUEST_SCHED_FIFO       = 1;
+constexpr int GUEST_SCHED_RR         = 3;
+constexpr int GUEST_PRIORITY_MIN     = 256;
+constexpr int GUEST_PRIORITY_MAX     = 767;
+constexpr int GUEST_DEFAULT_PRIORITY = 700;
+
+static bool IsGuestPolicy(int policy) {
+	return policy == GUEST_SCHED_FIFO || policy == GUEST_SCHED_RR;
+}
+
+static bool IsGuestPriority(int priority) {
+	return priority >= GUEST_PRIORITY_MIN && priority <= GUEST_PRIORITY_MAX;
+}
+
 static void SchedulerBackoffOnce() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (SwitchToThread() == 0) {
@@ -522,20 +538,7 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
-static void SleepMicroWithSignalPoll(uint64_t microseconds) {
-	if (microseconds == 0) {
-		KernelDispatchPendingSignalForCurrentThread();
-		return;
-	}
-
-	while (microseconds > 0) {
-		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		Common::Thread::SleepMicro(step);
-		microseconds -= step;
-		KernelDispatchPendingSignalForCurrentThread();
-	}
-}
-
+// A sleep is one absolute deadline, as on the PS5, whatever number of slices the signal polls cut it in.
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	if (nanoseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -543,12 +546,33 @@ static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	}
 
 	constexpr uint64_t poll_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	constexpr uint64_t NANOS_PER_SEC = 1000000000ull;
+
+	const auto now = [] {
+		timespec ts {};
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		return static_cast<uint64_t>(ts.tv_sec) * NANOS_PER_SEC + static_cast<uint64_t>(ts.tv_nsec);
+	};
+	const uint64_t deadline = now() + nanoseconds;
+	for (uint64_t current = now(); current < deadline; current = now()) {
+		const uint64_t target = std::min(deadline, current + poll_nanos);
+		const timespec until  = {.tv_sec = static_cast<time_t>(target / NANOS_PER_SEC), .tv_nsec = static_cast<long>(target % NANOS_PER_SEC)};
+		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, nullptr);
+		KernelDispatchPendingSignalForCurrentThread();
+	}
+#else
 	while (nanoseconds > 0) {
 		const auto step = std::min<uint64_t>(nanoseconds, poll_nanos);
 		Common::Thread::SleepNano(step);
 		nanoseconds -= step;
 		KernelDispatchPendingSignalForCurrentThread();
 	}
+#endif
+}
+
+static void SleepMicroWithSignalPoll(uint64_t microseconds) {
+	SleepNanoWithSignalPoll(microseconds * 1000ull);
 }
 
 struct PthreadStaticObject {
@@ -1174,8 +1198,8 @@ static int PthreadAttrCopy(PthreadAttr* dst, const PthreadAttr* src) {
 	result = (result == 0 ? PthreadAttrSetdetachstate(dst, state) : result);
 	result = (result == 0 ? PthreadAttrSetguardsize(dst, guard_size) : result);
 	result = (result == 0 ? PthreadAttrSetinheritsched(dst, inherit_sched) : result);
-	result = (result == 0 ? PthreadAttrSetschedparam(dst, &param) : result);
 	result = (result == 0 ? PthreadAttrSetschedpolicy(dst, policy) : result);
+	result = (result == 0 ? PthreadAttrSetschedparam(dst, &param) : result);
 	result = (result == 0 ? PthreadAttrSetsolosched(dst, solosched) : result);
 	if (stack_addr != nullptr) {
 		result = (result == 0 ? PthreadAttrSetstackaddr(dst, stack_addr) : result);
@@ -1972,8 +1996,8 @@ int KYTY_SYSV_ABI PthreadAttrInit(PthreadAttr* attr) {
 	param.sched_priority = 700;
 
 	result = (result == 0 ? PthreadAttrSetinheritsched(attr, 4) : result);
-	result = (result == 0 ? PthreadAttrSetschedparam(attr, &param) : result);
 	result = (result == 0 ? PthreadAttrSetschedpolicy(attr, 1) : result);
+	result = (result == 0 ? PthreadAttrSetschedparam(attr, &param) : result);
 	result = (result == 0 ? PthreadAttrSetdetachstate(attr, 0) : result);
 	result = (result == 0 ? PthreadAttrSetstacksize(attr, PTHREAD_STACK_DEFAULT) : result);
 
@@ -2254,8 +2278,11 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 	// PRINT_NAME();
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetschedparam");
-	if (param == nullptr || attr_value == nullptr) {
+	if (attr_value == nullptr) {
 		return KERNEL_ERROR_EINVAL;
+	}
+	if (param == nullptr || !IsGuestPriority(param->sched_priority)) {
+		return KERNEL_ERROR_ENOTSUP;
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2285,6 +2312,10 @@ int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	if (!IsGuestPolicy(policy)) {
+		return KERNEL_ERROR_ENOTSUP;
+	}
+
 	// winpthreads supports only SCHED_OTHER policy
 	int ppolicy = SCHED_OTHER;
 
@@ -2292,10 +2323,14 @@ int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
 
 	int result = pthread_attr_setschedpolicy(&attr_value->p, ppolicy);
 
-	if (result == 0) {
-		return OK;
+	if (result != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
-	return KERNEL_ERROR_EINVAL;
+
+	// A policy comes with its default priority.
+	KernelSchedParam param {};
+	param.sched_priority = GUEST_DEFAULT_PRIORITY;
+	return PthreadAttrSetschedparam(attr, &param);
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetsolosched(PthreadAttr* attr, int solosched) {
@@ -3258,24 +3293,10 @@ bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_
 }
 
 int PthreadGetPriorityForKernel(Pthread thread) {
-	if (thread == nullptr) {
-		return 700;
+	if (thread == nullptr || thread->attr == nullptr) {
+		return GUEST_DEFAULT_PRIORITY;
 	}
-
-	sched_param param {};
-	int         pol = 0;
-
-	if (pthread_getschedparam(thread->p, &pol, &param) != 0) {
-		return 700;
-	}
-
-	if (param.sched_priority <= -2) {
-		return 767;
-	}
-	if (param.sched_priority >= +2) {
-		return 256;
-	}
-	return 700;
+	return thread->attr->guest_priority;
 }
 
 int PthreadGetCurrentPriorityForKernel() {
@@ -3638,6 +3659,10 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	if (!IsGuestPriority(prio)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
 	sched_param param {};
 	int         pol = 0;
 
@@ -3667,6 +3692,20 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 		std::fprintf(stderr, "thread: \"%s\" (guest %d) priority %d\n", thread->name.c_str(), thread->guest.thread_id, prio);
 	}
 	return OK;
+}
+
+int KYTY_SYSV_ABI PthreadSetschedparam(Pthread thread, int policy, const KernelSchedParam* param) {
+	PRINT_NAME();
+
+	if (thread == nullptr || param == nullptr || !IsGuestPolicy(policy)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (thread->free) {
+		return KERNEL_ERROR_ESRCH;
+	}
+
+	thread->attr->policy = policy;
+	return PthreadSetprio(thread, param->sched_priority);
 }
 
 void KYTY_SYSV_ABI PthreadTestcancel() {
@@ -4245,14 +4284,7 @@ int KYTY_SYSV_ABI pthread_setschedparam(LibKernel::Pthread thread, int policy,
                                         const LibKernel::KernelSchedParam* param) {
 	PRINT_NAME();
 
-	if (thread == nullptr || param == nullptr) {
-		return POSIX_EINVAL;
-	}
-
-	int result = LibKernel::PthreadAttrSetschedpolicy(&thread->attr, policy);
-	result = (result == OK ? LibKernel::PthreadAttrSetschedparam(&thread->attr, param) : result);
-
-	return (result == OK ? 0 : LibKernel::KernelToPosix(result));
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadSetschedparam(thread, policy, param));
 }
 
 void KYTY_SYSV_ABI pthread_yield() {
