@@ -221,9 +221,14 @@ SystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance)
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	luminance->max_full_frame_tone_map_luminance = 80.0f;
-	luminance->max_tone_map_luminance            = 1000.0f;
-	luminance->min_tone_map_luminance            = 0.0f;
+	// As a PS5 whose HDR has not been adjusted in the system settings: the console keeps the three
+	// adjustment screens' results as 10-bit PQ codes and turns them into nits; without them it reports
+	// 637.32 (PQ code 0x2cf) full frame, 981.15 (0x2ff) peak and 0.12494 minimum. The full-frame value
+	// is what games tone map most of the picture to: a low one (80 nits before) gives a dim, washed out
+	// picture on an HDR display (issue #7).
+	luminance->max_full_frame_tone_map_luminance = 637.318970f;
+	luminance->max_tone_map_luminance            = 981.145996f;
+	luminance->min_tone_map_luminance            = 0.124935f;
 
 	return OK;
 }
