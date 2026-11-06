@@ -415,6 +415,28 @@ static bool AjmCodecIsValid(uint32_t codec) {
 	}
 }
 
+// Results a title can stop a voice on. Each kind is logged a few times, with where the stream stood.
+static void AjmLogDecodeFailure(uint32_t instance, const AjmDecodeResult& result, const void* input,
+                                size_t input_size, size_t output_size) {
+	constexpr int32_t BENIGN = AJM_RESULT_PARTIAL_INPUT | AJM_RESULT_NOT_ENOUGH_ROOM;
+	if ((result.result & ~BENIGN) == 0) {
+		return;
+	}
+	static std::atomic_uint32_t logged {0};
+	if (logged.fetch_add(1) >= 32) {
+		return;
+	}
+	std::string head;
+	const auto* bytes = static_cast<const uint8_t*>(input);
+	for (size_t i = 0; bytes != nullptr && i < std::min<size_t>(input_size, 16); i++) {
+		head += fmt::sprintf("%02x", bytes[i]);
+	}
+	Log::WriteToConsoleAndLog(fmt::sprintf(
+	    "AJM: instance %u: result 0x%08x, internal %d, input %zu consumed %zu, output %zu written %zu, input starts %s\n",
+	    instance, static_cast<uint32_t>(result.result), result.internal_result, input_size,
+	    static_cast<size_t>(result.input_consumed), output_size, static_cast<size_t>(result.output_written), head));
+}
+
 static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
                                          void* output, size_t output_size, bool multiple_frames) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
@@ -425,8 +447,10 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 		return result;
 	}
 
-	return state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
+	auto decode_result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
 	                              &state->gapless);
+	AjmLogDecodeFailure(instance, decode_result, input, input_size, output_size);
+	return decode_result;
 }
 
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,
