@@ -1898,6 +1898,17 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 	voice.rendered  = true;
 }
 
+// A patch can name a rack instead of a voice: it reaches the rack's first voice.
+static Ngs2VoiceInternal* Ngs2PatchDestination(uint64_t handle) {
+	Common::LockGuard racks_lock(g_racks_mutex);
+	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+		if (reinterpret_cast<uintptr_t>(rack) == handle) {
+			return reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+		}
+	}
+	return reinterpret_cast<Ngs2VoiceInternal*>(handle);
+}
+
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
@@ -2376,8 +2387,8 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoicePatchParam));
 						const auto* patch = reinterpret_cast<const Ngs2VoicePatchParam*>(param);
 						EXIT_NOT_IMPLEMENTED(patch->port >= voice->ports.size());
-						voice->ports[patch->port].dest =
-						    reinterpret_cast<Ngs2VoiceInternal*>(patch->dest_handle);
+						auto* patch_dest = Ngs2PatchDestination(patch->dest_handle);
+						voice->ports[patch->port].dest = patch_dest;
 						voice->ports[patch->port].input = patch->dest_input_id;
 						LOGF("\t connect->port          = %u\n"
 						     "\t connect->dest_input_id = %u\n"
