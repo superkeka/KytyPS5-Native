@@ -5327,7 +5327,7 @@ void TestAtomicOps() {
 	Check(!CpuAtomicMem(&q, 0x41u, 1, 0), "a float op is not done");
 }
 
-// MEM_SEMAPHORE (SetMemSemaphore) and DRAW_INDEX_MULTI_INST (0x3A) with its switch off.
+// MEM_SEMAPHORE (SetMemSemaphore).
 void TestMemSemaphoreAnd3A() {
 	const uint64_t addr = 0x202000600ull;
 	std::vector<uint32_t> cb;
@@ -5350,10 +5350,6 @@ void TestMemSemaphoreAnd3A() {
 	c.SetMemSemaphore(Pm4Translator::MemSemaphore::AsIs);
 	auto rc = c.Translate(cb);
 	Check(!rc.ok && RefusedFor(rc, RefuseWhy::SemaphoreForm), "MEM_SEMAPHORE on MEC refused");
-
-	std::vector<uint32_t> multi = {0xc0073a00u, 3u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
-	auto r3 = t.Translate(multi);
-	Check(!r3.ok && r3.unknown_op == 0x3Au, "DrawIndexMultiInstanced (0x3A) refused while the switch is off");
 }
 
 // DRAW_INDEX_MULTI_INST (SetMultiInst, KYTY_NATIVE_GPU_MULTI_INST), AgcDcbDrawIndexMultiInstanced: N, the object-id table,
@@ -5383,10 +5379,23 @@ void TestMultiInst() {
 	};
 
 	{
+		constexpr uint32_t IT_DRAW_INDEX_2_T = 0x27u;
 		Pm4Translator         off;
-		std::vector<uint32_t> dcb = multi(3u, 36u, 0x80u);
-		auto                  r   = off.Translate(dcb);
-		Check(!r.ok && r.unknown_op == IT_MULTI_INST, "0x3A refused with the switch off (KYTY_NATIVE_GPU_MULTI_INST=0)");
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_SET_UCONFIG_REG, {0x243u, 1u}, false); // VGT_INDEX_TYPE = 32-bit
+		const auto pkt = multi(3u, 36u, 0xA0u);
+		dcb.insert(dcb.end(), pkt.begin(), pkt.end());
+		auto          r    = off.Translate(dcb);
+		const auto    pkts = Decode(r.ib);
+		const Packet* d    = FindFirst(pkts, IT_DRAW_INDEX_2_T);
+		const Packet* n    = before(pkts, d);
+		Check(r.ok && r.stats.draws == 1 && r.stats.multi_inst == 1 && Count(pkts, IT_MULTI_INST) == 0 && d != nullptr &&
+		          d->body == std::vector<uint32_t> {36u, static_cast<uint32_t>(kIndex), static_cast<uint32_t>(kIndex >> 32u), 36u, 0u},
+		      "0x3A by default: one DRAW_INDEX_2 of the same buffer, without UNROLLED_INST and NOT_EOP");
+		Check(n != nullptr && n->op == IT_NUM_INSTANCES && n->body == std::vector<uint32_t> {3u}, "with NUM_INSTANCES N right before it");
+		Check(HasRef(r.refs, kIndex, 36u * 4u, false) && !HasRef(r.refs, kTable, 0, false), "the index buffer referenced, the table not read");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the strict gfx-ring check");
 	}
 
 	Pm4Translator t;
@@ -6014,15 +6023,26 @@ void TestUconfigProbed() {
 	Append(bc, IT_SET_UCONFIG_REG, {0x380u, 0x1000u, 0x2u}, true);
 	Append(bc, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
 	auto rc = c.Translate(bc);
-	Check(rc.ok && rc.unknown_ops.empty() && rc.stats.uconfig_skipped == 1 && rc.skipped_uconfig.count(0x380u) == 1 &&
-	          FindFirst(Decode(rc.ib), IT_SET_UCONFIG_REG) == nullptr,
-	      "on MEC TA_CS_BC_BASE_ADDR is dropped, the ACB still translates");
+	const auto    pc = Decode(rc.ib);
+	const Packet* uc = FindFirst(pc, IT_SET_UCONFIG_REG);
+	Check(rc.ok && rc.unknown_ops.empty() && rc.stats.uconfig_skipped == 0 && Count(pc, IT_SET_UCONFIG_REG) >= 2 && uc != nullptr &&
+	          uc->body == std::vector<uint32_t> {0x380u, 0x1000u},
+	      "on MEC TA_CS_BC_BASE_ADDR goes, one register a packet");
+	Check(ValidateNativeIb(rc.ib, false, &bad, NativeIbKind::Compute), "the IB passes the compute-ring check");
+	std::vector<uint32_t> bg;
+	Append(bg, IT_SET_UCONFIG_REG, {0x25Cu, 1u}, true);
+	Append(bg, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rv = c.Translate(bg);
+	Check(rv.ok && rv.stats.uconfig_skipped == 1 && rv.skipped_uconfig.count(0x25Cu) == 1, "GE_USER_VGPR1 stays dropped on MEC");
+	Check(!ValidateNativeIb(std::vector<uint32_t> {0xc0017902u, 0x25Cu, 1u}, false, &bad, NativeIbKind::Compute),
+	      "the compute-ring check takes no other UCONFIG write");
 	static std::vector<uint32_t> pairs = {0x380u, 0x1000u, 0x381u, 0x2u};
 	std::vector<uint32_t>        table;
 	AppendIndirect(table, IT_SET_UCONFIG_REG_INDIRECT, pairs);
 	Append(table, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
 	auto rt = c.Translate(table);
-	Check(rt.ok && rt.unknown_ops.empty() && rt.stats.uconfig_skipped == 2, "and in a register table too");
+	Check(rt.ok && rt.unknown_ops.empty() && rt.stats.uconfig_skipped == 0 && Count(Decode(rt.ib), IT_SET_UCONFIG_REG) >= 2,
+	      "and from a register table too, as SET_UCONFIG_REG");
 	std::vector<uint32_t> ge;
 	Append(ge, IT_SET_UCONFIG_REG, {0x260u, 0x40u}, true);
 	Append(ge, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);

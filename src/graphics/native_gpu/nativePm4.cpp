@@ -233,16 +233,21 @@ bool DmaDataAllowed(uint32_t control, uint32_t command, bool gds) {
 // WRITE_DATA DST_SEL values that target memory (1 = memory via GRBM, 2 = TC/L2, 5 = memory).
 // DST_SEL 0 writes a register and is refused, like any non-whitelisted register write.
 // UCONFIG registers Pm4Translator::UconfigAllowed passes on the gfx ring that a compute ring drops instead of refusing
-// the buffer, as it did before they were allowed: probe uconfig-w ran their SETs on the gfx ring only (2.11), so MEC
-// keeps leaving out GE_USER_VGPR1-3 and GE_PC_ALLOC and TA_CS_BC_BASE_ADDR and _HI (compute state an ACB may write).
-// The registers of AgcInit's reset defaults (zero, 0x38 = 2) ran the same way, one by one, on the gfx ring only.
+// the buffer, as it did before they were allowed: probe uconfig-w ran their SETs on the gfx ring only, so MEC keeps
+// leaving out GE_USER_VGPR1-3 and GE_PC_ALLOC. The registers of AgcInit's reset defaults (zero, 0x38 = 2) ran the same
+// way, one by one, on the gfx ring only.
 bool UconfigResetDefault(uint32_t off) {
 	return (off >= 0x35u && off <= 0x3Cu) || (off >= 0x2BBu && off <= 0x2BFu) || (off >= 0x2C4u && off <= 0x2D3u) ||
 	       (off >= 0x2E4u && off <= 0x2EBu) || (off >= 0x41Du && off <= 0x41Fu);
 }
 
 bool UconfigComputeDropped(uint32_t off) {
-	return (off >= 0x25Cu && off <= 0x25Eu) || off == 0x260u || off == 0x380u || off == 0x381u || UconfigResetDefault(off);
+	return (off >= 0x25Cu && off <= 0x25Eu) || off == 0x260u || UconfigResetDefault(off);
+}
+
+// TA_CS_BC_BASE_ADDR and _HI: compute state an ACB writes, and probe uconfig-w runs them on a compute ring too.
+bool UconfigOnCompute(uint32_t off) {
+	return off == 0x380u || off == 0x381u;
 }
 
 // KYTY_NATIVE_GPU_UCONFIG_PROBED=0 leaves the probed registers out on the gfx ring too.
@@ -1802,8 +1807,14 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				}
 				break;
 			}
+			// A compute ring takes the one UCONFIG state of its own, one register a packet (UconfigOnCompute).
+			case IT_SET_UCONFIG_REG:
+				if (compute && (size != 3 || header != Pkt3(IT_SET_UCONFIG_REG, 2, true) || !UconfigOnCompute(b[0]))) {
+					return bad();
+				}
+				break;
 			// Graphics-only: on a compute ring no handler in MEC's microcode (stock or the PS5's), but SET_UCONFIG_REG,
-			// which MEC runs; the translator sends no UCONFIG write there (geometry state, see the case in Translate).
+			// which MEC runs; the translator sends no other UCONFIG write there (geometry state, see the case in Translate).
 			case IT_CLEAR_STATE:
 			case IT_SET_PREDICATION:
 			case IT_INDEX_BUFFER_SIZE:
@@ -1816,7 +1827,6 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 			case IT_NUM_INSTANCES:
 			case IT_PFP_SYNC_ME:
 			case IT_SET_CONTEXT_REG:
-			case IT_SET_UCONFIG_REG:
 			case IT_SET_UCONFIG_REG_INDEX:
 			case IT_SET_CONTEXT_REG_INDIRECT: // the guest's register tables, checked by the translator
 			case IT_SET_SH_REG_INDIRECT:
@@ -2289,8 +2299,8 @@ bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
 		case 0x380: // TA_CS_BC_BASE_ADDR
 		case 0x381: // TA_CS_BC_BASE_ADDR_HI
 			// Dropped before only for want of a probe. Probe uconfig-w: a single SET_UCONFIG_REG of each on the gfx ring is
-			// harmless (no ring stop, no reset), so the title's goes as written. A compute ring still drops them
-			// (UconfigComputeDropped): the probe ran none on MEC. 0x342 stops the compute ring and stays dropped.
+			// harmless (no ring stop, no reset), so the title's goes as written. A compute ring drops all but
+			// TA_CS_BC_BASE_ADDR and _HI (UconfigComputeDropped). 0x342 stops the compute ring and stays dropped.
 			return UconfigProbedAllowed();
 		case 0x248: // VGT_OBJECT_ID
 		case 0x383: // TEXTURE_GRADIENT_FACTORS
@@ -2382,10 +2392,16 @@ void Pm4Translator::EmitPreamble(std::vector<uint32_t>& ib, Pm4TranslateStats& s
 	if (m_compute_ring) {
 		// MEC has no graphics context: CONTEXT_CONTROL, CLEAR_STATE, SET_CONTEXT_REG, the LOAD_*_REG and the register
 		// tables have no handler in its microcode, stock or the PS5's. SET_UCONFIG_REG has one, but the UCONFIG keys
-		// are geometry state, which a compute ring has no use for. SH state is replayed: other jobs share the ring.
+		// are geometry state, which a compute ring has no use for, but TA_CS_BC_BASE_ADDR. SH state is replayed: other jobs
+		// share the ring, and the UCONFIG one with it, since it is the GPU's only copy.
 		for (const auto& [offset, value]: sh) {
 			EmitSet(ib, IT_SET_SH_REG, offset, PatchSh(offset, value), true);
 			stats.preamble_sh++;
+		}
+		for (const auto& [offset, value]: uc) {
+			if (UconfigOnCompute(offset)) {
+				EmitSet(ib, IT_SET_UCONFIG_REG, offset, value, true);
+			}
 		}
 		return;
 	}
@@ -5128,7 +5144,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					                                                        : Normalize(bptr[0]);
 					bool graphics = false;
 					for (uint32_t i = 1; i < body_count; i++) {
-						if (uc_allowed(base + (i - 1)) && !UconfigComputeDropped(base + (i - 1))) {
+						if (uc_allowed(base + (i - 1)) && !UconfigComputeDropped(base + (i - 1)) && !UconfigOnCompute(base + (i - 1))) {
 							graphics = true;
 						}
 					}
@@ -5171,7 +5187,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (allowed) {
 					// As the title wrote it, several registers and the index form included: the PS5's PFP runs it with
 					// the stock handler (a plain VGT_INDEX_TYPE leaves its copy of the index type alone on both).
-					if (direct) {
+					if (m_compute_ring) {
+						// With the compute shader-type bit, as probe uconfig-w ran them.
+						for (uint32_t i = 1; i < body_count; i++) {
+							EmitSet(body, IT_SET_UCONFIG_REG, Normalize(bptr[0]) + (i - 1), bptr[i], true);
+						}
+					} else if (direct) {
 						in_place = true;
 					} else {
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
@@ -5309,7 +5330,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							r.skipped_uconfig.insert(off);
 							continue;
 						}
-						if (m_compute_ring) {
+						if (m_compute_ring && !UconfigOnCompute(off)) {
 							if (r.unknown_ops.empty()) {
 								r.unknown_op = op;
 								r.unknown_dw = dw;
@@ -5317,6 +5338,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 							r.unknown_ops.insert(op);
 							note_refusal(op, dw, RefuseWhy::UconfigOnMec);
 							continue;
+						}
+						if (m_compute_ring) {
+							EmitSet(body, IT_SET_UCONFIG_REG, off, value, true);
 						}
 						uc[off] = value;
 						writer(wuc, off, RegWriter::Table);
@@ -5713,20 +5737,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// UNROLLED_INST the first draw runs one instance and every later one nine, with or without NOT_EOP and
 				// OBJECT_ID_INST_EN (3 + 27 (N - 1) VS invocations for N draws of one triangle, where N instances want 3N),
 				// and an initiator without UNROLLED_INST took the whole board down. Whether the PS5 does the same with a
-				// title's state is not known, so the backend leaves this off (KYTY_NATIVE_GPU_MULTI_INST=1 turns it on) and
-				// the buffer goes to Kyty's command processor, which draws N instances of index_count indices.
-				if (!m_multi_inst) {
-					static std::atomic<uint32_t> told {0};
-					if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
-						std::fprintf(stderr, "native shadow: DrawIndexMultiInstanced (0x3A) refused (KYTY_NATIVE_GPU_MULTI_INST):");
-						for (uint32_t i = 0; i < std::min<uint32_t>(body_count, 8u); i++) {
-							std::fprintf(stderr, " %08x", bptr[i]);
-						}
-						std::fprintf(stderr, "\n");
-					}
-					soft_unknown(op, dw);
-					break;
-				}
+				// title's state is not known, so the packet goes only with KYTY_NATIVE_GPU_MULTI_INST=1. By default the same
+				// probe's control runs: NUM_INSTANCES N and one DRAW_INDEX_2 draw N instances exactly, and they leave the same
+				// index registers. The object-id table is not applied, VGT_OBJECT_ID stays as the title left it.
 				if (body_count != 8) { // libSceAgc's nine dwords only: the header is passed on with the body
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
@@ -5754,7 +5767,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					log_draw(op, index_count, 0, false);
 				}
 				const bool skipped = draw && skip_draw();
-				if (draw && !skipped) {
+				if (draw && !skipped && m_multi_inst) {
 					pfp_sync_me(); // the PFP fetches the object-id table as it does an indirect draw's arguments
 				}
 				body.push_back(Pkt3(IT_NUM_INSTANCES, 1, false));
@@ -5762,20 +5775,24 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (!draw || skipped) {
 					body.insert(body.end(), {Pkt3(IT_INDEX_BASE, 2, false), bptr[4], bptr[5], Pkt3(IT_INDEX_BUFFER_SIZE, 1, false), max_size});
 					stats.index_state++;
-				} else {
+				} else if (m_multi_inst) {
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + 8);
 					body.push_back(bptr[7] | 0x20u); // NOT_EOP: the stock CP's single-chunk path, the PS5's
+				} else {
+					// Without UNROLLED_INST and NOT_EOP, which only the packet's own draws use.
+					body.insert(body.end(), {Pkt3(IT_DRAW_INDEX_2, 5, false), max_size, bptr[4], bptr[5], index_count, bptr[7] & ~0xA0u});
 				}
 				if (draw) {
 					stats.draws_skipped += skipped ? 1u : 0u;
 					stats.draws++;
 					collect_refs();
-					if (!skipped) {
+					if (!skipped && m_multi_inst) {
 						add_ref(table, static_cast<uint64_t>(instances) * 4u, false);
 					}
 				}
 				add_ref(index_base, static_cast<uint64_t>(max_size) * stride, false, true);
-				NoteOnce(36, "DRAW_INDEX_MULTI_INST (NUM_INSTANCES, the packet with NOT_EOP)");
+				NoteOnce(36, m_multi_inst ? "DRAW_INDEX_MULTI_INST (NUM_INSTANCES, the packet with NOT_EOP)"
+				                          : "DRAW_INDEX_MULTI_INST as an instanced draw, its object ids not applied");
 				break;
 			}
 			case IT_COPY_DATA: {

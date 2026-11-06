@@ -3824,10 +3824,13 @@ static bool DangerMecPlain(Device* d, Common* c) {
 // UCW_REG=<dword offset>,<value>[,<value after>] (offset from 0xC000, or the full dword address): the optional third
 // value is written after the marker, with a second marker. No register is read on any ring. GRBM_GFX_INDEX (0x200, the
 // kernel's routing of every later register write) is refused. Output is unbuffered; run with --awake 3.
+// UCW_RING=compute runs it on compute ring 0 instead, with the compute shader-type bit.
 static bool DangerUconfigWrite(Device* d, Common* c) {
 	const char* spec = getenv("UCW_REG");
-	printf("== danger uconfig-w: one SET_UCONFIG_REG on the gfx ring, then a WRITE_DATA marker (UCW_REG=%s)\n",
-	       spec != NULL ? spec : "unset");
+	const char* ring    = getenv("UCW_RING");
+	const bool  compute = ring != NULL && strcmp(ring, "compute") == 0;
+	printf("== danger uconfig-w: one SET_UCONFIG_REG on the %s ring, then a WRITE_DATA marker (UCW_REG=%s)\n",
+	       compute ? "compute" : "gfx", spec != NULL ? spec : "unset");
 	uint32_t    v[3] = {0, 0, 0};
 	int         n    = 0;
 	const char* p    = spec;
@@ -3863,20 +3866,21 @@ static bool DangerUconfigWrite(Device* d, Common* c) {
 	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
 	Bo*                bos[] = {&mem};
 	Ib                 ib    = {.n = 0};
-	IbPush(&ib, 0xc0017904u); // SET_UCONFIG_REG, one register
+	const uint32_t header = compute ? 0xc0017902u : 0xc0017904u; // SET_UCONFIG_REG, one register
+	IbPush(&ib, header);
 	IbPush(&ib, off);
 	IbPush(&ib, v[1]);
-	GuestMark(&ib, false, mem.va, 0x0c570001u);
+	GuestMark(&ib, compute, mem.va, 0x0c570001u);
 	if (n == 3) {
-		IbPush(&ib, 0xc0017904u);
+		IbPush(&ib, header);
 		IbPush(&ib, off);
 		IbPush(&ib, v[2]);
-		GuestMark(&ib, false, mem.va + 4, 0x0c570002u);
+		GuestMark(&ib, compute, mem.va + 4, 0x0c570002u);
 	}
 	char what[64];
 	snprintf(what, sizeof(what), "UCONFIG 0x%04x (0x%05x) = 0x%08x:", 0xc000u + off, 0x30000u + 4u * off, v[1]);
 	PrintDwords("packet", ib.dw, 3);
-	GuestRun(d, &c->ib, &ib, false, bos, 1, 1.0, what);
+	GuestRun(d, &c->ib, &ib, compute, bos, 1, 1.0, what);
 	const bool first  = m[0] == 0x0c570001u;
 	const bool second = n < 3 || m[1] == 0x0c570002u;
 	printf("    marker after the write %s\n", first ? "landed" : "MISSING");

@@ -1137,6 +1137,7 @@ public:
 	void SetCondExec(bool on) { m_cond_exec = on; }
 	// DRAW_INDEX_MULTI_INST, 0x3A (KYTY_NATIVE_GPU_MULTI_INST), libSceAgc's AgcDcbDrawIndexMultiInstanced: NUM_INSTANCES
 	// with the packet's count and the packet as written with NOT_EOP set, which the stock CP then runs as the PS5's does.
+	// Off: NUM_INSTANCES and one DRAW_INDEX_2, without the object ids.
 	void SetMultiInst(bool on) { m_multi_inst = on; }
 
 	// Compact references (default off): instead of every GpuRef, only the 16 MiB buckets they touch

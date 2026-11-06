@@ -5514,7 +5514,7 @@ private:
 		// ATOMIC_MEM; 0 refuses it, asis passes the title's packet on as written (research only).
 		// KYTY_NATIVE_GPU_MULTI_INST (DRAW_INDEX_MULTI_INST, 0x3A): 1 sends NUM_INSTANCES and the packet with NOT_EOP, the
 		// PS5's register writes (microcode, 2.11); off by default, since probe multiinst saw the stock board run 1 + 9 (N
-		// - 1) instances for N draws instead of N, so the buffer goes to Kyty's command processor.
+		// - 1) instances for N draws instead of N, so it is NUM_INSTANCES and one DRAW_INDEX_2.
 		{
 			auto on = [](const char* name, bool def) {
 				const char* v = std::getenv(name);
