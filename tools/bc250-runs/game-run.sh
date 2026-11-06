@@ -68,7 +68,7 @@ play_video() {
 # ... no such file or directory"); a clean stop and start brings it back.
 distrobox enter kyty-dev -- true >/dev/null 2>&1 || { podman stop -t 5 kyty-dev; podman start kyty-dev; } >/dev/null 2>&1
 play_video "$VIDEOS/boot.webm"
-(cd "$OUT" && distrobox enter kyty-dev -- env DISPLAY=:1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" ${EXTRA_ENV:-} $ENVS timeout -s INT "$SECS" "$EMU" --game /home/deck/Games/$TITLE --screen-width ${SCREEN%x*} --screen-height ${SCREEN#*x} --fullscreen --no-splash --skip-notice-screen ${OVERLAY---perf-overlay} ${EXTRA_ARGS:-} > run.log 2>&1; echo "exit=$?" >> run.log) &
+(cd "$OUT" && distrobox enter kyty-dev -- env DISPLAY=:1 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" ${EXTRA_ENV:-} $ENVS timeout -s INT "$SECS" "$EMU" --game "${KYTY_GAME_PATH:-/home/deck/Games/$TITLE}" --screen-width ${SCREEN%x*} --screen-height ${SCREEN#*x} --fullscreen --no-splash --skip-notice-screen ${OVERLAY---perf-overlay} ${EXTRA_ARGS:-} > run.log 2>&1; echo "exit=$?" >> run.log) &
 EMUPID=$!
 ( while :; do
     [ -e "$MARKER" ] && { play_video "$VIDEOS/exit.webm"; break; }
