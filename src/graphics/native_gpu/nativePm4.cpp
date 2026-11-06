@@ -235,8 +235,23 @@ bool DmaDataAllowed(uint32_t control, uint32_t command, bool gds) {
 // UCONFIG registers Pm4Translator::UconfigAllowed passes on the gfx ring that a compute ring drops instead of refusing
 // the buffer, as it did before they were allowed: probe uconfig-w ran their SETs on the gfx ring only (2.11), so MEC
 // keeps leaving out GE_USER_VGPR1-3 and GE_PC_ALLOC and TA_CS_BC_BASE_ADDR and _HI (compute state an ACB may write).
+// The registers of AgcInit's reset defaults (zero, 0x38 = 2) ran the same way, one by one, on the gfx ring only.
+bool UconfigResetDefault(uint32_t off) {
+	return (off >= 0x35u && off <= 0x3Cu) || (off >= 0x2BBu && off <= 0x2BFu) || (off >= 0x2C4u && off <= 0x2D3u) ||
+	       (off >= 0x2E4u && off <= 0x2EBu) || (off >= 0x41Du && off <= 0x41Fu);
+}
+
 bool UconfigComputeDropped(uint32_t off) {
-	return (off >= 0x25Cu && off <= 0x25Eu) || off == 0x260u || off == 0x380u || off == 0x381u;
+	return (off >= 0x25Cu && off <= 0x25Eu) || off == 0x260u || off == 0x380u || off == 0x381u || UconfigResetDefault(off);
+}
+
+// KYTY_NATIVE_GPU_UCONFIG_PROBED=0 leaves the probed registers out on the gfx ring too.
+bool UconfigProbedAllowed() {
+	static const bool probed = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_UCONFIG_PROBED");
+		return v == nullptr || v[0] != '0';
+	}();
+	return probed;
 }
 
 bool WriteDataToMemory(uint32_t control) {
@@ -2273,18 +2288,10 @@ bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
 		case 0x260: // GE_PC_ALLOC
 		case 0x380: // TA_CS_BC_BASE_ADDR
 		case 0x381: // TA_CS_BC_BASE_ADDR_HI
-		{
-			// Dropped before only for want of a probe. Probe uconfig-w (2.11): a single SET_UCONFIG_REG of each on the gfx
-			// ring is harmless (no ring stop, no reset), so the title's goes as written, as the PS5's CP runs it. The rest
-			// of the dropped offsets (0x35-0x3c, 0x2bb-0x2bf, 0x2c4-0x2d3, 0x2e4-0x2eb, 0x41d-0x41f, and 0x342 on MEC) were
-			// not run and stay dropped. A compute ring drops all six as before (UconfigComputeDropped): the probe ran none on
-			// MEC. KYTY_NATIVE_GPU_UCONFIG_PROBED=0 drops all six on the gfx ring again.
-			static const bool probed = [] {
-				const char* v = std::getenv("KYTY_NATIVE_GPU_UCONFIG_PROBED");
-				return v == nullptr || v[0] != '0';
-			}();
-			return probed;
-		}
+			// Dropped before only for want of a probe. Probe uconfig-w: a single SET_UCONFIG_REG of each on the gfx ring is
+			// harmless (no ring stop, no reset), so the title's goes as written. A compute ring still drops them
+			// (UconfigComputeDropped): the probe ran none on MEC. 0x342 stops the compute ring and stays dropped.
+			return UconfigProbedAllowed();
 		case 0x248: // VGT_OBJECT_ID
 		case 0x383: // TEXTURE_GRADIENT_FACTORS
 		case 0x384: // TEXTURE_GRADIENT_CONTROL
@@ -2297,7 +2304,7 @@ bool Pm4Translator::UconfigAllowed(uint32_t normalized_offset) {
 			}();
 			return extra;
 		}
-		default: return false;
+		default: return UconfigResetDefault(normalized_offset) && UconfigProbedAllowed();
 	}
 }
 

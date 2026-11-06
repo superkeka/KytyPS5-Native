@@ -5983,25 +5983,27 @@ void TestWaitFunctionsAll() {
 }
 
 // UCONFIG registers probe uconfig-w (2.11) wrote harmlessly on the gfx ring go as written there: GE_USER_VGPR1-3,
-// GE_PC_ALLOC, TA_CS_BC_BASE_ADDR/_HI. The unprobed rest stays dropped. MEC drops all six as before (none ran there).
+// GE_PC_ALLOC, TA_CS_BC_BASE_ADDR/_HI and the registers of AgcInit's reset defaults. The unprobed rest stays dropped.
+// MEC drops them all as before (none ran there).
 void TestUconfigProbed() {
-	for (const uint32_t off: {0x25Cu, 0x25Du, 0x25Eu, 0x260u, 0x380u, 0x381u}) {
+	for (const uint32_t off: {0x25Cu, 0x25Du, 0x25Eu, 0x260u, 0x380u, 0x381u, 0x035u, 0x03Cu, 0x2BBu, 0x2C4u, 0x2D3u, 0x2E4u,
+	                          0x41Du}) {
 		Check(Pm4Translator::UconfigAllowed(off), "a probed UCONFIG register is allowed");
 	}
-	for (const uint32_t off: {0x035u, 0x03Cu, 0x2BBu, 0x2C4u, 0x2D3u, 0x2E4u, 0x41Du, 0x342u}) {
+	for (const uint32_t off: {0x342u, 0x343u, 0x2C0u, 0x2C3u, 0x2D4u, 0x2ECu, 0x420u}) {
 		Check(!Pm4Translator::UconfigAllowed(off), "an unprobed UCONFIG register stays dropped");
 	}
 	std::vector<uint32_t> dcb;
 	Append(dcb, IT_SET_UCONFIG_REG, {0x25Cu, 1u, 2u, 3u}, false);
 	Append(dcb, IT_SET_UCONFIG_REG, {0x260u, 0x40u}, false);
 	Append(dcb, IT_SET_UCONFIG_REG, {0x380u, 0x1000u, 0x2u}, false);
-	Append(dcb, IT_SET_UCONFIG_REG, {0x2BBu, 0x5u}, false);
+	Append(dcb, IT_SET_UCONFIG_REG, {0x2C0u, 0x5u}, false);
 	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
 	Pm4Translator t;
 	auto          r = t.Translate(dcb);
-	Check(r.ok && r.stats.uconfig_skipped == 1 && r.skipped_uconfig.count(0x2BBu) == 1 &&
+	Check(r.ok && r.stats.uconfig_skipped == 1 && r.skipped_uconfig.count(0x2C0u) == 1 &&
 	          std::search(r.ib.begin(), r.ib.end(), dcb.begin(), dcb.begin() + 12) != r.ib.end(),
-	      "on the gfx ring the three packets as written, 0x2BB dropped");
+	      "on the gfx ring the three packets as written, 0x2C0 dropped");
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the gfx-ring check");
 
