@@ -525,11 +525,16 @@ static void* KYTY_SYSV_ABI GuestSignal(int signum, void* handler) {
 	return old.handler;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+extern "C" {
+extern char __executable_start;
+extern char etext;
+}
+#endif
+
 // libkernel's code is in this program.
 static int KYTY_SYSV_ABI KernelGetLibkernelTextLocation(void** address, uint64_t* size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	extern char __executable_start;
-	extern char etext;
 	*address = &__executable_start;
 	*size    = static_cast<uint64_t>(&etext - &__executable_start);
 #else
