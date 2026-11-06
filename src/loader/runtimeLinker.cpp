@@ -124,6 +124,7 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
+	bool        called = false;
 };
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
@@ -208,22 +209,26 @@ uint64_t UnresolvedImportStubCalls() {
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	t_unresolved_stub_calls++;
-	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
-		if (record_id < g_stubbed_imports.size()) {
-			const auto& record = g_stubbed_imports[record_id];
-			printf("Unresolved import stub called: %s\n", record.name.c_str());
-			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
-			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
-			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
-			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
-			     record.program.c_str());
-		} else {
-			printf("Unresolved import stub called: <bad-record>\n");
-			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
-			     log_index, record_id);
-		}
+	if (record_id >= g_stubbed_imports.size()) {
+		printf("Unresolved import stub called: <bad-record>\n");
+		return 0;
 	}
+	auto& record = g_stubbed_imports[record_id];
+	if (__atomic_exchange_n(&record.called, true, __ATOMIC_RELAXED)) {
+		return 0;
+	}
+	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
+	// A size query or a patch answered with 0 makes the caller work on nothing.
+	const bool risky = record.name.find("GetSize") != std::string::npos ||
+	                   record.name.find("QueryMemory") != std::string::npos ||
+	                   record.name.find("Patch") != std::string::npos;
+	printf("Unresolved import stub called%s: %s (%s)\n", risky ? " (returns 0 where the caller needs a value)" : "",
+	       record.name.c_str(), record.program.c_str());
+	LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
+	     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
+	     log_index, record.patch_vaddr, record.index, record.name.c_str(),
+	     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
+	     record.program.c_str());
 	return 0;
 }
 
