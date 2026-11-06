@@ -1636,6 +1636,70 @@ static bool DangerGdsDma(Device* d, Common* c) {
 	return ok;
 }
 
+// A title's cache prefetch: DMA_DATA from memory through L2 to no destination (DST_SEL 2), with and without
+// CP_SYNC, on compute ring 0 and on gfx. A memory copy after it shows the ring went on past the packet.
+static bool DangerDmaNowhere(Device* d, Common* c) {
+	printf("== danger dmanowhere: DMA_DATA memory -> nowhere (DST_SEL 2), compute ring 0 then gfx\n");
+	Bo  buf;
+	int r = MemCreate(d, &buf, MEM_GTT, 256 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &buf, 0x0300000000ull, AMDGPU_VM_MTYPE_UC);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		return false;
+	}
+	static const struct {
+		uint32_t    ip;
+		const char* name;
+	} rings[] = {{AMDGPU_HW_IP_COMPUTE, "compute 0"}, {AMDGPU_HW_IP_GFX, "gfx"}};
+	static const uint32_t controls[] = {0x66204000u, 0xe6204000u};
+	bool ok = true;
+	for (size_t k = 0; k < ARRAY_SIZE(rings) && ok; k++) {
+		for (size_t f = 0; f < ARRAY_SIZE(controls) && ok; f++) {
+			uint32_t* m = (uint32_t*)buf.cpu;
+			const uint32_t magic = 0x5a000000u + (uint32_t)(k * 16u + f);
+			m[0] = magic;
+			m[0x8000] = 0xeeeeeeeeu;
+			__sync_synchronize();
+			Ib ib = {.n = 0};
+			IbPush(&ib, Pkt3(0x50u, 6));
+			IbPush(&ib, controls[f]);
+			IbPush(&ib, (uint32_t)buf.va);
+			IbPush(&ib, (uint32_t)(buf.va >> 32));
+			IbPush(&ib, 0u);
+			IbPush(&ib, 0u);
+			IbPush(&ib, 64u * 1024u);
+			IbPush(&ib, Pkt3(0x50u, 6));
+			IbPush(&ib, 1u << 31);
+			IbPush(&ib, (uint32_t)buf.va);
+			IbPush(&ib, (uint32_t)(buf.va >> 32));
+			IbPush(&ib, (uint32_t)(buf.va + 0x20000));
+			IbPush(&ib, (uint32_t)((buf.va + 0x20000) >> 32));
+			IbPush(&ib, 4u);
+			IbPad(&ib);
+			Bo*      bos[] = {&buf};
+			uint64_t seq   = 0;
+			double   t0    = NowSec();
+			r              = SubmitOn(d, rings[k].ip, 0, &c->ib, &ib, bos, 1, &seq);
+			if (r == 0) {
+				r = WaitOn(d, rings[k].ip, 0, seq, 5.0);
+			}
+			const int64_t state = ContextState(d);
+			printf("  %-9s control 0x%08x: %s after %.1f ms, next copy %s, context state 0x%" PRIx64 "\n", rings[k].name,
+			       controls[f], r == 0 ? "signaled" : (r == 1 ? "TIMEOUT" : ErrStr(r)), (NowSec() - t0) * 1e3,
+			       m[0x8000] == magic ? "landed" : "missing", (uint64_t)state);
+			fflush(stdout);
+			if (r != 0 || state != 0) {
+				_exit(3);
+			}
+			ok = m[0x8000] == magic;
+		}
+	}
+	BoDestroy(d, &buf);
+	return ok;
+}
+
 // Job A on compute ring 1 waits (WAIT_REG_MEM) for a memory flag; 100 ms later job B on
 // compute ring 0 writes it (WRITE_DATA). Checks that queues can wait on each other via memory.
 static bool DangerCrossQueue(Device* d, Common* c) {
@@ -6664,6 +6728,8 @@ int main(int argc, char** argv) {
 			ok = DangerGds(&d, &c);
 		} else if (strcmp(danger, "gdsdma") == 0) {
 			ok = DangerGdsDma(&d, &c);
+		} else if (strcmp(danger, "dmanowhere") == 0) {
+			ok = DangerDmaNowhere(&d, &c);
 		} else if (strcmp(danger, "crossqueue") == 0) {
 			ok = DangerCrossQueue(&d, &c);
 		} else if (strcmp(danger, "uconfig") == 0) {

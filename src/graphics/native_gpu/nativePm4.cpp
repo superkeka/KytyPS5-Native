@@ -219,13 +219,13 @@ bool WaitConditionMet(uint32_t function, uint64_t value, uint64_t reference) {
 	}
 }
 
-// DMA_DATA between guest memory (or an immediate source) only: DST_SEL 0/3 (memory), SRC_SEL 0/2/3
-// (memory or immediate data), and both address-space bits (SAS bit 26, DAS bit 27 of the command
-// dword) clear. GDS and register transfers are refused.
+// DMA_DATA between guest memory (or an immediate source) only: DST_SEL 0/3 (memory) or 2 (no destination, a cache
+// prefetch; probe dmanowhere), SRC_SEL 0/2/3 (memory or immediate data), and both address-space bits (SAS bit 26,
+// DAS bit 27 of the command dword) clear. GDS and register transfers are refused.
 bool DmaDataAllowed(uint32_t control, uint32_t command, bool gds) {
 	const uint32_t dst_sel = (control >> 20u) & 0x3u;
 	const uint32_t src_sel = (control >> 29u) & 0x3u;
-	const bool     dst_ok  = dst_sel == 0u || dst_sel == 3u || (gds && dst_sel == 1u);
+	const bool     dst_ok  = dst_sel == 0u || dst_sel == 2u || dst_sel == 3u || (gds && dst_sel == 1u);
 	const bool     src_ok  = src_sel == 0u || src_sel == 2u || src_sel == 3u || (gds && src_sel == 1u);
 	return dst_ok && src_ok && (command & (3u << 26u)) == 0u;
 }
@@ -5396,7 +5396,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (src_sel != 1u && src_sel != 2u) {
 						add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bytes, false);
 					}
-					if (dst_sel != 1u) {
+					if (dst_sel == 0u || dst_sel == 3u) {
 						const uint64_t dst = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
 						add_ref(dst, bytes, false);
 						note_gpu_written(dst, dst + bytes);

@@ -497,6 +497,10 @@ void TestDmaData() {
 	Append(dcb, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.dma_data == 1, "memory DMA_DATA passed through");
+	std::vector<uint32_t> prefetch;
+	Append(prefetch, 0x50u, {0xe6204000u, 0x1000u, 0x2u, 0x0u, 0x0u, 256u}, false);
+	auto rp = t.Translate(prefetch);
+	Check(rp.ok && rp.stats.dma_data == 1, "DMA_DATA prefetch (DST_SEL 2) passed through");
 	std::vector<uint32_t> to_reg;
 	Append(to_reg, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2c00u, 0x0u, 4u | (1u << 27u)}, false);
 	Check(!t.Translate(to_reg).ok, "DMA_DATA into the register space refused");
