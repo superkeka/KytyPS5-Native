@@ -996,6 +996,61 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 	return g_tls_cached_main_tcb;
 }
 
+static KYTY_SYSV_ABI void GuestFatalTrap(uint32_t code, uint64_t site) {
+	static std::atomic_uint32_t logged {0};
+	if (logged.fetch_add(1) < 64) {
+		char thread_name[64] = "(host thread)";
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+			}
+		}
+		std::printf("Guest fatal trap 0x%08" PRIx32 " at 0x%016" PRIx64 " on %s: continuing\n", code, site, thread_name);
+		LOGF("Guest fatal trap 0x%08" PRIx32 " at 0x%016" PRIx64 " on %s: continuing\n", code, site, thread_name);
+	}
+}
+
+// Stands in for a guest's `mov fs:[0x28], code; int 0x45`: logs the code and leaves the function, which
+// keeps its frame pointer in rbp.
+static uint64_t AllocateFatalTrapThunk(uint32_t code, uint64_t site) {
+	constexpr uint64_t thunk_size = 41;
+
+	if (g_unresolved_stub_thunk_pages.empty() ||
+	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
+		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+		    "unresolved_import_thunk");
+		EXIT_NOT_IMPLEMENTED(page == 0);
+		g_unresolved_stub_thunk_pages.push_back(page);
+		g_unresolved_stub_thunk_offset = 0;
+	}
+
+	auto* thunk = reinterpret_cast<uint8_t*>(g_unresolved_stub_thunk_pages.back() +
+	                                         g_unresolved_stub_thunk_offset);
+	g_unresolved_stub_thunk_offset += thunk_size;
+
+	uint8_t bytes[thunk_size] = {
+	    0x53,                                 // push rbx
+	    0x48, 0x89, 0xe3,                     // mov rbx, rsp
+	    0x48, 0x83, 0xe4, 0xf0,               // and rsp, -16
+	    0xbf, 0, 0, 0, 0,                     // mov edi, code
+	    0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0, // mov rsi, site
+	    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, GuestFatalTrap
+	    0xff, 0xd0,                           // call rax
+	    0x48, 0x89, 0xdc,                     // mov rsp, rbx
+	    0x5b,                                 // pop rbx
+	    0x5d,                                 // pop rbp
+	    0xc3,                                 // ret
+	};
+	const auto target = reinterpret_cast<uint64_t>(GuestFatalTrap);
+	std::memcpy(bytes + 9, &code, sizeof(code));
+	std::memcpy(bytes + 15, &site, sizeof(site));
+	std::memcpy(bytes + 25, &target, sizeof(target));
+	std::memcpy(thunk, bytes, sizeof(bytes));
+	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(thunk), thunk_size);
+	return reinterpret_cast<uint64_t>(thunk);
+}
+
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(program->elf == nullptr);
@@ -1014,9 +1069,15 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				     reinterpret_cast<uint64_t>(ptr));
 				if (ptr + 16 < start_ptr + size && ptr[12] == 0xcd && ptr[13] == 0x45 &&
 				    ptr[14] == 0x90 && ptr[15] == 0x0f && ptr[16] == 0x0b) {
-					ptr[0] = 0x5d; // pop rbp
-					ptr[1] = 0xc3; // ret
-					std::memset(ptr + 2, 0x90, 15);
+					uint32_t code = 0;
+					std::memcpy(&code, ptr + 8, sizeof(code));
+					const uint64_t thunk = AllocateFatalTrapThunk(code, reinterpret_cast<uint64_t>(ptr));
+					ptr[0] = 0x48; // mov rax, thunk
+					ptr[1] = 0xb8;
+					std::memcpy(ptr + 2, &thunk, sizeof(thunk));
+					ptr[10] = 0xff; // jmp rax
+					ptr[11] = 0xe0;
+					std::memset(ptr + 12, 0x90, 5);
 				} else {
 					std::memset(ptr, 0x90, 12);
 				}
