@@ -103,6 +103,7 @@ Run one at a time with `--danger CASE`, only with the owner's approval.
 | `gds` | GDS/GWS/OA allocation, then 64 lanes of GDS `ds_add_rtn_u32` |
 | `crossqueue` | `WAIT_REG_MEM` on compute ring 1 released by `WRITE_DATA` on ring 0 |
 | `uconfig` | **took the board down**, see below; do not rerun as is (`uconfig-w` is the next attempt) |
+| `regforms` | the register forms libSceAgc can write, one per process: `REGFORM=dmapreop` (`ATOMIC_MEM` ADD_RTN, then `DMA_DATA` with SAS from the CP's pre-op register), `copypreop` (`COPY_DATA` SRC_SEL 6), `atomicrtn` (the atomic alone, `REGFORM_CMD`), `wruc`, `wrcx`, `wrsh` (`WRITE_DATA` DST_SEL 0 to UCONFIG, context, SH). `REGFORM_RING=compute`, `REGFORM_ENGINE=pfp`, `REGFORM_SRC`. All pass on the gfx ring. **`dmapreop` on a compute ring took the whole board down**, no kernel line: do not rerun; `atomicrtn` and `copypreop` pass there. |
 | `uconfig-w` | one `SET_UCONFIG_REG` (libSceAgc's DCB header 0xC0017904) on the gfx ring per process, then a `WRITE_DATA` marker: `UCW_REG=<dword offset>,<value>[,<value after>]` (offset from 0xC000 or the full address; the third value is written after the marker, with a second marker). `UCW_RING=compute` runs it on a compute ring. No register reads on any ring; GRBM_GFX_INDEX refused. Run with `--awake 3` |
 | `clock` | GPU clock reads on the gfx ring: `COPY_DATA` SRC_SEL 9, `RELEASE_MEM` DATA_SEL 3 (two events) |
 | `tag342` | libSceAgc's internal-data tags (`SET_UCONFIG_REG` of 0x342) on the gfx and a compute ring |

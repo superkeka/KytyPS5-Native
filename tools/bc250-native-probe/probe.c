@@ -3891,6 +3891,103 @@ static bool DangerUconfigWrite(Device* d, Common* c) {
 	return first && second;
 }
 
+// regforms: the register forms libSceAgc can write that the translator leaves out, one per process.
+// REGFORM=dmapreop   ATOMIC_MEM ADD_RTN, then DMA_DATA with SAS from CP_ME_ATOMIC_PREOP_LO (0x30174) into memory
+// REGFORM=copypreop  ATOMIC_MEM ADD_RTN, then COPY_DATA SRC_SEL 6 (the atomic's return data) into memory
+// REGFORM=wruc|wrcx|wrsh  WRITE_DATA DST_SEL 0 to a UCONFIG, context or SH register
+// REGFORM=atomicrtn  ATOMIC_MEM ADD_RTN alone (REGFORM_CMD: its COMMAND, default 0)
+// REGFORM_RING=compute runs the atomic forms on a compute ring: the first compute run, dmapreop with COMMAND 0, took the
+// whole board down, so run them apart. REGFORM_ENGINE=pfp runs dmapreop's atomic and copy on the prefetch parser, from
+// CP_PFP_ATOMIC_PREOP_LO; REGFORM_SRC overrides the register dmapreop reads. A marker follows.
+static bool DangerRegForms(Device* d, Common* c) {
+	const char* form = getenv("REGFORM") != NULL ? getenv("REGFORM") : "";
+	const char* ring = getenv("REGFORM_RING");
+	const bool  cs   = ring != NULL && strcmp(ring, "compute") == 0;
+	const bool  dma  = strcmp(form, "dmapreop") == 0, copy = strcmp(form, "copypreop") == 0, alone = strcmp(form, "atomicrtn") == 0;
+	const bool  pfp  = getenv("REGFORM_ENGINE") != NULL && strcmp(getenv("REGFORM_ENGINE"), "pfp") == 0;
+	const uint32_t cmd = getenv("REGFORM_CMD") != NULL ? (uint32_t)strtoul(getenv("REGFORM_CMD"), NULL, 0) & 3u : 0u;
+	const uint32_t src = getenv("REGFORM_SRC") != NULL ? (uint32_t)strtoul(getenv("REGFORM_SRC"), NULL, 0) : (pfp ? 0x30148u : 0x30174u);
+	uint32_t    reg  = 0, val = 0;
+	if (strcmp(form, "wruc") == 0) {
+		reg = 0xc248u; // VGT_OBJECT_ID
+	} else if (strcmp(form, "wrcx") == 0) {
+		reg = 0xa08eu; // CB_TARGET_MASK
+		val = 0xfu;
+	} else if (strcmp(form, "wrsh") == 0) {
+		reg = 0x2c0cu; // SPI_SHADER_USER_DATA_PS_0
+	} else if (!dma && !copy && !alone) {
+		printf("  REGFORM must be dmapreop, copypreop, atomicrtn, wruc, wrcx or wrsh\n");
+		return false;
+	}
+	if (reg != 0 && cs) {
+		printf("  the register writes run on the gfx ring only\n");
+		return false;
+	}
+	printf("== danger regforms: %s on the %s ring, atomic COMMAND %u, %s, source 0x%x\n", form, cs ? "compute" : "gfx", cmd,
+	       pfp ? "PFP" : "ME", src);
+	Bo mem;
+	if (!GuestMem(d, &mem, 0x0770000000ull)) {
+		return false;
+	}
+	volatile uint32_t* m     = (volatile uint32_t*)mem.cpu;
+	Bo*                bos[] = {&mem};
+	const uint64_t     word  = mem.va + 0x100, out = mem.va + 0x200;
+	const uint32_t     old   = 0x11223344u;
+	m[0x100 / 4]             = old;
+	m[0x200 / 4]             = 0xeeeeeeeeu;
+	m[0]                     = 0;
+	__sync_synchronize();
+	Ib ib = {.n = 0};
+	if (reg != 0) {
+		IbPush(&ib, GuestPkt(cs, 0x37u, 4));
+		IbPush(&ib, 1u << 16); // WR_ONE_ADDR, DST_SEL 0
+		IbPush(&ib, reg);
+		IbPush(&ib, 0u);
+		IbPush(&ib, val);
+		PrintDwords("packet", ib.dw, 5);
+	} else {
+		IbPush(&ib, GuestPkt(cs, 0x1eu, 8)); // ATOMIC_MEM, TC_OP_ATOMIC_ADD_RTN_32, COMMAND 0
+		IbPush(&ib, 0x0fu | (cmd << 8) | (pfp ? 1u << 30 : 0u));
+		IbPush(&ib, (uint32_t)word);
+		IbPush(&ib, (uint32_t)(word >> 32));
+		IbPush(&ib, 5u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0u);
+		IbPush(&ib, 0u);
+		const uint32_t at = ib.n;
+		if (dma) {
+			IbPush(&ib, GuestPkt(cs, 0x50u, 6));
+			IbPush(&ib, (1u << 31) | (pfp ? 1u : 0u)); // CP_SYNC, memory destination
+			IbPush(&ib, src);
+			IbPush(&ib, 0u);
+			IbPush(&ib, (uint32_t)out);
+			IbPush(&ib, (uint32_t)(out >> 32));
+			IbPush(&ib, 4u | (1u << 26)); // SAS
+			PrintDwords("packet", ib.dw + at, 7);
+		} else if (copy) {
+			IbPush(&ib, GuestPkt(cs, 0x40u, 5));
+			IbPush(&ib, 6u | (5u << 8) | (1u << 20));
+			IbPush(&ib, 0u);
+			IbPush(&ib, 0u);
+			IbPush(&ib, (uint32_t)out);
+			IbPush(&ib, (uint32_t)(out >> 32));
+			PrintDwords("packet", ib.dw + at, 6);
+		}
+	}
+	GuestMark(&ib, cs, mem.va, 0x4f500001u);
+	GuestRun(d, &c->ib, &ib, cs, bos, 1, 1.0, form);
+	const bool landed = m[0] == 0x4f500001u;
+	printf("    marker %s\n", landed ? "landed" : "MISSING");
+	bool ok = landed;
+	if (reg == 0) {
+		printf("    word 0x%08x (want 0x%08x), pre-op read 0x%08x (want 0x%08x)\n", m[0x100 / 4], old + 5u, m[0x200 / 4], old);
+		ok = ok && m[0x100 / 4] == old + 5u && (alone || m[0x200 / 4] == old);
+	}
+	BoDestroy(d, &mem);
+	return ok;
+}
+
 // Does a DMA_DATA without CP_SYNC finish before the job that issued it is done? Kyty inserts Mesa's
 // si_cp_dma_wait_for_idle form (a zero-byte DMA_DATA with CP_SYNC) before every job end and tracker release after a
 // title's unsynced DMA_DATA (BC5 F41: the next IB hung); Sony's PFP and ME DMA_DATA handlers have extra blocks at entry
@@ -6656,7 +6753,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem mecplain uconfig-w cpdma-tail condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop multiinst\n");
+	printf("danger cases (owner approval required, run alone): regforms vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem mecplain uconfig-w cpdma-tail condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop multiinst\n");
 	printf("PRT cases, in risk order: prt-map prt-split prt-read-compute prt-write-compute prt-kfd-tlb prt-replace-race prt-cp-compute prt-gfx-{copy,dma,write,wait,dispatch}\n");
 }
 
@@ -6758,6 +6855,8 @@ int main(int argc, char** argv) {
 			ok = DangerExitGuard(&d, &c);
 		} else if (strcmp(danger, "copydata") == 0) {
 			ok = DangerCopyData(&d, &c);
+		} else if (strcmp(danger, "regforms") == 0) {
+			ok = DangerRegForms(&d, &c);
 		} else if (strcmp(danger, "atomicops") == 0) {
 			ok = DangerAtomicOps(&d, &c);
 		} else if (strcmp(danger, "memsem") == 0) {

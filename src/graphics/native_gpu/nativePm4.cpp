@@ -230,8 +230,19 @@ bool DmaDataAllowed(uint32_t control, uint32_t command, bool gds) {
 	return dst_ok && src_ok && (command & (3u << 26u)) == 0u;
 }
 
+// The previous ATOMIC_MEM's result, into memory: libSceAgc's DMA_DATA sources 0x14, 0x24 and 0x64 read a pre-op register
+// of the CP (SAS), the prefetch parser's or the micro engine's. Probe regforms ran it on the gfx ring; on MEC it took the
+// whole board down, so a compute ring gets COPY_DATA of the return data instead, which the probe ran there.
+bool DmaAtomicResult(uint32_t control, uint32_t src_lo, uint32_t src_hi, uint32_t command) {
+	const uint32_t src_sel = (control >> 29u) & 0x3u;
+	const uint32_t dst_sel = (control >> 20u) & 0x3u;
+	const bool     preop   = src_lo == 0x30148u || src_lo == 0x30150u || src_lo == 0x30158u || src_lo == 0x30174u || src_lo == 0x3017cu ||
+	                   src_lo == 0x30184u;
+	return preop && src_hi == 0 && src_sel == 0 && (dst_sel == 0 || dst_sel == 3) && (command & (3u << 26u)) == (1u << 26u);
+}
+
 // WRITE_DATA DST_SEL values that target memory (1 = memory via GRBM, 2 = TC/L2, 5 = memory).
-// DST_SEL 0 writes a register and is refused, like any non-whitelisted register write.
+// DST_SEL 0 writes a register: the Translate case turns it into its space's SET packet.
 // UCONFIG registers Pm4Translator::UconfigAllowed passes on the gfx ring that a compute ring drops instead of refusing
 // the buffer, as it did before they were allowed: probe uconfig-w ran their SETs on the gfx ring only, so MEC keeps
 // leaving out GE_USER_VGPR1-3 and GE_PC_ALLOC. The registers of AgcInit's reset defaults (zero, 0x38 = 2) ran the same
@@ -1457,7 +1468,8 @@ bool ValidateNativeIbBlacklist(std::span<const uint32_t> ib, bool lod_stats, uin
 				break;
 			// S, P and the fix tables only through the translator's DMA_DATA and ATOMIC_MEM; no register space.
 			case IT_DMA_DATA: {
-				if (n < 6 || (b[5] & (3u << 26u)) != 0u) { // SAS / DAS: register addresses
+				// SAS / DAS: register addresses, but an atomic's result on the gfx ring.
+				if (n < 6 || ((b[5] & (3u << 26u)) != 0u && (compute || !DmaAtomicResult(b[0], b[1], b[2], b[5])))) {
 					return bad();
 				}
 				const uint32_t src_sel = (b[0] >> 29u) & 0x3u;
@@ -1619,7 +1631,7 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 				}
 				const uint32_t src_sel = b[0] & 0xfu;
 				const uint32_t dst_sel = (b[0] >> 8u) & 0xfu;
-				if (size != 6 || (compute && (header & 2u) == 0 && !MecPlainOp(IT_COPY_DATA)) || !(src_sel == 1u || src_sel == 2u || src_sel == 5u || src_sel == 9u) ||
+				if (size != 6 || (compute && (header & 2u) == 0 && !MecPlainOp(IT_COPY_DATA)) || !(src_sel == 6u || src_sel == 1u || src_sel == 2u || src_sel == 5u || src_sel == 9u) ||
 				    !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || (b[3] & 3u) != 0u || (b[3] == 0u && b[4] == 0u) ||
 				    (b[0] >> 30u) > 1u) { // ENGINE_SEL: the micro engine or the prefetch parser (MEC reads neither)
 					return bad();
@@ -1686,6 +1698,10 @@ bool ValidateNativeIbStrict(std::span<const uint32_t> ib, bool lod_stats, uint32
 			// back, or a slot's CB_COLORn_INFO in S into the value dword of one of its fix tables, exactly as the
 			// translator writes it. Any other one passes as before.
 			case IT_DMA_DATA: {
+				// SAS / DAS: register addresses, but an atomic's result on the gfx ring.
+				if (size < 7 || ((b[5] & (3u << 26u)) != 0u && (compute || !DmaAtomicResult(b[0], b[1], b[2], b[5])))) {
+					return bad();
+				}
 				const uint64_t s = g_cp_shadow_va.load(std::memory_order_relaxed);
 				if (s != 0 && size >= 7) {
 					const uint32_t src_sel = (b[0] >> 29u) & 0x3u;
@@ -4375,6 +4391,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// An ATOMIC_MEM `pk` (header and body): the title's, or one of ours (`own`: a MEM_SEMAPHORE's, any integer op
 	// whatever SetAtomicOps says, never run in place, its label write recorded by the caller). Returns the refusal, if
 	// any; `gpu` tells whether the GPU performs it (otherwise the tracker does on the CPU, or Kyty's command processor).
+	bool atomic_on_cpu = false; // the latest ATOMIC_MEM ran on the CPU: the CP's pre-op registers do not hold its result
 	auto atomic_mem = [&](std::span<const uint32_t> pk, bool own, bool& in_place, bool& gpu) -> std::optional<RefuseWhy> {
 		const uint32_t* const bptr = pk.data() + 1;
 		gpu                        = false;
@@ -4408,6 +4425,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			if (!own) {
 				note_write({addr, 0, false, false, bytes == 8u});
 			}
+			atomic_on_cpu = true;
 			stats.atomics_cpu++;
 			NoteOnce(24, "ATOMIC_MEM performed by the tracker (memory the GPU cannot write, or MEC with KYTY_NATIVE_GPU_ACB_ATOMICS=0)");
 			return std::nullopt;
@@ -4415,6 +4433,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (m_compute_ring && !labels) {
 			return std::nullopt;
 		}
+		atomic_on_cpu = false;
 		if (direct && !own) {
 			in_place = true;
 		} else {
@@ -5412,7 +5431,23 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.find_hits.push_back(h);
 					}
 				}
-				if (body_count < 6 || !DmaDataAllowed(bptr[0], bptr[5], m_gds)) {
+				if (m_compute_ring && body_count >= 6 && !atomic_on_cpu && bptr[1] == 0x30174u &&
+				    DmaAtomicResult(bptr[0], bptr[1], bptr[2], bptr[5])) {
+					const uint64_t bytes = bptr[5] & 0x3ffffffu;
+					const uint64_t dst   = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
+					if ((bytes == 4u || bytes == 8u) && dst != 0 && (dst & (bytes - 1u)) == 0) {
+						const uint32_t wide = bytes == 8u ? 1u << 16u : 0u;
+						body.insert(body.end(), {Pkt3(IT_COPY_DATA, 5, true), 6u | (5u << 8u) | wide | (1u << 20u) | (bptr[0] & (3u << 25u)), 0u, 0u,
+						                         bptr[3], bptr[4]});
+						add_ref(dst, bytes, false);
+						note_gpu_written(dst, dst + bytes);
+						stats.dma_data++;
+						break;
+					}
+				}
+				if (body_count < 6 ||
+				    !(DmaDataAllowed(bptr[0], bptr[5], m_gds) ||
+				      (!m_compute_ring && !atomic_on_cpu && DmaAtomicResult(bptr[0], bptr[1], bptr[2], bptr[5])))) {
 					r.unknown_detail = {bptr[0], body_count >= 6 ? bptr[5] : 0u};
 					if (drop_refused(op, dw, RefuseWhy::DmaForm)) {
 						break;
@@ -5449,7 +5484,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					if (src_sel == 1u) {
 						r.gds_dma.emplace_back(bptr[1], static_cast<uint32_t>(bytes));
 					}
-					if (src_sel != 1u && src_sel != 2u) {
+					if (src_sel != 1u && src_sel != 2u && (bptr[5] & (1u << 26u)) == 0u) {
 						add_ref(static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u), bytes, false);
 					}
 					if (dst_sel == 0u || dst_sel == 3u) {
@@ -5482,6 +5517,52 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				if (!WriteDataToMemory(bptr[0])) {
+					// A register write (DST_SEL 0). Probe regforms ran one in each space on the gfx ring. It goes as its space's
+					// SET packet, so the state it leaves is the translator's too. UCONFIG follows UconfigAllowed.
+					const uint32_t reg    = bptr[1];
+					const uint32_t count  = body_count - 3u;
+					const bool     single = ((bptr[0] >> 16u) & 1u) != 0;
+					const bool     in_cx  = reg >= 0xa000u && reg + count <= 0xb000u;
+					const bool     in_sh  = reg >= 0x2c00u && reg + count <= 0x3000u;
+					const bool     in_uc  = reg >= 0xc000u && reg + count <= 0x10000u;
+					if (!m_compute_ring && ((bptr[0] >> 8u) & 0xfu) == 0u && bptr[2] == 0u && (in_cx || in_sh || in_uc)) {
+						for (uint32_t i = 0; i < count; i++) {
+							const uint32_t at    = reg + (single ? 0u : i);
+							const uint32_t value = bptr[3 + i];
+							if (in_cx) {
+								const uint32_t off     = at - 0xa000u;
+								uint32_t&      slot    = cx[off];
+								const bool     changed = slot != value;
+								slot                   = value;
+								mark_cx(off, changed);
+								writer(wcx, off, RegWriter::Set);
+								EmitSet(body, IT_SET_CONTEXT_REG, off, PatchContext(off, value), false);
+								stats.set_context++;
+							} else if (in_sh) {
+								const uint32_t off = at - 0x2c00u;
+								sh[off]            = value;
+								mark_sh(off, value);
+								writer(wsh, off, RegWriter::Set);
+								for (uint32_t lo: {0x8u, 0x88u, 0xC8u, 0x108u, 0x148u, 0x20Cu}) {
+									if (off == lo || off == lo + 1u) {
+										note_shader(lo);
+									}
+								}
+								EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, value), false);
+								stats.set_sh++;
+							} else if (const uint32_t off = at - 0xc000u; uc_allowed(off) && off != 0x242u && off != 0x243u) {
+								uc[off] = value;
+								writer(wuc, off, RegWriter::Set);
+								EmitSet(body, IT_SET_UCONFIG_REG, off, value, false);
+								stats.set_uconfig++;
+							} else {
+								stats.uconfig_skipped++;
+								r.skipped_uconfig.insert(off);
+							}
+						}
+						reg_write = true;
+						break;
+					}
 					if (drop_refused(op, dw, RefuseWhy::WriteDataRegister)) {
 						break;
 					}
@@ -5686,6 +5767,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					NoteOnce(34, "MEM_SEMAPHORE signal (barrier, ATOMIC_MEM)");
 					break;
 				}
+				// The limit above can only bite when two waiters share a counter: say so when both rings wait on one.
+				{
+					static std::mutex                            waiters_mutex;
+					static std::map<uint64_t, uint8_t>           waiters;
+					const uint8_t                                ring = m_compute_ring ? 2u : 1u;
+					std::lock_guard<std::mutex>                  lock(waiters_mutex);
+					uint8_t&                                     seen = waiters[addr];
+					if ((seen | ring) == 3u && seen != 3u) {
+						std::fprintf(stderr, "native shadow: both rings wait on the MEM_SEMAPHORE counter 0x%llx: one signal may pass both\n",
+						             static_cast<unsigned long long>(addr));
+					}
+					seen |= ring;
+				}
 				// ENGINE_SEL the PFP on the gfx ring, so nothing behind the wait is fetched before the counter is seen; MEC
 				// has only the micro engine. The poll interval is the translator's own waits'.
 				const std::array<uint32_t, 9> wait {Pkt3(IT_WAIT_REG_MEM_64, 8, false),
@@ -5800,8 +5894,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// into memory (DST_SEL 1, 2, 5), 32 or 64 bits (COUNT_SEL). As written where the GPU may write the
 				// destination, as the PS5's CP runs it; an immediate into memory it cannot write is the tracker's CPU store,
 				// the clock the tracker's CPU timestamp as for a RELEASE_MEM (KYTY_NATIVE_GPU_CPU_TIMESTAMPS=1 too). Register,
-				// GDS and perf-counter selects and the atomic return data refuse: the first stop the ring from a user IB
-				// (probe: COPY_DATA of UCONFIG/context), the last needs the CP's internal register. Only with
+				// GDS and perf-counter selects refuse: they stop the ring from a user IB (probe: COPY_DATA of UCONFIG/context).
+				// The atomic's return data (6) goes on both rings (probe regforms), but not after an atomic the tracker ran on
+				// the CPU, which the CP's register does not hold. Only with
 				// KYTY_NATIVE_GPU_COPY_DATA=1 (MEC: KYTY_NATIVE_GPU_MEC_COPY_DATA=1) until probe copydata has run it.
 				if (!labels || (m_compute_ring ? !m_mec_copy_data : !m_copy_data)) {
 					soft_unknown(op, dw);
@@ -5817,6 +5912,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const bool     src_mem = src_sel == 1u || src_sel == 2u;
 				const bool     imm     = src_sel == 5u;
 				const bool     clock   = src_sel == 9u;
+				const bool     result  = src_sel == 6u && !atomic_on_cpu;
 				const uint64_t src     = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
 				const uint64_t dst     = static_cast<uint64_t>(bptr[3]) | (static_cast<uint64_t>(bptr[4]) << 32u);
 				// ENGINE_SEL (bits 31:30, gfx ring): libSceAgc's DCB form picks the micro engine or the prefetch parser (bit 30,
@@ -5826,7 +5922,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// (DST_64B_ADDR_LO, SRC_64B_ADDR_LO): the CP would write elsewhere than the label bookkeeping and the tracker's
 				// fallbacks assume, so an address not aligned to the copy's size refuses.
 				const uint32_t engine = bptr[0] >> 30u;
-				if (!(src_mem || imm || clock) || !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || dst == 0 || (dst & (bytes - 1u)) != 0 ||
+				if (!(src_mem || imm || clock || result) || !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || dst == 0 || (dst & (bytes - 1u)) != 0 ||
 				    (src_mem && (src == 0 || (src & (bytes - 1u)) != 0)) || engine > 1u) {
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]};
 					if (drop_refused(op, dw, RefuseWhy::CopyDataForm)) {
