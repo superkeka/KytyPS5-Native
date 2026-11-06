@@ -504,6 +504,19 @@ void TestDmaData() {
 	std::vector<uint32_t> to_reg;
 	Append(to_reg, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2c00u, 0x0u, 4u | (1u << 27u)}, false);
 	Check(!t.Translate(to_reg).ok, "DMA_DATA into the register space refused");
+	{
+		Pm4Translator dropper;
+		dropper.SetDropRefused(true);
+		std::vector<uint32_t> mixed = to_reg;
+		Append(mixed, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
+		auto rd = dropper.Translate(mixed);
+		Check(rd.ok && rd.stats.dma_data == 1, "a refused DMA_DATA is left out and the rest of the buffer goes on");
+		std::vector<uint32_t> unknown;
+		Append(unknown, 0xeeu, {0x1u, 0x2u}, false);
+		Append(unknown, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
+		auto ru = dropper.Translate(unknown);
+		Check(ru.ok && ru.stats.dma_data == 1 && ru.unknown_ops.empty(), "an unknown opcode is left out and the buffer goes on");
+	}
 	std::vector<uint32_t> gds;
 	Append(gds, 0x50u, {1u << 20u, 0x1000u, 0x2u, 0x0u, 0x0u, 4u}, false);
 	Check(!t.Translate(gds).ok, "DMA_DATA into GDS refused without a GDS partition");

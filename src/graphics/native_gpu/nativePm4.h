@@ -967,6 +967,8 @@ public:
 
 	// Experiment: render targets without DCC compression (CB_COLORn_INFO.DCC_ENABLE cleared).
 	void SetNoDcc(bool no_dcc) { m_no_dcc = no_dcc; }
+	// A packet that would refuse the buffer is left out and logged once instead (fail-only forms stay refusals).
+	void SetDropRefused(bool on) { m_drop_refused = on; }
 	// COMPUTE_STATIC_THREAD_MGMT_SE0..3 are ANDed with `masks` (0 for a word: left alone). KFD queues
 	// with KYTY_NATIVE_GPU_KFD_CU_CLAMP: the kernel sizes a queue's wave save area by the CUs it found
 	// at init (24 on the BC-250), and waves on the CUs enabled after it would overflow it.
@@ -1327,6 +1329,8 @@ private:
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 	bool                         m_no_dcc     = false;
+	bool                         m_drop_refused = false;
+	std::set<uint32_t>           m_dropped_seen;
 	std::array<uint32_t, 4>      m_cu_clamp {};
 	std::vector<std::pair<uint64_t, uint64_t>> m_display_ranges; // AddDisplayRange
 	uint32_t                     m_display_dcc_off = 0;           // MRT slots drawn with DCC cleared

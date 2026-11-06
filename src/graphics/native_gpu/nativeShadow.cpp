@@ -5483,6 +5483,11 @@ private:
 			m_acb_translator.SetSkippedOpcodes(skip);
 			std::fprintf(stderr, "native shadow: leaving %zu packet type(s) out of the IB: %s\n", skip.size(), ops);
 		}
+		// KYTY_NATIVE_GPU_KEEP_REFUSED=1: a packet the GPU cannot run sends its whole buffer to Kyty's command processor.
+		if (const char* keep = std::getenv("KYTY_NATIVE_GPU_KEEP_REFUSED"); keep == nullptr || std::atoi(keep) == 0) {
+			m_translator.SetDropRefused(true);
+			m_acb_translator.SetDropRefused(true);
+		}
 		// KYTY_NATIVE_GPU_FORCE_REFUSE=<op,op> (test only): buffers holding these opcodes are refused as unknown, so the
 		// refused-buffer path (Kyty's command processor) runs on the board without a title that needs it.
 		if (const char* ops = std::getenv("KYTY_NATIVE_GPU_FORCE_REFUSE"); ops != nullptr && ops[0] != '\0') {

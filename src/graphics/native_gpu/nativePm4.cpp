@@ -4128,6 +4128,22 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		r.stats = stats;
 		return r;
 	};
+	// With SetDropRefused a packet the GPU must not get is left out and named once, instead of the whole buffer going to
+	// Kyty's command processor, which has not run a title since the native backend took over.
+	auto drop_refused = [&](uint32_t op, uint32_t at, RefuseWhy why) {
+		if (!m_drop_refused) {
+			return false;
+		}
+		note_refusal(op, at, why);
+		if (m_dropped_seen.insert((op << 8u) | static_cast<uint32_t>(why)).second && m_dropped_seen.size() <= 64) {
+			std::fprintf(stderr, "native shadow: left out a packet the GPU cannot run: op 0x%02x (%s):", op, RefuseWhyName(why));
+			for (uint32_t i = at; i < dcb.size() && i < at + 8u; i++) {
+				std::fprintf(stderr, " 0x%08x", dcb[i]);
+			}
+			std::fprintf(stderr, "\n");
+		}
+		return true;
+	};
 	// A packet with no translation (yet): the walk goes on, so one refused buffer names every such packet, and the
 	// buffer is refused at its end.
 	auto soft_unknown = [&](uint32_t op, uint32_t dw) {
@@ -4766,6 +4782,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					if (sel != 0 && sel != 1 && sel != 2 && sel != 3 && sel != 5) {
 						r.unknown_detail = {bptr[0], bptr[1]};
+						if (drop_refused(op, dw, RefuseWhy::ReleaseDataSel)) {
+							break;
+						}
 						return fail(op, dw, RefuseWhy::ReleaseDataSel);
 					}
 					// The guest's packet as written: a DCB release in an end-of-pipe event the ring runs
@@ -5344,6 +5363,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_WAIT_REG_MEM:
 			case IT_WAIT_REG_MEM_64: {
 				if (const auto why = wait_mem(dcb.subspan(dw, size), dw, false)) {
+					if (drop_refused(op, dw, *why)) {
+						break;
+					}
 					return fail(op, dw, *why);
 				}
 				break;
@@ -5361,6 +5383,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				if (body_count < 6 || !DmaDataAllowed(bptr[0], bptr[5], m_gds)) {
 					r.unknown_detail = {bptr[0], body_count >= 6 ? bptr[5] : 0u};
+					if (drop_refused(op, dw, RefuseWhy::DmaForm)) {
+						break;
+					}
 					return fail(op, dw, RefuseWhy::DmaForm);
 				}
 				{
@@ -5426,6 +5451,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
 				if (!WriteDataToMemory(bptr[0])) {
+					if (drop_refused(op, dw, RefuseWhy::WriteDataRegister)) {
+						break;
+					}
 					return fail(op, dw, RefuseWhy::WriteDataRegister);
 				}
 				{
@@ -5458,6 +5486,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// the tracker as before.
 					const bool gpu = (engine <= 1 || m_compute_ring || !m_tracker_writes) && label_gpu(dst, bytes);
 					if (gpu && m_compute_ring && ((bptr[0] >> 8u) & 0xfu) == 1u) {
+						if (drop_refused(op, dw, RefuseWhy::WriteDataOnMec)) {
+							break;
+						}
 						return fail(op, dw, RefuseWhy::WriteDataOnMec);
 					}
 					if (gpu && direct && (bptr[0] & (1u << 20u)) != 0 && engine <= 1) {
@@ -5573,6 +5604,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (m_mem_semaphore == MemSemaphore::AsIs) {
 					if (!form || m_compute_ring || !labels || !label_gpu(addr, 8)) {
 						r.unknown_detail = {bptr[0], bptr[1], bptr[2]};
+						if (drop_refused(op, dw, RefuseWhy::SemaphoreForm)) {
+							break;
+						}
 						return fail(op, dw, RefuseWhy::SemaphoreForm);
 					}
 					if (direct) {
@@ -5588,6 +5622,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				}
 				if (!form || !labels || addr == 0) {
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2]};
+					if (drop_refused(op, dw, RefuseWhy::SemaphoreForm)) {
+						break;
+					}
 					return fail(op, dw, RefuseWhy::SemaphoreForm);
 				}
 				const uint32_t policy = MemSemaphorePolicy() << 25u;
@@ -5602,6 +5639,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					emit_barrier(false);
 					const bool write = (bptr[2] & (1u << 20u)) != 0;
 					if (const auto why = atomic_mem(atomic(write ? 0x67u : 0x6fu), true, unused, gpu)) { // SWAP_64 or ADD_64
+						if (drop_refused(op, dw, *why)) {
+							break;
+						}
 						return fail(op, dw, *why);
 					}
 					if (!gpu) {
@@ -5627,9 +5667,15 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				                                    0xffffffffu,
 				                                    kWaitPoll};
 				if (const auto why = wait_mem(wait, dw, true)) {
+					if (drop_refused(op, dw, *why)) {
+						break;
+					}
 					return fail(op, dw, *why);
 				}
 				if (const auto why = atomic_mem(atomic(0x70u), true, unused, gpu)) { // SUB_64
+					if (drop_refused(op, dw, *why)) {
+						break;
+					}
 					return fail(op, dw, *why);
 				}
 				if (!gpu) {
@@ -5759,6 +5805,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (!(src_mem || imm || clock) || !(dst_sel == 1u || dst_sel == 2u || dst_sel == 5u) || dst == 0 || (dst & (bytes - 1u)) != 0 ||
 				    (src_mem && (src == 0 || (src & (bytes - 1u)) != 0)) || engine > 1u) {
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]};
+					if (drop_refused(op, dw, RefuseWhy::CopyDataForm)) {
+						break;
+					}
 					return fail(op, dw, RefuseWhy::CopyDataForm);
 				}
 				const uint64_t value = imm ? (wide ? src : (src & 0xffffffffull)) : 0u;
@@ -5791,6 +5840,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					// Memory to memory the GPU cannot write: the tracker would read the source before the GPU work ahead
 					// of the copy has written it.
 					r.unknown_detail = {bptr[0], bptr[1], bptr[2], bptr[3], bptr[4]};
+					if (drop_refused(op, dw, RefuseWhy::CopyDataForm)) {
+						break;
+					}
 					return fail(op, dw, RefuseWhy::CopyDataForm);
 				}
 				if (direct && !m_compute_ring) {
@@ -6137,6 +6189,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// libSceAgc's around a context push or pop turns on register shadowing, which needs the kernel's
 				// shadow memory; the translator keeps the context in its shadow and sets its own preamble.
 				if (m_compute_ring) {
+					if (drop_refused(op, dw, RefuseWhy::ContextControlOnMec)) {
+						break;
+					}
 					return fail(op, dw, RefuseWhy::ContextControlOnMec);
 				}
 				break;
@@ -6221,6 +6276,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			case IT_ATOMIC_MEM: {
 				bool gpu = false;
 				if (const auto why = atomic_mem(dcb.subspan(dw, size), false, in_place, gpu)) {
+					if (drop_refused(op, dw, *why)) {
+						break;
+					}
 					return fail(op, dw, *why);
 				}
 				break;
@@ -6352,6 +6410,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	}
 	if (!labels) {
 		cp_dma_idle(); // with native labels the last segment's close puts it before the tracker's release
+	}
+	if (m_drop_refused && !r.unknown_ops.empty()) {
+		for (uint32_t op: r.unknown_ops) {
+			drop_refused(op, op == r.unknown_op ? r.unknown_dw : static_cast<uint32_t>(dcb.size()), RefuseWhy::Unknown);
+		}
+		r.unknown_ops.clear();
 	}
 	if (!r.unknown_ops.empty()) {
 		const uint32_t first_op = r.unknown_op;
