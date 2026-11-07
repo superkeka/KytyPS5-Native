@@ -3891,6 +3891,101 @@ static bool DangerUconfigWrite(Device* d, Common* c) {
 	return first && second;
 }
 
+// waitflush: does a GPU wait on cached (NC) memory see a CPU write, and what makes it? The gfx ring waits on a 64-bit word
+// (EQUAL 1, LRU, as a title's) in a cached GTT buffer. After WAITFLUSH_MS (default 300 ms) of polling, the CPU writes 1, and
+// after as long again a job on a compute ring invalidates GL2 (ACQUIRE_MEM, GL2_INV | GL2_WB); WAITFLUSH_NOFLUSH=1 leaves
+// that out. A marker follows the wait. On a ring that stays stopped the kernel resets it.
+static bool DangerWaitFlush(Device* d, Common* c) {
+	const uint32_t ms = getenv("WAITFLUSH_MS") != NULL ? (uint32_t)strtoul(getenv("WAITFLUSH_MS"), NULL, 0) : 300u;
+	const bool     no = getenv("WAITFLUSH_NOFLUSH") != NULL;
+	printf("== danger waitflush: gfx WAIT_REG_MEM_64 on NC memory, CPU write after %u ms, %s\n", ms, no ? "no flush" : "then GL2 invalidate from compute");
+	Bo mem, nc = {0};
+	if (!GuestMem(d, &mem, 0x0770000000ull)) {
+		return false;
+	}
+	int r = MemCreate(d, &nc, MEM_GTT, 64 * KiB, NULL);
+	if (r == 0) {
+		r = BoBind(d, &nc, 0x0750000000ull, AMDGPU_VM_MTYPE_DEFAULT);
+	}
+	if (r != 0) {
+		printf("  setup failed: %s\n", ErrStr(r));
+		BoDestroy(d, &mem);
+		return false;
+	}
+	volatile uint32_t* m    = (volatile uint32_t*)mem.cpu;
+	volatile uint64_t* word = (volatile uint64_t*)nc.cpu;
+	word[0]                 = 0;
+	m[0]                    = 0;
+	__sync_synchronize();
+	Bo* bos[] = {&mem, &nc};
+	Ib  ib    = {.n = 0};
+	IbPush(&ib, Pkt3Gfx(0x93u, 8)); // WAIT_REG_MEM_64: memory, EQUAL, micro engine, CACHE_POLICY LRU
+	IbPush(&ib, 3u | (1u << 4));
+	IbPush(&ib, (uint32_t)nc.va);
+	IbPush(&ib, (uint32_t)(nc.va >> 32));
+	IbPush(&ib, 1u);
+	IbPush(&ib, 0u);
+	IbPush(&ib, 0xffffffffu);
+	IbPush(&ib, 0xffffffffu);
+	IbPush(&ib, 4u);
+	GuestMark(&ib, false, mem.va, 0x57460001u);
+	IbPad(&ib);
+	uint64_t seq = 0;
+	r            = SubmitOn(d, AMDGPU_HW_IP_GFX, 0, &c->ib, &ib, bos, 2, &seq);
+	if (r != 0) {
+		printf("  submit failed: %s\n", ErrStr(r));
+		return false;
+	}
+	const struct timespec nap = {ms / 1000u, (long)(ms % 1000u) * 1000000L};
+	nanosleep(&nap, NULL);
+	printf("  after %u ms of polling: marker %s\n", ms, m[0] == 0x57460001u ? "landed (too early)" : "not yet, as it should be");
+	word[0] = 1;
+	__sync_synchronize();
+	nanosleep(&nap, NULL);
+	const bool seen_write = m[0] == 0x57460001u;
+	printf("  %u ms after the CPU write: marker %s\n", ms, seen_write ? "landed: the CP saw the write" : "MISSING: the CP did not see the write");
+	bool seen_flush = seen_write;
+	if (!seen_write && !no) {
+		Bo  ib2_bo;
+		int e = MemCreate(d, &ib2_bo, MEM_GTT, 64 * KiB, NULL);
+		if (e == 0) {
+			e = BoBind(d, &ib2_bo, 0x0751000000ull, AMDGPU_VM_MTYPE_UC);
+		}
+		if (e != 0) {
+			printf("  second IB setup failed: %s\n", ErrStr(e));
+			fflush(stdout);
+			_exit(3);
+		}
+		Ib f = {.n = 0};
+		IbPush(&f, Pkt3(0x58u, 7));
+		IbPush(&f, 0u);
+		IbPush(&f, 0xffffffffu);
+		IbPush(&f, 0xffffffu);
+		IbPush(&f, 0u);
+		IbPush(&f, 0u);
+		IbPush(&f, 0xau);
+		IbPush(&f, 0x8000u | 0x4000u | 0x200u | 0x100u);
+		IbPad(&f);
+		uint64_t fseq = 0;
+		e             = SubmitOn(d, AMDGPU_HW_IP_COMPUTE, 0, &ib2_bo, &f, NULL, 0, &fseq);
+		const int w   = e == 0 ? WaitOn(d, AMDGPU_HW_IP_COMPUTE, 0, fseq, 1.0) : e;
+		printf("  GL2 invalidate on compute ring 0: %s\n", w == 0 ? "done" : ErrStr(w));
+		nanosleep(&nap, NULL);
+		seen_flush = m[0] == 0x57460001u;
+		printf("  after the invalidate: marker %s\n", seen_flush ? "landed: GL2 held the old line" : "MISSING");
+	}
+	const int     w  = WaitOn(d, AMDGPU_HW_IP_GFX, 0, seq, 1.0);
+	const int64_t st = ContextState(d);
+	printf("  gfx job: %s, ctx 0x%" PRIx64 "\n", w == 1 ? "TIMEOUT" : ErrStr(w), (uint64_t)st);
+	if (w != 0 || st != 0) {
+		fflush(stdout);
+		_exit(3);
+	}
+	BoDestroy(d, &nc);
+	BoDestroy(d, &mem);
+	return seen_flush;
+}
+
 // regforms: the register forms libSceAgc can write that the translator leaves out, one per process.
 // REGFORM=dmapreop   ATOMIC_MEM ADD_RTN, then DMA_DATA with SAS from CP_ME_ATOMIC_PREOP_LO (0x30174) into memory
 // REGFORM=copypreop  ATOMIC_MEM ADD_RTN, then COPY_DATA SRC_SEL 6 (the atomic's return data) into memory
@@ -6753,7 +6848,7 @@ static void Usage(const char* argv0) {
 	printf("usage: %s [--device PATH] [--max-alloc-gib N] [--danger CASE [--awake SEC]] [--blob FILE [--vgprs N]] [probe...]\n",
 	       argv0);
 	printf("probes: info va alloc dispatch identity bandwidth coherency dmabuf submit ib2 dot2emu (default: all)\n");
-	printf("danger cases (owner approval required, run alone): regforms vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem mecplain uconfig-w cpdma-tail condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop multiinst\n");
+	printf("danger cases (owner approval required, run alone): waitflush regforms vmfault vmfault-read long sqkill semtrans dot2c dot2x gds gdsdma crossqueue uconfig tag342 mecforms atomicmem atomicand atomicand-order atomicops copydata memsem mecplain uconfig-w cpdma-tail condib condexec condexec2 exitguard labelvis clock regindex-{sh,ctx,uc,uc342,sh-nr,ctx-nr} shadow shadow-restore shadow-pushpop multiinst\n");
 	printf("PRT cases, in risk order: prt-map prt-split prt-read-compute prt-write-compute prt-kfd-tlb prt-replace-race prt-cp-compute prt-gfx-{copy,dma,write,wait,dispatch}\n");
 }
 
@@ -6855,6 +6950,8 @@ int main(int argc, char** argv) {
 			ok = DangerExitGuard(&d, &c);
 		} else if (strcmp(danger, "copydata") == 0) {
 			ok = DangerCopyData(&d, &c);
+		} else if (strcmp(danger, "waitflush") == 0) {
+			ok = DangerWaitFlush(&d, &c);
 		} else if (strcmp(danger, "regforms") == 0) {
 			ok = DangerRegForms(&d, &c);
 		} else if (strcmp(danger, "atomicops") == 0) {

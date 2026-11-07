@@ -365,6 +365,57 @@ public:
 
 	// A stop (Shadow::StopGpu): destroys every KFD queue, the relay included, so the title's compute work
 	// stops where it stands, as the PS5 kernel stops a title's queues. Returns how many KFD destroyed.
+	// Makes GL2 drop its lines, from a job on a compute ring of amdgpu's: a wait polling cached memory keeps reading the line
+	// it holds, so a CPU store reaches it only after this. No fence is waited for. `offset` is where in the scratch area the
+	// caller keeps 8 dwords, 32-byte aligned, for the IB.
+	bool InvalidateGl2(uint32_t offset) {
+		static constexpr std::array<uint32_t, 8> kIb = {(3u << 30u) | (6u << 16u) | (0x58u << 8u) | 2u, // ACQUIRE_MEM, compute
+		                                                0u,
+		                                                0xffffffffu,
+		                                                0xffffffu,
+		                                                0u,
+		                                                0u,
+		                                                0xau,
+		                                                0x8000u | 0x4000u | 0x200u | 0x100u}; // GL2_WB, GL2_INV, GL1_INV, GLV_INV
+		volatile uint8_t* to = ScratchCpu() + offset;
+		for (size_t i = 0; i < kIb.size(); i++) {
+			reinterpret_cast<volatile uint32_t*>(to)[i] = kIb[i];
+		}
+		__sync_synchronize();
+		drm_amdgpu_cs_chunk_ib info;
+		std::memset(&info, 0, sizeof(info));
+		info.va_start    = ScratchVa() + offset;
+		info.ib_bytes    = static_cast<uint32_t>(kIb.size() * 4u);
+		info.ip_type     = AMDGPU_HW_IP_COMPUTE;
+		info.ip_instance = 0;
+		info.ring        = 0;
+		drm_amdgpu_bo_list_entry entry;
+		std::memset(&entry, 0, sizeof(entry));
+		entry.bo_handle = m_ib_handle;
+		struct drm_amdgpu_bo_list_in list;
+		std::memset(&list, 0, sizeof(list));
+		list.operation    = ~0u;
+		list.list_handle  = ~0u;
+		list.bo_number    = 1;
+		list.bo_info_size = sizeof(entry);
+		list.bo_info_ptr  = reinterpret_cast<uintptr_t>(&entry);
+		std::array<drm_amdgpu_cs_chunk, 2> chunks;
+		std::memset(chunks.data(), 0, sizeof(chunks));
+		chunks[0].chunk_id   = AMDGPU_CHUNK_ID_IB;
+		chunks[0].length_dw  = sizeof(info) / 4;
+		chunks[0].chunk_data = reinterpret_cast<uintptr_t>(&info);
+		chunks[1].chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES;
+		chunks[1].length_dw  = sizeof(list) / 4;
+		chunks[1].chunk_data = reinterpret_cast<uintptr_t>(&list);
+		const std::array<uint64_t, 2> chunk_ptrs = {reinterpret_cast<uintptr_t>(&chunks[0]), reinterpret_cast<uintptr_t>(&chunks[1])};
+		union drm_amdgpu_cs cs;
+		std::memset(&cs, 0, sizeof(cs));
+		cs.in.ctx_id     = m_ctx;
+		cs.in.num_chunks = 2;
+		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs.data());
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CS, &cs) == 0;
+	}
+
 	uint32_t DestroyKfdQueues() {
 		uint32_t n = 0;
 		for (KfdQueue* q: m_kfd_queue) {

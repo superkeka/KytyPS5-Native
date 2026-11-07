@@ -3574,12 +3574,21 @@ public:
 			}
 			m_gem->WriteGuest(w.addr, &v, w.wide ? 8 : 4);
 		};
-		uint32_t released = 0;
-		bool     idle     = false;
+		uint32_t released  = 0;
+		uint32_t gl2_flush = 0;
+		uint32_t flushed_at = 0; // the count of releases the last invalidate has covered
+		uint32_t rounds    = 0;
+		bool     idle      = false;
 		for (;;) {
 			idle = m_submitter->CsIdle(0.0);
 			if (idle || NowSecShadow() > until) {
 				break;
+			}
+			// A release is a CPU store: the wait the CP already polls holds the old word in GL2 (cached guest memory) and never
+			// sees it. Invalidate GL2 after the releases, and again while the ring is still busy.
+			if (released != flushed_at || (released != 0 && (++rounds % 16u) == 0)) {
+				flushed_at = released;
+				gl2_flush += m_submitter->InvalidateGl2(kStopFlushOffset) ? 1u : 0u;
 			}
 			if (!stream_ended) {
 				stream_ended = EndStreamForStop();
@@ -3619,6 +3628,9 @@ public:
 		                                                                     std::to_string(static_cast<int>((t_kfd - t0) * 1e3)) + " ms").c_str(),
 		             stream_ended ? ", stream chain ended" : "", unfinished, released, idle ? "idle" : "STILL BUSY",
 		             (NowSecShadow() - t0) * 1e3);
+		if (gl2_flush != 0) {
+			std::fprintf(stderr, "native shadow: stop: GL2 invalidated %u times for the releases\n", gl2_flush);
+		}
 		if (!idle) {
 			std::fprintf(stderr, "native shadow: stop: %s\n", m_submitter->QueueState({}).c_str());
 		}
@@ -6302,6 +6314,7 @@ private:
 	static constexpr uint32_t kExitAbortOffset = 2056;
 	static constexpr uint32_t kExitRunOffset   = 2060;
 	static constexpr uint32_t kExitStubOffset  = 4064;
+	static constexpr uint32_t kStopFlushOffset = 4032; // the stop's GL2 invalidate, between the trampolines and the stub
 	// KYTY_NATIVE_GPU_INJECT_HANG's wait word (Pm4Translator::SetInjectWait), between the run word and the trampolines:
 	// 0 from Init on, written by nobody but a stop's release of the injected wait.
 	static constexpr uint32_t kInjectOffset = 2064;
