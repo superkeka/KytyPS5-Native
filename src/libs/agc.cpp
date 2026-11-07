@@ -5027,6 +5027,241 @@ uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexIndirectGetSize() {
 	return 5u * 4u;
 }
 
+uint32_t KYTY_SYSV_ABI AgcDcbAtomicGdsGetSize() { return 11u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcAcbAtomicGdsGetSize() { return 11u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbPrimeUtcl2GetSize() { return 5u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcAcbPrimeUtcl2GetSize() { return 5u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbQueueEndOfShaderActionGetSize() { return 8u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcAcbQueueEndOfShaderActionGetSize() { return 8u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetBaseDispatchIndirectArgsGetSize() { return 4u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetBaseDrawIndirectArgsGetSize() { return 4u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetBoolPredicationEnableGetSize() { return 4u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetZPassPredicationEnableGetSize() { return 4u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetIndexIndirectArgsGetSize() { return 4u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetShRegisterDirectGetSize() { return 3u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetUcRegisterDirectGetSize() { return 3u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirectGetSize() { return 5u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbStallCommandBufferParserGetSize() { return 2u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcCbSetShRegistersDirectGetSize(uint32_t num_regs) { return num_regs * 3u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcCbSetUcRegistersDirectGetSize(uint32_t num_regs) { return num_regs * 3u * 4u; }
+uint32_t KYTY_SYSV_ABI AgcCbSetUcRegisterRangeDirectGetSize(uint32_t num_values) { return (num_values + 2u) * 4u; }
+uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMultiGetSize() {
+	return (2u * AGC_INTERNAL_DATA_PACKET_SIZE_DW + 10u) * 4u;
+}
+
+static uint32_t* agc_atomic_gds(CommandBuffer* buf, uint32_t engine, uint32_t op, uint32_t command, uint32_t write_confirm, uint32_t gds_base,
+                                uint16_t offset0, uint16_t offset1, uint32_t mask, uint32_t data0, uint64_t data1, uint64_t data2) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(11);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	cmd[0]  = KYTY_PM4(11, 0x1du /* ATOMIC_GDS */, 0u);
+	cmd[1]  = (engine << 30u) | ((op | (op << 7u)) & 0x1007fu) | ((op & 0x40u) << 14u) | ((op & 0x20u) << 13u) | (command == 1u ? 1u << 17u : 0u);
+	cmd[2]  = (gds_base & 0x3fu) | ((write_confirm & 0x1u) << 8u);
+	cmd[3]  = offset0;
+	cmd[4]  = offset1;
+	cmd[5]  = mask & 0xff00ffu;
+	cmd[6]  = data0;
+	cmd[7]  = static_cast<uint32_t>(data1);
+	cmd[8]  = static_cast<uint32_t>(data1 >> 32u);
+	cmd[9]  = static_cast<uint32_t>(data2);
+	cmd[10] = static_cast<uint32_t>(data2 >> 32u);
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbAtomicGds(CommandBuffer* buf, uint32_t engine, uint32_t op, uint32_t command, uint32_t write_confirm, uint32_t gds_base,
+                                        uint16_t offset0, uint16_t offset1, uint32_t mask, uint32_t data0, uint64_t data1, uint64_t data2) {
+	return agc_atomic_gds(buf, engine, op, command, write_confirm, gds_base, offset0, offset1, mask, data0, data1, data2);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbAtomicGds(CommandBuffer* buf, uint32_t op, uint32_t command, uint32_t write_confirm, uint32_t gds_base, uint16_t offset0,
+                                        uint16_t offset1, uint32_t mask, uint32_t data0, uint64_t data1, uint64_t data2) {
+	return agc_atomic_gds(buf, 0, op, command, write_confirm, gds_base, offset0, offset1, mask, data0, data1, data2);
+}
+
+static uint32_t* agc_prime_utcl2(CommandBuffer* buf, uint32_t permission, uint32_t prime_mode, uint64_t address, uint32_t num_pages) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(5);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	cmd[0] = KYTY_PM4(5, 0x5du /* PRIME_UTCL2 */, 0u);
+	cmd[1] = (permission & 0x7u) | ((prime_mode & 0x1u) << 3u) | (1u << 30u);
+	cmd[2] = static_cast<uint32_t>(address) & ~0x3fffu;
+	cmd[3] = static_cast<uint32_t>(address >> 32u);
+	cmd[4] = num_pages & 0x3fffu;
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbPrimeUtcl2(CommandBuffer* buf, uint32_t permission, uint32_t prime_mode, uint64_t address,
+                                         uint32_t num_pages) {
+	return agc_prime_utcl2(buf, permission, prime_mode, address, num_pages);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcAcbPrimeUtcl2(CommandBuffer* buf, uint32_t permission, uint32_t prime_mode, uint64_t address,
+                                         uint32_t num_pages) {
+	return agc_prime_utcl2(buf, permission, prime_mode, address, num_pages);
+}
+
+uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexIndirectArgs(CommandBuffer* buf, uint64_t address, uint16_t mode) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(4);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	cmd[0] = KYTY_PM4(4, 0x91u /* INDEX_ATTRIBUTES_INDIRECT */, 0u);
+	cmd[1] = static_cast<uint32_t>(address) & ~0xfu;
+	cmd[2] = static_cast<uint32_t>(address >> 32u);
+	cmd[3] = mode;
+	return cmd;
+}
+
+uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegisterRangeDirect(CommandBuffer* buf, uint32_t offset, const volatile uint32_t* values,
+                                                      uint32_t num_values) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+	auto* cmd = buf->AllocateDW(num_values + 2u);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+	cmd[0] = KYTY_PM4(num_values + 2u, Pm4::IT_SET_UCONFIG_REG, 0u);
+	cmd[1] = offset & 0xffffu;
+	if (values != nullptr) {
+		memcpy(cmd + 2, const_cast<const uint32_t*>(values), static_cast<size_t>(num_values) * 4u);
+	}
+	return cmd;
+}
+
+int KYTY_SYSV_ABI AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_ACQUIRE_MEM) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(engine) << 31u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcBranchPatchSetCompareAddress(uint32_t* cmd, uint64_t address) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[2] = (cmd[2] & 0x7u) | (static_cast<uint32_t>(address) & ~0x7u);
+	cmd[3] = static_cast<uint32_t>(address >> 32u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcBranchPatchSetThenTargetAddress(uint32_t* cmd, uint64_t target, uint32_t size_in_dwords) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[8]  = (cmd[8] & 0x3u) | (static_cast<uint32_t>(target) & ~0x3u);
+	cmd[9]  = static_cast<uint32_t>(target >> 32u);
+	cmd[10] = (cmd[10] & 0xfff00000u) | (size_in_dwords & 0xfffffu);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcBranchPatchSetElseTargetAddress(uint32_t* cmd, uint64_t target, uint32_t size_in_dwords) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[11] = (cmd[11] & 0x3u) | (static_cast<uint32_t>(target) & ~0x3u);
+	cmd[12] = static_cast<uint32_t>(target >> 32u);
+	cmd[13] = (cmd[13] & 0xfff00000u) | (size_in_dwords & 0xfffffu);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcBranchPatchSetElseTarget(uint32_t* cmd, uint8_t cache_policy, uint64_t target, uint32_t size_in_dwords) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_INDIRECT_BUFFER) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[11] = (cmd[11] & 0x3u) | (static_cast<uint32_t>(target) & ~0x3u);
+	cmd[12] = static_cast<uint32_t>(target >> 32u);
+	cmd[13] = (cmd[13] & 0xcff00000u) | (size_in_dwords & 0xfffffu) | ((static_cast<uint32_t>(cache_policy) & 0x3u) << 28u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchGcrCntl(uint32_t* cmd, uint32_t gcr_cntl) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_RELEASE_MEM) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[1] = (cmd[1] & ~(0xfffu << 12u)) | ((gcr_cntl & 0xfffu) << 12u);
+	return OK;
+}
+
+// EVENT_INDEX follows the type: 6 for the CS_DONE and PS_DONE family (0x2f and up), 5 for the rest.
+int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchType(uint32_t* cmd, uint8_t type) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_RELEASE_MEM) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[1] = (cmd[1] & ~0xf3fu) | (type & 0x3fu) | ((type >= 0x2fu ? 6u : 5u) << 8u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcWaitRegMemPatchCompareFunction(uint32_t* cmd, uint8_t compare_function) {
+	auto* wait = get_agc_wait_packet(cmd);
+	if (wait == nullptr) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	wait[1] = (wait[1] & ~0x7u) | (compare_function & 0x7u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcWaitRegMemPatchMask(uint32_t* cmd, uint32_t mask) {
+	auto* wait = get_agc_wait_packet(cmd);
+	if (wait == nullptr) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	wait[((wait[0] >> 8u) & 0xffu) == Pm4::IT_WAIT_REG_MEM ? 5u : 6u] = mask;
+	return OK;
+}
+
+// The rest of a WRITE_DATA's fields, as AgcDcbWriteData packs them.
+int KYTY_SYSV_ABI AgcWriteDataPatchCachePolicy(uint32_t* cmd, uint8_t cache_policy) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_WRITE_DATA) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[1] = (cmd[1] & 0xf9ffffffu) | ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcWriteDataPatchDst(uint32_t* cmd, uint8_t dst) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_WRITE_DATA) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	const uint32_t value = dst;
+	cmd[1] = (cmd[1] & 0x3ffff0ffu) | (((value << 30u) | (value << 7u)) & 0x40000f00u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcWriteDataPatchDstSel(uint32_t* cmd, uint8_t dst_sel) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_WRITE_DATA) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[1] = (cmd[1] & 0xfffff0ffu) | ((static_cast<uint32_t>(dst_sel) & 0xfu) << 8u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcWriteDataPatchAddress(uint32_t* cmd, uint64_t address) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_WRITE_DATA) {
+		return GRAPHICS5_ERROR_INVALID_PACKET;
+	}
+	cmd[2] = static_cast<uint32_t>(address);
+	cmd[3] = static_cast<uint32_t>(address >> 32u);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AgcGetDataPacketPayloadStart(const uint32_t** payload, const uint32_t* cmd, uint32_t has_offset) {
+	*payload = cmd + (has_offset != 0 ? 2 : 1);
+	return OK;
+}
+
 uint32_t KYTY_SYSV_ABI AgcDcbDrawIndirectMultiGetSize() {
 	return (2u * AGC_INTERNAL_DATA_PACKET_SIZE_DW + 10u) * 4u;
 }
