@@ -520,6 +520,9 @@ int wmain(int argc, wchar_t* argv[]) {
 #else
 
 int main(int argc, char* argv[]) {
+	// Line by line: a run that stops by a signal or a fault must not lose what is still in the buffer.
+	std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     return Main(argc, argv);
 }
 
