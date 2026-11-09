@@ -487,13 +487,17 @@ enum TriggerState : int32_t {
 	TRIGGER_STATE_VIBRATION_ACTIVE  = 7,
 };
 
+constexpr int TRIGGER_PRESSED_MIN = 8;
+
 static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int value,
                                   int32_t previous) {
 	// Trigger positions use nonuniform travel ranges, with endpoints at 0 and 255.
 	const int pos = value == 0 ? 0 : value == 255 ? 9 : 1 + value / 32;
 	switch (command.mode) {
 		case 1: // feedback: resistance from position data[0], strength data[1]
-			return command.data[1] != 0 && pos >= command.data[0] ? TRIGGER_STATE_FEEDBACK_ACTIVE
+			// A trigger at rest pushes against nothing, even when the zone starts at position 0.
+			return value >= TRIGGER_PRESSED_MIN && command.data[1] != 0 && pos >= command.data[0]
+			           ? TRIGGER_STATE_FEEDBACK_ACTIVE
 			                                                      : TRIGGER_STATE_FEEDBACK_STANDBY;
 		case 2: // weapon: resistance from data[0], released at data[1]
 			if (value < command.data[0] * 32) {
