@@ -24,6 +24,18 @@ int main(int argc,char**) {
     if(argc>1)return 0;
     CHECK(m.max_frame_buffer_size>=2048u*1088u*3u/2u);
     CHECK(m.max_frame_buffer_size<8u*1024u*1024u);
+    const auto size_for=[&](uint32_t codec,uint32_t profile,int32_t width,int32_t height){
+        c.codec_type=codec;c.profile=profile;c.max_frame_width=width;c.max_frame_height=height;
+        CHECK(QueryDecoderMemoryInfo(&c,&m)==0);
+        return m.max_frame_buffer_size;
+    };
+    CHECK(size_for(974921,1,1920,1088)==3346432u);
+    CHECK(size_for(974921,2,1920,1088)==6688768u);
+    CHECK(size_for(974921,2,3840,2160)==24887296u);
+    CHECK(size_for(2382845,0,1920,1088)==3350528u);
+    CHECK(size_for(2382845,2,1920,1088)==6692864u);
+    CHECK(size_for(2382845,0,1920,1090)==3547136u);
+    c.codec_type=1;c.profile=100;
     c.max_frame_width=c.max_frame_height=-1;
     CHECK(QueryDecoderMemoryInfo(&c,&m)==0 && m.max_frame_buffer_size>=16u*1024u*1024u);
     c.max_frame_width=c.max_frame_height=16;

@@ -307,9 +307,17 @@ static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo& config) {
 	if (config.max_frame_width < 0 || config.max_frame_height < 0) {
 		return VIDEODEC2_MIN_MEMORY_SIZE;
 	}
-	const auto pitch = (static_cast<uint64_t>(config.max_frame_width) + 255u) & ~uint64_t {255};
-	const auto height = (static_cast<uint64_t>(config.max_frame_height) + 15u) & ~uint64_t {15};
-	return static_cast<size_t>(pitch * height * 3u / 2u + 4096u);
+	constexpr uint32_t CODEC_HEVC = 974921;
+	constexpr uint32_t CODEC_VP9  = 2382845;
+
+	const bool     vp9       = config.codec_type == CODEC_VP9;
+	const bool     ten_bit   = (config.codec_type == CODEC_HEVC || vp9) && config.profile == 2;
+	const uint64_t row_align = vp9 ? 64u : 16u;
+	const auto pitch  = (static_cast<uint64_t>(config.max_frame_width) + 255u) & ~uint64_t {255};
+	const auto height =
+	    (static_cast<uint64_t>(config.max_frame_height) + row_align - 1u) & ~(row_align - 1u);
+	const auto pixels = pitch * height * 3u / 2u * (ten_bit ? 2u : 1u);
+	return static_cast<size_t>(pixels + (vp9 ? 8192u : 4096u));
 }
 
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
