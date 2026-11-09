@@ -445,6 +445,14 @@ add_executable(vdecsw_tests EXCLUDE_FROM_ALL
 target_link_libraries(vdecsw_tests common FFmpeg::ffmpeg)
 target_include_directories(vdecsw_tests PRIVATE ${inc_headers})
 
+add_executable(videodec2_frame_size_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VideoDec2FrameSizeTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/videoDec2Decoder.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(videodec2_frame_size_tests common FFmpeg::ffmpeg)
+target_include_directories(videodec2_frame_size_tests PRIVATE ${inc_headers})
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
