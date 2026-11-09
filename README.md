@@ -39,6 +39,10 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
       <strong>Dead Cells</strong> (60 fps)<br>
       <img src="docs/screenshots/bc250-dead-cells.jpg" width="300" alt="Dead Cells running natively on the BC-250">
     </td>
+    <td align="center">
+      <strong>Demon's Souls</strong> (playable)<br>
+      <img src="docs/screenshots/bc250-demons-souls.jpg" width="300" alt="Demon's Souls running natively on the BC-250">
+    </td>
   </tr>
 </table>
 
