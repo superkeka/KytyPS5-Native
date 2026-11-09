@@ -79,7 +79,7 @@ static void PrintUsage() {
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
-	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
+	::printf("  --console-language <0-30>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
 	::printf("  --network-connected                  Use the host local network.\n");
 	::printf("  --gpu-assisted-validation            Bounds-check shader accesses on the GPU.\n"
