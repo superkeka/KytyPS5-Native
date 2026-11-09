@@ -49,6 +49,7 @@ queues. Steam games use Vulkan on gfx ring 0 and the kernel compute rings as bef
 | PASID TLB flush through MMIO (`bc250_flush_pasid_kiq=0`) | `gmc_v10_0.c` | The KIQ path hung under gfx load (ROCm#6313). |
 | Runlist rebuild on KFD map/unmap (`bc250_flush_by_runlist`) | `kfd_*` | Under HWS the PASID flush finds no VMID. Inactive without HWS. |
 | KFD VMID flushed by VMID without HWS | `kfd_priv.h` | With `sched_policy=2` a process keeps one static VMID that neither flush reached. |
+| KFD VMID flushes over MMIO, not the KIQ | `gmc_v10_0.c` | A GFX hub flush of a KFD VMID (the one above, and the PASID flush once it finds the VMID) went through the KIQ, whose register write-wait stopped answering under several compute processes (`failed to write reg 28b4 wait reg 28c6`), seconds per flush. Semaphore-guarded and type 0, as the MMIO path for MMHUB. Graphics VMIDs and GART keep the KIQ. |
 | `bc250_tlb_flush_type` (0 = legacy) | `gmc_v10_0.c` | A type 2 invalidation of a KFD VMID never got its ACK while a KFD queue flushed GL2, and the KIQ stopped the GPU. |
 | Wave save area for every CU | `kfd_queue.c` | Sized for 40 CUs, not the 24 enabled at init. |
 | Two gfx rings (`bc250_gfx_queues=2`) | `gfx_v10_0.c`, `amdgpu_gfx.c` | The PS5's main and "AGR" rings (pipe 0 queues 0 and 1). An EOP on pipe 0 checks the fences of both. |

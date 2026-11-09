@@ -148,17 +148,39 @@
  static int gmc_v10_0_ecc_interrupt_state(struct amdgpu_device *adev,
  					 struct amdgpu_irq_src *src,
  					 unsigned int type,
-@@ -237,7 +256,8 @@
+@@ -235,9 +254,19 @@
+ static void gmc_v10_0_flush_gpu_tlb(struct amdgpu_device *adev, uint32_t vmid,
+ 					uint32_t vmhub, uint32_t flush_type)
  {
- 	bool use_semaphore = gmc_v10_0_use_invalidate_semaphore(adev, vmhub);
+-	bool use_semaphore = gmc_v10_0_use_invalidate_semaphore(adev, vmhub);
++	/* BC-250: a GFX hub flush of a KFD VMID (without HWS, kfd_flush_tlb() flushes the process's
++	 * static VMID by number) goes over MMIO, semaphore-guarded and as type 0, not through the KIQ:
++	 * with several compute processes the KIQ stopped answering ("failed to write reg 28b4 wait reg
++	 * 28c6", "Timeout waiting for VM flush hub: 0!"), seconds per flush. A KFD VMID is only found
++	 * without HWS, where amdgpu turns GFXOFF off (amdgpu_device_ip_early_init), so MMIO is safe.
++	 * Graphics VMIDs and GART keep the KIQ. */
++	bool bc250_kfd_vmid = adev->pdev->device == 0x13FE && vmhub == AMDGPU_GFXHUB(0) &&
++		vmid >= adev->vm_manager.first_kfd_vmid;
++	bool use_semaphore = gmc_v10_0_use_invalidate_semaphore(adev, vmhub) || bc250_kfd_vmid;
  	struct amdgpu_vmhub *hub = &adev->vmhub[vmhub];
 -	u32 inv_req = hub->vmhub_funcs->get_invalidate_req(vmid, flush_type);
 +	u32 inv_req = hub->vmhub_funcs->get_invalidate_req(vmid,
-+		bc250_tlb_flush_type >= 0 ? (uint32_t)bc250_tlb_flush_type : flush_type); /* BC-250 */
++		bc250_tlb_flush_type >= 0 ? (uint32_t)bc250_tlb_flush_type :
++		(bc250_kfd_vmid && flush_type == 2) ? 0 : flush_type); /* BC-250 */
  	/* Use register 17 for GART */
  	const unsigned int eng = 17;
  	unsigned char hub_ip = 0;
-@@ -500,6 +520,9 @@
+@@ -255,7 +284,8 @@
+ 	/* This is necessary for SRIOV as well as for GFXOFF to function
+ 	 * properly under bare metal
+ 	 */
+-	if (adev->gfx.kiq[0].ring.sched.ready && !adev->enable_mes &&
++	if (!bc250_kfd_vmid && /* BC-250 */
++	    adev->gfx.kiq[0].ring.sched.ready && !adev->enable_mes &&
+ 	    (amdgpu_sriov_runtime(adev) || !amdgpu_sriov_vf(adev))) {
+ 		amdgpu_gmc_fw_reg_write_reg_wait(adev, req, ack, inv_req,
+ 						 1 << vmid, GET_INST(GC, 0));
+@@ -500,6 +530,9 @@
  	case AMDGPU_VM_MTYPE_UC:
  		*flags = AMDGPU_PTE_MTYPE_NV10(*flags, MTYPE_UC);
  		break;
@@ -168,7 +190,7 @@
  	}
  
  	if (vm_flags & AMDGPU_VM_PAGE_NOALLOC)
-@@ -964,7 +987,7 @@
+@@ -964,7 +997,7 @@
  	struct amdgpu_device *adev = ip_block->adev;
  	int r;
  
