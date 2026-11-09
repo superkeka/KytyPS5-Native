@@ -17,6 +17,14 @@ import zipfile
 
 import decky
 
+# Decky points LD_LIBRARY_PATH at its bundled libraries, older than the system's on some
+# distributions: a system program started from here would load them and fail before it runs.
+_original_library_path = os.environ.pop("LD_LIBRARY_PATH_ORIG", None)
+if _original_library_path:
+    os.environ["LD_LIBRARY_PATH"] = _original_library_path
+else:
+    os.environ.pop("LD_LIBRARY_PATH", None)
+
 REPO = "superkeka/KytyPS5-Native"
 USER = decky.DECKY_USER
 HOME = decky.DECKY_USER_HOME
