@@ -11,7 +11,7 @@ import {
 import { callable, definePlugin, openFilePicker, toaster } from "@decky/api";
 import { useEffect, useState } from "react";
 import { FaPlaystation } from "react-icons/fa";
-import { ART_VERSION, Game, needsSync, syncAll } from "./shortcuts";
+import { ART_VERSION, Game, languageChanged, needsSync, syncAll } from "./shortcuts";
 
 interface KernelItem {
   key: string;
@@ -112,7 +112,7 @@ function Content() {
   const refresh = async () => {
     const s = await getState();
     setState(s);
-    if (s.kyty_installed && (needsSync(s.games, s.gone) || s.art_version !== ART_VERSION) && !syncRunning) {
+    if (s.kyty_installed && (needsSync(s.games, s.gone) || s.art_version !== ART_VERSION || (await languageChanged())) && !syncRunning) {
       setSyncing(true);
       await sync(s);
       setSyncing(false);
@@ -377,7 +377,7 @@ async function sync(s: State) {
 // Also when the panel is closed: at start and every 10 minutes.
 async function autoSync() {
   const s = await getState();
-  if (s.kyty_installed && (needsSync(s.games, s.gone) || s.art_version !== ART_VERSION)) await sync(s);
+  if (s.kyty_installed && (needsSync(s.games, s.gone) || s.art_version !== ART_VERSION || (await languageChanged()))) await sync(s);
 }
 
 export default definePlugin(() => {
