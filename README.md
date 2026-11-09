@@ -69,6 +69,10 @@ On the BC-250 native mode turns on by itself; `KYTY_NATIVE_GPU=0` turns it off.
 `kyty_emulator --game /path/to/game` runs a game without the launcher, `kyty_emulator --help` lists
 the options.
 
+## Troubleshooting
+
+- [Ghost of Yōtei: infinite loading spinner and additional-content registrations](docs/ghost-of-yotei-additional-content.md)
+
 ## Requirements
 
 - BC-250 with SteamOS (tested), stock or patched amdgpu
