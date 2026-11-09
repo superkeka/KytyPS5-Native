@@ -26,8 +26,32 @@ if(BUILD_TESTING)
 	add_dependencies(kyty_tests native_gpu_shader_scan_tests)
 endif()
 
-# GEM backing is header-only (src/graphics/native_gpu/gemBacking.h), so the emulator needs no extra
-# source; this standalone test exercises it directly and skips cleanly off the board.
+# Mapping metadata and synchronization regressions run entirely on the CPU.
+find_package(Threads REQUIRED)
+add_executable(native_gpu_mapping_index_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuMappingIndexTests.cpp"
+)
+target_include_directories(native_gpu_mapping_index_tests PRIVATE ${inc_headers})
+target_link_libraries(native_gpu_mapping_index_tests PRIVATE Threads::Threads)
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_mapping_index COMMAND $<TARGET_FILE:native_gpu_mapping_index_tests>)
+	add_dependencies(kyty_tests native_gpu_mapping_index_tests)
+endif()
+
+if(LINUX)
+	add_executable(native_gpu_mapping_sync_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/NativeGpuMappingSyncTests.cpp"
+	)
+	target_include_directories(native_gpu_mapping_sync_tests PRIVATE ${inc_headers})
+	target_link_libraries(native_gpu_mapping_sync_tests PRIVATE Threads::Threads)
+	target_link_options(native_gpu_mapping_sync_tests PRIVATE "-Wl,--wrap=ioctl")
+	if(BUILD_TESTING)
+		add_test(NAME native_gpu_mapping_sync COMMAND $<TARGET_FILE:native_gpu_mapping_sync_tests>)
+		add_dependencies(kyty_tests native_gpu_mapping_sync_tests)
+	endif()
+endif()
+
+# GEM backing is header-only; this hardware test skips cleanly off the board.
 add_executable(native_gpu_gem_backing_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/NativeGpuGemBackingTests.cpp"
 )

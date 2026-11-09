@@ -14,6 +14,8 @@
 
 #if KYTY_GEM_BACKING_SUPPORTED
 
+#include "graphics/native_gpu/gpuMappingIndex.h"
+
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -519,6 +521,7 @@ public:
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
+		m_mapping_index.Erase(GpuMappingIndex::Kind::Direct, vaddr, vaddr + size);
 		bool ok = ForEachBackingPiece(offset, size,
 		                              [&](const Bo& bo, uint64_t bo_size, uint64_t inner, bool resident, bool carved, uint64_t done, uint64_t part) {
 			void* const dst = reinterpret_cast<void*>(vaddr + done);
@@ -537,7 +540,7 @@ public:
 		if (ok) {
 			EraseViewsUnlocked(vaddr, size);
 			m_views[vaddr] = View {size, offset, false};
-			m_views_generation++;
+			m_mapping_index.Replace(GpuMappingIndex::Kind::Direct, {vaddr, vaddr + size, false});
 		}
 		return ok;
 	}
@@ -552,6 +555,7 @@ public:
 			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
+		m_mapping_index.Erase(GpuMappingIndex::Kind::Direct, vaddr, vaddr + size);
 		VaSync                      va_sync(*this, !InPrtApertureUnlocked(vaddr, size));
 		const bool                  over_prt = PreSplitNetUnlocked(vaddr, size);
 		const bool ok = ForEachBackingPiece(offset, size,
@@ -567,11 +571,15 @@ public:
 		auto it = m_views.find(vaddr);
 		if (it != m_views.end() && it->second.size == size && it->second.offset == offset) {
 			it->second.gpu = true;
-			m_views_generation++; // GpuWritableRange answers change
 		} else {
 			EraseViewsUnlocked(vaddr, size);
 			m_views[vaddr] = View {size, offset, true};
-			m_views_generation++;
+		}
+		// Publish only after the existing page-table wait. Unrelated lookups can proceed while
+		// it waits; a pending/replaced range is not advertised as ready for GPU writes.
+		va_sync.Finish();
+		if (ok) {
+			m_mapping_index.Replace(GpuMappingIndex::Kind::Direct, {vaddr, vaddr + size, true});
 		}
 		return ok;
 	}
@@ -623,7 +631,6 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
 		EraseViewsUnlocked(vaddr, size);
-		m_views_generation++;
 		// With explicit sync the unmap does not wait for this VM's jobs, so a job still running on the range must not
 		// fault (on this board a GPU VM fault halts the wave and the ring with it): the range goes PRT, which reads zeros
 		// and drops writes, the way a PRT aperture's holes behave, and the next mapping there replaces it.
@@ -815,49 +822,28 @@ public:
 
 	// True when `vaddr` lies in a view of this backing.
 	[[nodiscard]] bool IsBacked(uint64_t vaddr) const {
-		std::lock_guard<std::mutex> lock(m_lock);
-		return FindViewUnlocked(vaddr) != m_views.end();
+		return m_mapping_index.Lookup(vaddr).backed;
 	}
 
 	// True when `vaddr` is mapped into the GPU VM at all: a view of the backing or an external range.
 	[[nodiscard]] bool IsGpuMapped(uint64_t vaddr) const {
-		std::lock_guard<std::mutex> lock(m_lock);
-		if (FindViewUnlocked(vaddr) != m_views.end()) {
-			return true;
-		}
-		auto it = m_external.upper_bound(vaddr);
-		return it != m_external.begin() && vaddr < std::prev(it)->second.end;
+		return m_mapping_index.Lookup(vaddr).mapped;
 	}
 
 	// True when the GPU may write `vaddr`: a view mapped into the GPU VM (its block must be made
 	// resident before the write lands, or it goes to the dummy) or a writable external range. CPU
 	// stacks and read-only ranges are not.
 	[[nodiscard]] bool IsGpuWritable(uint64_t vaddr) const {
-		std::lock_guard<std::mutex> lock(m_lock);
-		if (auto v = FindViewUnlocked(vaddr); v != m_views.end()) {
-			return v->second.gpu;
-		}
-		auto it = m_external.upper_bound(vaddr);
-		return it != m_external.begin() && vaddr < std::prev(it)->second.end && std::prev(it)->second.writable;
+		return m_mapping_index.Lookup(vaddr).writable;
 	}
 
 	// IsGpuWritable, plus the range [*lo, *hi) holding `vaddr` that the answer holds for until
 	// ViewsGeneration changes (lo == hi when `vaddr` is in no range).
 	[[nodiscard]] bool GpuWritableRange(uint64_t vaddr, uint64_t* lo, uint64_t* hi) const {
-		std::lock_guard<std::mutex> lock(m_lock);
-		*lo = *hi = 0;
-		if (auto v = FindViewUnlocked(vaddr); v != m_views.end()) {
-			*lo = v->first;
-			*hi = v->first + v->second.size;
-			return v->second.gpu;
-		}
-		auto it = m_external.upper_bound(vaddr);
-		if (it != m_external.begin() && vaddr < std::prev(it)->second.end) {
-			*lo = std::prev(it)->first;
-			*hi = std::prev(it)->second.end;
-			return std::prev(it)->second.writable;
-		}
-		return false;
+		const auto range = m_mapping_index.Lookup(vaddr);
+		*lo = range.begin;
+		*hi = range.end;
+		return range.writable;
 	}
 
 	// Copies up to `size` bytes of guest memory at `vaddr` (clipped to the view holding it) through
@@ -906,7 +892,7 @@ public:
 	}
 
 	// Bumped whenever the set of views changes; a caller caching ViewRanges() refreshes on a change.
-	[[nodiscard]] uint64_t ViewsGeneration() const { return m_views_generation.load(std::memory_order_acquire); }
+	[[nodiscard]] uint64_t ViewsGeneration() const { return m_mapping_index.Generation(); }
 
 	// The guest address ranges [start, end) covered by views, sorted and merged.
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> ViewRanges() const {
@@ -960,7 +946,8 @@ public:
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
 		VaSync                      va_sync(*this);
-		ClearExternalRangeUnlocked(vaddr, size);
+		std::vector<GpuMappingIndex::Range> pending;
+		ClearExternalRangeUnlocked(vaddr, size, pending);
 		// A single guest range can hold sub-ranges the guest reprotected to execute-only or no-access
 		// (seen in program memory: the shader is a readable slice, with an execute-only tail). A
 		// userptr cannot fault in an unreadable page, which fails the whole submission, so register one
@@ -977,8 +964,12 @@ public:
 			if (executable && !bind_code) {
 				return;
 			}
-			any = RegisterExternalUnlocked(s, sz, gpu_write && writable) || any;
+			any = RegisterExternalUnlocked(s, sz, gpu_write && writable, pending) || any;
 		});
+		va_sync.Finish();
+		for (const auto& range: pending) {
+			m_mapping_index.Replace(GpuMappingIndex::Kind::External, range);
+		}
 		return any;
 	}
 
@@ -991,8 +982,12 @@ public:
 			return true;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
-		ClearExternalRangeUnlocked(vaddr, size);
+		std::vector<GpuMappingIndex::Range> pending;
+		ClearExternalRangeUnlocked(vaddr, size, pending);
 		MapNetHolesUnlocked(vaddr, size, false); // CloseExternal left the net's holes PRT
+		for (const auto& range: pending) {
+			m_mapping_index.Replace(GpuMappingIndex::Kind::External, range);
+		}
 		return true;
 	}
 
@@ -1383,6 +1378,7 @@ private:
 	};
 
 	GemBacking() = default;
+	friend struct GemBackingMappingTest;
 
 	int Ioctl(unsigned long request, void* arg) const {
 		int r = -1;
@@ -1580,12 +1576,14 @@ private:
 	struct VaSync {
 		const GemBacking& g;
 		const uint64_t    start;
-		const bool        on;
+		bool              on;
 		explicit VaSync(const GemBacking& b, bool wait = true): g(b), start(b.m_va_point), on(wait) {}
-		~VaSync() {
+		~VaSync() { Finish(); }
+		void Finish() {
 			if (on && g.m_va_point != start) {
 				g.WaitVaUpdates();
 			}
+			on = false;
 		}
 		VaSync(const VaSync&)            = delete;
 		VaSync& operator=(const VaSync&) = delete;
@@ -2147,6 +2145,7 @@ private:
 
 	// Forgets views in [vaddr, vaddr + size), keeping the parts of straddling views outside it.
 	void EraseViewsUnlocked(uint64_t vaddr, uint64_t size) {
+		m_mapping_index.Erase(GpuMappingIndex::Kind::Direct, vaddr, vaddr + size);
 		const uint64_t                            end = vaddr + size;
 		std::vector<std::pair<uint64_t, View>>    keep;
 		auto                                      it = m_views.upper_bound(vaddr);
@@ -2543,7 +2542,8 @@ private:
 	// Registers [vaddr, vaddr + size) host pages as a userptr GEM buffer and maps it into the GPU VM
 	// at vaddr. `gpu_write` selects a writable or read-only buffer and page mapping. Caller holds
 	// m_lock and has already cleared any overlapping external binding.
-	bool RegisterExternalUnlocked(uint64_t vaddr, uint64_t size, bool gpu_write) {
+	bool RegisterExternalUnlocked(uint64_t vaddr, uint64_t size, bool gpu_write,
+	                              std::vector<GpuMappingIndex::Range>& pending) {
 		if (m_kfd_userptr) {
 			// A KFD userptr buffer at its own guest VA: KFD keeps it valid (it stops its queues while the
 			// CPU pages change), so a KFD queue reaches it and a render-node CS need not list it.
@@ -2572,7 +2572,7 @@ private:
 				return false;
 			}
 			m_external.emplace(vaddr, External {vaddr + size, 0, gpu_write, a.handle});
-			m_views_generation++;
+			pending.push_back({vaddr, vaddr + size, gpu_write});
 			return true;
 		}
 		struct drm_amdgpu_gem_userptr u;
@@ -2600,7 +2600,7 @@ private:
 			MarkVaStale(); // a KFD queue may hold the PRT translations (zeros) of the hole
 		}
 		m_external.emplace(vaddr, External {vaddr + size, u.handle, gpu_write});
-		m_views_generation++;
+		pending.push_back({vaddr, vaddr + size, gpu_write});
 		return true;
 	}
 
@@ -2781,7 +2781,7 @@ private:
 		return hole;
 	}
 
-	void ClearExternalRangeUnlocked(uint64_t vaddr, uint64_t size) {
+	void ClearExternalRangeUnlocked(uint64_t vaddr, uint64_t size, std::vector<GpuMappingIndex::Range>& pending) {
 		MarkVaStale();
 		const uint64_t end = vaddr + size;
 
@@ -2795,9 +2795,11 @@ private:
 		}
 		while (it != m_external.end() && it->first < end) {
 			if (it->second.end > vaddr) {
+				// CloseExternal frees the entire old buffer, including any surviving tails.
+				// Invalidate it before that operation; publish re-registered tails with the caller.
+				m_mapping_index.Erase(GpuMappingIndex::Kind::External, it->first, it->second.end);
 				overlapping.emplace_back(it->first, it->second);
 				it = m_external.erase(it);
-				m_views_generation++;
 			} else {
 				++it;
 			}
@@ -2806,10 +2808,10 @@ private:
 		for (const auto& [start, ext]: overlapping) {
 			CloseExternal(start, ext);
 			if (start < vaddr) {
-				RegisterExternalUnlocked(start, vaddr - start, ext.writable);
+				RegisterExternalUnlocked(start, vaddr - start, ext.writable, pending);
 			}
 			if (end < ext.end) {
-				RegisterExternalUnlocked(end, ext.end - end, ext.writable);
+				RegisterExternalUnlocked(end, ext.end - end, ext.writable, pending);
 			}
 		}
 	}
@@ -2893,7 +2895,7 @@ private:
 	std::vector<Block>            m_blocks;
 	std::map<uint64_t, View>      m_views;     // guest VA -> view of the backing
 	std::map<uint64_t, uint64_t>  m_coherent;  // backing ranges of coherent memory types: start -> end
-	std::atomic<uint64_t>         m_views_generation {0}; // changed under m_lock, read without it
+	GpuMappingIndex              m_mapping_index; // read-only queries never acquire m_lock
 	Bo                            m_dummy;     // GPU target of every non-resident block
 	uint8_t*                      m_dummy_cpu = nullptr;
 	static inline std::atomic<uint32_t> s_promoting {0}; // blocks being moved right now
