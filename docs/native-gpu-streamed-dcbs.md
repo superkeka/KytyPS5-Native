@@ -125,6 +125,7 @@ CS and so missing from its BO list), the chain is ended there and the rest goes 
 | `KYTY_NATIVE_GPU_CHUNK_DW=N` | cut every N dwords instead |
 | `KYTY_NATIVE_GPU_CHUNK_STREAM=0` | a CS per chunk, each with a preamble, instead of the stream |
 | `KYTY_NATIVE_GPU_ACB_AHEAD=0` | the title's compute buffers wait for the rest of the DCB instead of being translated between its chunks |
+| `KYTY_NATIVE_GPU_ACB_THREAD=0` | no separate thread for the title's compute buffers: the DCB worker translates them, between chunks as above (the thread is the default when every compute wait stays on the GPU; `KYTY_NATIVE_GPU_ACB_AHEAD=0` turns it off too) |
 | `KYTY_NATIVE_GPU_CHUNK_COMPARE=1` | dumps the first chunked DCB translated whole and in chunks to `KYTY_NATIVE_GPU_DUMP_DIR` |
 | `KYTY_NATIVE_GPU_FLIP_STATS=1` | per-flip report: `graphics buffers per flip` (guest size, chunked, queued), `streamed DCB chunks so far` (chains ended early, waits for a trampoline, chains ended for a slot wait) |
 | `KYTY_NATIVE_GPU_FLIP_TRACE=1` | `flips.csv` with `dcb_latency_ms` (title's submission to the GPU's end), `game_gap_ms` (that to its next DCB), `acb_gap_ms`, `acb_latency_max_ms`, `irq_timeouts` |

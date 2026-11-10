@@ -97,6 +97,17 @@ if(BUILD_TESTING)
 	add_dependencies(kyty_tests native_gpu_jobs_ahead_tests)
 endif()
 
+# The order between the ACB thread and Kyty's own submissions (nativeAcbNullGate.h): header-only and pure.
+add_executable(native_gpu_acb_null_gate_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuAcbNullGateTests.cpp"
+)
+target_include_directories(native_gpu_acb_null_gate_tests PRIVATE ${inc_headers})
+
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_acb_null_gate COMMAND $<TARGET_FILE:native_gpu_acb_null_gate_tests>)
+	add_dependencies(kyty_tests native_gpu_acb_null_gate_tests)
+endif()
+
 # The root helper (tools/bc250-lodhw): the privileged registers the native backend needs (LOD
 # statistics, KFD TLB flushes). Built with the emulator and shipped next to it with its service
 # and installer (sudo ./install-helper.sh).
