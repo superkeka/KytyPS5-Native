@@ -1,5 +1,6 @@
 #include "graphics/native_gpu/nativeShadow.h"
 
+#include "graphics/native_gpu/nativeJobsAhead.h"
 #include "graphics/native_gpu/nativePm4.h"
 #include "graphics/native_gpu/nativeSubmit.h" // KYTY_GEM_BACKING_SUPPORTED + NativeSubmitter
 #include "graphics/native_gpu/nativeWatch.h"
@@ -84,6 +85,11 @@ std::atomic<uint64_t> g_dcb_jobs {0};
 std::atomic<uint64_t> g_dcb_guest_dw {0};
 std::atomic<uint64_t> g_dcb_chunked {0};
 std::atomic<uint64_t> g_dcb_queued_us {0};
+// Compute buffers through the label pipeline since the last flip report: how many, how long they sat queued before the
+// worker took them, and how many it took between the chunks of a graphics buffer (TranslateComputeAhead).
+std::atomic<uint64_t> g_acb_jobs {0};
+std::atomic<uint64_t> g_acb_queued_us {0};
+std::atomic<uint64_t> g_acb_ahead {0};
 // By why the piece was first held: 0 cross-ring writer not submitted yet, 1 the write ahead does not
 // satisfy the wait (value or function), 2 the write ahead is a CPU (tracker) write, 3 partial cover,
 // 4 no write ahead and the label not in memory yet, 5 no native form of the wait.
@@ -2500,6 +2506,12 @@ public:
 				             static_cast<double>(g_dcb_guest_dw.exchange(0, std::memory_order_relaxed)) / jobs,
 				             static_cast<double>(g_dcb_chunked.exchange(0, std::memory_order_relaxed)) / m_flips,
 				             static_cast<double>(g_dcb_queued_us.exchange(0, std::memory_order_relaxed)) / 1e3 / jobs);
+			}
+			if (const uint64_t jobs = g_acb_jobs.exchange(0, std::memory_order_relaxed); jobs != 0) {
+				std::fprintf(stderr, "native shadow: compute buffers per flip: %.2f, %.2f ms queued each, %.2f taken between DCB chunks\n",
+				             static_cast<double>(jobs) / m_flips,
+				             static_cast<double>(g_acb_queued_us.exchange(0, std::memory_order_relaxed)) / 1e3 / jobs,
+				             static_cast<double>(g_acb_ahead.exchange(0, std::memory_order_relaxed)) / m_flips);
 			}
 			if (m_stream_chunks != 0 || m_stream_fallbacks != 0) {
 				std::fprintf(stderr,
@@ -7044,7 +7056,6 @@ private:
 
 	void Work() {
 		for (;;) {
-			std::deque<Job> jobs;
 			{
 				std::unique_lock<std::mutex> lock(m_mutex);
 				if (m_held > 0) {
@@ -7055,10 +7066,13 @@ private:
 				} else {
 					m_cv.wait(lock, [this] { return !m_jobs.empty(); });
 				}
-				jobs.swap(m_jobs);
+				m_round.swap(m_jobs);
 			}
 			const double picked = NowSecShadow();
-			for (auto& job: jobs) {
+			while (!m_round.empty()) {
+				// Out of the deque first: TranslateComputeAhead takes jobs from the middle of it.
+				Job job = std::move(m_round.front());
+				m_round.pop_front();
 				Translate(job, picked);
 			}
 			// A cross-ring wait stays on the CPU until the writer's CS ioctl has returned, then the
@@ -7138,6 +7152,9 @@ private:
 			g_dcb_jobs.fetch_add(1, std::memory_order_relaxed);
 			g_dcb_guest_dw.fetch_add(job.size_dw, std::memory_order_relaxed);
 			g_dcb_queued_us.fetch_add(static_cast<uint64_t>((NowSecShadow() - job.enqueued) * 1e6), std::memory_order_relaxed);
+		} else if (job.buffer != nullptr) {
+			g_acb_jobs.fetch_add(1, std::memory_order_relaxed);
+			g_acb_queued_us.fetch_add(static_cast<uint64_t>((NowSecShadow() - job.enqueued) * 1e6), std::memory_order_relaxed);
 		}
 		// The size that matters is the inlined one: a title's DCB is often a few dwords of INDIRECT_BUFFER
 		// calls (GT7: 25 dwords standing for ~100K).
@@ -7192,6 +7209,35 @@ private:
 			}
 			queue.push_back(std::move(p));
 		}
+	}
+
+	// Between the chunks of a graphics buffer: the compute buffers the title has submitted, translated now instead of
+	// after the rest of it. Each guest compute queue is a hardware queue of its own, as on the PS5, so its work does not
+	// wait for a graphics buffer submitted earlier, while the graphics buffer often waits for labels it writes. Only with
+	// every compute wait on the GPU: then nothing about a compute buffer depends on what the graphics queue has emitted
+	// so far. Their order among themselves stays, and none passes Kyty's own submissions (GuestGpu::Enqueue).
+	// KYTY_NATIVE_GPU_ACB_AHEAD=0: they wait for the graphics buffer.
+	void TranslateComputeAhead(uint32_t gfx_queue) {
+		static const bool on = !EnvIs("KYTY_NATIVE_GPU_ACB_AHEAD", "0");
+		if (!on || !m_acb_rings || !AllWaitsOnGpu()) {
+			return;
+		}
+		const auto takes = [](const Job& j) { return j.buffer != nullptr && IsGuestComputeQueue(j.queue); };
+		const auto stops = [](const Job& j) { return j.buffer == nullptr; };
+		std::vector<Job> ahead;
+		if (TakeJobsAhead(m_round, &ahead, takes, stops)) {
+			std::lock_guard<std::mutex> lock(m_mutex);
+			TakeJobsAhead(m_jobs, &ahead, takes, stops);
+		}
+		if (ahead.empty()) {
+			return;
+		}
+		g_acb_ahead.fetch_add(ahead.size(), std::memory_order_relaxed);
+		const double picked = NowSecShadow();
+		for (Job& job: ahead) {
+			Translate(job, picked);
+		}
+		m_translating = gfx_queue;
 	}
 
 	// Pumps the pieces ready so far to the GPU, as Work does after each round.
@@ -7368,6 +7414,7 @@ private:
 			done->tail.insert(done->tail.end(), r.cpu_tail.begin(), r.cpu_tail.end());
 			PushPieces(r, c + 1 == chunks.size() ? done : nullptr, queue);
 			if (c + 1 < chunks.size()) {
+				TranslateComputeAhead(job.queue);
 				PumpAndFlush(); // this chunk runs while the next is translated
 			}
 		}
@@ -8172,6 +8219,7 @@ private:
 	std::mutex                              m_mutex;
 	std::condition_variable                 m_cv;
 	std::deque<Job>                         m_jobs;
+	std::deque<Job>                         m_round; // what the worker took from m_jobs and has not translated yet (its thread only)
 	bool                                    m_native  = false;
 	bool                                    m_acb_rings = false;
 	uint32_t                                m_compute_mask = 0;
