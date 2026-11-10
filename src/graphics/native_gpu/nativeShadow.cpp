@@ -7089,8 +7089,8 @@ private:
 		m_acb_rings = Shadow::Instance().AcbRings();
 		m_compute_mask = Shadow::Instance().ComputeRingMask();
 		m_timeout = Shadow::Instance().TimeoutSec();
-		// KYTY_NATIVE_GPU_ACB_THREAD=0: the worker translates the compute buffers too (and with ACB_AHEAD=0 they wait).
-		m_acb_thread = m_native && m_acb_rings && AllWaitsOnGpu() && !EnvIs("KYTY_NATIVE_GPU_ACB_THREAD", "0") &&
+		// KYTY_NATIVE_GPU_ACB_THREAD=1: a thread of their own translates the compute buffers. Off by default: the worker does it.
+		m_acb_thread = m_native && m_acb_rings && AllWaitsOnGpu() && EnvIs("KYTY_NATIVE_GPU_ACB_THREAD", "1") &&
 		               !EnvIs("KYTY_NATIVE_GPU_ACB_AHEAD", "0");
 		if (m_acb_thread) {
 			Shadow::Instance().UseAcbThread(&m_acb_oracle);
