@@ -2188,7 +2188,7 @@ int KYTY_SYSV_ABI PthreadAttrInit(PthreadAttr* attr) {
 
 	int result = pthread_attr_init(&(*attr)->p);
 
-	(*attr)->affinity       = ~KernelCpumask {0};
+	(*attr)->affinity       = 0x7f;
 	(*attr)->guard_size     = 0x1000;
 	(*attr)->stack_addr     = nullptr;
 	(*attr)->stack_size     = PTHREAD_STACK_DEFAULT;
