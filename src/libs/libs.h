@@ -156,7 +156,7 @@ namespace Libs {
 		CountHleCall(function);
 		return;
 	}
-	if (Log::GetDirection() != Log::Direction::Silent && !PrintNameSkipped(function)) {
+	if (!Log::IsSilent() && !PrintNameSkipped(function)) {
 		const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
 		const auto print_name_time = fmt::format(
 		    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,

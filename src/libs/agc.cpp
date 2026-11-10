@@ -7,7 +7,6 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
-#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -28,6 +27,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -45,13 +45,6 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
 
 namespace Libs::Graphics {
 
@@ -913,8 +906,8 @@ static bool is_native_reg_indirect_packet(const uint32_t* cmd, RegIndirectPacket
 	return ((cmd[0] >> 8u) & 0xffu) == reg_indirect_native_op(type);
 }
 
-static constexpr bool is_trinity_mode() {
-	return false;
+static bool is_trinity_mode() {
+	return Loader::SystemContentIsTrinityMode();
 }
 
 static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
@@ -2936,8 +2929,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 	     "\t index_addr     = 0x%016" PRIx64 "\n"
 	     "\t index_count    = 0x%" PRIx32 "\n"
 	     "\t modifier       = 0x%016" PRIx64 "\n",
-	     instance_count, reinterpret_cast<uint64_t>(object_ids), reinterpret_cast<uint64_t>(index_addr),
-	     index_count, modifier);
+	     instance_count, reinterpret_cast<uint64_t>(object_ids),
+	     reinterpret_cast<uint64_t>(index_addr), index_count, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 

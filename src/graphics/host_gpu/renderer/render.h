@@ -4,13 +4,13 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -30,14 +30,6 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
-enum class CommandBufferDebugOp : uint32_t {
-	DispatchDirect,
-	DrawIndex,
-	DrawIndexAuto,
-	DispatchIndirect = 9,
-	Unknown,
-};
-
 enum class DrawOffsetSource : uint8_t {
 	DrawState,
 	IndirectArgs,
@@ -52,25 +44,23 @@ struct DrawIndirectArgs {
 };
 
 struct DrawIndexArgs {
-	uint32_t         index_count                = 0;
-	const void*      index_addr                 = nullptr;
-	uint32_t         instance_count             = 0;
-	uint32_t         index_type_and_size        = 0;
-	int32_t          base_vertex                = 0;
-	uint32_t         first_instance             = 0;
-	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	uint32_t         render_target_slice_offset = 0;
+	uint32_t         index_count         = 0;
+	const void*      index_addr          = nullptr;
+	uint32_t         instance_count      = 0;
+	uint32_t         index_type_and_size = 0;
+	int32_t          base_vertex         = 0;
+	uint32_t         first_instance      = 0;
+	DrawOffsetSource offset_source       = DrawOffsetSource::DrawState;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
 };
 
 struct DrawAutoArgs {
-	uint32_t         vertex_count               = 0;
-	uint32_t         instance_count             = 0;
-	uint32_t         first_vertex               = 0;
-	uint32_t         first_instance             = 0;
-	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
-	uint32_t         render_target_slice_offset = 0;
+	uint32_t         vertex_count   = 0;
+	uint32_t         instance_count = 0;
+	uint32_t         first_vertex   = 0;
+	uint32_t         first_instance = 0;
+	DrawOffsetSource offset_source  = DrawOffsetSource::DrawState;
 	DrawIndirectArgs indirect;
 };
 
@@ -106,10 +96,8 @@ public:
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
-	[[nodiscard]] bool IsInvalid() const;
+	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
 
-	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
-	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
@@ -135,14 +123,7 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer          = nullptr;
-	uint32_t            m_debug_op        = 0;
-	uint64_t            m_debug_submit_id = 0;
-	uint32_t            m_debug_arg0      = 0;
-	uint32_t            m_debug_arg1      = 0;
-	uint32_t            m_debug_arg2      = 0;
-	uint32_t            m_debug_arg3      = 0;
-	uint64_t            m_debug_arg4      = 0;
+	vk::CommandBuffer   m_buffer = nullptr;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_used        = false;
@@ -153,15 +134,21 @@ private:
 	friend class CommandScheduler;
 };
 
+namespace Pssr {
+struct Request;
+}
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
-	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
-	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode, bool async_compute);
+	void DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x, uint32_t thread_group_y,
+	                    uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	void DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
+	                      bool async_compute);
+	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
@@ -175,38 +162,34 @@ public:
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
-	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
-		std::optional<PreparedBindings> pixel;
+		PreparedBindings                pixel;
 	};
 
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
-	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
-	                              bool ignore_target_mask = false, bool exact_format = false);
+	                              uint32_t render_target_slot, bool ignore_target_mask = false,
+	                              bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
-	                                          const DrawCallInfo& draw,
-	                                          uint32_t            render_target_slice_offset,
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                          DrawRenderState& state);
-	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
-	                         DrawRenderState& state, const DrawEmitInfo& emit,
-	                         const DrawIndexBufferSource& index_source);
+	void                      ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                              DrawRenderState& state, const DrawEmitInfo& emit,
+	                                              const DrawIndexBufferSource& index_source);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
-	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
-	                                              uint32_t render_target_slice_offset);
-	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
-	                                                       uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
@@ -215,13 +198,36 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                                  Dlss::Inputs& inputs);
+
+	// DLSS history of a PSSR context; a null feature is one DLSS refused or failed.
+	struct DlssContext {
+		uint64_t       context;
+		Dlss::Creation creation;
+		Dlss::Feature* feature;
+	};
+
+	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
+	// enabled counts as sampled at its BASE_LEVEL, clamped when its MIN_LOD lies above that level.
+	struct MipStatsCounter {
+		uint8_t finest_level = 15; // no samples
+		bool    clamped      = false;
+		bool    unclamped    = false;
+	};
 
 	RenderContext&                        m_context;
+	bool                                  m_lod_stats = Config::LodStatsEnabled();
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	std::vector<DlssContext>              m_dlss_contexts;
+	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

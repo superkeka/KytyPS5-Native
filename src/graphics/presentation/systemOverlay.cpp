@@ -737,7 +737,7 @@ SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
 	const bool splash        = g_splash_active.load(std::memory_order_acquire);
 	const auto cursor        = GetHostInputTouchPadVisualState();
 	return {core.active || dialog.active || system.active || trophy_active || splash ||
-	            (cursor.enabled && cursor.cursor_visible) || GameMenuOpen(),
+	            cursor.enabled || GameMenuOpen(),
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u) +
 	            (splash ? 2u : 0u) + static_cast<decltype(core.revision)>(cursor.revision) +
 	            PerformanceOverlayRevision() + GameMenuRevision()};
@@ -1558,32 +1558,33 @@ struct SystemOverlay::Impl {
 			};
 
 			if (skin != TouchParticleSkin::Classic) {
-				const ImU32 glow =
-				    skin == TouchParticleSkin::BlueNeon
-				        ? IM_COL32(0, 115, 255, static_cast<int>(38.0f * alpha))
-				        : (skin == TouchParticleSkin::RedBlue
-				               ? IM_COL32(75, 100, 255, static_cast<int>(55.0f * alpha))
-				               : (skin == TouchParticleSkin::Crimson
-				               ? IM_COL32(255, 70, 0, static_cast<int>(70.0f * alpha))
-				               : IM_COL32(115, 165, 255, static_cast<int>(30.0f * alpha))));
+				ImU32 glow = 0;
+				if (skin == TouchParticleSkin::BlueNeon) {
+					glow = IM_COL32(0, 115, 255, static_cast<int>(38.0f * alpha));
+				} else if (skin == TouchParticleSkin::RedBlue) {
+					glow = IM_COL32(75, 100, 255, static_cast<int>(55.0f * alpha));
+				} else if (skin == TouchParticleSkin::Crimson) {
+					glow = IM_COL32(255, 70, 0, static_cast<int>(70.0f * alpha));
+				} else {
+					glow = IM_COL32(115, 165, 255, static_cast<int>(30.0f * alpha));
+				}
 				draw->AddCircleFilled(center, size + 6.0f, glow);
 			}
-			const ImU32 particle_glow =
-			    skin == TouchParticleSkin::Crimson
-			        ? (particle.icon == TouchParticleIcon::Triangle ||
-			                   particle.icon == TouchParticleIcon::Circle
-			               ? IM_COL32(255, 195, 30, static_cast<int>(135.0f * alpha))
-			               : IM_COL32(255, 95, 0, static_cast<int>(135.0f * alpha)))
-			        : (skin == TouchParticleSkin::RedBlue
-			               ? (particle.icon == TouchParticleIcon::Square ||
-			                          particle.icon == TouchParticleIcon::Cross
-			                      ? IM_COL32(255, 40, 65, static_cast<int>(105.0f * alpha))
-			                      : IM_COL32(35, 125, 255, static_cast<int>(105.0f * alpha)))
-			               : IM_COL32(35, 145, 255,
-			                          static_cast<int>((skin == TouchParticleSkin::BlueNeon
-			                                                ? 100.0f
-			                                                : 65.0f) *
-			                                           alpha)));
+			ImU32 particle_glow = 0;
+			if (skin == TouchParticleSkin::Crimson) {
+				const bool ember = particle.icon == TouchParticleIcon::Triangle ||
+				                   particle.icon == TouchParticleIcon::Circle;
+				particle_glow    = ember ? IM_COL32(255, 195, 30, static_cast<int>(135.0f * alpha))
+				                         : IM_COL32(255, 95, 0, static_cast<int>(135.0f * alpha));
+			} else if (skin == TouchParticleSkin::RedBlue) {
+				const bool red = particle.icon == TouchParticleIcon::Square ||
+				                 particle.icon == TouchParticleIcon::Cross;
+				particle_glow  = red ? IM_COL32(255, 40, 65, static_cast<int>(105.0f * alpha))
+				                     : IM_COL32(35, 125, 255, static_cast<int>(105.0f * alpha));
+			} else {
+				const float strength = skin == TouchParticleSkin::BlueNeon ? 100.0f : 65.0f;
+				particle_glow        = IM_COL32(35, 145, 255, static_cast<int>(strength * alpha));
+			}
 			draw->AddCircleFilled(center, size + 2.0f, particle_glow);
 			switch (particle.icon) {
 				case TouchParticleIcon::Square:
@@ -1647,8 +1648,7 @@ struct SystemOverlay::Impl {
 		}
 		auto* draw = ImGui::GetForegroundDrawList();
 		DrawTouchParticles(draw, now);
-		if (!state.enabled || !state.cursor_visible ||
-		    !state.position_valid || !cursor_initialized) {
+		if (!state.enabled || !state.position_valid || !cursor_initialized) {
 			return;
 		}
 

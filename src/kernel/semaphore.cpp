@@ -50,10 +50,9 @@ public:
 private:
 	enum class Status { Set, Deleted };
 
-	// Each waiter sleeps on its own condition variable, so a signal wakes only the threads it
-	// gives the count to, as the console does, not every waiter in turn.
+	// Each waiter sleeps on its own condition variable, so a signal wakes only the waiters it
+	// gives counts to.
 	struct WaitingThread {
-		int             id         = 0;
 		int             priority   = 700;
 		int             need_count = 0;
 		Result          result     = Result::TimedOut;
@@ -212,12 +211,8 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
-	t.Start();
-
-	int id = Common::Thread::GetThreadIdUnique();
 
 	WaitingThread waiter {};
-	waiter.id         = id;
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
 	waiter.need_count = need_count;
 	AddWaiter(&waiter);
@@ -229,11 +224,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 			return Result::TimedOut;
 		}
 
-		if (infinitely) {
-			waiter.cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
-		} else {
-			waiter.cond_var.WaitFor(&m_mutex, micros - elapsed);
-		}
+		waiter.cond_var.WaitFor(&m_mutex, infinitely ? SIGNAL_APC_POLL_MICROS : micros - elapsed);
 
 		m_mutex.Unlock();
 		LibKernel::KernelDispatchPendingSignalForCurrentThread();
@@ -406,7 +397,6 @@ public:
 		uint32_t      elapsed    = 0;
 		const bool    timed_wait = (micros != nullptr);
 		Common::Timer timer;
-		timer.Start();
 
 		while (m_count <= 0) {
 			if (timed_wait && elapsed >= *micros) {

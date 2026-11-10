@@ -38,9 +38,6 @@ void PrintSet(const char* what, const std::set<uint32_t>& offsets) {
 }
 
 void TestResetTablesCovered() {
-	GraphicsInitJmpTablesShIndirect();
-	GraphicsInitJmpTablesUcIndirect();
-
 	// The first pair of the sorted SH defaults, the register a refused buffer used to die on.
 	Check(g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_PS] != nullptr, "SPI_SHADER_PGM_RSRC4_PS has a handler");
 

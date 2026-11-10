@@ -36,7 +36,6 @@ public:
 	                       int64_t flip_arg, uint64_t& request_id);
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
-	void SubmitFlipPreparation(uint64_t request_id);
 	// `on_gpu_thread`: the GPU thread waits (PrepareVideoOutFlip), where a port full of CPU flips
 	// that only it can prepare is a deadlock; another thread just waits.
 	void WaitForSubmitSlot(int handle, bool on_gpu_thread = true);

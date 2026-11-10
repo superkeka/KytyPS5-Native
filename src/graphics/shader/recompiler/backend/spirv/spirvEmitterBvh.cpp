@@ -17,29 +17,10 @@ uint32_t Vector(EmitterState& s, uint32_t type, std::span<const uint32_t> compon
 	return result;
 }
 
-uint32_t NodeWord(EmitterState& s, uint32_t block, uint32_t word) {
-	const auto offset = Binary(s, spv::OpShiftLeftLogical, TypeU32(s), word, ConstantU32(s, 2));
-	const auto address =
-	    Binary(s, spv::OpIAdd, TypeU64(s), block, Unary(s, spv::OpUConvert, TypeU64(s), offset));
-	const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), address);
-	const auto result = s.builder.AllocateId();
-	s.builder.AddFunction(spv::OpLoad, TypeU32(s), result, pointer, spv::MemoryAccessAlignedMask, 4u);
-	return result;
-}
-
 uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
                   Vec3 origin, Vec3 direction) {
 	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
-	const auto zero = ConstantF32Value(s, 0.0f);
-	const auto op = [&](spv::Op code, uint32_t x, uint32_t y) {
-		const auto value = Binary(s, code, f, x, y);
-		s.builder.AddAnnotation(spv::OpDecorate, value, spv::DecorationNoContraction);
-		return value;
-	};
 	const auto cmp = [&](spv::Op code, uint32_t x, uint32_t y) { return Binary(s, code, b, x, y); };
-	const auto either = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalOr, b, x, y); };
-	const auto both = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalAnd, b, x, y); };
-	const auto abs = [&](uint32_t x) { return EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(s, x); };
 	const auto is_kind = [&](uint32_t n) { return cmp(spv::OpIEqual, kind, ConstantU32(s, n)); };
 	// The four triangles are (0,1,2), (1,3,2), (2,3,4), (2,4,0).
 	const std::array vertices {
@@ -53,9 +34,45 @@ uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
 		const auto first = Binary(s, spv::OpIMul, u, vertices[i], ConstantU32(s, 3));
 		for (uint32_t axis = 0; axis < 3; ++axis)
 			positions[i][axis] = Unary(s, spv::OpBitcast, f,
-			    NodeWord(s, block, Binary(s, spv::OpIAdd, u, first, ConstantU32(s, axis))));
+			    BvhNodeWord(s, block, Binary(s, spv::OpIAdd, u, first, ConstantU32(s, axis))));
 	}
-	const auto flag = NodeWord(s, block, ConstantU32(s, 15));
+	const auto flag = BvhNodeWord(s, block, ConstantU32(s, 15));
+	const auto remap = Binary(s, spv::OpShiftRightLogical, u, flag,
+	    Binary(s, spv::OpIMul, u, kind, ConstantU32(s, 8)));
+	return EmitBvhTriangle(s, positions, origin, direction, remap,
+	    Binary(s, spv::OpIAdd, u, flag, kind), bary);
+}
+
+} // namespace
+
+uint32_t BvhNode(EmitterState& s, uint32_t address) {
+	return Unary(s, spv::OpConvertUToPtr, TypePhysicalU32BufferPointer(s), address);
+}
+
+uint32_t BvhNodeWord(EmitterState& s, uint32_t block, uint32_t word) {
+	const auto pointer = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(s), pointer, block,
+	                      ConstantU32(s, 0), word);
+	const auto result = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpLoad, TypeU32(s), result, pointer,
+	                      spv::MemoryAccessAlignedMask, 4u);
+	return result;
+}
+
+uint32_t EmitBvhTriangle(EmitterState& s, const std::array<Vec3, 3>& positions,
+                         Vec3 origin, Vec3 direction, uint32_t remap,
+                         uint32_t triangle_id, uint32_t bary) {
+	const auto f = TypeF32(s), u = TypeU32(s), b = TypeBool(s);
+	const auto zero = ConstantF32Value(s, 0.0f);
+	const auto op = [&](spv::Op code, uint32_t x, uint32_t y) {
+		const auto value = Binary(s, code, f, x, y);
+		s.builder.AddAnnotation(spv::OpDecorate, value, spv::DecorationNoContraction);
+		return value;
+	};
+	const auto cmp = [&](spv::Op code, uint32_t x, uint32_t y) { return Binary(s, code, b, x, y); };
+	const auto either = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalOr, b, x, y); };
+	const auto both = [&](uint32_t x, uint32_t y) { return Binary(s, spv::OpLogicalAnd, b, x, y); };
+	const auto abs = [&](uint32_t x) { return EmitGlsl<GLSLstd450FAbs, IR::Type::F32>(s, x); };
 	const auto y_largest = cmp(spv::OpFOrdLessThan, abs(direction[0]), abs(direction[1]));
 	const auto z_largest = cmp(spv::OpFOrdLessThan,
 	    Select(s, f, y_largest, abs(direction[1]), abs(direction[0])), abs(direction[2]));
@@ -112,8 +129,6 @@ uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
 		    cmp(spv::OpFOrdGreaterThan, projected[i][1], zero), right);
 		missed = either(missed, both(cmp(spv::OpFOrdEqual, edge[i], zero), excluded));
 	}
-	const auto remap = Binary(s, spv::OpShiftRightLogical, u, flag,
-	    Binary(s, spv::OpIMul, u, kind, ConstantU32(s, 8)));
 	const auto coordinate = [&](uint32_t shift) {
 		const auto index = Binary(s, spv::OpBitwiseAnd, u,
 		    Binary(s, spv::OpShiftRightLogical, u, remap, ConstantU32(s, shift)), ConstantU32(s, 3));
@@ -124,10 +139,12 @@ uint32_t Triangle(EmitterState& s, uint32_t block, uint32_t kind, uint32_t bary,
 	const std::array result {
 		Unary(s, spv::OpBitcast, u, Select(s, f, missed, ConstantF32(s, 0x7f800000), numerator)),
 		Unary(s, spv::OpBitcast, u, Select(s, f, missed, ConstantF32Value(s, 1.0f), denominator)),
-		Select(s, u, bary, coordinate(0), Binary(s, spv::OpIAdd, u, flag, kind)),
+		Select(s, u, bary, coordinate(0), triangle_id),
 		Select(s, u, bary, coordinate(2), Select(s, u, missed, ConstantU32(s, 0), ConstantU32(s, 1))) };
 	return Vector(s, TypeU32Vector(s, 4), result);
 }
+
+namespace {
 
 std::array<uint32_t, 6> Box(EmitterState& s, uint32_t first, uint32_t second,
                            uint32_t half, uint32_t child) {
@@ -139,7 +156,7 @@ std::array<uint32_t, 6> Box(EmitterState& s, uint32_t first, uint32_t second,
 	EmitLabel(s, half_label);
 	std::array<uint32_t, 6> packed, full, result;
 	for (uint32_t pair = 0; pair < 3; ++pair) {
-		const auto word = NodeWord(s, first, ConstantU32(s, 4 + child * 3 + pair));
+		const auto word = BvhNodeWord(s, first, ConstantU32(s, 4 + child * 3 + pair));
 		const auto unpacked = EmitGlsl<GLSLstd450UnpackHalf2x16, IR::Type::F32x2>(s, word);
 		packed[pair * 2] = Extract(s, f, unpacked, 0);
 		packed[pair * 2 + 1] = Extract(s, f, unpacked, 1);
@@ -149,7 +166,7 @@ std::array<uint32_t, 6> Box(EmitterState& s, uint32_t first, uint32_t second,
 	for (uint32_t component = 0; component < 6; ++component) {
 		const auto word = 4 + child * 6 + component;
 		full[component] = Unary(s, spv::OpBitcast, f,
-		    NodeWord(s, word < 16 ? first : second, ConstantU32(s, word % 16)));
+		    BvhNodeWord(s, word < 16 ? first : second, ConstantU32(s, word % 16)));
 	}
 	s.builder.AddFunction(spv::OpBranch, merge);
 	EmitLabel(s, merge);
@@ -198,7 +215,8 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 		depths[child] = Unary(s, spv::OpBitcast, u, Select(s, f, hit,
 		    Select(s, f, Binary(s, spv::OpFOrdGreaterThan, b, entry, zero), entry, zero),
 		    ConstantF32(s, 0x7f800000)));
-		indices[child] = Select(s, u, hit, NodeWord(s, first, ConstantU32(s, child)), ConstantU32(s, ~0u));
+		indices[child] =
+		    Select(s, u, hit, BvhNodeWord(s, first, ConstantU32(s, child)), ConstantU32(s, ~0u));
 	}
 	// A select network keeps the original child order when sorting is disabled.
 	constexpr std::array<std::pair<uint32_t, uint32_t>, 5> network {{{0,1}, {2,3}, {0,2}, {1,3}, {1,2}}};
@@ -302,16 +320,18 @@ void DefineBvhIntersect(EmitterState& s) {
 		    Binary(s, spv::OpLogicalOr, b, Unary(s, spv::OpLogicalNot, b, full),
 		           Binary(s, spv::OpINotEqual, b, second, ConstantU64(s, 0))));
 		return EmitValueOrDefaultIfCondition(s, present, vec4, invalid, [&] {
+			const auto block = BvhNode(s, first);
 			const auto tri_label = s.builder.AllocateId(), box_label = s.builder.AllocateId();
 			const auto merge = s.builder.AllocateId();
 			s.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
 			s.builder.AddFunction(spv::OpBranchConditional, triangle, tri_label, box_label);
 			EmitLabel(s, tri_label);
-			const auto tri_value = Triangle(s, first, kind, bary, origin, direction);
+			const auto tri_value = Triangle(s, block, kind, bary, origin, direction);
 			const auto tri_exit = s.current_label;
 			s.builder.AddFunction(spv::OpBranch, merge);
 			EmitLabel(s, box_label);
-			const auto box_value = Boxes(s, first, second, half, grow, sort, extent, origin, inverse);
+			const auto box_value =
+			    Boxes(s, block, BvhNode(s, second), half, grow, sort, extent, origin, inverse);
 			const auto box_exit = s.current_label;
 			s.builder.AddFunction(spv::OpBranch, merge);
 			EmitLabel(s, merge);

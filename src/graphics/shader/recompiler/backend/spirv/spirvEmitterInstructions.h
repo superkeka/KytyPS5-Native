@@ -236,6 +236,7 @@ uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& i
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupOrU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -266,6 +267,7 @@ uint32_t              EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst
 uint32_t              EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitLoadDeviceAddressU32(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitLoadAddressU8         = EmitLoadMemory;
 inline constexpr auto EmitLoadAddressU16        = EmitLoadMemory;
 inline constexpr auto EmitLoadAddressU32        = EmitLoadMemory;
@@ -338,6 +340,9 @@ inline constexpr auto EmitDataConsume           = EmitAppendConsume;
 uint32_t              EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitImage(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvh8Extract(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitImageQueryDimensions = EmitImage;
 inline constexpr auto EmitImageQueryLod        = EmitImage;
 inline constexpr auto EmitImageRead            = EmitImage;
