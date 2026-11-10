@@ -301,6 +301,25 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
+// Size NV12 output frames separately from decoder working memory. A fixed
+// 16 MiB per frame prevents games with bounded movie pools from queuing enough frames.
+static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo& config) {
+	if (config.max_frame_width < 0 || config.max_frame_height < 0) {
+		return VIDEODEC2_MIN_MEMORY_SIZE;
+	}
+	constexpr uint32_t CODEC_HEVC = 974921;
+	constexpr uint32_t CODEC_VP9  = 2382845;
+
+	const bool     vp9       = config.codec_type == CODEC_VP9;
+	const bool     ten_bit   = (config.codec_type == CODEC_HEVC || vp9) && config.profile == 2;
+	const uint64_t row_align = vp9 ? 64u : 16u;
+	const auto pitch  = (static_cast<uint64_t>(config.max_frame_width) + 255u) & ~uint64_t {255};
+	const auto height =
+	    (static_cast<uint64_t>(config.max_frame_height) + row_align - 1u) & ~(row_align - 1u);
+	const auto pixels = pitch * height * 3u / 2u * (ten_bit ? 2u : 1u);
+	return static_cast<size_t>(pixels + (vp9 ? 8192u : 4096u));
+}
+
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
                                                     Videodec2DecoderMemoryInfo*       memory_info) {
 	PRINT_NAME();
@@ -325,7 +344,7 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
+	memory_info->max_frame_buffer_size  = MaxFrameBufferSize(*config);
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
@@ -354,7 +373,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < VIDEODEC2_MIN_MEMORY_SIZE) {
+	    memory_info->max_frame_buffer_size < MaxFrameBufferSize(*config)) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 

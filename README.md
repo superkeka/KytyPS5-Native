@@ -39,6 +39,10 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
       <strong>Dead Cells</strong> (60 fps)<br>
       <img src="docs/screenshots/bc250-dead-cells.jpg" width="300" alt="Dead Cells running natively on the BC-250">
     </td>
+    <td align="center">
+      <strong>Demon's Souls</strong> (playable)<br>
+      <img src="docs/screenshots/bc250-demons-souls.jpg" width="300" alt="Demon's Souls running natively on the BC-250">
+    </td>
   </tr>
 </table>
 
@@ -68,6 +72,10 @@ sudo ./install-helper.sh   # the root helper as a service (LOD statistics, KFD T
 On the BC-250 native mode turns on by itself; `KYTY_NATIVE_GPU=0` turns it off.
 `kyty_emulator --game /path/to/game` runs a game without the launcher, `kyty_emulator --help` lists
 the options.
+
+## Troubleshooting
+
+- [Ghost of Yōtei: infinite loading spinner and additional-content registrations](docs/ghost-of-yotei-additional-content.md)
 
 ## Requirements
 

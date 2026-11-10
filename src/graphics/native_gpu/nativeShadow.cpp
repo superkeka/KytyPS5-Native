@@ -1,5 +1,7 @@
 #include "graphics/native_gpu/nativeShadow.h"
 
+#include "graphics/native_gpu/nativeAcbNullGate.h"
+#include "graphics/native_gpu/nativeJobsAhead.h"
 #include "graphics/native_gpu/nativePm4.h"
 #include "graphics/native_gpu/nativeSubmit.h" // KYTY_GEM_BACKING_SUPPORTED + NativeSubmitter
 #include "graphics/native_gpu/nativeWatch.h"
@@ -84,6 +86,11 @@ std::atomic<uint64_t> g_dcb_jobs {0};
 std::atomic<uint64_t> g_dcb_guest_dw {0};
 std::atomic<uint64_t> g_dcb_chunked {0};
 std::atomic<uint64_t> g_dcb_queued_us {0};
+// Compute buffers through the label pipeline since the last flip report: how many, how long they sat queued before the
+// worker took them, and how many it took between the chunks of a graphics buffer (TranslateComputeAhead).
+std::atomic<uint64_t> g_acb_jobs {0};
+std::atomic<uint64_t> g_acb_queued_us {0};
+std::atomic<uint64_t> g_acb_ahead {0};
 // By why the piece was first held: 0 cross-ring writer not submitted yet, 1 the write ahead does not
 // satisfy the wait (value or function), 2 the write ahead is a CPU (tracker) write, 3 partial cover,
 // 4 no write ahead and the label not in memory yet, 5 no native form of the wait.
@@ -1343,6 +1350,18 @@ public:
 #endif
 	}
 
+	// A compute buffer the ACB thread has translated (TranslateAcb), for the worker's FinishAcb.
+	struct AcbTranslation {
+		Pm4TranslateResult    result;
+		std::vector<uint32_t> flat;     // the buffer with its chains and calls inlined, when it had any
+		std::string           flat_why; // why it could not be inlined
+		LodBankScan           lod_left; // what it saw after its last GET_LOD_STATS
+		double                before_ms = 0.0;
+		double                core_ms   = 0.0;
+		bool                  ib_ok     = true; // the packet check
+		uint32_t              bad_dw    = 0;
+	};
+
 	// `acb`: an asynchronous compute buffer. ACBs go through their own translator (their own shadow
 	// of the compute registers) and run on the same gfx ring as the DCBs, in guest submission order.
 	// With `out` (native labels) the buffer is translated and made resident, and the result goes to
@@ -1350,9 +1369,9 @@ public:
 	// native path is off) and Kyty has to run it.
 	// `source`: where `dcb`'s dwords sit in guest memory when it is not the guest's buffer itself (a chunk of
 	// one LabelPipeline flattened), for direct runs. `agr`: a DCB of the AGR queue, through its own translator
-	// (CreateAgrTranslatorLocked).
+	// (CreateAgrTranslatorLocked). `pre`: an ACB already translated (FinishAcb); everything up to its translation is done.
 	bool Submit(std::span<const uint32_t> dcb, bool acb = false, Pm4TranslateResult* out = nullptr,
-	            const std::vector<SourcePiece>* source = nullptr, bool agr = false) {
+	            const std::vector<SourcePiece>* source = nullptr, bool agr = false, AcbTranslation* pre = nullptr) {
 		const double                t_enter = NowSecShadow();
 		std::lock_guard<std::mutex> lock(m_mutex);
 		const double                t_locked = NowSecShadow();
@@ -1376,7 +1395,9 @@ public:
 			return false;
 		}
 
-		SyncCollectRefs();
+		if (pre == nullptr) {
+			SyncCollectRefs();
+		}
 		const uint64_t     frame = acb ? m_acbs++ : m_frames++;
 		const char* const  kind  = acb ? "acb" : "frame";
 		if (!acb) {
@@ -1401,8 +1422,14 @@ public:
 		std::string              flat_why;
 		std::vector<SourcePiece> pieces;
 		const bool               direct = m_direct_min_dw != 0 && !acb;
-		if (source == nullptr && !FlattenIndirectBuffers(dcb, &flat, &flat_why, direct ? &pieces : nullptr) && !flat_why.empty() &&
-		    m_flatten_failed++ < 8) {
+		if (pre != nullptr) {
+			flat     = std::move(pre->flat);
+			flat_why = std::move(pre->flat_why);
+		}
+		const bool not_inlined = pre != nullptr ? !flat_why.empty()
+		                                        : source == nullptr && !FlattenIndirectBuffers(dcb, &flat, &flat_why, direct ? &pieces : nullptr) &&
+		                                              !flat_why.empty();
+		if (not_inlined && m_flatten_failed++ < 8) {
 			std::fprintf(stderr, "native shadow: %s %llu not inlined: %s\n", kind, static_cast<unsigned long long>(frame),
 			             flat_why.c_str());
 		}
@@ -1443,16 +1470,18 @@ public:
 		if (bench_min != 0 && !acb && out != nullptr && dcb.size() >= bench_min && (m_bench_count++ % 120) == 0) {
 			bench_snap = tr.Clone();
 		}
-		ArmInjectLocked(acb, agr);
+		if (pre == nullptr) {
+			ArmInjectLocked(acb, agr);
+		}
 		const double       t_core      = NowSecShadow();
-		Pm4TranslateResult result      = tr.Translate(dcb);
+		Pm4TranslateResult result      = pre != nullptr ? std::move(pre->result) : tr.Translate(dcb);
 		if (result.injected) {
 			std::fprintf(stderr, "native inject: %s at dcb %llu (%s %llu carries it on scratch + %u)\n", InjectName(),
 			             static_cast<unsigned long long>(m_frames), kind, static_cast<unsigned long long>(frame), kInjectOffset);
 			std::fflush(stderr);
 		}
-		m_phase_ms[acb ? 2 : 0] += (t_core - t_translate) * 1e3;
-		m_phase_ms[acb ? 3 : 1] += (NowSecShadow() - t_core) * 1e3;
+		m_phase_ms[acb ? 2 : 0] += pre != nullptr ? pre->before_ms : (t_core - t_translate) * 1e3;
+		m_phase_ms[acb ? 3 : 1] += pre != nullptr ? pre->core_ms : (NowSecShadow() - t_core) * 1e3;
 		if (bench_snap != nullptr) {
 			auto run = [&](bool refs, bool direct_runs) {
 				double best = 1e9;
@@ -1478,7 +1507,7 @@ public:
 			             "(a copy of the translator %.2f ms, included)\n",
 			             dcb.size(), run(m_collect_refs, true), run(false, true), run(m_collect_refs, false), clone_ms);
 		}
-		const double       translate_ms = (NowSecShadow() - t_translate) * 1e3;
+		const double       translate_ms = pre != nullptr ? pre->before_ms + pre->core_ms : (NowSecShadow() - t_translate) * 1e3;
 		for (uint32_t i = 0; i < result.stats.event_type.size(); i++) {
 			m_event_type_hist[i] += result.stats.event_type[i];
 		}
@@ -1541,14 +1570,23 @@ public:
 			// (the completion thread when submissions are pipelined, otherwise this same thread,
 			// after Submit returns) takes it by buffer address and writes the usage records.
 			for (auto& scan: result.lod_scans) {
-				for (Pm4Translator* other: {&m_translator, &m_acb_translator, m_agr_translator.get()}) {
+				for (Pm4Translator* other: {&m_translator, AcbThreadOn() ? nullptr : &m_acb_translator, m_agr_translator.get()}) {
 					if (other != nullptr && other != &tr) {
 						scan.Merge(other->TakeLodScan());
 					}
 				}
+				// The ACB thread's translator is its own: what it has handed over so far stands in for it.
+				if (AcbThreadOn()) {
+					scan.Merge(m_acb_lod_left);
+					m_acb_lod_left = {};
+					m_lod_reports.fetch_add(1, std::memory_order_release);
+				}
 				LogLodScan(scan);
 				LodStatsReports().Push(scan.addr, scan.banks);
 			}
+		}
+		if (pre != nullptr) {
+			m_acb_lod_left.Merge(pre->lod_left);
 		}
 		// KYTY_NATIVE_GPU_LOG_WAITS=N: report the waits of the first N buffers that were not met when
 		// translated, i.e. work the native path runs before what the guest made it wait for.
@@ -1738,7 +1776,8 @@ public:
 			// Only packet forms that have run on the board before go to the GPU; anything else and the
 			// buffer is Kyty's.
 			const NativeIbKind ib_kind = acb && m_acb_rings ? NativeIbKind::Compute : NativeIbKind::Gfx;
-			if (uint32_t bad = 0; m_validate != 0 && !ValidateNativeIb(result.ib, NativeLodStats(), &bad, ib_kind)) {
+			if (uint32_t bad = pre != nullptr ? pre->bad_dw : 0;
+			    m_validate != 0 && !(pre != nullptr ? pre->ib_ok : ValidateNativeIb(result.ib, NativeLodStats(), &bad, ib_kind))) {
 				if (m_validate_refused++ < 16) {
 					std::fprintf(stderr,
 					             "native shadow: %s %llu left to Kyty by the packet check: op 0x%02x (header 0x%08x) at dw %u\n",
@@ -2501,6 +2540,12 @@ public:
 				             static_cast<double>(g_dcb_chunked.exchange(0, std::memory_order_relaxed)) / m_flips,
 				             static_cast<double>(g_dcb_queued_us.exchange(0, std::memory_order_relaxed)) / 1e3 / jobs);
 			}
+			if (const uint64_t jobs = g_acb_jobs.exchange(0, std::memory_order_relaxed); jobs != 0) {
+				std::fprintf(stderr, "native shadow: compute buffers per flip: %.2f, %.2f ms queued each, %.2f taken between DCB chunks\n",
+				             static_cast<double>(jobs) / m_flips,
+				             static_cast<double>(g_acb_queued_us.exchange(0, std::memory_order_relaxed)) / 1e3 / jobs,
+				             static_cast<double>(g_acb_ahead.exchange(0, std::memory_order_relaxed)) / m_flips);
+			}
 			if (m_stream_chunks != 0 || m_stream_fallbacks != 0) {
 				std::fprintf(stderr,
 				             "native shadow: streamed DCB chunks so far: %llu, chains ended early for want of a slot: %llu, "
@@ -2972,7 +3017,7 @@ public:
 			return;
 		}
 		const uint64_t va = m_submitter->ScratchVa() + kTrackerOffset + static_cast<uint64_t>(slot) * kTrackerStride;
-		m_acb_translator.SetNativeLabels(m_label_oracle, va);
+		m_acb_translator.SetNativeLabels(AcbThreadOn() ? m_acb_oracle : m_label_oracle, va);
 		m_acb_translator.SetFenceAddress(va + 12);
 		// A guest compute queue with a KFD queue of its own: its interrupts with context ids are raised
 		// by the GPU too, and the EOP log tells its hardware queue apart (ReadEopLog).
@@ -2984,6 +3029,58 @@ public:
 #else
 		(void)slot;
 #endif
+	}
+
+	// LabelPipeline's ACB thread takes the ACB translator over, with `oracle` for its labels. Before that thread starts.
+	void UseAcbThread(LabelOracle* oracle) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_acb_oracle       = oracle;
+		m_acb_collect_refs = m_collect_refs;
+		m_acb_kfd_inject   = m_inject == InjectKind::KfdWait;
+	}
+	bool AcbThreadOn() const { return m_acb_oracle != nullptr; }
+
+	// On the ACB thread, without m_mutex: Submit's part up to the end of the translation; FinishAcb goes on from it. False:
+	// not translated (the native path is off), Kyty runs the buffer.
+	bool TranslateAcb(std::span<const uint32_t> acb, AcbTranslation* out) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (!m_active.load(std::memory_order_acquire) || m_acb_mode == AcbMode::Off) {
+			return false;
+		}
+		if (const bool collect = m_gem == nullptr || !m_gem->MapComplete(); collect != m_acb_collect_refs) {
+			m_acb_collect_refs = collect;
+			m_acb_translator.SetCollectRefs(collect);
+		}
+		// A LOD window ended on another translator: this one's record of the tables it has read goes with it.
+		if (const uint64_t reports = m_lod_reports.load(std::memory_order_acquire); reports != m_acb_lod_reports) {
+			m_acb_lod_reports = reports;
+			m_acb_translator.ForgetLodSeen();
+		}
+		if (m_acb_kfd_inject && !m_inject_armed.load(std::memory_order_relaxed) && m_frames.load(std::memory_order_relaxed) > m_inject_dcb) {
+			m_acb_translator.SetInjectWait(m_submitter->ScratchVa() + kInjectOffset);
+			m_inject_armed.store(true, std::memory_order_relaxed);
+		}
+		const double t_translate = NowSecShadow();
+		(void)FlattenIndirectBuffers(acb, &out->flat, &out->flat_why);
+		const std::span<const uint32_t> buffer = out->flat.empty() ? acb : std::span<const uint32_t>(out->flat);
+		const double                    t_core = NowSecShadow();
+		out->result                            = m_acb_translator.Translate(buffer);
+		out->before_ms                         = (t_core - t_translate) * 1e3;
+		out->core_ms                           = (NowSecShadow() - t_core) * 1e3;
+		out->lod_left                          = m_acb_translator.TakeLodSeen();
+		if (out->result.ok && m_validate != 0) {
+			out->ib_ok = ValidateNativeIb(out->result.ib, NativeLodStats(), &out->bad_dw, m_acb_rings ? NativeIbKind::Compute : NativeIbKind::Gfx);
+		}
+		return true;
+#else
+		(void)acb;
+		(void)out;
+		return false;
+#endif
+	}
+	// On the worker: the rest of Submit for what TranslateAcb translated, in the order the ACB thread handed it over.
+	bool FinishAcb(std::span<const uint32_t> acb, AcbTranslation* translated, Pm4TranslateResult* out) {
+		return Submit(acb, true, out, nullptr, false, translated);
 	}
 
 	// KYTY_NATIVE_GPU_VALIDATE (1 unless set): 0 no packet check, 1 every translated IB goes through
@@ -3010,8 +3107,16 @@ public:
 #endif
 	}
 
-	// Whether the GPU may write a label at `addr`. Called while translating (the lock is held).
-	bool GpuWritable(uint64_t addr) const {
+	// The range of the last answer of GpuWritable: one per translating thread.
+	struct WritableCache {
+		uint64_t gen      = ~0ull;
+		uint64_t lo       = 0;
+		uint64_t hi       = 0;
+		bool     writable = false;
+	};
+	bool GpuWritable(uint64_t addr) const { return GpuWritable(addr, m_writable); }
+	// Whether the GPU may write a label at `addr`. Called while translating.
+	bool GpuWritable(uint64_t addr, WritableCache& cache) const {
 #if KYTY_GEM_BACKING_SUPPORTED
 		// The range of the last answer, kept while the views stay the same: labels sit in a few views,
 		// and each asked the backing under its lock (~8000 a frame in ASTRO BOT).
@@ -3019,18 +3124,19 @@ public:
 			return false;
 		}
 		const uint64_t gen = m_gem->ViewsGeneration();
-		if (gen == m_writable_gen && addr >= m_writable_lo && addr < m_writable_hi) {
-			return m_writable;
+		if (gen == cache.gen && addr >= cache.lo && addr < cache.hi) {
+			return cache.writable;
 		}
 		uint64_t lo = 0, hi = 0;
 		const bool writable = m_gem->GpuWritableRange(addr, &lo, &hi);
-		m_writable_gen      = gen;
-		m_writable_lo       = lo;
-		m_writable_hi       = hi;
-		m_writable          = writable;
+		cache.gen      = gen;
+		cache.lo       = lo;
+		cache.hi       = hi;
+		cache.writable = writable;
 		return writable;
 #else
 		(void)addr;
+		(void)cache;
 		return false;
 #endif
 	}
@@ -5044,7 +5150,9 @@ private:
 		}
 		m_collect_refs = collect;
 		m_translator.SetCollectRefs(collect);
-		m_acb_translator.SetCollectRefs(collect);
+		if (!AcbThreadOn()) {
+			m_acb_translator.SetCollectRefs(collect);
+		}
 		if (m_agr_translator != nullptr) {
 			m_agr_translator->SetCollectRefs(collect);
 		}
@@ -6240,6 +6348,13 @@ private:
 	bool          m_disabled    = false;
 	Pm4Translator m_translator;
 	Pm4Translator m_acb_translator; // async compute buffers (KYTY_NATIVE_GPU_ACB)
+	// With an ACB thread (UseAcbThread) that translator is its own. The next four are set before it starts or are its alone.
+	LabelOracle*          m_acb_oracle       = nullptr;
+	bool                  m_acb_collect_refs = true;
+	uint64_t              m_acb_lod_reports  = 0; // m_lod_reports when it last looked
+	bool                  m_acb_kfd_inject   = false;
+	std::atomic<uint64_t> m_lod_reports {0}; // LOD reports made, for the ACB thread to start a new window
+	LodBankScan           m_acb_lod_left;    // what it has handed over since the last report (m_mutex)
 	std::unique_ptr<Pm4Translator> m_agr_translator; // the AGR queue's DCBs (kGuestAgrQueue; CreateAgrTranslatorLocked)
 	AcbMode       m_acb_mode = AcbMode::Off;
 	uint64_t      m_acbs           = 0;
@@ -6378,7 +6493,7 @@ private:
 	// KYTY_NATIVE_GPU_INJECT_HANG (ParseInject).
 	InjectKind            m_inject       = InjectKind::None;
 	uint64_t              m_inject_dcb   = 900;
-	bool                  m_inject_armed = false;
+	std::atomic<bool>     m_inject_armed {false};
 	bool                  m_inject_done  = false; // the stream kind's delay has happened
 	// Per-ring batches and the last fence on each (KYTY_NATIVE_GPU_ACB_RINGS). Slot 0 is gfx.
 	struct SlotFence {
@@ -6440,9 +6555,8 @@ private:
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
 	std::atomic<double> m_gpu_busy_s {0.0};
-	// GpuWritable's last answer (translation runs under m_mutex).
-	mutable uint64_t m_writable_gen = ~0ull, m_writable_lo = 0, m_writable_hi = 0;
-	mutable bool     m_writable     = false;
+	// GpuWritable's last answer for what is translated under m_mutex.
+	mutable WritableCache m_writable;
 	// KYTY_NATIVE_GPU_FLIP_TRACE=1: never-reset totals FlipTrace takes per-flip differences of.
 	double                  m_trace_busy_s = 0.0;
 	std::atomic<double>     m_trace_last_dcb {0.0};  // when the pipeline took the title's last DCB (FlipTrace)
@@ -6491,7 +6605,7 @@ private:
 	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
 	std::vector<FrameDraw>               m_frame_draws;   // KYTY_NATIVE_GPU_CTL: draws since the last flip
 	uint32_t                             m_frame_buffers = 0;
-	uint64_t      m_frames         = 0;
+	std::atomic<uint64_t> m_frames {0}; // the ACB thread reads it for the hang tests
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
 	uint64_t      m_flattened      = 0; // buffers FlattenIndirectBuffers inlined
@@ -6810,7 +6924,17 @@ public:
 
 	void Enqueue(const uint32_t* buffer, uint32_t size_dw, uint32_t queue, Then then) {
 		std::lock_guard<std::mutex> lock(m_mutex);
-		m_jobs.push_back(Job {buffer, size_dw, queue, std::move(then), NowSecShadow()});
+		Job job {buffer, size_dw, queue, std::move(then), NowSecShadow()};
+		if (m_acb_thread && buffer != nullptr && IsGuestComputeQueue(queue)) {
+			job.gate = m_acb_gate.EnqueueCompute();
+			m_acb_jobs.push_back(std::move(job));
+			m_acb_cv.notify_one();
+			return;
+		}
+		if (m_acb_thread && buffer == nullptr) {
+			job.gate = m_acb_gate.EnqueueNull();
+		}
+		m_jobs.push_back(std::move(job));
 		m_cv.notify_one();
 	}
 
@@ -6888,6 +7012,7 @@ private:
 		uint32_t        queue;
 		Then            then;
 		double          enqueued;
+		uint64_t        gate = 0; // m_acb_gate's stamp, with the ACB thread: compute buffers and Kyty's own submissions
 	};
 	// What runs once a buffer is done.
 	struct Done {
@@ -6945,6 +7070,16 @@ private:
 		uint32_t   slot  = 0; // which ring wrote it
 		uint64_t   batch = 0; // the m_batch it was appended in: its CS ioctl has returned once that is flushed
 	};
+	// A compute buffer the ACB thread is done with, refused or not.
+	struct AcbReady {
+		const uint32_t*        buffer  = nullptr;
+		uint32_t               size_dw = 0;
+		uint32_t               queue   = 0;
+		std::shared_ptr<Done>  done;
+		uint64_t               made       = 0; // m_emits when its translation began
+		bool                   translated = false;
+		Shadow::AcbTranslation t;
+	};
 	enum class Release { No, Plain, Native, Observed };
 
 	bool Submitted(const RingWrite& w) const { return w.batch < m_batch; }
@@ -6954,6 +7089,12 @@ private:
 		m_acb_rings = Shadow::Instance().AcbRings();
 		m_compute_mask = Shadow::Instance().ComputeRingMask();
 		m_timeout = Shadow::Instance().TimeoutSec();
+		// KYTY_NATIVE_GPU_ACB_THREAD=0: the worker translates the compute buffers too (and with ACB_AHEAD=0 they wait).
+		m_acb_thread = m_native && m_acb_rings && AllWaitsOnGpu() && !EnvIs("KYTY_NATIVE_GPU_ACB_THREAD", "0") &&
+		               !EnvIs("KYTY_NATIVE_GPU_ACB_AHEAD", "0");
+		if (m_acb_thread) {
+			Shadow::Instance().UseAcbThread(&m_acb_oracle);
+		}
 		std::thread([this] {
 			RunAtTopClock();
 			Work();
@@ -6962,6 +7103,12 @@ private:
 			RunAtTopClock();
 			Track();
 		}).detach();
+		if (m_acb_thread) {
+			std::thread([this] {
+				RunAtTopClock();
+				WorkAcb();
+			}).detach();
+		}
 	}
 
 	// With KFD queues every guest wait stays a GPU wait, as on the PS5: each guest queue has a hardware
@@ -7008,6 +7155,8 @@ private:
 		if (!Shadow::Instance().KfdQueuesOn()) {
 			return ComputeRingForQueue(queue, m_compute_mask) + 1u;
 		}
+		// The ACB thread and the worker both ask.
+		std::lock_guard<std::mutex> lock(m_slot_mutex);
 		auto [it, fresh] = m_queue_index.try_emplace(queue, static_cast<uint32_t>(m_queue_index.size()) % Shadow::Instance().KfdQueueCount());
 		if (fresh) {
 			std::fprintf(stderr, "native shadow: guest compute queue 0x%x runs on KFD queue %u\n", queue, it->second);
@@ -7062,23 +7211,37 @@ private:
 
 	void Work() {
 		for (;;) {
-			std::deque<Job> jobs;
 			{
 				std::unique_lock<std::mutex> lock(m_mutex);
 				if (m_held > 0) {
 					// A label with no GPU writer shows up in memory when the tracker writes it, or when
 					// the GPU does and the fence (or this timeout) says so. Not a 50 us poll.
-					m_cv.wait_for(lock, std::chrono::milliseconds(2), [this] { return !m_jobs.empty() || m_wake; });
+					m_cv.wait_for(lock, std::chrono::milliseconds(2), [this] { return !m_jobs.empty() || m_wake || !m_acb_done.empty(); });
 					m_wake = false;
 				} else {
-					m_cv.wait(lock, [this] { return !m_jobs.empty(); });
+					m_cv.wait(lock, [this] { return !m_jobs.empty() || !m_acb_done.empty(); });
 				}
-				jobs.swap(m_jobs);
+				m_round.swap(m_jobs);
 			}
 			const double picked = NowSecShadow();
-			for (auto& job: jobs) {
+			while (!m_round.empty()) {
+				// Out of the deque first: TranslateComputeAhead takes jobs from the middle of it.
+				Job job = std::move(m_round.front());
+				m_round.pop_front();
+				const bool own_submission = m_acb_thread && job.buffer == nullptr;
+				if (own_submission) {
+					WaitForAcbsBefore(job);
+				}
 				Translate(job, picked);
+				if (own_submission) {
+					{
+						std::lock_guard<std::mutex> lock(m_mutex);
+						m_acb_gate.NullPassed();
+					}
+					m_acb_cv.notify_one();
+				}
 			}
+			DrainAcbDone();
 			// A cross-ring wait stays on the CPU until the writer's CS ioctl has returned, then the
 			// next pump puts a real WAIT_REG_MEM on the waiter's ring. Same-ring waits are appended
 			// behind the writer in one batch, so they do not need that round trip. Loop until a pump
@@ -7104,7 +7267,7 @@ private:
 				bool quiet = m_held == 0;
 				{
 					std::lock_guard<std::mutex> lock(m_mutex);
-					quiet = quiet && m_jobs.empty();
+					quiet = quiet && m_jobs.empty() && m_acb_jobs.empty() && !m_acb_busy && m_acb_done.empty();
 				}
 				if (quiet && !Shadow::Instance().StreamActive()) {
 					Shadow::Instance().CpShadowCheck();
@@ -7147,7 +7310,7 @@ private:
 		auto& queue    = m_pending[job.queue];
 		Pm4TranslateResult r;
 		m_translating = job.queue;
-		if (m_acb_rings && compute) {
+		if (m_acb_rings && compute && !m_acb_thread) {
 			Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
 		} else if (job.queue == kGuestAgrQueue) {
 			Shadow::Instance().UseAgrTracker(SlotOf(job.queue)); // before its waits are planned
@@ -7156,6 +7319,9 @@ private:
 			g_dcb_jobs.fetch_add(1, std::memory_order_relaxed);
 			g_dcb_guest_dw.fetch_add(job.size_dw, std::memory_order_relaxed);
 			g_dcb_queued_us.fetch_add(static_cast<uint64_t>((NowSecShadow() - job.enqueued) * 1e6), std::memory_order_relaxed);
+		} else if (job.buffer != nullptr) {
+			g_acb_jobs.fetch_add(1, std::memory_order_relaxed);
+			g_acb_queued_us.fetch_add(static_cast<uint64_t>((NowSecShadow() - job.enqueued) * 1e6), std::memory_order_relaxed);
 		}
 		// The size that matters is the inlined one: a title's DCB is often a few dwords of INDIRECT_BUFFER
 		// calls (GT7: 25 dwords standing for ~100K).
@@ -7186,9 +7352,13 @@ private:
 
 	// A translated buffer as pieces, one per segment; `done` (when given) on the last. Takes r's IB.
 	void PushPieces(Pm4TranslateResult& r, const std::shared_ptr<Done>& done, std::deque<Piece>& queue) {
+		PushPieces(r, done, queue, m_emits.load(std::memory_order_relaxed));
+	}
+	// `made`: m_emits when the translation began or ended, for Ready.
+	void PushPieces(Pm4TranslateResult& r, const std::shared_ptr<Done>& done, std::deque<Piece>& queue, uint64_t made) {
 		for (size_t k = 0; k < r.segments.size(); k++) {
 			Piece p;
-			p.made   = m_emits;
+			p.made   = made;
 			p.cp_own = r.cp_shadow;
 			if (k == 0) {
 				p.cp_resume = std::move(r.cp_shadow_resume);
@@ -7212,8 +7382,132 @@ private:
 		}
 	}
 
+	// Between the chunks of a graphics buffer: the compute buffers the title has submitted, translated now instead of
+	// after the rest of it. Each guest compute queue is a hardware queue of its own, as on the PS5, so its work does not
+	// wait for a graphics buffer submitted earlier, while the graphics buffer often waits for labels it writes. Only with
+	// every compute wait on the GPU: then nothing about a compute buffer depends on what the graphics queue has emitted
+	// so far. Their order among themselves stays, and none passes Kyty's own submissions (GuestGpu::Enqueue).
+	// KYTY_NATIVE_GPU_ACB_AHEAD=0: they wait for the graphics buffer.
+	void TranslateComputeAhead(uint32_t gfx_queue) {
+		static const bool on = !EnvIs("KYTY_NATIVE_GPU_ACB_AHEAD", "0");
+		if (m_acb_thread || !on || !m_acb_rings || !AllWaitsOnGpu()) {
+			return;
+		}
+		const auto takes = [](const Job& j) { return j.buffer != nullptr && IsGuestComputeQueue(j.queue); };
+		const auto stops = [](const Job& j) { return j.buffer == nullptr; };
+		std::vector<Job> ahead;
+		if (TakeJobsAhead(m_round, &ahead, takes, stops)) {
+			std::lock_guard<std::mutex> lock(m_mutex);
+			TakeJobsAhead(m_jobs, &ahead, takes, stops);
+		}
+		if (ahead.empty()) {
+			return;
+		}
+		g_acb_ahead.fetch_add(ahead.size(), std::memory_order_relaxed);
+		const double picked = NowSecShadow();
+		for (Job& job: ahead) {
+			Translate(job, picked);
+		}
+		m_translating = gfx_queue;
+	}
+
+	// The ACB thread: translates the compute buffers in order beside the graphics buffers the worker translates, and hands
+	// each to the worker, refused ones too, so every continuation runs. It never takes Shadow's lock and never submits:
+	// the worker finishes each piece of work (Shadow::FinishAcb), pumps and flushes.
+	void WorkAcb() {
+#if defined(__linux__)
+		::prctl(PR_SET_NAME, "kyty-acb-xlate", 0ul, 0ul, 0ul);
+#endif
+		for (;;) {
+			Job job {};
+			{
+				std::unique_lock<std::mutex> lock(m_mutex);
+				m_acb_cv.wait(lock, [this] { return !m_acb_jobs.empty() && m_acb_gate.ComputeMayStart(m_acb_jobs.front().gate); });
+				job = std::move(m_acb_jobs.front());
+				m_acb_jobs.pop_front();
+				m_acb_busy = true;
+			}
+			AcbReady ready = TranslateAcbJob(job);
+			{
+				std::lock_guard<std::mutex> lock(m_mutex);
+				m_acb_done.push_back(std::move(ready));
+				m_acb_gate.ComputeHanded();
+				m_acb_busy = false;
+			}
+			m_cv.notify_one();
+		}
+	}
+
+	AcbReady TranslateAcbJob(Job& job) {
+		const double now = NowSecShadow();
+		auto         done = std::make_shared<Done>();
+		done->then        = std::move(job.then);
+		done->buffer      = job.buffer;
+		done->size_dw     = job.size_dw;
+		done->enqueued    = job.enqueued;
+		done->picked      = now;
+		done->acb         = true;
+		g_acb_jobs.fetch_add(1, std::memory_order_relaxed);
+		g_acb_queued_us.fetch_add(static_cast<uint64_t>((now - job.enqueued) * 1e6), std::memory_order_relaxed);
+		AcbReady ready;
+		ready.buffer  = job.buffer;
+		ready.size_dw = job.size_dw;
+		ready.queue   = job.queue;
+		ready.done    = std::move(done);
+		ready.made    = m_emits.load(std::memory_order_relaxed);
+		Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
+		ready.translated = Shadow::Instance().TranslateAcb(std::span<const uint32_t>(job.buffer, job.size_dw), &ready.t);
+		return ready;
+	}
+
+	// The compute buffers the ACB thread has handed over, in its order, into their queues.
+	void DrainAcbDone() {
+		if (!m_acb_thread) {
+			return;
+		}
+		std::deque<AcbReady> ready;
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			ready.swap(m_acb_done);
+		}
+		for (AcbReady& a: ready) {
+			auto&              queue     = m_pending[a.queue];
+			Pm4TranslateResult r;
+			const bool         submitted = a.translated && Shadow::Instance().FinishAcb(std::span<const uint32_t>(a.buffer, a.size_dw), &a.t, &r);
+			if (!submitted || r.segments.empty()) {
+				if (AuditOn()) {
+					g_audit_to_kyty[1][submitted ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+				}
+				a.done->whole = true;
+				queue.push_back(Piece {{}, {}, std::move(a.done)});
+				continue;
+			}
+			a.done->tail = std::move(r.cpu_tail);
+			PushPieces(r, a.done, queue, a.made);
+		}
+	}
+
+	// Kyty's own submission keeps its place behind the compute buffers enqueued before it: until those are in their queues
+	// the worker goes on pumping and holds no lock of Shadow's.
+	void WaitForAcbsBefore(const Job& job) {
+		for (;;) {
+			{
+				std::unique_lock<std::mutex> lock(m_mutex);
+				const auto                   handed = [&] { return m_acb_gate.NullMayGo(job.gate); };
+				if (handed() && m_acb_done.empty()) {
+					return;
+				}
+				if (m_acb_done.empty()) {
+					m_cv.wait_for(lock, std::chrono::milliseconds(2), [&] { return handed() || !m_acb_done.empty(); });
+				}
+			}
+			PumpAndFlush();
+		}
+	}
+
 	// Pumps the pieces ready so far to the GPU, as Work does after each round.
 	void PumpAndFlush() {
+		DrainAcbDone();
 		for (;;) {
 			Pump();
 			if (!m_appended) {
@@ -7386,6 +7680,7 @@ private:
 			done->tail.insert(done->tail.end(), r.cpu_tail.begin(), r.cpu_tail.end());
 			PushPieces(r, c + 1 == chunks.size() ? done : nullptr, queue);
 			if (c + 1 < chunks.size()) {
+				TranslateComputeAhead(job.queue);
 				PumpAndFlush(); // this chunk runs while the next is translated
 			}
 		}
@@ -7770,7 +8065,7 @@ private:
 		if (m_last_write.size() > 65536) {
 			m_last_write.clear();
 		}
-		m_emits++;
+		m_emits.fetch_add(1, std::memory_order_relaxed);
 		// Who writes a label matters only to a wait that may be held on the CPU. With every wait on the
 		// GPU (compute queues on KFD, gfx waits while each guest gfx queue has its own ring) none is,
 		// and recording ~5000 label writes a frame in these maps took a fifth of this thread.
@@ -7783,7 +8078,7 @@ private:
 			if (!holds_possible) {
 				continue;
 			}
-			m_last_write[w.addr] = {w, m_emits};
+			m_last_write[w.addr] = {w, m_emits.load(std::memory_order_relaxed)};
 			if (w.span_dw > 2) { // a block of data: each dword touched, its value unknown here
 				for (uint32_t i = 0; i < std::min<uint32_t>(w.span_dw, 64u); i++) {
 					m_ring[w.addr + 4ull * i] = RingWrite {LabelWrite {w.addr + 4ull * i, 0, false, w.gpu, false}, m_seq, slot, m_batch};
@@ -8186,10 +8481,29 @@ private:
 		}
 	}
 
+	// What the ACB thread translates through: every compute wait stays a GPU wait there, and its cache is its own.
+	class AcbOracle final: public LabelOracle {
+	public:
+		bool GpuWritable(uint64_t addr) override { return Shadow::Instance().GpuWritable(addr, m_writable); }
+		bool SampleDword(uint64_t addr, uint32_t* out) override { return Shadow::Instance().SampleDword(addr, out); }
+		Plan PlanWait(const WaitCond& /*wait*/) override { return Plan::Native; }
+
+	private:
+		Shadow::WritableCache m_writable;
+	};
 	// Worker side.
 	std::mutex                              m_mutex;
 	std::condition_variable                 m_cv;
 	std::deque<Job>                         m_jobs;
+	// The ACB thread (m_acb_thread, fixed before the threads start); under m_mutex.
+	bool                                    m_acb_thread = false;
+	AcbOracle                               m_acb_oracle;
+	std::condition_variable                 m_acb_cv;
+	std::deque<Job>                         m_acb_jobs; // what it has not taken yet
+	std::deque<AcbReady>                    m_acb_done; // what it has translated, for the worker
+	bool                                    m_acb_busy = false; // it holds a job
+	AcbNullGate                             m_acb_gate;
+	std::deque<Job>                         m_round; // what the worker took from m_jobs and has not translated yet (its thread only)
 	bool                                    m_native  = false;
 	bool                                    m_acb_rings = false;
 	uint32_t                                m_compute_mask = 0;
@@ -8211,7 +8525,8 @@ private:
 	uint64_t                                m_held        = 0;
 	uint32_t                                m_pending_dumps = 0; // NoteStaleHold's queue dumps so far
 	std::unordered_map<uint64_t, std::pair<LabelWrite, uint64_t>> m_last_write; // label -> its last write emitted, and when
-	uint64_t                                m_emits = 0; // Emit calls so far
+	std::atomic<uint64_t>                   m_emits {0}; // Emit calls so far (the worker's; the ACB thread reads it)
+	mutable std::mutex                      m_slot_mutex;  // m_queue_index
 	mutable std::map<uint32_t, uint32_t>    m_queue_index; // guest compute queue -> its KFD queue index (SlotOf)
 	mutable std::map<uint32_t, uint32_t>    m_gfx_index;   // guest graphics queue -> its index: 0 main, 1 AGR, 2 others (SlotOf)
 	mutable bool                            m_gfx_shared = true; // gfx waits with no known writer ahead held (SlotOf decides)

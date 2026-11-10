@@ -1208,6 +1208,17 @@ public:
 		m_lod_stages.clear();
 		return out;
 	}
+	// What was seen since the last take, keeping the record of what has been read: the window has not ended.
+	LodBankScan TakeLodSeen() {
+		LodBankScan out = std::move(m_lod_cur);
+		m_lod_cur       = {};
+		return out;
+	}
+	// A new window: what was read counts again.
+	void ForgetLodSeen() {
+		m_lod_tables.clear();
+		m_lod_stages.clear();
+	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
 	// A zero-byte DMA_DATA with CP_SYNC before a job ends after a DMA_DATA without CP_SYNC (on by default).

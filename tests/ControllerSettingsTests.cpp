@@ -612,11 +612,23 @@ void TestTriggerEffectState() {
 	check_state(2, 5, "keyboard trigger travel did not activate feedback");
 	param.command[0].data[0] = 0;
 	set_effect();
-	SetAxis(1, Axis::TriggerLeft, 0);
-	check_state(2, 5, "feedback at position 0 was suppressed by a dead zone");
+	SetAxis(1, Axis::TriggerLeft, 8);
+	check_state(2, 5, "pressed feedback at position 0 was suppressed");
 	param.command[0].data[1] = 0;
 	set_effect();
 	check_state(1, 5, "zero-strength feedback reported active");
+
+	param.command[0]         = {};
+	param.command[0].mode    = 1;
+	param.command[0].data[0] = 0;
+	param.command[0].data[1] = 8;
+	set_effect();
+	SetAxis(1, Axis::TriggerLeft, 0);
+	check_state(1, 5, "feedback from position 0 reported active at rest");
+	SetAxis(1, Axis::TriggerLeft, 7);
+	check_state(1, 5, "feedback from position 0 reported active below the press threshold");
+	SetAxis(1, Axis::TriggerLeft, 8);
+	check_state(2, 5, "feedback from position 0 did not activate when pressed");
 
 	param.command[0]         = {};
 	param.command[0].mode    = 4;

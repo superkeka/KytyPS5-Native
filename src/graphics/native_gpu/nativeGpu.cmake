@@ -26,8 +26,32 @@ if(BUILD_TESTING)
 	add_dependencies(kyty_tests native_gpu_shader_scan_tests)
 endif()
 
-# GEM backing is header-only (src/graphics/native_gpu/gemBacking.h), so the emulator needs no extra
-# source; this standalone test exercises it directly and skips cleanly off the board.
+# Mapping metadata and synchronization regressions run entirely on the CPU.
+find_package(Threads REQUIRED)
+add_executable(native_gpu_mapping_index_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuMappingIndexTests.cpp"
+)
+target_include_directories(native_gpu_mapping_index_tests PRIVATE ${inc_headers})
+target_link_libraries(native_gpu_mapping_index_tests PRIVATE Threads::Threads)
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_mapping_index COMMAND $<TARGET_FILE:native_gpu_mapping_index_tests>)
+	add_dependencies(kyty_tests native_gpu_mapping_index_tests)
+endif()
+
+if(LINUX)
+	add_executable(native_gpu_mapping_sync_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/NativeGpuMappingSyncTests.cpp"
+	)
+	target_include_directories(native_gpu_mapping_sync_tests PRIVATE ${inc_headers})
+	target_link_libraries(native_gpu_mapping_sync_tests PRIVATE Threads::Threads)
+	target_link_options(native_gpu_mapping_sync_tests PRIVATE "-Wl,--wrap=ioctl")
+	if(BUILD_TESTING)
+		add_test(NAME native_gpu_mapping_sync COMMAND $<TARGET_FILE:native_gpu_mapping_sync_tests>)
+		add_dependencies(kyty_tests native_gpu_mapping_sync_tests)
+	endif()
+endif()
+
+# GEM backing is header-only; this hardware test skips cleanly off the board.
 add_executable(native_gpu_gem_backing_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/NativeGpuGemBackingTests.cpp"
 )
@@ -60,6 +84,28 @@ target_include_directories(native_gpu_watch_tests PRIVATE ${inc_headers})
 if(BUILD_TESTING)
 	add_test(NAME native_gpu_watch COMMAND $<TARGET_FILE:native_gpu_watch_tests>)
 	add_dependencies(kyty_tests native_gpu_watch_tests)
+endif()
+
+# Which buffers go ahead of a graphics buffer being translated (nativeJobsAhead.h): header-only and pure.
+add_executable(native_gpu_jobs_ahead_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuJobsAheadTests.cpp"
+)
+target_include_directories(native_gpu_jobs_ahead_tests PRIVATE ${inc_headers})
+
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_jobs_ahead COMMAND $<TARGET_FILE:native_gpu_jobs_ahead_tests>)
+	add_dependencies(kyty_tests native_gpu_jobs_ahead_tests)
+endif()
+
+# The order between the ACB thread and Kyty's own submissions (nativeAcbNullGate.h): header-only and pure.
+add_executable(native_gpu_acb_null_gate_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NativeGpuAcbNullGateTests.cpp"
+)
+target_include_directories(native_gpu_acb_null_gate_tests PRIVATE ${inc_headers})
+
+if(BUILD_TESTING)
+	add_test(NAME native_gpu_acb_null_gate COMMAND $<TARGET_FILE:native_gpu_acb_null_gate_tests>)
+	add_dependencies(kyty_tests native_gpu_acb_null_gate_tests)
 endif()
 
 # The root helper (tools/bc250-lodhw): the privileged registers the native backend needs (LOD

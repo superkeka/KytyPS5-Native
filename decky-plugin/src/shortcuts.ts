@@ -25,6 +25,63 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export const shortcutName = (g: Game) => `${g.name} (PS5)`;
 
+// Steam's language names and the console language each one maps to. Depends on upstream Kyty: the
+// numbers follow its console language list (src/common/localization.cpp), and a number past its
+// MAX_CONSOLE_LANGUAGE stops the emulator from starting.
+const CONSOLE_LANGUAGE: Record<string, number> = {
+  japanese: 0,
+  english: 1,
+  french: 2,
+  spanish: 3,
+  german: 4,
+  italian: 5,
+  dutch: 6,
+  portuguese: 7,
+  russian: 8,
+  koreana: 9,
+  tchinese: 10,
+  schinese: 11,
+  finnish: 12,
+  swedish: 13,
+  danish: 14,
+  norwegian: 15,
+  polish: 16,
+  brazilian: 17,
+  turkish: 19,
+  latam: 20,
+  arabic: 21,
+  czech: 23,
+  hungarian: 24,
+  greek: 25,
+  romanian: 26,
+  thai: 27,
+  vietnamese: 28,
+  indonesian: 29,
+  ukrainian: 30,
+};
+
+const LANGUAGE_KEY = "kytyps5-native-language";
+
+async function steamLanguage(): Promise<string> {
+  try {
+    return (await steam().Settings.GetCurrentLanguage()) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+// A language Steam has and the console does not keeps the emulator's default.
+async function languageOption(): Promise<string> {
+  const language = CONSOLE_LANGUAGE[await steamLanguage()];
+  return language === undefined ? "" : ` --console-language=${language}`;
+}
+
+// True when the shortcuts were last written for another Steam language.
+export async function languageChanged(): Promise<boolean> {
+  const language = await steamLanguage();
+  return !!language && localStorage.getItem(LANGUAGE_KEY) !== language;
+}
+
 function exists(appid: number): boolean {
   return !!appid && !!appStore()?.GetAppOverviewByAppID(appid);
 }
@@ -115,7 +172,10 @@ export async function syncGame(g: Game, runner: string, kytyDir: string, redoArt
   steam().Apps.SetShortcutName(appid, shortcutName(g));
   steam().Apps.SetShortcutExe(appid, `"${runner}"`);
   steam().Apps.SetShortcutStartDir(appid, `"${kytyDir}/"`);
-  steam().Apps.SetShortcutLaunchOptions(appid, `"${g.path}"${g.keep_steam ? " --keep-steam" : ""}`);
+  steam().Apps.SetShortcutLaunchOptions(
+    appid,
+    `"${g.path}"${g.keep_steam ? " --keep-steam" : ""}${await languageOption()}`,
+  );
   steam().Apps.SetShortcutIcon(appid, g.icon);
   if (fresh || redoArt) await setArtwork(appid, g);
   await setGame(g.title_id, appid, g.keep_steam, g.path);
@@ -139,6 +199,8 @@ export async function syncAll(
 ) {
   for (const g of games) await syncGame(g, runner, kytyDir, redoArt);
   await removeGone(gone);
+  const language = await steamLanguage();
+  if (language) localStorage.setItem(LANGUAGE_KEY, language);
 }
 
 // True when a game has no shortcut yet, one was removed or the game moved (packed to .zar or unpacked):
