@@ -184,6 +184,7 @@ struct Pm4TranslateStats {
 	uint32_t gds_releases      = 0; // RELEASE_MEM markers that send GDS data, run natively
 	uint32_t packets_skipped   = 0; // packets left out (SetSkippedOpcodes)
 	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
+	uint32_t set_base_typed    = 0; // SET_BASE put before an indirect draw or dispatch (Pm4CpDrawState::dispatch_base)
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
@@ -918,7 +919,11 @@ struct Pm4CpDrawState {
 	uint64_t index_base    = 0;           // INDEX_BASE
 	uint32_t index_size    = 0xffffffffu; // INDEX_BUFFER_SIZE
 	bool     index_set     = false;       // the title has sent INDEX_BASE or INDEX_BUFFER_SIZE
-	uint64_t draw_base     = 0;           // SET_BASE, BASE_INDEX 1 (indirect draw/dispatch arguments)
+	uint64_t draw_base     = 0;           // SET_BASE, BASE_INDEX 1, graphics shader type (indirect draw arguments)
+	// The PS5's CP keeps a second base for DISPATCH_INDIRECT on the gfx ring: a SET_BASE with the compute
+	// shader type sets it and leaves the draw base alone. The BC-250's has one base for both.
+	uint64_t dispatch_base = 0;     // SET_BASE, BASE_INDEX 1, compute shader type
+	bool     dispatch_set  = false; // the title has sent one
 };
 
 class Pm4Translator {

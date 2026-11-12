@@ -748,6 +748,38 @@ void TestIndirectDraws() {
 	Check(Count(pkts, 0x25u) == 1 && Count(pkts, 0x8Eu) == 0, "indirect draw kept, LOD statistics dropped");
 }
 
+// The PS5's CP keeps the indirect draw base and the gfx ring's dispatch base apart (SET_BASE's shader type); the
+// BC-250's keeps one. Each indirect consumer gets its own base back right before it.
+void TestTypedIndirectBases() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x10000000u, 0x2u}, false); // draw arguments at 0x2_1000_0000
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x30000000u, 0x2u}, true);  // dispatch arguments at 0x2_3000_0000
+	Append(dcb, 0x16u /* IT_DISPATCH_INDIRECT */, {0x40u, 0x41u}, false);
+	Append(dcb, 0x25u /* IT_DRAW_INDEX_INDIRECT */, {0x80u, 0u, 0u, 0u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.set_base == 2 && r.stats.set_base_typed == 2, "typed bases: both consumers get their base");
+	const auto pkts = Decode(r.ib);
+	std::vector<const Packet*> seq;
+	for (const auto& p: pkts) {
+		if (p.op == 0x11u || p.op == 0x16u || p.op == 0x25u) {
+			seq.push_back(&p);
+		}
+	}
+	const auto base_of = [](const Packet* p) { return static_cast<uint64_t>(p->body[1]) | (static_cast<uint64_t>(p->body[2]) << 32u); };
+	Check(seq.size() == 6 && seq[2]->op == 0x11u && seq[2]->compute && base_of(seq[2]) == 0x230000000ull && seq[3]->op == 0x16u,
+	      "the dispatch reads the compute base");
+	Check(seq.size() == 6 && seq[4]->op == 0x11u && !seq[4]->compute && base_of(seq[4]) == 0x210000000ull && seq[5]->op == 0x25u,
+	      "the draw after a compute SET_BASE reads the graphics base again");
+	// A draw with only a graphics base, and a dispatch before any compute base: as written.
+	Pm4Translator         u;
+	std::vector<uint32_t> plain;
+	Append(plain, 0x11u /* IT_SET_BASE */, {1u, 0x10000000u, 0x2u}, false);
+	Append(plain, 0x16u /* IT_DISPATCH_INDIRECT */, {0x40u, 0x41u}, false);
+	auto ru = u.Translate(plain);
+	Check(ru.ok && ru.stats.set_base_typed == 0 && Count(Decode(ru.ib), 0x11u) == 1, "no compute base yet: the dispatch keeps the title's");
+}
+
 void TestIndirectMultiDraws() {
 	Pm4Translator         t;
 	std::vector<uint32_t> dcb;
@@ -6641,6 +6673,7 @@ int main() {
 	TestComputeQueueDispatchIndirect();
 	TestCpDmaIdle();
 	TestIndirectDraws();
+	TestTypedIndirectBases();
 	TestIndirectMultiDraws();
 	TestContextStatePushPop();
 	TestResetQueuePop();

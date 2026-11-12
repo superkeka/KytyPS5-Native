@@ -3837,6 +3837,36 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			stats.pfp_syncs_emitted++;
 		}
 	};
+	// Pm4CpDrawState::dispatch_base: the PS5's CP keeps the indirect draw base apart from the gfx ring's dispatch base,
+	// picked by SET_BASE's shader type, and the BC-250's keeps one. A title's compute SET_BASE between its graphics
+	// one and its indirect draws moved those draws onto the dispatch arguments: counts in the billions, a draw that
+	// never ends. So each indirect draw, and a gfx-ring DISPATCH_INDIRECT once the title has set a compute base, gets
+	// its own base put back right before it. KYTY_NATIVE_GPU_TYPED_BASES=0 leaves the title's SET_BASE as the only one.
+	static const bool typed_bases = [] {
+		const char* e = std::getenv("KYTY_NATIVE_GPU_TYPED_BASES");
+		return e == nullptr || e[0] != '0';
+	}();
+	auto set_typed_base = [&](bool compute) {
+		const uint64_t base = compute ? cp.dispatch_base : cp.draw_base;
+		if (!typed_bases || m_compute_ring || (compute ? !cp.dispatch_set : base == 0)) {
+			return;
+		}
+		body.push_back(Pkt3(IT_SET_BASE, 3, compute));
+		body.push_back(1u);
+		body.push_back(static_cast<uint32_t>(base));
+		body.push_back(static_cast<uint32_t>(base >> 32u));
+		stats.set_base_typed++;
+	};
+	// The argument base a draw (or a gfx-ring dispatch) reads, for logs and references.
+	auto args_base = [&](bool compute) -> uint64_t {
+		if (!typed_bases || m_compute_ring) {
+			return log_set_base;
+		}
+		if (compute) {
+			return cp.dispatch_set ? cp.dispatch_base & 0xffffffffffffull : log_set_base;
+		}
+		return cp.draw_base & 0xffffffffffffull;
+	};
 
 	// CP DMA runs beside the CP and outlives the IB it was issued in: a DMA_DATA without CP_SYNC is not finished when
 	// the job's end-of-pipe fence or a bottom-of-pipe label after it says the job is done. Probe cpdma-tail (2.11): such
@@ -6078,11 +6108,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			}
 			case IT_DRAW_INDIRECT:       // arguments at the SET_BASE address + DATA_OFFSET; same on the gfx ring
 			case IT_DRAW_INDEX_INDIRECT: // the same, indexed through INDEX_BASE / INDEX_BUFFER_SIZE
-				log_draw(op, 0, log_set_base + (body_count >= 1 ? bptr[0] : 0u), false);
+				log_draw(op, 0, args_base(false) + (body_count >= 1 ? bptr[0] : 0u), false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
 					pfp_sync_me();
+					set_typed_base(false);
 					pass_on(dw, size, body_before, segs_before, in_place);
 				}
 				stats.draws++;
@@ -6099,12 +6130,13 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				if (body_count < 9) {
 					return fail(op, dw, RefuseWhy::ShortBody);
 				}
-				const uint64_t args = log_set_base + bptr[0];
+				const uint64_t args = args_base(false) + bptr[0];
 				log_draw(op, 0, args, false);
 				if (skip_draw()) {
 					stats.draws_skipped++;
 				} else {
 					pfp_sync_me();
+					set_typed_base(false);
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 				}
 				stats.draws++;
@@ -6173,14 +6205,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				        kMetadataSpan, false);
 				log_set_base = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2] & 0xffffu) << 32u);
 				if (!m_compute_ring && (bptr[0] & 0xfu) == 1u) {
-					cp.draw_base = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					const uint64_t base = static_cast<uint64_t>(bptr[1]) | (static_cast<uint64_t>(bptr[2]) << 32u);
+					if (typed_bases && (dcb[dw] & 2u) != 0) {
+						cp.dispatch_base = base;
+						cp.dispatch_set  = true;
+					} else {
+						cp.draw_base = base;
+					}
 				}
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
 				log_draw(op, 0,
 				         m_compute_queue && body_count >= 2 ? (static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u))
-				                                           : log_set_base + (body_count >= 1 ? bptr[0] : 0u),
+				                                           : args_base(true) + (body_count >= 1 ? bptr[0] : 0u),
 				         true);
 				if (m_compute_ring) {
 					// The guest packet already carries ADDR_LO, ADDR_HI, DISPATCH_INITIATOR. MEC reads
@@ -6211,6 +6249,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						body.push_back(bptr[2]);
 						add_ref(args, kMetadataSpan, false);
 					} else {
+						set_typed_base(true);
 						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					}
 				}
