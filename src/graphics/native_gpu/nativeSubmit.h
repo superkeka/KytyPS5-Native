@@ -453,6 +453,31 @@ public:
 		return true;
 	}
 
+	// Keeps one gfx-hub VMID for this DRM VM while its fd is open (AMDGPU_VM_OP_RESERVE_VMID), as a PS5 title's
+	// VMID never changes: per-VMID state set on it (apertures, accumulation) holds for every later job. Then
+	// runs the empty shadowing-off IB once, so the kernel maps the VMID to our PASID (IH_VMID_n_LUT).
+	// Synchronous mode only (before SetAsync). 0 or -errno.
+	int ReserveGfxVmid() {
+		if (m_async) {
+			return -EBUSY;
+		}
+		union drm_amdgpu_vm vm;
+		std::memset(&vm, 0, sizeof(vm));
+		vm.in.op    = AMDGPU_VM_OP_RESERVE_VMID;
+		const int r = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_VM, &vm);
+		if (r != 0) {
+			return r;
+		}
+		const Result prime = Submit(kCpShadowOff, {}, 1.0);
+		if (prime.err != 0) {
+			return prime.err;
+		}
+		if (prime.reset) {
+			return -EIO;
+		}
+		return prime.submitted && prime.completed && !prime.timed_out ? 0 : -ETIMEDOUT;
+	}
+
 	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
 	              double timeout_sec, RingTarget target = {}) {
 		Result res;

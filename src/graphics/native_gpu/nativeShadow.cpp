@@ -2984,14 +2984,29 @@ public:
 	}
 	uint32_t KfdQueueCount() const { return std::max(m_submitter != nullptr ? m_submitter->KfdQueueCount() : 0u, 1u); }
 
-	// The per-VMID PS5 settings follow this VM's gfx VMID, which amdgpu may change between jobs: once
-	// per flip they move to the VMID it holds now and the one it left gets the Linux values back.
+	// With the gfx VMID reserved (InitPs5Regs) the per-VMID PS5 settings were made once before any title
+	// work; every 600 flips the IH LUT is checked to still give it our PASID. Without the reservation they
+	// follow this VM's gfx VMID, which amdgpu may change between jobs: once per flip they move to the VMID
+	// it holds now and the one it left gets the Linux values back.
 	void Ps5RegsOnFlip() {
 #if KYTY_GEM_BACKING_SUPPORTED
 		if ((m_ps5_regs & (kPs5Accum | kPs5ShMem)) == 0) {
 			return;
 		}
 		std::lock_guard<std::mutex> lock(m_ps5_mutex);
+		if (m_ps5_vmid_fixed) {
+			if (++m_ps5_fixed_checks % 600u != 0) {
+				return;
+			}
+			uint32_t pasid = 0;
+			if (m_ps5_hw.ReadAbs(kIhVmidLut + m_ps5_gfx_vmid, &pasid) != 0 || pasid == m_ps5_pasid) {
+				return;
+			}
+			std::fprintf(stderr, "native shadow: reserved gfx VMID %u now serves PASID %u, not ours (%u); following the VMID per flip\n",
+			             m_ps5_gfx_vmid, pasid, m_ps5_pasid);
+			m_ps5_vmid_fixed = false;
+			m_fixed_gfx_vmid.store(0, std::memory_order_relaxed);
+		}
 		const uint32_t vmid = m_ps5_hw.GfxVmid(m_ps5_pasid);
 		if (vmid == 0 || vmid == m_ps5_gfx_vmid) {
 			return;
@@ -3848,8 +3863,9 @@ public:
 			}
 			// L2 (KYTY_NATIVE_GPU_WATCH_SQKILL=1): the title's waves killed through the helper (op 17: SQ_CMD KILL for the
 			// VMID, broadcast, as amdgpu's soft recovery on gfx9), so a draw or barrier behind a hung wave finishes and the
-			// next exit guard takes the job out. The VMID is the gfx one op 13 gives our PASID; a gfx fault's must match it.
-			uint32_t       vmid  = m_watch_hw.GfxVmid(m_watch_pasid);
+			// next exit guard takes the job out. The VMID is the reserved one (or the gfx one op 13 gives our PASID); a gfx fault's must match it.
+			const uint32_t fixed = m_fixed_gfx_vmid.load(std::memory_order_relaxed);
+			uint32_t       vmid  = fixed != 0 ? fixed : m_watch_hw.GfxVmid(m_watch_pasid);
 			const uint32_t fault = FaultVmid(m_watch_fault_status.load(std::memory_order_relaxed));
 			if (m_watch_fault_status.load(std::memory_order_relaxed) != 0 && fault >= 1 && fault <= 7 && fault != vmid) {
 				std::fprintf(stderr, "native watch: L2: the fault's VMID %u is not ours (%u); no kill\n", fault, vmid);
@@ -4070,7 +4086,8 @@ public:
 				if (not_ours_prog == d.LastProgressMs()) {
 					continue;
 				}
-				const uint32_t mine = m_watch_hw.GfxVmid(m_watch_pasid);
+				const uint32_t fixed = m_fixed_gfx_vmid.load(std::memory_order_relaxed);
+				const uint32_t mine  = fixed != 0 ? fixed : m_watch_hw.GfxVmid(m_watch_pasid);
 				uint32_t       v0 = 0, v1 = 0;
 				const int      r0 = m_watch_hw.ReadReg(0x1260u + 0x1e81u, LodStatsHw::SelHqd(0, 0, 0), &v0);
 				struct timespec gap = {0, 20000000};
@@ -4429,8 +4446,8 @@ private:
 	//             the GDS resource state (OA and 48 GWS); written while it runs, and KFD's scheduler
 	//             may reload the queue from its MQD on any remap
 	//   golden    the helper's local golden table (/etc/kyty/ps5-golden.conf)
-	// "all" (or 1) is gfx_pipe,accum,kfd_gds. The game's VMIDs are this VM's gfx VMID (by PASID,
-	// followed per flip) and, with KFD queues, 8-15. Unset, primary mode writes hqd,kfd_gds,shmem: the compute
+	// "all" (or 1) is gfx_pipe,accum,kfd_gds. The game's VMIDs are this VM's gfx VMID (reserved at start;
+	// KYTY_NATIVE_GPU_FIXED_VMID=0 or a failed reservation: found by PASID and followed per flip) and, with KFD queues, 8-15. Unset, primary mode writes hqd,kfd_gds,shmem: the compute
 	// queues as the PS5 kernel sets them up (with the OA and GWS their GDS resource state asks for) and its
 	// aperture bases, which FLAT accesses with the PS5's aperture addresses in literals need (BC5 F249); 0
 	// writes nothing. The helper puts every register back when the connection closes (exit or crash).
@@ -4442,6 +4459,8 @@ private:
 	                          kPs5HqdPersistentState = 0x1260 + 0x1fad, kPs5HqdPqControl = 0x1260 + 0x1fba,
 	                          kPs5HqdGdsResourceState = 0x1260 + 0x1fdb, kPs5GdsGwsVmid0 = 0x1260 + 0x20c0,
 	                          kPs5GdsOaVmid0 = 0x1260 + 0x20d0;
+	// IH_VMID_0_LUT (OSSSYS): the PASID each gfx-hub VMID served last, written at every VMID assignment.
+	static constexpr uint32_t kIhVmidLut = 0x10a0;
 
 	void InitPs5Regs() {
 #if KYTY_GEM_BACKING_SUPPORTED
@@ -4500,6 +4519,9 @@ private:
 		if ((regs & (kPs5Accum | kPs5ShMem)) != 0 && m_ps5_pasid == 0) {
 			std::fprintf(stderr, "native shadow: no PASID in the DRM fdinfo; the gfx VMID gets no per-VMID PS5 registers\n");
 		}
+		if ((regs & (kPs5Accum | kPs5ShMem)) != 0 && m_ps5_pasid != 0) {
+			ReserveGfxVmidLocked();
+		}
 		if ((regs & (kPs5Accum | kPs5KfdGds | kPs5ShMem | kPs5Hqd)) != 0) {
 			// KFD queues are created on their first submission; each gets its settings then.
 			m_submitter->SetKfdQueueHook([this](uint32_t ring) {
@@ -4509,6 +4531,49 @@ private:
 			});
 		}
 #endif
+	}
+
+	// The gfx VMIDs (1-7) whose IH LUT entry is `pasid`, as a bit mask; 0 when a read fails.
+	uint32_t GfxVmidMaskLocked(uint32_t pasid) {
+		uint32_t mask = 0;
+		for (uint32_t vmid = 1; vmid < 8; vmid++) {
+			uint32_t v = 0;
+			if (m_ps5_hw.ReadAbs(kIhVmidLut + vmid, &v) != 0) {
+				return 0;
+			}
+			mask |= v == pasid ? 1u << vmid : 0u;
+		}
+		return mask;
+	}
+
+	// A PS5 title runs on one VMID for its whole life. Reserves this VM's gfx VMID before any title work
+	// (KYTY_NATIVE_GPU_FIXED_VMID=0: not), finds it by the IH LUT entry the priming job wrote (one new or
+	// one in all), and sets the per-VMID PS5 registers on it once. Anything unclear leaves the per-flip
+	// following. Callers hold m_ps5_mutex.
+	void ReserveGfxVmidLocked() {
+		const char* env = std::getenv("KYTY_NATIVE_GPU_FIXED_VMID");
+		if (env != nullptr && std::strcmp(env, "0") == 0) {
+			return;
+		}
+		const uint32_t before = GfxVmidMaskLocked(m_ps5_pasid);
+		const int      r      = m_submitter->ReserveGfxVmid();
+		if (r != 0) {
+			std::fprintf(stderr, "native shadow: gfx VMID not reserved: %s; per-VMID PS5 registers follow it per flip\n", std::strerror(-r));
+			return;
+		}
+		const uint32_t after = GfxVmidMaskLocked(m_ps5_pasid);
+		const uint32_t vmid  = ReservedGfxVmid(before, after);
+		if (vmid == 0) {
+			std::fprintf(stderr, "native shadow: gfx VMID reserved but not identified (LUT mask 0x%02x, 0x%02x before); "
+			                     "per-VMID PS5 registers follow it per flip\n", after, before);
+			return;
+		}
+		m_ps5_gfx_vmid   = vmid;
+		m_ps5_vmid_fixed = true;
+		m_fixed_gfx_vmid.store(vmid, std::memory_order_relaxed);
+		std::fprintf(stderr, "native shadow: gfx VMID %u reserved for PASID %u; per-VMID PS5 registers set before title work\n", vmid,
+		             m_ps5_pasid);
+		Ps5VmidRegs(vmid);
 	}
 
 	// One PS5 setting: (reg & ~mask) | (value & mask), logged with the old and new value when it changes.
@@ -6533,6 +6598,9 @@ private:
 	uint32_t              m_ps5_regs     = 0; // kPs5* bits
 	uint32_t              m_ps5_pasid    = 0;
 	uint32_t              m_ps5_gfx_vmid = 0; // the gfx VMID the per-VMID settings are on now
+	bool                  m_ps5_vmid_fixed  = false; // m_ps5_gfx_vmid is reserved for this VM (InitPs5Regs)
+	uint32_t              m_ps5_fixed_checks = 0;
+	std::atomic<uint32_t> m_fixed_gfx_vmid {0}; // the reserved gfx VMID for the watchdog; 0 = ask op 13
 	LabelOracle*          m_label_oracle = nullptr;
 	std::vector<uint32_t> m_ring_batch[kTrackerSlots];
 	SlotFence             m_slot_fence[kTrackerSlots];

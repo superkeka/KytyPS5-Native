@@ -8,6 +8,7 @@ using Libs::Graphics::NativeGpu::FaultCid;
 using Libs::Graphics::NativeGpu::FaultVmid;
 using Libs::Graphics::NativeGpu::FaultWrite;
 using Libs::Graphics::NativeGpu::ParseGfxLockupTimeoutMs;
+using Libs::Graphics::NativeGpu::ReservedGfxVmid;
 using Libs::Graphics::NativeGpu::WatchConfig;
 using Libs::Graphics::NativeGpu::WatchDecider;
 using Libs::Graphics::NativeGpu::WatchSample;
@@ -120,6 +121,17 @@ void TestFaultAndReset() {
 	Check(z.Feed(zs) == WatchTrigger::VmFault, "the first fault after an empty baseline (a KFD VMID)");
 }
 
+void TestReservedVmid() {
+	Check(ReservedGfxVmid(0, 1u << 5) == 5, "nothing before: the primed VMID");
+	Check(ReservedGfxVmid(1u << 3, (1u << 3) | (1u << 6)) == 6, "a stale entry and a new one: the new one");
+	Check(ReservedGfxVmid(1u << 4, 1u << 4) == 4, "the reserved VMID served us already, alone");
+	Check(ReservedGfxVmid((1u << 2) | (1u << 4), (1u << 2) | (1u << 4)) == 0, "two old entries, none new: unclear");
+	Check(ReservedGfxVmid(0, (1u << 2) | (1u << 4)) == 0, "two new entries: unclear");
+	Check(ReservedGfxVmid(0, 0) == 0, "no entry");
+	Check(ReservedGfxVmid(0, 1u) == 0, "VMID 0 is the kernel's");
+	Check(ReservedGfxVmid(1u << 7, 1u << 7) == 7, "VMID 7");
+}
+
 } // namespace
 
 int main() {
@@ -128,6 +140,7 @@ int main() {
 	TestStall();
 	TestStreamPark();
 	TestFaultAndReset();
+	TestReservedVmid();
 	std::fprintf(stderr, "NativeGpuWatchTests: all passed\n");
 	return 0;
 }

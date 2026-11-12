@@ -175,6 +175,25 @@ private:
 	bool                    m_have_fault = false;
 };
 
+// The gfx VMID a reservation got, from the IH LUT masks (bit n: VMID n serves our PASID) read before and after the
+// priming job: the one new bit, or with none new (the reserved VMID served us already) the only bit. 0 when that is
+// not one gfx VMID (1-7): stale entries of VMIDs this VM held before leave it unclear.
+inline uint32_t ReservedGfxVmid(uint32_t before, uint32_t after) {
+	after &= 0xfeu;
+	uint32_t pick = after & ~before;
+	if (pick == 0) {
+		pick = after;
+	}
+	if (pick == 0 || (pick & (pick - 1u)) != 0) {
+		return 0;
+	}
+	uint32_t vmid = 1;
+	while ((pick & (1u << vmid)) == 0) {
+		vmid++;
+	}
+	return vmid;
+}
+
 } // namespace Libs::Graphics::NativeGpu
 
 #endif // EMULATOR_SRC_GRAPHICS_NATIVE_GPU_NATIVEWATCH_H_
