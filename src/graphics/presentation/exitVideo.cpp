@@ -5,6 +5,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mathematics.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -83,6 +84,14 @@ int PlayExitVideo(const char* path) {
 	SDL_Texture* texture = renderer != nullptr ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING,
 	                                                               video.context->width, video.context->height)
 	                                           : nullptr;
+	// The picture keeps the video's shape in a window of another one: bars beside it, or above and below.
+	const AVRational pixel = av_guess_sample_aspect_ratio(format, format->streams[video.stream], nullptr);
+	const int        shape_width =
+	    pixel.num > 0 && pixel.den > 0 ? static_cast<int>(av_rescale(video.context->width, pixel.num, pixel.den))
+	                                   : video.context->width;
+	if (renderer != nullptr) {
+		SDL_SetRenderLogicalPresentation(renderer, shape_width, video.context->height, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+	}
 	SDL_AudioStream* sound = nullptr;
 	SwrContext*      resample = nullptr;
 	if (has_audio) {
@@ -183,8 +192,14 @@ int PlayExitVideo(const char* path) {
 		SDL_Delay(10);
 	}
 
-	std::fprintf(stderr, "exit video: %s, %dx%d, %d frames shown, %d dropped, renderer %s\n", path, video.context->width,
-	             video.context->height, shown, dropped, renderer != nullptr ? SDL_GetRendererName(renderer) : "none");
+	int window_width  = 0;
+	int window_height = 0;
+	if (renderer != nullptr) {
+		SDL_GetRenderOutputSize(renderer, &window_width, &window_height);
+	}
+	std::fprintf(stderr, "exit video: %s, %dx%d in a %dx%d window, %d frames shown, %d dropped, renderer %s\n", path,
+	             shape_width, video.context->height, window_width, window_height, shown, dropped,
+	             renderer != nullptr ? SDL_GetRendererName(renderer) : "none");
 
 	av_packet_free(&packet);
 	av_frame_free(&yuv);
