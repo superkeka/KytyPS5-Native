@@ -288,6 +288,7 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 }
 
 void CommandProcessor::BufferInit() {
+	m_draws = 0;
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
@@ -900,10 +901,23 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// Submits the recorded work every N draws so the host GPU starts before a long buffer ends.
+void CommandProcessor::CountDraw() {
+	if (m_flush_draws == 0) {
+		return;
+	}
+	if (m_draws == m_flush_draws) {
+		GetScheduler().Flush();
+		m_draws = 0;
+	}
+	m_draws++;
+}
+
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (NativeGpu::PrimaryRendering()) { // BC-250 native GPU path already drew this DCB
 		return;
 	}
+	CountDraw();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
@@ -968,6 +982,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed) {
+	CountDraw();
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 	// The guest records match Vulkan's indirect commands byte for byte.
@@ -1065,6 +1080,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (NativeGpu::PrimaryRendering()) {
 		return;
 	}
+	CountDraw();
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}

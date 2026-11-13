@@ -226,6 +226,7 @@ struct VideoOutConfig {
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	uint64_t                            pre_vblanks = 0;
+	uint64_t                            flip_vblank = 0; // vblank_status.count at the last flip.
 	VideoOutFlipStatus                  flip_status;
 	uint64_t                            current_flip_id = 0; // the request that put flip_status.currentBuffer on screen
 	// That request's source and, for an EOP flip reserved by SubmitEopFlip, the order in which its
@@ -647,10 +648,12 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
+// A flip is due once flip_rate + 1 vblanks have passed since the last flip, so a late frame flips
+// at the next vblank.
 static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
-	const int interval = cfg.flip_rate + 1;
+	const auto interval = static_cast<uint64_t>(cfg.flip_rate) + 1;
 
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+	return interval <= 1 || cfg.vblank_status.count - cfg.flip_vblank >= interval;
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -862,6 +865,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.pre_vblanks               = 0;
+	config.flip_vblank               = 0;
 	config.vblank_status             = VideoOutVblankStatus();
 	for (auto& label: config.labels) {
 		std::atomic_ref<uint64_t>(label).store(0, std::memory_order_release);
@@ -1729,6 +1733,7 @@ bool FlipQueue::Flip() {
 		}
 		auto&     r        = *it;
 		const int previous = r.cfg->flip_status.currentBuffer;
+		r.cfg->flip_vblank = r.cfg->vblank_status.count;
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1969,6 +1974,7 @@ std::list<FlipQueue::Request>::iterator FlipQueue::CompleteDirectLocked(std::lis
 	auto&     r        = *it;
 	auto&     cfg      = *r.cfg;
 	const int previous = cfg.flip_status.currentBuffer;
+	cfg.flip_vblank    = cfg.vblank_status.count;
 	cfg.flip_status.count++;
 	cfg.flip_status.processTime              = LibKernel::KernelGetProcessTime();
 	cfg.flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();

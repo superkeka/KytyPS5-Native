@@ -7,9 +7,10 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/upscaler/dlss.h"
+#include "graphics/host_gpu/renderer/upscaler/fsr.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
@@ -397,11 +398,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderClockFeaturesKHR,
 	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
-	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>
+	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
+	                   vk::PhysicalDeviceRayQueryFeaturesKHR,
+	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
+	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
-	       image_atomic_int64, conditional_rendering, barycentric] = supported;
+	       image_atomic_int64, conditional_rendering, barycentric, acceleration_structure,
+	       ray_query, cooperative_matrix, float8] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 #if defined(__linux__)
 	// Importing the BC-250 native path's buffers (dma-bufs) for zero-copy presentation.
@@ -446,12 +452,36 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
 	}
+	// Ray queries take all three extensions or none.
+	const bool ray_query_extensions =
+	    Config::NativeRtEnabled() &&
+	    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+	if (ray_query_extensions) {
+		add(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+		add(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+		add(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+	} else {
+		supported.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+		supported.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
+	}
+	// FSR's ML upscalers run on cooperative matrices.
+	const bool fsr = Fsr::Enabled();
+	if (!fsr || !add(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+	}
+	if (!fsr || !add(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	// The recompiler falls back to interpolated inputs for raw vertex reads without it.
 	graphics.fragment_shader_barycentric_enabled = barycentric_supported;
+	const bool ray_query_enabled =
+	    acceleration_structure.accelerationStructure && ray_query.rayQuery;
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
 		    "WARNING: Your GPU is not fully supported (fragmentShaderBarycentric is unavailable). "
@@ -574,6 +604,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    graphics.occlusion_queries_enabled && supported2.features.occlusionQueryPrecise;
 	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
 	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
+	LOGF("Vulkan ray query: %s\n", ray_query_enabled ? "true" : "false");
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
 	     graphics.occlusion_queries_enabled ? "true" : "false",
 	     graphics.occlusion_query_precise_enabled ? "true" : "false");
@@ -584,6 +615,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	auto features13                = WindowContext::RequiredVulkan13Features();
 	features13.robustImageAccess   = supported13.robustImageAccess;
 	features13.subgroupSizeControl = graphics.compute_subgroup_size_control_enabled;
+	if (fsr) {
+		device_features.shaderInt16            = supported2.features.shaderInt16;
+		features12.shaderFloat16               = supported12.shaderFloat16;
+		features12.shaderInt8                  = supported12.shaderInt8;
+		features12.separateDepthStencilLayouts = supported12.separateDepthStencilLayouts;
+		features13.shaderIntegerDotProduct     = supported13.shaderIntegerDotProduct;
+		features13.computeFullSubgroups        = supported13.computeFullSubgroups;
+	}
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -613,6 +652,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceMeshShaderFeaturesEXT {.taskShader = VK_TRUE, .meshShader = VK_TRUE},
 	    feedback_layout, feedback_dynamic, provoking_vertex, image_atomic_int64, maintenance8,
 	    shader_clock, conditional_rendering,
+	    vk::PhysicalDeviceAccelerationStructureFeaturesKHR {.accelerationStructure = VK_TRUE},
+	    vk::PhysicalDeviceRayQueryFeaturesKHR {.rayQuery = VK_TRUE}, cooperative_matrix, float8,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
@@ -649,6 +690,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!extended_dynamic_state) {
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+	}
+	if (!cooperative_matrix.cooperativeMatrix) {
+		create.unlink<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+	}
+	if (!float8.shaderFloat8) create.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+	if (!ray_query_enabled) {
+		create.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
 
 	vk::Device device = nullptr;
@@ -831,6 +880,7 @@ void WindowContext::CreateVulkan() {
 
 	Vr::OpenXrInit();
 	Dlss::Load();
+	Fsr::Load();
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
@@ -958,6 +1008,7 @@ void WindowContext::CreateVulkan() {
 	EXIT_IF(graphic_ctx.queue == nullptr);
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -995,6 +1046,7 @@ WindowContext::~WindowContext() {
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
 	Dlss::Shutdown();
+	Fsr::Shutdown();
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
