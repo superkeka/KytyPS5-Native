@@ -1947,6 +1947,9 @@ public:
 			             r.timed_out ? "a slot's earlier submission did not finish (timeout or reset)" : std::strerror(-r.err), r.retries,
 			             handles.size());
 			if (r.timed_out || r.err == -ECANCELED || r.err == -ENODEV) {
+				// As a ring timeout seen by WaitSlot: what the rings hold goes to the hang dump first.
+				DumpHangLocked();
+				RunHangHook();
 				OnGpuFailureLocked(r.timed_out ? "slot wait" : "submission refused after a reset", r.err);
 			} else {
 				Disable("submit error");
@@ -4980,6 +4983,9 @@ private:
 			// A slot whose earlier job amdgpu reset, or a context amdgpu cancelled, is a GPU failure, not a refused
 			// submission: the title stops as on a hang (OnGpuFailure). Other errors leave the path as before.
 			if (r.timed_out || r.err == -ECANCELED || r.err == -ENODEV) {
+				// As a ring timeout seen by WaitSlot: what the rings hold goes to the hang dump first.
+				DumpHangLocked();
+				RunHangHook();
 				OnGpuFailureLocked(r.timed_out ? "slot wait" : "submission refused after a reset", r.err);
 			} else {
 				Disable("submit error");
