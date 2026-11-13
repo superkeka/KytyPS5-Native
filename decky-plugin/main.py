@@ -39,6 +39,10 @@ UPDATE_FLAG = os.path.join(CONFIG_DIR, "update-available")
 # Present while games may run in HDR: the launch wrapper then passes --hdr when gamescope outputs HDR
 # (Steam's display setting). Absent, as by default, games run in SDR.
 HDR_FLAG = os.path.join(CONFIG_DIR, "hdr")
+# A game's add-ons (DLC and licences), a file per title id with a label on each line: the launch
+# wrapper tells Kyty the game has them. A game can wait forever for one it was sold with.
+ADDCONT_DIR = os.path.join(CONFIG_DIR, "addcont")
+ADDCONT_HEAD = "# Add-ons Kyty tells this game it has. Switch them in the Decky plugin: Games, the game's menu.\n"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
 VIDEOS = {
     "boot": "https://steamdeckrepo.com/post/download/YWW81",
@@ -497,6 +501,137 @@ def _scan(folder):
     return games
 
 
+# --- add-ons ------------------------------------------------------------------------------------
+# A label is 16 characters, A-Z and 0-9, and a game's executable names the ones it asks about as
+# plain strings. Those of this game start as its own does (GHOST2SHIP000000: GHOST2APP0000000,
+# GHOST2BASE000000, ...); a 16-character string that starts otherwise is something else.
+_LABEL = re.compile(rb"(?<![A-Z0-9])([A-Z0-9]{16})\x00")
+_LABEL_LINE = re.compile(r"^[A-Z0-9]{16}(=.+)?$")
+
+
+def _executable_labels(path):
+    """Every label-shaped string of the game's eboot.bin, read in pieces (it can be 200 MB)."""
+    zar = path.endswith(".zar")
+    try:
+        if zar:
+            pipe = subprocess.Popen([os.path.join(KYTY_DIR, "kyty_emulator"), "--zar-cat", path, "eboot.bin"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            stream = pipe.stdout
+        else:
+            pipe = None
+            stream = open(os.path.join(path, "eboot.bin"), "rb")
+    except OSError as e:
+        decky.logger.error("add-ons of %s: %s", path, e)
+        return None
+    found = set()
+    tail = b""
+    with stream:
+        while True:
+            piece = stream.read(8 << 20)
+            if not piece:
+                break
+            data = tail + piece
+            found.update(m.group(1).decode() for m in _LABEL.finditer(data))
+            tail = data[-17:]  # a label cut by the piece's end is whole in the next one
+    if pipe is not None and pipe.wait() != 0:
+        return None
+    return found
+
+
+def _addon_key(path):
+    try:
+        st = os.stat(path if path.endswith(".zar") else os.path.join(path, "eboot.bin"))
+    except OSError:
+        return ""
+    return f"{path}|{st.st_size}|{int(st.st_mtime)}"
+
+
+def _own_label(path):
+    try:
+        content_id = json.loads(_sce_sys(path, "param.json") or b"").get("contentId") or ""
+    except ValueError:
+        content_id = ""
+    return content_id.rsplit("-", 1)[-1]
+
+
+def _find_addons(path):
+    """The labels the game's executable names that begin as the game's own; None when unreadable."""
+    own = _own_label(path)
+    if len(own) != 16 or own.isdigit():
+        return []
+    labels = _executable_labels(path)
+    if labels is None:
+        return None
+    return sorted(l for l in labels if l[:4] == own[:4] and l != own and not l.isdigit())
+
+
+def _addcont_file(tid):
+    return os.path.join(ADDCONT_DIR, tid)
+
+
+def _addcont_lines(tid):
+    """What the game's file lists now: label or label=folder, comments left out."""
+    try:
+        with open(_addcont_file(tid)) as f:
+            lines = [l.split("#", 1)[0].strip() for l in f]
+    except OSError:
+        return []
+    return [l for l in lines if _LABEL_LINE.match(l)]
+
+
+def _addcont_write(tid, entry):
+    """The file the wrapper reads: what was found and is not switched off, then the user's own lines."""
+    off = set(entry.get("off", []))
+    lines = [l for l in entry.get("found", []) if l not in off]
+    lines += [l for l in entry.get("extra", []) if l.split("=", 1)[0] not in off]
+    path = _addcont_file(tid)
+    if not lines:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    _mkdir_user(ADDCONT_DIR)
+    with open(path + ".tmp", "w") as f:
+        f.write(ADDCONT_HEAD + "".join(l + "\n" for l in lines))
+    os.replace(path + ".tmp", path)
+    os.lchown(path, *_ids())
+
+
+def _addons_scan(games, again=""):
+    """Looks for the add-ons of every game not looked at yet (or changed since, or `again`): all
+    found are on. Lines the user wrote into a game's file by hand stay, as the game's extra ones."""
+    done = 0
+    for g in games:
+        tid, key = g["title_id"], _addon_key(g["path"])
+        entry = _load().get("addcont", {}).get(tid)
+        if not key or (entry and entry.get("key") == key and tid != again):
+            continue
+        found = _find_addons(g["path"])
+        if found is None:
+            continue
+        entry = dict(entry or {})
+        known = set(found) | set(entry.get("off", []))
+        extra = entry.get("extra", []) + [l for l in _addcont_lines(tid) if l.split("=", 1)[0] not in known]
+        entry.update({"key": key, "found": found, "extra": sorted(set(extra)),
+                      "off": [l for l in entry.get("off", []) if l in found or l in {e.split("=", 1)[0] for e in extra}]})
+        s = _load()
+        s.setdefault("addcont", {})[tid] = entry
+        _save(s)
+        _addcont_write(tid, entry)
+        decky.logger.info("add-ons of %s: %d found, %d by hand", tid, len(found), len(entry["extra"]))
+        done += 1
+    return done
+
+
+def _addons(tid, entry):
+    """The game's add-ons for its menu: found ones first, then the user's own lines."""
+    off = set((entry or {}).get("off", []))
+    rows = [{"label": l, "on": l not in off, "found": True, "folder": ""} for l in (entry or {}).get("found", [])]
+    for l in (entry or {}).get("extra", []):
+        label, _, folder = l.partition("=")
+        rows.append({"label": label, "on": label not in off, "found": False, "folder": folder})
+    return rows
+
+
 def _icon(path, tid):
     """The shortcut's icon file: the folder's own, or one taken out of the archive."""
     if not path.endswith(".zar"):
@@ -518,6 +653,22 @@ class Plugin:
         loop.create_task(self._default_videos())
         loop.create_task(self._watch_updates())
         loop.create_task(self._repair_helper())
+        loop.create_task(self._look_for_addons())
+
+    # Add-ons are found without the panel being opened: a game added to the folder starts with them.
+    _addons_running = False
+
+    async def _look_for_addons(self, again=""):
+        if Plugin._addons_running:
+            return
+        Plugin._addons_running = True
+        try:
+            s = _load()
+            games = await asyncio.to_thread(_scan, s.get("games_dir") or os.path.join(HOME, "Games"))
+            await asyncio.to_thread(_addons_scan, games, again)
+        except Exception:
+            decky.logger.exception("add-ons")
+        Plugin._addons_running = False
 
     # A helper that did not install (stock SteamOS before 2026-10-30) or went missing goes in again.
     async def _repair_helper(self):
@@ -560,8 +711,15 @@ class Plugin:
             folder_state = "ok" if os.listdir(folder) else "empty"
         except OSError:
             folder_state = "missing"
+        addcont = s.get("addcont", {})
         for g in games:
             g.update({"appid": 0, "keep_steam": False, **known.get(g["title_id"], {})})
+            rows = _addons(g["title_id"], addcont.get(g["title_id"]))
+            g["addons"] = len(rows)
+            g["addons_on"] = sum(r["on"] for r in rows)
+        # A game not looked at yet (new in the folder, or its executable changed) is looked at now.
+        if any(addcont.get(g["title_id"], {}).get("key") != _addon_key(g["path"]) for g in games):
+            asyncio.get_event_loop().create_task(self._look_for_addons())
         return {
             "kyty_dir": KYTY_DIR,
             "runner": os.path.join(KYTY_DIR, "kytyps5-run.sh"),
@@ -809,6 +967,49 @@ class Plugin:
         else:
             games.pop(title_id, None)
         _save(s)
+
+    # --- a game's menu --------------------------------------------------------------------------------
+
+    async def get_game(self, title_id):
+        s = _load()
+        games = await asyncio.to_thread(_scan, s.get("games_dir") or os.path.join(HOME, "Games"))
+        g = next((g for g in games if g["title_id"] == title_id), None)
+        if g is None:
+            return None
+        try:
+            param = json.loads(_sce_sys(g["path"], "param.json") or b"")
+        except ValueError:
+            param = {}
+        entry = s.get("addcont", {}).get(title_id)
+        return {
+            "title_id": title_id,
+            "name": g["name"],
+            "path": g["path"],
+            "size": g["size"],
+            "version": param.get("contentVersion") or "",
+            "addons": _addons(title_id, entry),
+            # False while the game's executable is still being read for the first time.
+            "addons_known": bool(entry) and entry.get("key") == _addon_key(g["path"]),
+            "game_running": _game_running(),
+        }
+
+    async def set_addon(self, title_id, label, on):
+        s = _load()
+        entry = s.setdefault("addcont", {}).setdefault(title_id, {})
+        off = set(entry.get("off", []))
+        (off.discard if on else off.add)(label)
+        entry["off"] = sorted(off)
+        _save(s)
+        try:
+            await asyncio.to_thread(_addcont_write, title_id, entry)
+        except OSError as e:
+            decky.logger.exception("add-ons file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def find_addons(self, title_id):
+        await self._look_for_addons(title_id)
+        return {"ok": True}
 
     # Artwork made once per game (the frontend composes it) and kept: a shortcut added again reuses it.
     async def get_cached_art(self, title_id):

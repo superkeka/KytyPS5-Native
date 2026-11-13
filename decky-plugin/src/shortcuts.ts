@@ -11,6 +11,9 @@ export interface Game {
   shortcut_path?: string;
   appid: number;
   keep_steam: boolean;
+  // Add-ons known for the game, and how many of them are switched on.
+  addons: number;
+  addons_on: number;
 }
 
 const getArt = callable<[path: string], { icon: string; pic: string }>("get_art");
