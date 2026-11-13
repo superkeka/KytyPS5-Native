@@ -40,6 +40,18 @@ For command-line troubleshooting, the existing `--addcont` option accepts a
   --addcont GHOST2BASE000000
 ```
 
+A Steam shortcut made by the Decky plugin starts the game through `kytyps5-run.sh`,
+which reads the game's add-ons from `~/.config/KytyPS5-Native/addcont/<title id>`,
+a line each (`<label>` or `<label>=<folder with its data>`, `#` starts a comment):
+
+```sh
+mkdir -p ~/.config/KytyPS5-Native/addcont
+printf '%s\n' GHOST2APP0000000 GHOST2BASE000000 > ~/.config/KytyPS5-Native/addcont/PPSA26344
+```
+
+Without the two entries the game shows a black screen at a steady 30 FPS and never
+leaves it; the session's log then has no `add-ons from ...` line under its `==` header.
+
 These flags register labels with the emulator; they **do not install missing
 game data or verify ownership**. Only register content you are authorized to
 use. Content names and requirements may differ across releases/editions.

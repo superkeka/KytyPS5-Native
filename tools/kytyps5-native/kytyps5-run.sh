@@ -8,6 +8,9 @@
 # ~/.config/KytyPS5-Native/boot.webm plays before the game and exit.webm when the game is left from the
 # in-game menu (PS button). A missing file plays nothing. ~/.config/KytyPS5-Native/hdr (the plugin's HDR
 # toggle) lets the game run in HDR when gamescope outputs it.
+# ~/.config/KytyPS5-Native/addcont/<title id> lists the game's add-ons (DLC and licences), a line each:
+# <label> or <label>=<folder with its data>; a # starts a comment. A game can wait for one of them
+# forever (Ghost of Yotei stays on a black loading screen without its two).
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -34,6 +37,13 @@ CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/KytyPS5-Native
 SHARE=${XDG_DATA_HOME:-$HOME/.local/share}/KytyPS5-Native
 mkdir -p "$SHARE/data" "$SHARE/logs"
 LOG=$SHARE/logs/$TITLE.log
+ADDCONT_ARGS=()
+if [ -f "$CONFIG/addcont/$TITLE" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=$(printf '%s' "${line%%#*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+		[ -n "$line" ] && ADDCONT_ARGS+=(--addcont "$line")
+	done < "$CONFIG/addcont/$TITLE"
+fi
 # Games run on the gamescope Xwayland Steam gives them, the base layer is set on the root one (:0).
 export DISPLAY=${DISPLAY:-:1}
 ROOT_DISPLAY=${KYTYPS5_ROOT_DISPLAY:-:0}
@@ -161,8 +171,10 @@ rm -f "$MARKER" "$VIDEO_FLAG"
 front "$GAME_APPID"
 {
 	echo "== $(date) $GAME"
+	[ ${#ADDCONT_ARGS[@]} -gt 0 ] && echo "add-ons from $CONFIG/addcont/$TITLE: ${ADDCONT_ARGS[*]}"
 	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" KYTY_GAMESCOPE_APPID=$GAME_APPID "$EMU" --game "$GAME" \
-		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS $LANGUAGE_ARGS
+		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS $LANGUAGE_ARGS \
+		"${ADDCONT_ARGS[@]}"
 	echo "== exit=$?"
 } >> "$LOG" 2>&1 &
 EMUPID=$!
