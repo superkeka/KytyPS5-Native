@@ -511,20 +511,24 @@ public:
 		std::vector<uint32_t> slots;
 		std::bitset<kSlots>   taken;
 		for (const auto& [at, len]: parts) {
-			const uint32_t slot = m_async ? PickSlot(target, taken) : 0;
-			taken.set(slot);
+			uint32_t slot = m_async ? PickSlot(target, taken) : 0;
 			if (m_async && m_slot[slot].seq != 0) {
-				// The slot's submission may be a streamed DCB whose CP waits for the caller's next chunk:
-				// the caller ends that chain before this thread blocks on it (SetBeforeBlockingWait).
+				// No slot is free. The one picked may hold a submission that cannot end before this very one
+				// goes: a streamed DCB whose CP waits for the caller's next chunk (the caller ends that chain
+				// first, SetBeforeBlockingWait), or an ACB waiting for a label that a later chunk of that DCB
+				// writes, which comes only after this submission. So no single slot is waited for: the first
+				// submission to end gives its slot.
 				if (!WaitSeq(m_slot[slot].seq, 0.0, m_slot[slot].target) && m_before_block) {
 					m_before_block();
 				}
-				if (!WaitSeq(m_slot[slot].seq, timeout_sec, m_slot[slot].target)) {
+				slot = WaitAnySlot(slot, taken, timeout_sec);
+				if (slot == kSlots) {
 					res.timed_out = true;
 					return res;
 				}
 				m_slot[slot].seq = 0;
 			}
+			taken.set(slot);
 			auto* dst = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize);
 			size_t padded = 0;
 			if (part_guards && at != 0) {
@@ -1160,6 +1164,25 @@ private:
 			}
 		}
 		return own != kSlots ? own : any;
+	}
+	// Every slot is in use: waits until the submission of any slot outside `taken` ends and returns that
+	// slot, or kSlots after `timeout_sec`. Between looks at them all it waits a moment on `first`.
+	uint32_t WaitAnySlot(uint32_t first, const std::bitset<kSlots>& taken, double timeout_sec) {
+		const double deadline = NowSec() + timeout_sec;
+		for (;;) {
+			for (uint32_t i = 0; i < kSlots; i++) {
+				if (!taken[i] && (m_slot[i].seq == 0 || WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target))) {
+					return i;
+				}
+			}
+			const double left = deadline - NowSec();
+			if (left <= 0.0) {
+				return kSlots;
+			}
+			if (WaitSeq(m_slot[first].seq, std::min(left, 0.001), m_slot[first].target)) {
+				return first;
+			}
+		}
 	}
 	bool     m_async     = false;
 	bool     m_gfx_mem_sync = false;
