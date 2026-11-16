@@ -3767,6 +3767,19 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			const bool display = addr != 0 && std::any_of(m_display_ranges.begin(), m_display_ranges.end(), [&](const auto& d) {
 				return addr >= d.first && addr < d.first + d.second;
 			});
+			// The title's own DCC metadata for this video-out target (CB_COLORn_DCC_BASE): it fast-clears it and samples the
+			// buffer through it, so it is kept uncompressed too (AddDisplayMetaRange), the size of the buffer's own metadata.
+			if (display && (info & kCbDccEnable) != 0 && !m_display_meta.empty()) {
+				const uint64_t dcc = (static_cast<uint64_t>(reg(cx, kCbColor0DccBase + step)) << 8u) |
+				                     (static_cast<uint64_t>(reg(cx, kCbColor0DccExt + i) & 0xffu) << 40u);
+				const auto range = std::find_if(m_display_ranges.begin(), m_display_ranges.end(), [&](const auto& d) {
+					return addr >= d.first && addr < d.first + d.second;
+				});
+				if (dcc != 0 && AddDisplayMetaRange(dcc, m_display_meta.front().size, range->first, range->second)) {
+					std::fprintf(stderr, "native shadow: video-out target 0x%llx: its DCC metadata 0x%llx kept uncompressed too\n",
+					             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(dcc));
+				}
+			}
 			// Load mode, an INFO the copy took from a verbatim table: the CP may hold another (it reads the table when it
 			// runs it), so the GPU clears DCC in its own (EmitCpShadowDccOff), once until the slot's INFO or BASE change, and
 			// gives it back when the slot leaves the video-out buffer with that INFO. The copy's INFO would replace the CP's,
@@ -6279,11 +6292,81 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					r.inspected.push_back(snap);
 				}
-				if (m_compute_ring) {
-					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-					body[body.size() - size] |= 2u;
-				} else {
-					pass_on(dw, size, body_before, segs_before, in_place);
+				{
+					// AddDisplayMetaRange: libSceAgc's DCC clear writing a display buffer's DCC metadata (the V# in
+					// COMPUTE_USER_DATA_0/1) is followed by fills that keep the metadata uncompressed (0xFF).
+					static const bool meta_fill = [] {
+						const char* e = std::getenv("KYTY_NATIVE_GPU_DISPLAY_META_FILL");
+						return e == nullptr || e[0] != '0';
+					}();
+					const DisplayMeta* hit = nullptr;
+					if (meta_fill && !m_display_meta.empty()) {
+						const uint64_t vbase = static_cast<uint64_t>(reg(sh, 0x240u)) | (static_cast<uint64_t>(reg(sh, 0x241u) & 0xffffu) << 32u);
+						const uint64_t cs    = (static_cast<uint64_t>(reg(sh, 0x20Cu)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20Du) & 0xffu) << 40u);
+						// libSceAgc's DCC clear: s_inst_prefetch, v_lshl_add_u32 v4, s9, 6, v0, v_mov v0-v3 <- s4-s7 (the fill
+						// pattern), v_cmpx_gt_u32 s8, v4, ..., buffer_store_format_x through the V# in s0-s3.
+						auto is_clear = [&]() {
+							if (const auto it = m_dcc_clear_cs.find(cs); it != m_dcc_clear_cs.end()) {
+								return it->second;
+							}
+							static constexpr uint32_t kSig[12] = {0xbfa00001u, 0xd7460004u, 0x04010c09u, 0x7e000204u, 0x7e020205u, 0x7e040206u,
+							                                      0x7e060207u, 0x7da80808u, 0xbf88000du, 0x360a0883u, 0xbe84047eu, 0xbe86047eu};
+							uint32_t   code[12] = {};
+							const bool match    = cs != 0 && read_safe(cs, code, 12) == 12 && std::equal(std::begin(kSig), std::end(kSig), code);
+							m_dcc_clear_cs[cs]  = match;
+							return match;
+						};
+						for (const auto& m: m_display_meta) {
+							if (vbase < m.addr || vbase >= m.addr + m.size) {
+								continue;
+							}
+							const bool clear = is_clear();
+							if (m_meta_fill_logged.insert({cs, m.addr}).second) {
+								std::fprintf(stderr, "native shadow: dispatch cs 0x%llx writes video-out DCC metadata 0x%llx (V# 0x%llx, ud4-7 %08x %08x %08x %08x, %s ring): %s\n",
+								             static_cast<unsigned long long>(cs), static_cast<unsigned long long>(m.addr), static_cast<unsigned long long>(vbase),
+								             reg(sh, 0x244u), reg(sh, 0x245u), reg(sh, 0x246u), reg(sh, 0x247u), m_compute_ring ? "compute" : "gfx",
+								             clear ? "libSceAgc DCC clear, kept uncompressed" : "not the DCC clear, left alone");
+							}
+							hit = clear ? &m : nullptr;
+							break;
+						}
+					}
+					if (m_compute_ring) {
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+						body[body.size() - size] |= 2u;
+					} else if (hit != nullptr) {
+						// Copied, not run in place: packets of ours follow it (a packet run in place has nothing of ours around it).
+						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					} else {
+						pass_on(dw, size, body_before, segs_before, in_place);
+					}
+					if (hit != nullptr) {
+						// CS_PARTIAL_FLUSH: the clear's stores have landed in L2 before the CP's fills.
+						body.push_back(Pkt3(IT_EVENT_WRITE, 1, m_compute_ring));
+						body.push_back(0x7u | (4u << 8u));
+						// DMA_DATA fills: CP_SYNC, SRC_SEL 2 (immediate data), DST_SEL 3 (memory through L2), RAW_WAIT.
+						auto fill = [&](uint64_t addr, uint64_t bytes, uint32_t value) {
+							for (uint64_t off = 0; off < bytes;) {
+								const uint64_t chunk = std::min<uint64_t>(bytes - off, (1ull << 26u) - 4u);
+								const uint64_t dst   = addr + off;
+								body.insert(body.end(), {Pkt3(IT_DMA_DATA, 6, m_compute_ring), (1u << 31u) | (2u << 29u) | (3u << 20u), value, 0u,
+								                         static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u),
+								                         (1u << 30u) | static_cast<uint32_t>(chunk)});
+								off += chunk;
+							}
+						};
+						// The clear's fill pattern (COMPUTE_USER_DATA_4..7). Clear code 0x00 is the colour 0000: the pixels too.
+						const bool zero = reg(sh, 0x244u) == 0 && reg(sh, 0x245u) == 0 && reg(sh, 0x246u) == 0 && reg(sh, 0x247u) == 0;
+						if (zero && hit->color_addr != 0 && hit->color_size != 0) {
+							fill(hit->color_addr, hit->color_size, 0u);
+							NoteOnce(43, "video-out pixels zeroed for a title's DCC clear to 0000");
+						} else if (!zero) {
+							NoteOnce(44, "video-out DCC clear with a non-zero code: pixels left as drawn");
+						}
+						fill(hit->addr, hit->size, 0xffffffffu);
+						stats.display_meta_fills++;
+						NoteOnce(42, "video-out DCC metadata set to uncompressed after a title's clear");
+					}
 				}
 				stats.dispatches++;
 				collect_refs();

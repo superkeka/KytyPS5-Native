@@ -767,6 +767,11 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	// Natively rendered display buffers hold plain pixels (ShadowDisplayWithoutDcc).
 	if (compression != Graphics::VideoOutCompression::Uncompressed &&
 	    Graphics::NativeGpu::ShadowDisplayWithoutDcc(buffer.data_address, info.data.size)) {
+		// The title may still clear the buffer's DCC metadata and sample the buffer through a DCC T#.
+		if (Graphics::TileSizeAlign meta_size {}; buffer.metadata_address != 0 &&
+		    Graphics::TileGetDccSize(attribute.width, attribute.height, 1, pixel_format.bytes_per_element, 1, tile_mode, meta_size)) {
+			Graphics::NativeGpu::ShadowDisplayMetaUncompressed(buffer.metadata_address, meta_size.size, buffer.data_address, info.data.size);
+		}
 		compression = Graphics::VideoOutCompression::Uncompressed;
 	}
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {

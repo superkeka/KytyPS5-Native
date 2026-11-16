@@ -88,6 +88,8 @@ bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufP
 // KYTY_NATIVE_GPU_PRIMARY, unless KYTY_NATIVE_GPU_DISPLAY_DCC=1) the translator draws it without DCC,
 // so the presenter can take it as uncompressed; true then.
 bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size);
+// The DCC metadata of such a buffer: kept uncompressed after the title's clears (Pm4Translator::AddDisplayMetaRange).
+void ShadowDisplayMetaUncompressed(uint64_t addr, uint64_t size, uint64_t color_addr, uint64_t color_size);
 
 // Direct scan-out flips (KYTY_DIRECT_PRESENT=1; off unless set, for now). On the PS5 a flip does no GPU
 // work: the title's release has written the frame, and the kernel queues the buffer itself to the display

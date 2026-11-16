@@ -238,6 +238,7 @@ struct Pm4TranslateStats {
 	// the GPU may hold another value than the copy).
 	uint32_t cp_shadow_dcc_gpu   = 0;
 	uint32_t cp_shadow_dcc_back  = 0; // and the DCC given back on the GPU (EmitCpShadowDccRestore)
+	uint32_t display_meta_fills  = 0; // display DCC metadata set to uncompressed after a dispatch (AddDisplayMetaRange)
 	// GPU waits run with shadowing off around them (SetCpShadowWaitOff): 6 dwords each, plus PFP_SYNC_ME where
 	// nothing else gave the ME wait one.
 	uint32_t cp_shadow_wait_wraps = 0;
@@ -1003,6 +1004,21 @@ public:
 		m_display_ranges.emplace_back(addr, size);
 		return true;
 	}
+	// The DCC metadata of a video-out buffer drawn without DCC (AddDisplayRange). The title still fast-clears it
+	// (libSceAgc's DCC clear dispatch writes clear code 0x00) and samples the buffer through a T# with DCC on (GT7's
+	// replay depth of field, its intro fades), which then reads every block as the clear colour, whatever Kyty drew:
+	// black. After any dispatch that writes into such a range, the translator does what the clear meant on plain
+	// pixels: a zero fill pattern zeroes the buffer's pixels, then the metadata is set to 0xFF (uncompressed) so
+	// DCC-aware reads see the pixels. KYTY_NATIVE_GPU_DISPLAY_META_FILL=0 turns it off. False when already known.
+	bool AddDisplayMetaRange(uint64_t addr, uint64_t size, uint64_t color_addr = 0, uint64_t color_size = 0) {
+		for (const auto& m: m_display_meta) {
+			if (m.addr == addr && m.size == size) {
+				return false;
+			}
+		}
+		m_display_meta.push_back({addr, size, color_addr, color_size});
+		return true;
+	}
 	// Context register overrides the PS5 kernel applies through the CP's RCIU CAM (see PatchContext).
 	void SetPs5RegOverrides(bool on) { m_ps5_reg_overrides = on; }
 
@@ -1350,6 +1366,15 @@ private:
 	std::set<uint32_t>           m_dropped_seen;
 	std::array<uint32_t, 4>      m_cu_clamp {};
 	std::vector<std::pair<uint64_t, uint64_t>> m_display_ranges; // AddDisplayRange
+	struct DisplayMeta {
+		uint64_t addr;       // DCC metadata
+		uint64_t size;
+		uint64_t color_addr; // the video-out buffer it describes (0: unknown)
+		uint64_t color_size;
+	};
+	std::vector<DisplayMeta> m_display_meta; // AddDisplayMetaRange
+	std::map<uint64_t, bool>      m_dcc_clear_cs;     // compute shader -> is libSceAgc's DCC clear (AddDisplayMetaRange)
+	std::set<std::pair<uint64_t, uint64_t>> m_meta_fill_logged; // (shader, metadata) pairs already logged
 	uint32_t                     m_display_dcc_off = 0;           // MRT slots drawn with DCC cleared
 	uint32_t                     m_display_dcc_gpu = 0;           // MRT slots whose CP INFO lost DCC on the GPU (EmitCpShadowDccOff)
 	uint32_t                     m_saved_display_dcc_gpu = 0;     // m_display_dcc_gpu at the GPU push
