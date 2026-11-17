@@ -44,6 +44,16 @@ if [ -f "$CONFIG/addcont/$TITLE" ]; then
 		[ -n "$line" ] && ADDCONT_ARGS+=(--addcont "$line")
 	done < "$CONFIG/addcont/$TITLE"
 fi
+# Patches switched on in the Decky plugin. Kyty stops a game given patches for another version of
+# it (the game was updated since): then they are left out.
+PATCH_ARGS=()
+PATCH=$CONFIG/patches/$TITLE.json
+if [ -f "$PATCH" ]; then
+	version_of() { grep -o "\"$1\" *: *\"[^\"]*\"" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'; }
+	game_version=$(printf '%s' "$PARAM" | version_of contentVersion)
+	patch_version=$(version_of version < "$PATCH")
+	[ -n "$patch_version" ] && [ "$patch_version" = "$game_version" ] && PATCH_ARGS=(--game-patch "$PATCH")
+fi
 # Games run on the gamescope Xwayland Steam gives them, the base layer is set on the root one (:0).
 export DISPLAY=${DISPLAY:-:1}
 ROOT_DISPLAY=${KYTYPS5_ROOT_DISPLAY:-:0}
@@ -172,9 +182,14 @@ front "$GAME_APPID"
 {
 	echo "== $(date) $GAME"
 	[ ${#ADDCONT_ARGS[@]} -gt 0 ] && echo "add-ons from $CONFIG/addcont/$TITLE: ${ADDCONT_ARGS[*]}"
+	if [ ${#PATCH_ARGS[@]} -gt 0 ]; then
+		echo "patches from $PATCH"
+	elif [ -f "$PATCH" ]; then
+		echo "patches in $PATCH are for version '$patch_version', the game is '$game_version': left out"
+	fi
 	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" KYTY_GAMESCOPE_APPID=$GAME_APPID "$EMU" --game "$GAME" \
 		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS $LANGUAGE_ARGS \
-		"${ADDCONT_ARGS[@]}"
+		"${ADDCONT_ARGS[@]}" "${PATCH_ARGS[@]}"
 	echo "== exit=$?"
 } >> "$LOG" 2>&1 &
 EMUPID=$!

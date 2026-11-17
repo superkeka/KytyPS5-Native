@@ -14,6 +14,8 @@ export interface Game {
   // Add-ons known for the game, and how many of them are switched on.
   addons: number;
   addons_on: number;
+  // Patches switched on for the game.
+  patches_on: number;
 }
 
 const getArt = callable<[path: string], { icon: string; pic: string }>("get_art");

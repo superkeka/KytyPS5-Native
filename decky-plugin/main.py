@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import glob
+import http.client
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import ssl
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -43,6 +45,11 @@ HDR_FLAG = os.path.join(CONFIG_DIR, "hdr")
 # wrapper tells Kyty the game has them. A game can wait forever for one it was sold with.
 ADDCONT_DIR = os.path.join(CONFIG_DIR, "addcont")
 ADDCONT_HEAD = "# Add-ons Kyty tells this game it has. Switch them in the Decky plugin: Games, the game's menu.\n"
+# A game's patches (cheats), a file per title id that the launch wrapper gives Kyty with --game-patch:
+# there while any of them is switched on. They come from a public collection, a file per game version.
+PATCHES_DIR = os.path.join(CONFIG_DIR, "patches")
+PATCH_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "patches")
+PATCH_SOURCE = "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
 VIDEOS = {
     "boot": "https://steamdeckrepo.com/post/download/YWW81",
@@ -632,6 +639,234 @@ def _addons(tid, entry):
     return rows
 
 
+# --- patches ------------------------------------------------------------------------------------
+# A patch (a cheat) rewrites bytes of the game's code in memory as the game loads. Kyty stops a game
+# given a file for another version, or with a write it cannot place: only a file for exactly this
+# version is taken, and only the patches whose every write Kyty can apply.
+_PATCH_NAME = re.compile(r"\A([A-Z]{4}[0-9]{5})_([0-9]+(?:\.[0-9]+)+)_[A-Za-z0-9_.-]+\.(json|shn)\Z")
+_PATCH_OFFSET = re.compile(r"\A(?:0[xX])?[0-9a-fA-F]{1,16}\Z")
+_PATCH_BYTES = re.compile(r"\A(?:[0-9a-fA-F]{2})+\Z")
+_PATCH_UNPLACED = ("section", "sectionName", "sectionProtection", "logicalOffset", "sectionOffset")
+_PATCH_DOWNLOAD = (OSError, http.client.HTTPException)
+_patch_catalog = {"time": 0.0, "files": None}
+
+
+def _get_limited(url, limit):
+    req = urllib.request.Request(url, headers={"User-Agent": "KytyPS5-Native-Decky"})
+    with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as r:
+        data = r.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("the download is larger than expected")
+    return data
+
+
+def _patch_files(again=False):
+    """The collection's files by title id, and why it could not be read now ("" when it was). Read at
+    most once an hour; while the collection cannot be reached, the list read last (None without one)."""
+    now = time.time()
+    if _patch_catalog["files"] is not None and not again and now - _patch_catalog["time"] < 3600:
+        return _patch_catalog["files"], ""
+    index = os.path.join(PATCH_CACHE, "index.json")
+    files = {}
+    try:
+        for fmt in ("json", "shn"):
+            text = _get_limited(PATCH_SOURCE + fmt + ".txt", 2 << 20).decode("utf-8", "replace").lstrip("\ufeff")
+            for line in text.splitlines():
+                name = line.split("=", 1)[0].strip()
+                m = _PATCH_NAME.match(name)
+                if m and m.group(3) == fmt:
+                    files.setdefault(m.group(1), []).append({"name": name, "version": m.group(2), "format": fmt})
+    except (*_PATCH_DOWNLOAD, ValueError) as e:
+        _patch_catalog.update(time=0.0, files=None)
+        try:
+            with open(index) as f:
+                return json.load(f), str(e) or type(e).__name__
+        except (OSError, ValueError):
+            return None, str(e) or type(e).__name__
+    os.makedirs(PATCH_CACHE, exist_ok=True)
+    with open(index + ".tmp", "w") as f:
+        json.dump(files, f)
+    os.replace(index + ".tmp", index)
+    _patch_catalog.update(time=now, files=files)
+    return files, ""
+
+
+_XML_ENTITY = re.compile(r"&(#[xX][0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);")
+_XML_ATTRIBUTE = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _xml_text(text):
+    def entity(m):
+        e = m.group(1)
+        if e[0] == "#":
+            return chr(int(e[2:], 16) if e[1] in "xX" else int(e[1:]))
+        return {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}[e]
+    return _XML_ENTITY.sub(entity, text)
+
+
+def _patch_trainer(data):
+    """A trainer file (XML) as the patch document Kyty reads. Read by its few tags: Decky's Python has
+    no XML parser."""
+    text = data.decode("utf-8", "replace").lstrip("\ufeff")
+    head = re.search(r"<Trainer\b([^>]*)>", text)
+    if head is None:
+        raise ValueError("not a trainer file")
+    trainer = {k: _xml_text(v) for k, v in _XML_ATTRIBUTE.findall(head.group(1))}
+    mods = []
+    for cheat in re.finditer(r"<Cheat\b([^>]*?)(?:/>|>(.*?)</Cheat>)", text, re.S):
+        memory = []
+        for line in re.finditer(r"<Cheatline\b[^>]*>(.*?)</Cheatline>", cheat.group(2) or "", re.S):
+            fields = {k: _xml_text(v).strip() for k, v in re.findall(r"<(\w+)>([^<]*)</\1>", line.group(1))}
+            write = {}
+            if "Offset" in fields:
+                write["offset"] = fields["Offset"]
+            if "ValueOn" in fields:
+                write["on"] = fields["ValueOn"].replace("-", "")
+            if "ValueOff" in fields:
+                write["off"] = fields["ValueOff"].replace("-", "")
+            if fields.get("Section", "0") != "0":
+                write["section"] = fields["Section"]
+            if re.search(r"<Absolute\b", line.group(1)):
+                write["absolute"] = True
+            memory.append(write)
+        mods.append({"name": _xml_text(dict(_XML_ATTRIBUTE.findall(cheat.group(1))).get("Text", "")), "memory": memory})
+    return {"name": trainer.get("Game", ""), "id": trainer.get("Cusa", ""), "version": trainer.get("Version", ""),
+            "process": trainer.get("Process", ""), "credits": [trainer.get("Moder", "")], "mods": mods}
+
+
+def _patch_writes(memory):
+    """A patch's writes as Kyty takes them; None when it could not place one of them."""
+    if not isinstance(memory, list) or not memory:
+        return None
+    writes = []
+    for w in memory:
+        if not isinstance(w, dict) or any(k in w for k in _PATCH_UNPLACED) or w.get("absolute") not in (None, False):
+            return None
+        offset, on, off = w.get("offset"), w.get("on"), w.get("off")
+        if not all(isinstance(v, str) for v in (offset, on, off)):
+            return None
+        if not _PATCH_OFFSET.match(offset) or not _PATCH_BYTES.match(on) or not _PATCH_BYTES.match(off) or len(on) != len(off):
+            return None
+        expected = w.get("expected")
+        if expected is not None and (not isinstance(expected, str) or expected.lower() != off.lower()):
+            return None
+        writes.append({"offset": offset, "on": on, "off": off})
+    return writes
+
+
+def _patch_document(doc, tid, version):
+    """The document cut down to what Kyty can apply to this game; ValueError says why there is nothing."""
+    if not isinstance(doc, dict) or str(doc.get("id", "")).upper() != tid.upper():
+        raise ValueError("made for another game")
+    if doc.get("version") != version:
+        raise ValueError("made for another version of the game")
+    if str(doc.get("process", "")).lower() != "eboot.bin" or "master" in doc:
+        raise ValueError("made in a way Kyty cannot apply")
+    mods, names = [], set()
+    for mod in doc.get("mods") if isinstance(doc.get("mods"), list) else []:
+        if not isinstance(mod, dict) or not isinstance(mod.get("name"), str) or "module_name" in mod:
+            continue
+        name = " ".join(mod["name"].split())
+        writes = _patch_writes(mod.get("memory"))
+        if not name or writes is None:
+            continue
+        # The switches go by name: a second patch of the same name gets a number.
+        unique, n = name, 2
+        while unique in names:
+            unique, n = f"{name} ({n})", n + 1
+        names.add(unique)
+        hint = mod.get("hint")
+        mods.append({"name": unique, "hint": " ".join(hint.split()) if isinstance(hint, str) else "", "memory": writes})
+    if not mods:
+        raise ValueError("nothing in it Kyty can apply")
+    credits = doc.get("credits") if isinstance(doc.get("credits"), list) else []
+    return {"name": str(doc.get("name") or ""), "id": tid, "version": version, "process": "eboot.bin",
+            "credits": [c.strip() for c in credits if isinstance(c, str) and c.strip()], "mods": mods}
+
+
+def _patch_file(tid):
+    return os.path.join(PATCHES_DIR, tid + ".json")
+
+
+def _patch_cached(name):
+    return os.path.join(PATCH_CACHE, name + ".json")
+
+
+def _patch_write(tid, doc, on):
+    """The file the wrapper gives Kyty: every patch of the document, the switched-on ones enabled.
+    No file while none is on."""
+    path = _patch_file(tid)
+    if doc is None or not any(m["name"] in on for m in doc["mods"]):
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    out = {**doc, "mods": [{**m, "enabled": m["name"] in on} for m in doc["mods"]]}
+    _mkdir_user(PATCHES_DIR)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=1, ensure_ascii=False)
+    os.replace(path + ".tmp", path)
+    os.lchown(path, *_ids())
+
+
+def _patch_entry(tid, entry):
+    s = _load()
+    if entry is None:
+        s.get("patches", {}).pop(tid, None)
+    else:
+        s.setdefault("patches", {})[tid] = entry
+    _save(s)
+
+
+def _patch_read(tid, version, again=False):
+    """The game's patch document (None without one) and what to show: state "ready", "none" (the
+    collection has none for this version; `others` are the versions it has) or "offline"."""
+    entry = _load().get("patches", {}).get(tid)
+    if entry and entry.get("version") != version:
+        # The game was replaced by another version: its old patches would stop it from starting.
+        _patch_write(tid, None, [])
+        _patch_entry(tid, None)
+        entry = None
+    cached = None
+    if entry:
+        try:
+            with open(_patch_cached(entry["file"]), encoding="utf-8") as f:
+                cached = json.load(f)
+        except (OSError, ValueError, KeyError):
+            cached = None
+    if cached and not again:
+        return cached, {"state": "ready"}
+    files, error = _patch_files(again)
+    if files is None:
+        return cached, {"state": "ready" if cached else "offline", "error": error}
+    mine = files.get(tid, [])
+    others = sorted({f["version"] for f in mine} - {version})
+    why = ""
+    # The collection's own format first: it has a description of each patch.
+    for f in sorted((f for f in mine if f["version"] == version), key=lambda f: (f["format"] != "json", f["name"])):
+        try:
+            data = _get_limited(PATCH_SOURCE + f["format"] + "/" + f["name"], 8 << 20)
+            doc = _patch_document(json.loads(data) if f["format"] == "json" else _patch_trainer(data), tid, version)
+        except _PATCH_DOWNLOAD as e:
+            return cached, {"state": "ready" if cached else "offline", "error": str(e) or type(e).__name__}
+        except ValueError as e:
+            why = f"{f['name']}: {e}"
+            decky.logger.info("patches of %s: %s", tid, why)
+            continue
+        os.makedirs(PATCH_CACHE, exist_ok=True)
+        with open(_patch_cached(f["name"]) + ".tmp", "w", encoding="utf-8") as out:
+            json.dump(doc, out, ensure_ascii=False)
+        os.replace(_patch_cached(f["name"]) + ".tmp", _patch_cached(f["name"]))
+        names = {m["name"] for m in doc["mods"]}
+        on = [n for n in (entry or {}).get("on", []) if n in names]
+        _patch_entry(tid, {"version": version, "file": f["name"], "count": len(doc["mods"]), "on": on})
+        _patch_write(tid, doc, on)
+        return doc, {"state": "ready"}
+    if entry:
+        _patch_write(tid, None, [])
+        _patch_entry(tid, None)
+    return None, {"state": "none", "others": others, "error": why}
+
+
 def _icon(path, tid):
     """The shortcut's icon file: the folder's own, or one taken out of the archive."""
     if not path.endswith(".zar"):
@@ -717,6 +952,7 @@ class Plugin:
             rows = _addons(g["title_id"], addcont.get(g["title_id"]))
             g["addons"] = len(rows)
             g["addons_on"] = sum(r["on"] for r in rows)
+            g["patches_on"] = len(s.get("patches", {}).get(g["title_id"], {}).get("on", []))
         # A game not looked at yet (new in the folder, or its executable changed) is looked at now.
         if any(addcont.get(g["title_id"], {}).get("key") != _addon_key(g["path"]) for g in games):
             asyncio.get_event_loop().create_task(self._look_for_addons())
@@ -981,12 +1217,17 @@ class Plugin:
         except ValueError:
             param = {}
         entry = s.get("addcont", {}).get(title_id)
+        patches = s.get("patches", {}).get(title_id, {})
         return {
             "title_id": title_id,
             "name": g["name"],
             "path": g["path"],
             "size": g["size"],
+            "appid": s.get("games", {}).get(title_id, {}).get("appid", 0),
             "version": param.get("contentVersion") or "",
+            # As last read from the collection (get_patches reads it again): how many there are and are on.
+            "patches": patches.get("count", 0),
+            "patches_on": len(patches.get("on", [])),
             "addons": _addons(title_id, entry),
             # False while the game's executable is still being read for the first time.
             "addons_known": bool(entry) and entry.get("key") == _addon_key(g["path"]),
@@ -1009,6 +1250,56 @@ class Plugin:
 
     async def find_addons(self, title_id):
         await self._look_for_addons(title_id)
+        return {"ok": True}
+
+    async def _version(self, title_id):
+        """The game's version as its param.json has it; None when the game is not in the folder."""
+        games = await asyncio.to_thread(_scan, _load().get("games_dir") or os.path.join(HOME, "Games"))
+        g = next((g for g in games if g["title_id"] == title_id), None)
+        if g is None:
+            return None
+        try:
+            return json.loads(_sce_sys(g["path"], "param.json") or b"").get("contentVersion") or ""
+        except ValueError:
+            return ""
+
+    async def get_patches(self, title_id, again=False):
+        version = await self._version(title_id)
+        if not version:
+            return {"state": "none", "version": "", "file": "", "credits": [], "mods": [], "others": [], "error": ""}
+        try:
+            doc, info = await asyncio.to_thread(_patch_read, title_id, version, again)
+        except OSError as e:
+            decky.logger.exception("patches of %s", title_id)
+            doc, info = None, {"state": "offline", "error": str(e)}
+        entry = _load().get("patches", {}).get(title_id, {})
+        on = set(entry.get("on", []))
+        return {
+            "others": [],
+            "error": "",
+            **info,
+            "version": version,
+            "file": entry.get("file", "") if doc else "",
+            "credits": doc["credits"] if doc else [],
+            "mods": [{"name": m["name"], "hint": m["hint"], "on": m["name"] in on} for m in doc["mods"]] if doc else [],
+        }
+
+    async def set_patch(self, title_id, name, on):
+        """Switches one patch; with no name and `on` false, all of them off."""
+        version = await self._version(title_id)
+        try:
+            doc, _ = await asyncio.to_thread(_patch_read, title_id, version or "")
+            entry = _load().get("patches", {}).get(title_id)
+            if doc is None or entry is None:
+                return {"ok": False, "log": "The patches of this game are not there any more"}
+            chosen = set(entry.get("on", [])) if name else set()
+            (chosen.add if on else chosen.discard)(name)
+            entry["on"] = [m["name"] for m in doc["mods"] if m["name"] in chosen]
+            _patch_entry(title_id, entry)
+            await asyncio.to_thread(_patch_write, title_id, doc, entry["on"])
+        except OSError as e:
+            decky.logger.exception("patches file")
+            return {"ok": False, "log": str(e)}
         return {"ok": True}
 
     # Artwork made once per game (the frontend composes it) and kept: a shortcut added again reuses it.

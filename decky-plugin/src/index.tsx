@@ -14,7 +14,10 @@ import {
   updatePlugin,
   usePlugin,
 } from "./api";
-import { GAME_PAGE, GamePage, PAGE_ROUTE, Page, openPage } from "./page";
+import { GamePage } from "./game";
+import { patchLibraryMenu } from "./menu";
+import { Page } from "./page";
+import { GAME_PAGE, PAGE_ROUTE, openPage } from "./routes";
 
 const confirm = (title: string, text: string, ok: string, action: () => void) =>
   showModal(<ConfirmModal strTitle={title} strDescription={text} strOKButtonText={ok} onOK={action} />);
@@ -198,6 +201,7 @@ export default definePlugin(() => {
   const timer = setInterval(auto, 10 * 60 * 1000);
   routerHook.addRoute(PAGE_ROUTE, Page, { exact: true });
   routerHook.addRoute(GAME_PAGE, GamePage, { exact: true });
+  const unpatchMenu = patchLibraryMenu();
   return {
     name: "KytyPS5-Native",
     titleView: <div className={staticClasses.Title}>KytyPS5-Native</div>,
@@ -205,6 +209,7 @@ export default definePlugin(() => {
     icon: <FaPlaystation />,
     onDismount() {
       clearInterval(timer);
+      unpatchMenu();
       routerHook.removeRoute(PAGE_ROUTE);
       routerHook.removeRoute(GAME_PAGE);
     },

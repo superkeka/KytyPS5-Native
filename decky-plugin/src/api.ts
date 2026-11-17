@@ -2,6 +2,7 @@
 // shortcut sync.
 import { callable, toaster } from "@decky/api";
 import { useEffect, useState } from "react";
+import { setMenuGames } from "./menu";
 import { ART_VERSION, Game, languageChanged, needsSync, syncAll } from "./shortcuts";
 
 export interface KernelItem {
@@ -61,13 +62,43 @@ export interface GameInfo {
   name: string;
   path: string;
   size: number;
+  // The game's Steam shortcut, 0 before it is made.
+  appid: number;
   version: string;
+  // As last read from the collection: how many patches the game has, and how many are on.
+  patches: number;
+  patches_on: number;
   addons: Addon[];
   addons_known: boolean;
   game_running: boolean;
 }
 
-export const getState = callable<[], State>("get_state");
+// A patch (a cheat) of a game: bytes of its code changed as it loads.
+export interface Patch {
+  name: string;
+  hint: string;
+  on: boolean;
+}
+
+// The patches the collection has for the game's version: "none" when it has none (`others` are the
+// versions it has some for), "offline" when it could not be reached and nothing was read before.
+export interface Patches {
+  state: "ready" | "none" | "offline";
+  version: string;
+  file: string;
+  credits: string[];
+  mods: Patch[];
+  others: string[];
+  error: string;
+}
+
+const readState = callable<[], State>("get_state");
+// Every read also tells the library's menu which shortcuts are the games'.
+export async function getState(): Promise<State> {
+  const s = await readState();
+  setMenuGames(s.games);
+  return s;
+}
 export const latestRelease = callable<[], Release>("latest_release");
 export const installKyty = callable<[url: string, tag: string], Result>("install_kyty");
 const installPlugin = callable<[url: string, tag: string], Result>("install_plugin");
@@ -81,6 +112,9 @@ const setArtVersion = callable<[version: number], void>("set_art_version");
 export const getGame = callable<[titleId: string], GameInfo | null>("get_game");
 export const setAddon = callable<[titleId: string, label: string, on: boolean], Result>("set_addon");
 export const findAddons = callable<[titleId: string], Result>("find_addons");
+export const getPatches = callable<[titleId: string, again: boolean], Patches>("get_patches");
+// With no name and `on` false: all of them off.
+export const setPatch = callable<[titleId: string, name: string, on: boolean], Result>("set_patch");
 
 export const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({ title, body });
 // Release tags without the project name: 2026-10-29-6957c86.
