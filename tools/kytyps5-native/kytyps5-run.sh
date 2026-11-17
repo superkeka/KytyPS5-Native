@@ -11,6 +11,8 @@
 # ~/.config/KytyPS5-Native/addcont/<title id> lists the game's add-ons (DLC and licences), a line each:
 # <label> or <label>=<folder with its data>; a # starts a comment. A game can wait for one of them
 # forever (Ghost of Yotei stays on a black loading screen without its two).
+# <game folder>/addcont: a folder of add-on packages (each with its sce_sys/param.json), passed as
+# --addcont-dir, the way the launcher's add-ons folder setting does.
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -44,6 +46,7 @@ if [ -f "$CONFIG/addcont/$TITLE" ]; then
 		[ -n "$line" ] && ADDCONT_ARGS+=(--addcont "$line")
 	done < "$CONFIG/addcont/$TITLE"
 fi
+[ -d "$GAME/addcont" ] && ADDCONT_ARGS+=(--addcont-dir "$GAME/addcont")
 # Patches switched on in the Decky plugin. Kyty stops a game given patches for another version of
 # it (the game was updated since): then they are left out.
 PATCH_ARGS=()
@@ -181,7 +184,7 @@ rm -f "$MARKER" "$VIDEO_FLAG"
 front "$GAME_APPID"
 {
 	echo "== $(date) $GAME"
-	[ ${#ADDCONT_ARGS[@]} -gt 0 ] && echo "add-ons from $CONFIG/addcont/$TITLE: ${ADDCONT_ARGS[*]}"
+	[ ${#ADDCONT_ARGS[@]} -gt 0 ] && echo "add-ons: ${ADDCONT_ARGS[*]}"
 	if [ ${#PATCH_ARGS[@]} -gt 0 ]; then
 		echo "patches from $PATCH"
 	elif [ -f "$PATCH" ]; then
