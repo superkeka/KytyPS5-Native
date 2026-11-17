@@ -238,7 +238,7 @@ struct Pm4TranslateStats {
 	// the GPU may hold another value than the copy).
 	uint32_t cp_shadow_dcc_gpu   = 0;
 	uint32_t cp_shadow_dcc_back  = 0; // and the DCC given back on the GPU (EmitCpShadowDccRestore)
-	uint32_t display_meta_fills  = 0; // display DCC metadata set to uncompressed after a dispatch (AddDisplayMetaRange)
+	uint32_t display_copies      = 0; // video-out buffers copied to their plain buffers at a flip (SetDisplayCopies)
 	// GPU waits run with shadowing off around them (SetCpShadowWaitOff): 6 dwords each, plus PFP_SYNC_ME where
 	// nothing else gave the ME wait one.
 	uint32_t cp_shadow_wait_wraps = 0;
@@ -878,6 +878,7 @@ struct Pm4TranslateResult {
 	std::vector<DrawRecord>       draw_log;       // SetDrawLog: every draw and dispatch
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
 	std::vector<LodBankScan>      lod_scans;      // SetLodBankScan: one per GET_LOD_STATS packet
+	std::vector<uint32_t>         display_copies; // SetDisplayCopies: the flips (their interrupt contexts) with a copy pass
 	struct UnmetWait {
 		uint64_t addr;
 		uint64_t ref;
@@ -991,6 +992,45 @@ public:
 		}
 		return value;
 	}
+	// A registered video-out buffer the presenter takes from a plain copy. The PS5's display engine scans the buffer
+	// out as the title left it, DCC and all; Kyty's presenter copies plain memory. So right before a flip of the
+	// buffer (the RELEASE_MEM that raises the flip's kernel interrupt context, in a DCB or an ACB), the queue runs a
+	// compute pass of the translator's own that loads every texel through a descriptor of the buffer (the texture
+	// unit decodes its DCC) and stores it through a descriptor of the plain buffer. The two descriptors, 8 dwords
+	// each, are at `table`; the source's DCC dwords come with the pass, from the registers the title last drew the
+	// buffer with (its CB_COLORn_DCC_BASE, DCC_CONTROL and ATTRIB3: the metadata a title registers with video-out may
+	// be another, for the display). The title's own memory is only read.
+	struct DisplayCopy {
+		uint64_t label     = 0; // the buffer's flip label
+		uint64_t source    = 0; // the video-out buffer
+		uint64_t size      = 0; // and its size, the plain buffer's too
+		uint64_t meta_size = 0; // of its DCC metadata; 0: the buffer is drawn without DCC, none is read
+		uint64_t plain     = 0; // the plain buffer
+		uint64_t table     = 0; // the two descriptors
+		uint32_t width     = 0;
+		uint32_t height    = 0;
+		// How the title last drew the buffer with DCC: the metadata's address and the source descriptor's dwords 6
+		// and 7. All 0 until it does.
+		uint64_t dcc       = 0;
+		uint32_t dcc6      = 0;
+		uint32_t dcc7      = 0;
+	};
+	// The registered copies, asked for at the start of each translation (they are registered on another thread):
+	// up to `max` of them into `out`.
+	using DisplayCopiesFn = size_t (*)(DisplayCopy* out, size_t max);
+	// The title has drawn the buffer at `source` with DCC, as DisplayCopy's last three fields say.
+	using DisplayDccFn = void (*)(uint64_t source, uint64_t dcc, uint32_t dcc6, uint32_t dcc7);
+	// The flip label of the video-out buffer a flip's kernel interrupt context was reserved for
+	// (sceVideoOutSubmitEopFlip), 0 when not known: a title may write the flip's RELEASE_MEM itself, into a label of
+	// its own.
+	using DisplayFlipSourceFn = uint64_t (*)(uint32_t ctx);
+	// `code_va`: the pass's code (displayCopy.s), 256-byte aligned; 0 leaves the copies out.
+	void SetDisplayCopies(uint64_t code_va, DisplayCopiesFn copies, DisplayDccFn dcc, DisplayFlipSourceFn flip_source) {
+		m_display_copy_shader = code_va;
+		m_display_copies_fn   = copies;
+		m_display_dcc_fn      = dcc;
+		m_display_flip_source = flip_source;
+	}
 	// The registered video-out buffers: color targets there are drawn without DCC (DCC_ENABLE cleared
 	// before each draw, the guest's value back once the slot points elsewhere). The PS5 display engine
 	// scans DCC out; Kyty's presenter copies the buffer as plain memory, so it has to hold plain pixels.
@@ -1002,21 +1042,6 @@ public:
 			}
 		}
 		m_display_ranges.emplace_back(addr, size);
-		return true;
-	}
-	// The DCC metadata of a video-out buffer drawn without DCC (AddDisplayRange). The title still fast-clears it
-	// (libSceAgc's DCC clear dispatch writes clear code 0x00) and samples the buffer through a T# with DCC on (GT7's
-	// replay depth of field, its intro fades), which then reads every block as the clear colour, whatever Kyty drew:
-	// black. After any dispatch that writes into such a range, the translator does what the clear meant on plain
-	// pixels: a zero fill pattern zeroes the buffer's pixels, then the metadata is set to 0xFF (uncompressed) so
-	// DCC-aware reads see the pixels. KYTY_NATIVE_GPU_DISPLAY_META_FILL=0 turns it off. False when already known.
-	bool AddDisplayMetaRange(uint64_t addr, uint64_t size, uint64_t color_addr = 0, uint64_t color_size = 0) {
-		for (const auto& m: m_display_meta) {
-			if (m.addr == addr && m.size == size) {
-				return false;
-			}
-		}
-		m_display_meta.push_back({addr, size, color_addr, color_size});
 		return true;
 	}
 	// Context register overrides the PS5 kernel applies through the CP's RCIU CAM (see PatchContext).
@@ -1366,15 +1391,10 @@ private:
 	std::set<uint32_t>           m_dropped_seen;
 	std::array<uint32_t, 4>      m_cu_clamp {};
 	std::vector<std::pair<uint64_t, uint64_t>> m_display_ranges; // AddDisplayRange
-	struct DisplayMeta {
-		uint64_t addr;       // DCC metadata
-		uint64_t size;
-		uint64_t color_addr; // the video-out buffer it describes (0: unknown)
-		uint64_t color_size;
-	};
-	std::vector<DisplayMeta> m_display_meta; // AddDisplayMetaRange
-	std::map<uint64_t, bool>      m_dcc_clear_cs;     // compute shader -> is libSceAgc's DCC clear (AddDisplayMetaRange)
-	std::set<std::pair<uint64_t, uint64_t>> m_meta_fill_logged; // (shader, metadata) pairs already logged
+	uint64_t                     m_display_copy_shader = 0;       // SetDisplayCopies
+	DisplayCopiesFn              m_display_copies_fn   = nullptr;
+	DisplayDccFn                 m_display_dcc_fn      = nullptr;
+	DisplayFlipSourceFn          m_display_flip_source = nullptr;
 	uint32_t                     m_display_dcc_off = 0;           // MRT slots drawn with DCC cleared
 	uint32_t                     m_display_dcc_gpu = 0;           // MRT slots whose CP INFO lost DCC on the GPU (EmitCpShadowDccOff)
 	uint32_t                     m_saved_display_dcc_gpu = 0;     // m_display_dcc_gpu at the GPU push

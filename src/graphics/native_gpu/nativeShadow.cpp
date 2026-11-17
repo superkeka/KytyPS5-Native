@@ -1294,6 +1294,25 @@ Host& HostCallbacks() {
 	return host;
 }
 
+#if KYTY_GEM_BACKING_SUPPORTED
+#include "graphics/native_gpu/displayCopyShader.inc"
+
+// A texture descriptor of a video-out buffer's layout at `base`, for the display copy: a 2D image of one level, the
+// channels as they lie in memory, no DCC (the pass gives the source its DCC dwords itself).
+void DisplayDescriptor(uint32_t* t, const NativeDisplaySurface& s, uint64_t base) {
+	const uint32_t w = s.width - 1u;
+	const uint32_t h = s.height - 1u;
+	t[0]             = static_cast<uint32_t>(base >> 8u);
+	t[1]             = static_cast<uint32_t>((base >> 40u) & 0xffu) | (s.format << 20u) | ((w & 3u) << 30u);
+	t[2]             = (w >> 2u) | (h << 14u);
+	t[3]             = 0xfacu | (s.tile_mode << 20u) | (9u << 28u);
+	t[4]             = 0;
+	t[5]             = 7u << 20u; // PERF_MOD
+	t[6]             = 0;
+	t[7]             = 0;
+}
+#endif
+
 // Shadow-mode state, built lazily on the first DCB so it sees the final env and the created GEM
 // backing. One instance for the process; submit_dcb is driven from the guest graphics thread, but
 // a mutex keeps it safe if that ever changes.
@@ -1800,6 +1819,7 @@ public:
 				m_refused++;
 				return false;
 			}
+			NoteDisplayCopies(result.display_copies);
 			m_cps_preambles += result.stats.cp_shadow_preambles;
 			m_cps_load_dw += result.stats.cp_shadow_load_dw;
 			m_cps_load_regs += result.stats.cp_shadow_load_regs;
@@ -2074,19 +2094,6 @@ public:
 		return true;
 	}
 
-	void AddDisplayMetaRange(uint64_t addr, uint64_t size, uint64_t color_addr, uint64_t color_size) {
-		std::lock_guard<std::mutex> lock(m_mutex);
-		if (m_agr_translator != nullptr) {
-			m_agr_translator->AddDisplayMetaRange(addr, size, color_addr, color_size);
-		}
-		m_acb_translator.AddDisplayMetaRange(addr, size, color_addr, color_size);
-		if (!m_translator.AddDisplayMetaRange(addr, size, color_addr, color_size)) {
-			return;
-		}
-		std::fprintf(stderr, "native shadow: video-out DCC metadata 0x%llx (%llu KiB) kept uncompressed after the title's clears\n",
-		             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size >> 10u));
-	}
-
 	void AddDisplayRange(uint64_t addr, uint64_t size) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (m_agr_translator != nullptr) {
@@ -2097,6 +2104,260 @@ public:
 		}
 		std::fprintf(stderr, "native shadow: video-out buffer 0x%llx (%llu MiB) drawn without DCC\n", static_cast<unsigned long long>(addr),
 		             static_cast<unsigned long long>(size >> 20u));
+	}
+
+	// ShadowAddDisplayCopy. The slots are written under the lock and read without it: the translators list them at
+	// the start of each translation (ListDisplayCopies; the ACB one on its own thread), the presenter asks at each
+	// flip (DisplayPlain). A slot's sequence number is odd while it is being written.
+	bool AddDisplayCopy(const NativeDisplaySurface& s) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		std::lock_guard<std::mutex> lock(m_mutex);
+		const auto* gem = m_gem != nullptr ? m_gem : LibKernel::Memory::GetGemBacking();
+		if (gem == nullptr || s.size == 0 || !gem->IsGpuWritable(s.plain) || !gem->IsGpuWritable(s.plain + s.size - 1u)) {
+			std::fprintf(stderr, "native shadow: video-out buffer 0x%llx gets no plain copy: 0x%llx is not mapped for the GPU\n",
+			             static_cast<unsigned long long>(s.address), static_cast<unsigned long long>(s.plain));
+			return false;
+		}
+		uint32_t index = kDisplayCopySlots;
+		for (uint32_t i = 0; i < kDisplayCopySlots; i++) {
+			const bool used = m_display_copies[i].source.load(std::memory_order_relaxed) != 0;
+			if (used && m_display_copies[i].surface.label == s.label) {
+				index = i;
+				break;
+			}
+			if (!used && index == kDisplayCopySlots) {
+				index = i;
+			}
+		}
+		if (index == kDisplayCopySlots) {
+			std::fprintf(stderr, "native shadow: video-out buffer 0x%llx gets no plain copy: no free slot\n",
+			             static_cast<unsigned long long>(s.address));
+			return false;
+		}
+		auto& slot = m_display_copies[index];
+		slot.seq.fetch_add(1, std::memory_order_acq_rel);
+		slot.source.store(0, std::memory_order_release);
+		slot.surface   = s;
+		slot.installed = false;
+		slot.resident.store(false, std::memory_order_relaxed);
+		slot.dcc.store(0, std::memory_order_relaxed);
+		slot.dcc67.store(0, std::memory_order_relaxed);
+		slot.plain.store(s.plain, std::memory_order_relaxed);
+		slot.label.store(s.label, std::memory_order_relaxed);
+		InstallDisplayCopyLocked(index);
+		slot.source.store(s.address, std::memory_order_release);
+		slot.seq.fetch_add(1, std::memory_order_acq_rel);
+		std::fprintf(stderr, "native shadow: video-out buffer 0x%llx (%ux%u, %llu MiB, format %u%s) is presented from its plain copy 0x%llx\n",
+		             static_cast<unsigned long long>(s.address), s.width, s.height, static_cast<unsigned long long>(s.size >> 20u), s.format,
+		             DisplayCopyMode() == 2 && s.metadata != 0 ? ", keeps its DCC" : "", static_cast<unsigned long long>(s.plain));
+		return true;
+#else
+		(void)s;
+		return false;
+#endif
+	}
+
+	void RemoveDisplayCopy(uint64_t label) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		for (auto& slot: m_display_copies) {
+			if (slot.source.load(std::memory_order_relaxed) != 0 && slot.surface.label == label) {
+				slot.seq.fetch_add(1, std::memory_order_acq_rel);
+				slot.source.store(0, std::memory_order_release);
+				slot.seq.fetch_add(1, std::memory_order_acq_rel);
+			}
+		}
+	}
+
+	// The pass's code, once, and slot `index`'s descriptors. Nothing before there is a submitter: Init installs
+	// what was registered by then.
+	void InstallDisplayCopyLocked(uint32_t index) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (m_submitter == nullptr) {
+			return;
+		}
+		if (!m_display_copy_code) {
+			auto* code = reinterpret_cast<volatile uint32_t*>(m_submitter->DisplayCopyCpu());
+			for (size_t i = 0; i < std::size(kDisplayCopyShader); i++) {
+				code[i] = kDisplayCopyShader[i];
+			}
+			m_display_copy_code = true;
+		}
+		auto&    slot  = m_display_copies[index];
+		uint32_t d[16] = {};
+		DisplayDescriptor(d, slot.surface, slot.surface.address);
+		DisplayDescriptor(d + 8, slot.surface, slot.surface.plain);
+		auto* to = reinterpret_cast<volatile uint32_t*>(m_submitter->DisplayCopyCpu() + kDisplayCopyTables + 64ull * index);
+		for (size_t i = 0; i < std::size(d); i++) {
+			to[i] = d[i];
+		}
+		slot.installed = true;
+#else
+		(void)index;
+#endif
+	}
+
+	// Init, once there is a submitter: the translators learn of the pass, and the buffers registered before get
+	// their descriptors.
+	void StartDisplayCopiesLocked() {
+#if KYTY_GEM_BACKING_SUPPORTED
+		if (DisplayCopyMode() == 0 || m_submitter == nullptr) {
+			return;
+		}
+		for (uint32_t i = 0; i < kDisplayCopySlots; i++) {
+			auto& slot = m_display_copies[i];
+			if (slot.source.load(std::memory_order_relaxed) != 0 && !slot.installed) {
+				slot.seq.fetch_add(1, std::memory_order_acq_rel);
+				InstallDisplayCopyLocked(i);
+				slot.seq.fetch_add(1, std::memory_order_acq_rel);
+			}
+		}
+		const auto list = [](Pm4Translator::DisplayCopy* out, size_t max) { return Shadow::Instance().ListDisplayCopies(out, max); };
+		const auto dcc  = [](uint64_t source, uint64_t at, uint32_t dcc6, uint32_t dcc7) {
+            Shadow::Instance().NoteDisplayDcc(source, at, dcc6, dcc7);
+        };
+		const auto flip = [](uint32_t ctx) { return Shadow::Instance().FlipSource(ctx); };
+		m_translator.SetDisplayCopies(m_submitter->DisplayCopyVa(), list, dcc, flip);
+		m_acb_translator.SetDisplayCopies(m_submitter->DisplayCopyVa(), list, dcc, flip);
+#endif
+	}
+
+	// Pm4Translator::DisplayCopiesFn, on a translating thread.
+	size_t ListDisplayCopies(Pm4Translator::DisplayCopy* out, size_t max) {
+		size_t n = 0;
+#if KYTY_GEM_BACKING_SUPPORTED
+		for (uint32_t i = 0; i < kDisplayCopySlots && n < max; i++) {
+			auto& slot = m_display_copies[i];
+			for (int tries = 0; tries < 4; tries++) {
+				const uint32_t seq = slot.seq.load(std::memory_order_acquire);
+				if ((seq & 1u) != 0 || slot.source.load(std::memory_order_acquire) == 0) {
+					break;
+				}
+				const NativeDisplaySurface s         = slot.surface;
+				const bool                 installed = slot.installed;
+				Pm4Translator::DisplayCopy c;
+				c.label     = s.label;
+				c.source    = s.address;
+				c.size      = s.size;
+				c.meta_size = DisplayCopyMode() == 2 && s.metadata != 0 ? s.metadata_size : 0;
+				c.plain     = s.plain;
+				c.table     = m_submitter->DisplayCopyVa() + kDisplayCopyTables + 64ull * i;
+				c.width     = s.width;
+				c.height    = s.height;
+				c.dcc       = slot.dcc.load(std::memory_order_relaxed);
+				c.dcc6      = static_cast<uint32_t>(slot.dcc67.load(std::memory_order_relaxed));
+				c.dcc7      = static_cast<uint32_t>(slot.dcc67.load(std::memory_order_relaxed) >> 32u);
+				if (slot.seq.load(std::memory_order_acquire) == seq) {
+					if (installed) {
+						out[n++] = c;
+					}
+					break;
+				}
+			}
+		}
+#else
+		(void)out;
+		(void)max;
+#endif
+		return n;
+	}
+
+	// Pm4Translator::DisplayDccFn: the DCB translator saw the title draw the buffer with DCC.
+	void NoteDisplayDcc(uint64_t source, uint64_t dcc, uint32_t dcc6, uint32_t dcc7) {
+		for (auto& slot: m_display_copies) {
+			if (slot.source.load(std::memory_order_acquire) == source) {
+				slot.dcc67.store(dcc6 | (static_cast<uint64_t>(dcc7) << 32u), std::memory_order_relaxed);
+				slot.dcc.store(dcc, std::memory_order_release);
+			}
+		}
+	}
+
+	// A translated buffer that is going to the GPU carries the copy passes of these flips.
+	void NoteDisplayCopies(const std::vector<uint32_t>& flips) {
+		for (const uint32_t ctx: flips) {
+			m_flip_copied[ctx & 0xffu].store(ctx, std::memory_order_release);
+		}
+	}
+
+	// ShadowNoteFlipContext: the flip requests are few at a time, and their contexts differ in the low byte.
+	void NoteFlipContext(uint32_t ctx, uint64_t source) {
+		m_flip_copied[ctx & 0xffu].store(0, std::memory_order_relaxed);
+		m_flip_sources[ctx & 0xffu].store(source, std::memory_order_release);
+	}
+	[[nodiscard]] uint64_t FlipSource(uint32_t ctx) const { return m_flip_sources[ctx & 0xffu].load(std::memory_order_acquire); }
+
+	[[nodiscard]] bool HasDisplayCopy(uint64_t address) const {
+		return std::any_of(m_display_copies.begin(), m_display_copies.end(),
+		                   [address](const DisplayCopySlot& slot) { return slot.source.load(std::memory_order_acquire) == address; });
+	}
+
+	// ShadowDisplayPlain. The flip's command buffer carried the copy pass (`ctx`), or the pass runs now as a job of
+	// its own: a flip submitted from the CPU has no packet to put it in front of.
+	bool DisplayPlain(uint64_t label, uint32_t ctx, uint64_t* plain) {
+		for (uint32_t i = 0; i < kDisplayCopySlots; i++) {
+			auto& slot = m_display_copies[i];
+			if (slot.source.load(std::memory_order_acquire) == 0 || slot.label.load(std::memory_order_acquire) != label) {
+				continue;
+			}
+			*plain = slot.plain.load(std::memory_order_relaxed);
+			if (ctx != 0 && m_flip_copied[ctx & 0xffu].exchange(0, std::memory_order_acq_rel) == ctx) {
+				return true;
+			}
+			if (CopyDisplayNow(i)) {
+				return true;
+			}
+			if (!slot.warned.exchange(true, std::memory_order_relaxed)) {
+				std::fprintf(stderr, "native shadow: a video-out buffer (label 0x%llx) could not be copied for a flip: presented as it is\n",
+				             static_cast<unsigned long long>(label));
+			}
+			return false;
+		}
+		return false;
+	}
+
+	bool CopyDisplayNow(uint32_t index) {
+#if KYTY_GEM_BACKING_SUPPORTED
+		auto& slot = m_display_copies[index];
+		if (m_submitter == nullptr || m_gem == nullptr || !slot.installed) {
+			return false;
+		}
+		const NativeDisplaySurface s = slot.surface;
+		// The plain buffer's blocks are made resident once, as a flipped buffer's are.
+		if (!slot.resident.exchange(true, std::memory_order_acq_rel)) {
+			KeepResident(s.plain, s.size);
+		}
+		std::lock_guard<std::mutex> lock(m_display_copy_mutex);
+		const uint64_t              code  = m_submitter->DisplayCopyVa();
+		const uint64_t              table = code + kDisplayCopyTables + 64ull * index;
+		const uint64_t              dcc67 = DisplayCopyMode() == 2 && s.metadata != 0 ? slot.dcc67.load(std::memory_order_acquire) : 0;
+		// As the pass in a command buffer (Pm4Translator), with the compute state a ring of amdgpu's may not hold.
+		std::vector<uint32_t> ib;
+		auto                  set = [&](uint32_t off, std::initializer_list<uint32_t> v) {
+            ib.push_back((3u << 30u) | (static_cast<uint32_t>(v.size()) << 16u) | (0x76u << 8u) | 2u); // SET_SH_REG, compute
+            ib.push_back(off);
+            ib.insert(ib.end(), v.begin(), v.end());
+        };
+		set(0x20Cu, {static_cast<uint32_t>(code >> 8u), static_cast<uint32_t>(code >> 40u)});
+		set(0x212u, {1u | (3u << 6u) | (0xc0u << 12u) | (1u << 21u) | (1u << 30u), (4u << 1u) | (1u << 7u) | (1u << 8u) | (1u << 11u)});
+		set(0x228u, {0u});
+		set(0x204u, {0u, 0u, 0u, 8u, 8u, 1u});
+		set(0x215u, {0u, 0xffffffffu, 0xffffffffu, 0u, 0xffffffffu, 0xffffffffu});
+		set(0x240u, {static_cast<uint32_t>(table), static_cast<uint32_t>(table >> 32u), static_cast<uint32_t>(dcc67),
+		             static_cast<uint32_t>(dcc67 >> 32u)});
+		ib.push_back((3u << 30u) | (3u << 16u) | (0x15u << 8u) | 2u); // DISPATCH_DIRECT, compute
+		ib.insert(ib.end(), {(s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u, 1u | (1u << 2u) | (1u << 6u)});
+		while ((ib.size() & 7u) != 0) {
+			ib.push_back(0xffff1000u);
+		}
+		const bool ok = m_submitter->RunDisplayCopy(ib, m_gem->CreatedHandles(), 1.0);
+		if (ok && !slot.said.exchange(true, std::memory_order_relaxed)) {
+			std::fprintf(stderr, "native shadow: video-out buffer 0x%llx is copied by a job of its own at each flip (the title flips from the CPU)\n",
+			             static_cast<unsigned long long>(s.address));
+		}
+		return ok;
+#else
+		(void)index;
+		return false;
+#endif
 	}
 
 	// Display buffers are written by the GPU (often by compute through a descriptor the translator
@@ -5937,15 +6198,8 @@ private:
 			m_acb_translator.SetFenceAddress(m_submitter->ScratchVa() + 1032);
 			std::fprintf(stderr, "native shadow: guest waits become GPU barriers\n");
 		}
-		// KYTY_NATIVE_GPU_DISPLAY_META_FILL (on unless 0): the translator reads compute shader code (the DCC clear's signature);
-		// shader code in GPU-resident blocks is read through the GEM alias.
-		if (const char* mf = std::getenv("KYTY_NATIVE_GPU_DISPLAY_META_FILL"); (mf == nullptr || mf[0] != '0') && m_gem != nullptr) {
-			auto read = [](uint64_t a, uint32_t* dst, size_t dwords, void* user) -> size_t {
-				return static_cast<size_t>(static_cast<GemBacking*>(user)->ReadGuest(a, dst, dwords * 4u) / 4u);
-			};
-			m_translator.SetLodGuestRead(read, m_gem);
-			m_acb_translator.SetLodGuestRead(read, m_gem);
-		}
+		// Video-out buffers presented from plain copies (ShadowAddDisplayCopy).
+		StartDisplayCopiesLocked();
 		// KYTY_NATIVE_GPU_FIND=0xADDR:0xSIZE: log the draws/dispatches whose resources reach that range.
 		if (const char* find = std::getenv("KYTY_NATIVE_GPU_FIND"); find != nullptr) {
 			char*          end  = nullptr;
@@ -6647,6 +6901,30 @@ private:
 	std::atomic<bool> m_started {false}; // Init has run (m_initialized, readable without m_mutex): NotGivenUp
 	unsigned long m_waits_logged     = 0;
 	std::set<uint64_t> m_flipped; // display buffers already made resident
+	// AddDisplayCopy: the video-out buffers presented from plain copies. Slot i's two descriptors are at
+	// DisplayCopyVa() + kDisplayCopyTables + 64 * i, after the pass's code.
+	struct DisplayCopySlot {
+		std::atomic<uint32_t> seq {0};          // odd while the fields below are being written
+		NativeDisplaySurface  surface {};
+		bool                  installed = false; // its descriptors are in place
+		std::atomic<uint64_t> source {0};        // the registered buffer; 0 while the slot is free
+		std::atomic<uint64_t> plain {0};
+		std::atomic<uint64_t> label {0};         // the buffer's flip label: one registration of a buffer, of several
+		std::atomic<bool>     warned {false};
+		std::atomic<bool>     said {false};
+		std::atomic<bool>     resident {false}; // the plain buffer has been made resident for a job of the copy's own
+		// How the title draws the buffer with DCC (Pm4Translator::DisplayCopy): the metadata's address, and the source
+		// descriptor's dwords 6 (low) and 7.
+		std::atomic<uint64_t> dcc {0};
+		std::atomic<uint64_t> dcc67 {0};
+	};
+	static constexpr uint32_t                      kDisplayCopySlots  = 32;
+	static constexpr uint32_t                      kDisplayCopyTables = 256;
+	std::array<DisplayCopySlot, kDisplayCopySlots> m_display_copies;
+	bool                                           m_display_copy_code = false; // the pass's code is in place
+	std::array<std::atomic<uint64_t>, 256>         m_flip_sources {};           // NoteFlipContext
+	std::array<std::atomic<uint32_t>, 256>         m_flip_copied {};            // NoteDisplayCopies: the flips with a pass
+	std::mutex                                     m_display_copy_mutex;        // CopyDisplayNow, one job at a time
 	double        m_busy_s      = 0.0;
 	double        m_wait_lock_s = 0.0;
 	double        m_present_s   = 0.0;
@@ -8707,19 +8985,52 @@ bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufP
 	return on && PrimaryRendering() && Shadow::Instance().DmabufPieces(vaddr, size, out);
 }
 
-void ShadowDisplayMetaUncompressed(uint64_t addr, uint64_t size, uint64_t color_addr, uint64_t color_size) {
-	if (addr != 0 && size != 0) {
-		Shadow::Instance().AddDisplayMetaRange(addr, size, color_addr, color_size);
-	}
-}
-
 bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size) {
 	static const bool on = EnvOn("KYTY_NATIVE_GPU_GEM") && EnvOn("KYTY_NATIVE_GPU_PRIMARY") && !EnvOn("KYTY_NATIVE_GPU_DISPLAY_DCC");
 	if (!on) {
 		return false;
 	}
+	// The title keeps the buffer's DCC and the presenter takes its plain copy (ShadowAddDisplayCopy).
+	if (DisplayCopyMode() == 2 && Shadow::Instance().HasDisplayCopy(addr)) {
+		return true;
+	}
 	Shadow::Instance().AddDisplayRange(addr, size);
 	return true;
+}
+
+int DisplayCopyMode() {
+	static const int mode = [] {
+		if (!EnvOn("KYTY_NATIVE_GPU_GEM") || !EnvOn("KYTY_NATIVE_GPU_PRIMARY")) {
+			return 0;
+		}
+		// A direct scan-out shows the title's buffer itself, which then has to hold plain pixels.
+		if (const char* direct = std::getenv("KYTY_DIRECT_PRESENT"); direct != nullptr && direct[0] == '1') {
+			return 0;
+		}
+		const char* e = std::getenv("KYTY_NATIVE_GPU_DISPLAY_COPY");
+		return e != nullptr && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : 2;
+	}();
+	return mode;
+}
+
+bool ShadowAddDisplayCopy(const NativeDisplaySurface& surface) {
+	return DisplayCopyMode() != 0 && Shadow::Instance().AddDisplayCopy(surface);
+}
+
+void ShadowRemoveDisplayCopy(uint64_t label) {
+	if (DisplayCopyMode() != 0) {
+		Shadow::Instance().RemoveDisplayCopy(label);
+	}
+}
+
+void ShadowNoteFlipContext(uint32_t ctx, uint64_t label) {
+	if (DisplayCopyMode() != 0) {
+		Shadow::Instance().NoteFlipContext(ctx, label);
+	}
+}
+
+bool ShadowDisplayPlain(uint64_t label, uint32_t ctx, uint64_t* plain) {
+	return DisplayCopyMode() != 0 && Shadow::Instance().DisplayPlain(label, ctx, plain);
 }
 
 bool DirectPresentWanted() {

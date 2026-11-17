@@ -85,11 +85,44 @@ struct NativeDmabufPiece {
 bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out);
 
 // A video-out buffer registered with DCC: in native primary mode (KYTY_NATIVE_GPU_GEM and
-// KYTY_NATIVE_GPU_PRIMARY, unless KYTY_NATIVE_GPU_DISPLAY_DCC=1) the translator draws it without DCC,
-// so the presenter can take it as uncompressed; true then.
+// KYTY_NATIVE_GPU_PRIMARY, unless KYTY_NATIVE_GPU_DISPLAY_DCC=1) the presenter takes it as uncompressed; true then.
+// The buffer has a plain copy for that (ShadowAddDisplayCopy), or else the translator draws it without DCC.
 bool ShadowDisplayWithoutDcc(uint64_t addr, uint64_t size);
-// The DCC metadata of such a buffer: kept uncompressed after the title's clears (Pm4Translator::AddDisplayMetaRange).
-void ShadowDisplayMetaUncompressed(uint64_t addr, uint64_t size, uint64_t color_addr, uint64_t color_size);
+
+// A video-out buffer the presenter takes from a plain copy (DisplayCopyMode). The PS5's display engine
+// scans a buffer out as the title left it, DCC and all, while Kyty's presenter copies plain memory. So the title's
+// buffer stays as on the PS5 (drawn and read with its DCC), and for each of its flips a compute pass copies it,
+// through the texture unit, into `plain`: a buffer of the same size and layout that holds plain pixels. The pass reads the buffer's DCC as the title's draws wrote it, which need not be the metadata registered
+// here. The title's memory is only read.
+struct NativeDisplaySurface {
+	uint64_t address       = 0; // the registered buffer
+	uint64_t size          = 0;
+	uint64_t metadata      = 0; // the DCC metadata it is registered with; 0 for a buffer registered without
+	uint64_t metadata_size = 0;
+	uint64_t plain         = 0; // guest memory the pass fills: `size` bytes, 64 KiB aligned
+	uint64_t label         = 0; // the buffer's flip label (sceVideoOutGetBufferLabelAddress)
+	uint32_t width         = 0;
+	uint32_t height        = 0;
+	uint32_t format        = 0; // texture descriptor format
+	uint32_t tile_mode     = 0; // texture descriptor tile mode
+};
+// How video-out buffers reach the presenter in native primary mode with GEM backing (0 outside it, and with direct
+// scan-out, which shows the title's buffer itself). 2, the default: buffers registered with DCC keep it and are
+// copied; the others are taken as they are. KYTY_NATIVE_GPU_DISPLAY_COPY=0: no copies, video-out buffers are drawn
+// without DCC (ShadowDisplayWithoutDcc). =1: every buffer is copied, still drawn without DCC (the pass on its own).
+int DisplayCopyMode();
+// sceVideoOutRegisterBuffers2, before the buffer's first ImageInfo. False when the copy cannot be made (no GEM
+// backing, `plain` not mapped for the GPU, no free slot): the buffer is then presented as without this.
+bool ShadowAddDisplayCopy(const NativeDisplaySurface& surface);
+void ShadowRemoveDisplayCopy(uint64_t label);
+// sceVideoOutSubmitEopFlip: the flip with interrupt context `ctx` shows the video-out buffer with flip label `label`
+// (a title may register one buffer under several indices, with different formats: the label tells them apart). The
+// copy pass goes before the RELEASE_MEM that raises that context, whatever label it writes.
+void ShadowNoteFlipContext(uint32_t ctx, uint64_t label);
+// A flip of the video-out buffer with flip label `label`, whose request has interrupt context `ctx`: true, with the
+// plain buffer to present. The flip's command buffer carried the copy pass, or (a flip submitted from the CPU has no
+// packet to put it in front of) the pass runs now as a job of its own and is waited for.
+bool ShadowDisplayPlain(uint64_t label, uint32_t ctx, uint64_t* plain);
 
 // Direct scan-out flips (KYTY_DIRECT_PRESENT=1; off unless set, for now). On the PS5 a flip does no GPU
 // work: the title's release has written the frame, and the kernel queues the buffer itself to the display

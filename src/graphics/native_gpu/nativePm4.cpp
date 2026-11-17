@@ -3754,7 +3754,54 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	// Color targets in a video-out buffer are drawn without DCC (AddDisplayRange). The shadow holds
 	// the value sent, so preambles agree; a slot that moves elsewhere gets the guest's value back.
+	// SetDisplayCopies: this translation's view of the video-out buffers presented from plain copies.
+	std::array<DisplayCopy, 32> display_copy_list;
+	const std::span<DisplayCopy> display_copies(
+	    display_copy_list.data(), m_display_copy_shader != 0 && m_display_copies_fn != nullptr
+	                                  ? m_display_copies_fn(display_copy_list.data(), display_copy_list.size())
+	                                  : 0);
 	auto fix_display_dcc = [&]() {
+		// SetDisplayCopies: how the title draws a copied buffer with DCC. The copy's pass reads the buffer the same way:
+		// the metadata at CB_COLORn_DCC_BASE, block sizes of DCC_CONTROL, pipe alignment of ATTRIB3.
+		for (uint32_t i = 0; i < 8 && !display_copies.empty(); i++) {
+			const uint32_t step = i * kCbColorStride;
+			const uint32_t info = reg(cx, kCbColor0Info + step);
+			if ((info & kCbDccEnable) == 0) {
+				continue;
+			}
+			const uint64_t addr = (static_cast<uint64_t>(reg(cx, kCbColor0Base + step)) << 8u) |
+			                      (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt + i) & 0xffu) << 40u);
+			const auto copy = std::find_if(display_copies.begin(), display_copies.end(),
+			                               [&](const DisplayCopy& c) { return c.source == addr && c.meta_size != 0; });
+			const uint64_t dcc = (static_cast<uint64_t>(reg(cx, kCbColor0DccBase + step)) << 8u) |
+			                     (static_cast<uint64_t>(reg(cx, kCbColor0DccExt + i) & 0xffu) << 40u);
+			if (addr == 0 || dcc == 0 || copy == display_copies.end()) {
+				continue;
+			}
+			const uint32_t attrib3 = reg(cx, kCbColor0Attrib3 + i);
+			const uint32_t control = reg(cx, kCbColor0Info + 2u + step); // CB_COLORn_DCC_CONTROL
+			// ALPHA_IS_ON_MSB: by the format (2_10_10_10 has it low) and, for the others, the component order.
+			const uint32_t format    = (info >> 2u) & 0x1fu;
+			const uint32_t swap      = (info >> 11u) & 0x3u;
+			const bool     alpha_msb = format == 9u || (format != 8u && swap <= 1u);
+			// MAX_UNCOMPRESSED_BLOCK_SIZE, MAX_COMPRESSED_BLOCK_SIZE, META_PIPE_ALIGNED, COMPRESSION_EN, ALPHA_IS_ON_MSB,
+			// then the metadata's address.
+			const uint32_t dcc6 = (((control >> 2u) & 3u) << 15u) | (((control >> 5u) & 3u) << 17u) | (((attrib3 >> 30u) & 1u) << 19u) |
+			                      (1u << 21u) | (alpha_msb ? 1u << 22u : 0u) | (static_cast<uint32_t>((dcc >> 8u) & 0xffu) << 24u);
+			const uint32_t dcc7 = static_cast<uint32_t>(dcc >> 16u);
+			if (copy->dcc != dcc || copy->dcc6 != dcc6 || copy->dcc7 != dcc7) {
+				copy->dcc  = dcc;
+				copy->dcc6 = dcc6;
+				copy->dcc7 = dcc7;
+				if (m_display_dcc_fn != nullptr) {
+					m_display_dcc_fn(addr, dcc, dcc6, dcc7);
+				}
+				std::fprintf(stderr,
+				             "native shadow: video-out buffer 0x%llx is drawn with DCC at 0x%llx (INFO %08x, ATTRIB3 %08x, DCC_CONTROL %08x): its "
+				             "copy reads it so\n",
+				             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(dcc), info, attrib3, control);
+			}
+		}
 		if (m_display_ranges.empty()) {
 			return;
 		}
@@ -3767,19 +3814,6 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			const bool display = addr != 0 && std::any_of(m_display_ranges.begin(), m_display_ranges.end(), [&](const auto& d) {
 				return addr >= d.first && addr < d.first + d.second;
 			});
-			// The title's own DCC metadata for this video-out target (CB_COLORn_DCC_BASE): it fast-clears it and samples the
-			// buffer through it, so it is kept uncompressed too (AddDisplayMetaRange), the size of the buffer's own metadata.
-			if (display && (info & kCbDccEnable) != 0 && !m_display_meta.empty()) {
-				const uint64_t dcc = (static_cast<uint64_t>(reg(cx, kCbColor0DccBase + step)) << 8u) |
-				                     (static_cast<uint64_t>(reg(cx, kCbColor0DccExt + i) & 0xffu) << 40u);
-				const auto range = std::find_if(m_display_ranges.begin(), m_display_ranges.end(), [&](const auto& d) {
-					return addr >= d.first && addr < d.first + d.second;
-				});
-				if (dcc != 0 && AddDisplayMetaRange(dcc, m_display_meta.front().size, range->first, range->second)) {
-					std::fprintf(stderr, "native shadow: video-out target 0x%llx: its DCC metadata 0x%llx kept uncompressed too\n",
-					             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(dcc));
-				}
-			}
 			// Load mode, an INFO the copy took from a verbatim table: the CP may hold another (it reads the table when it
 			// runs it), so the GPU clears DCC in its own (EmitCpShadowDccOff), once until the slot's INFO or BASE change, and
 			// gives it back when the slot leaves the video-out buffer with that INFO. The copy's INFO would replace the CP's,
@@ -4671,6 +4705,67 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		emit_barrier(pfp);
 		return std::nullopt;
 	};
+	// SetDisplayCopies: the pass that fills the plain copy of the video-out buffer a flip shows: the buffer (by its
+	// flip label) the flip's interrupt context was reserved for, or the one whose label this release writes.
+	auto emit_display_copy = [&](uint64_t label, uint32_t ctx) {
+		// A title registers one buffer under several indices, with different formats: the flip's own index decides.
+		const uint64_t reserved = m_display_flip_source != nullptr ? m_display_flip_source(ctx) : 0;
+		const uint64_t wanted   = reserved != 0 ? reserved : label;
+		const auto     copy     =
+		    std::find_if(display_copies.begin(), display_copies.end(), [&](const DisplayCopy& c) { return c.label == wanted; });
+		if (copy == display_copies.end()) {
+			NoteOnce(46, "a flip of a buffer without a plain copy");
+			return;
+		}
+		if (cond.active || (!m_compute_ring && m_fence_va == 0)) {
+			NoteOnce(48, "a flip inside a COND_EXEC range or without a barrier: the buffer's plain copy is not filled");
+			return;
+		}
+		// On the gfx ring the title's draws into the buffer, and their DCC, leave the color caches before the texture
+		// unit reads them: FLUSH_AND_INV_CB_META, then the barrier (CACHE_FLUSH_AND_INV_TS at the end of the pipe,
+		// waited for). A flip from a compute queue comes after the frame's graphics work by the title's own waits.
+		if (!m_compute_ring) {
+			body.push_back(Pkt3(IT_EVENT_WRITE, 1, false));
+			body.push_back(0x2eu);
+			emit_barrier(true);
+		}
+		auto set = [&](uint32_t off, std::initializer_list<uint32_t> v) {
+			body.push_back(Pkt3(IT_SET_SH_REG, 1u + static_cast<uint32_t>(v.size()), true));
+			body.push_back(off);
+			body.insert(body.end(), v.begin(), v.end());
+		};
+		set(0x20Cu, {static_cast<uint32_t>(m_display_copy_shader >> 8u), static_cast<uint32_t>(m_display_copy_shader >> 40u)}); // PGM_LO/HI
+		// RSRC1: 8 VGPRs, 32 SGPRs, denorms, DX10_CLAMP, MEM_ORDERED. RSRC2: four user SGPRs (the descriptors, the
+		// source's DCC dwords), then the group's x and y; the thread's x and y in v0 and v1.
+		set(0x212u, {1u | (3u << 6u) | (0xc0u << 12u) | (1u << 21u) | (1u << 30u), (4u << 1u) | (1u << 7u) | (1u << 8u) | (1u << 11u)});
+		set(0x204u, {0u, 0u, 0u, 8u, 8u, 1u}); // START_X..Z, NUM_THREAD_X..Z
+		set(0x240u, {static_cast<uint32_t>(copy->table), static_cast<uint32_t>(copy->table >> 32u), copy->dcc6, copy->dcc7}); // USER_DATA_0..3
+		body.push_back(Pkt3(IT_DISPATCH_DIRECT, 4, true));
+		// COMPUTE_SHADER_EN, FORCE_START_AT_0, ORDER_MODE.
+		body.insert(body.end(), {(copy->width + 7u) / 8u, (copy->height + 7u) / 8u, 1u, 1u | (1u << 2u) | (1u << 6u)});
+		// On the gfx ring, CS_PARTIAL_FLUSH: the stores are done before the release's write-back and the flip it raises.
+		// A compute queue's release comes at the end of the shaders before it (CS_DONE).
+		if (!m_compute_ring) {
+			body.push_back(Pkt3(IT_EVENT_WRITE, 1, false));
+			body.push_back(0x7u | (4u << 8u));
+		}
+		// The title's compute registers again, those it has written.
+		for (const uint32_t off:
+		     {0x20Cu, 0x20Du, 0x212u, 0x213u, 0x204u, 0x205u, 0x206u, 0x207u, 0x208u, 0x209u, 0x240u, 0x241u, 0x242u, 0x243u}) {
+			if (sh.count(off) != 0) {
+				EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, reg(sh, off)), true);
+			}
+		}
+		add_ref(copy->source, copy->size, false);
+		if (copy->dcc != 0) {
+			add_ref(copy->dcc, copy->meta_size, false);
+		}
+		add_ref(copy->plain, copy->size, false);
+		r.display_copies.push_back(ctx);
+		stats.display_copies++;
+		seg_effects = true;
+		NoteOnce(45, "video-out buffer copied to its plain buffer before a flip");
+	};
 	while (dw < dcb.size()) {
 		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
@@ -4679,6 +4774,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (cs_guards && body.size() - guard_from > 3000u) {
 			body_guards.push_back(EmitComputeExitGuard(body, m_exit_run_va));
 			guard_from = body.size();
+		}
+		// SetDisplayCopies: a flip of a registered video-out buffer comes next (libSceAgc's RELEASE_MEM into the buffer's
+		// label with a kernel interrupt context, bit 27). Its plain copy is filled first, in packets of their own.
+		if (!display_copies.empty() && (dcb[dw] >> 30u) == 3u && ((dcb[dw] >> 8u) & 0xffu) == IT_RELEASE_MEM && ((dcb[dw] >> 16u) & 0x3fffu) >= 6u && dw + 8u <= dcb.size() &&
+		    (dcb[dw + 7u] & (1u << 27u)) != 0) {
+			emit_display_copy(static_cast<uint64_t>(dcb[dw + 3u]) | (static_cast<uint64_t>(dcb[dw + 4u]) << 32u), dcb[dw + 7u] & 0x0fffffffu);
 		}
 		const size_t   body_before = body.size();
 		const size_t   segs_before = segs.size();
@@ -6292,81 +6393,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					}
 					r.inspected.push_back(snap);
 				}
-				{
-					// AddDisplayMetaRange: libSceAgc's DCC clear writing a display buffer's DCC metadata (the V# in
-					// COMPUTE_USER_DATA_0/1) is followed by fills that keep the metadata uncompressed (0xFF).
-					static const bool meta_fill = [] {
-						const char* e = std::getenv("KYTY_NATIVE_GPU_DISPLAY_META_FILL");
-						return e == nullptr || e[0] != '0';
-					}();
-					const DisplayMeta* hit = nullptr;
-					if (meta_fill && !m_display_meta.empty()) {
-						const uint64_t vbase = static_cast<uint64_t>(reg(sh, 0x240u)) | (static_cast<uint64_t>(reg(sh, 0x241u) & 0xffffu) << 32u);
-						const uint64_t cs    = (static_cast<uint64_t>(reg(sh, 0x20Cu)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20Du) & 0xffu) << 40u);
-						// libSceAgc's DCC clear: s_inst_prefetch, v_lshl_add_u32 v4, s9, 6, v0, v_mov v0-v3 <- s4-s7 (the fill
-						// pattern), v_cmpx_gt_u32 s8, v4, ..., buffer_store_format_x through the V# in s0-s3.
-						auto is_clear = [&]() {
-							if (const auto it = m_dcc_clear_cs.find(cs); it != m_dcc_clear_cs.end()) {
-								return it->second;
-							}
-							static constexpr uint32_t kSig[12] = {0xbfa00001u, 0xd7460004u, 0x04010c09u, 0x7e000204u, 0x7e020205u, 0x7e040206u,
-							                                      0x7e060207u, 0x7da80808u, 0xbf88000du, 0x360a0883u, 0xbe84047eu, 0xbe86047eu};
-							uint32_t   code[12] = {};
-							const bool match    = cs != 0 && read_safe(cs, code, 12) == 12 && std::equal(std::begin(kSig), std::end(kSig), code);
-							m_dcc_clear_cs[cs]  = match;
-							return match;
-						};
-						for (const auto& m: m_display_meta) {
-							if (vbase < m.addr || vbase >= m.addr + m.size) {
-								continue;
-							}
-							const bool clear = is_clear();
-							if (m_meta_fill_logged.insert({cs, m.addr}).second) {
-								std::fprintf(stderr, "native shadow: dispatch cs 0x%llx writes video-out DCC metadata 0x%llx (V# 0x%llx, ud4-7 %08x %08x %08x %08x, %s ring): %s\n",
-								             static_cast<unsigned long long>(cs), static_cast<unsigned long long>(m.addr), static_cast<unsigned long long>(vbase),
-								             reg(sh, 0x244u), reg(sh, 0x245u), reg(sh, 0x246u), reg(sh, 0x247u), m_compute_ring ? "compute" : "gfx",
-								             clear ? "libSceAgc DCC clear, kept uncompressed" : "not the DCC clear, left alone");
-							}
-							hit = clear ? &m : nullptr;
-							break;
-						}
-					}
-					if (m_compute_ring) {
-						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-						body[body.size() - size] |= 2u;
-					} else if (hit != nullptr) {
-						// Copied, not run in place: packets of ours follow it (a packet run in place has nothing of ours around it).
-						body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
-					} else {
-						pass_on(dw, size, body_before, segs_before, in_place);
-					}
-					if (hit != nullptr) {
-						// CS_PARTIAL_FLUSH: the clear's stores have landed in L2 before the CP's fills.
-						body.push_back(Pkt3(IT_EVENT_WRITE, 1, m_compute_ring));
-						body.push_back(0x7u | (4u << 8u));
-						// DMA_DATA fills: CP_SYNC, SRC_SEL 2 (immediate data), DST_SEL 3 (memory through L2), RAW_WAIT.
-						auto fill = [&](uint64_t addr, uint64_t bytes, uint32_t value) {
-							for (uint64_t off = 0; off < bytes;) {
-								const uint64_t chunk = std::min<uint64_t>(bytes - off, (1ull << 26u) - 4u);
-								const uint64_t dst   = addr + off;
-								body.insert(body.end(), {Pkt3(IT_DMA_DATA, 6, m_compute_ring), (1u << 31u) | (2u << 29u) | (3u << 20u), value, 0u,
-								                         static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u),
-								                         (1u << 30u) | static_cast<uint32_t>(chunk)});
-								off += chunk;
-							}
-						};
-						// The clear's fill pattern (COMPUTE_USER_DATA_4..7). Clear code 0x00 is the colour 0000: the pixels too.
-						const bool zero = reg(sh, 0x244u) == 0 && reg(sh, 0x245u) == 0 && reg(sh, 0x246u) == 0 && reg(sh, 0x247u) == 0;
-						if (zero && hit->color_addr != 0 && hit->color_size != 0) {
-							fill(hit->color_addr, hit->color_size, 0u);
-							NoteOnce(43, "video-out pixels zeroed for a title's DCC clear to 0000");
-						} else if (!zero) {
-							NoteOnce(44, "video-out DCC clear with a non-zero code: pixels left as drawn");
-						}
-						fill(hit->addr, hit->size, 0xffffffffu);
-						stats.display_meta_fills++;
-						NoteOnce(42, "video-out DCC metadata set to uncompressed after a title's clear");
-					}
+				if (m_compute_ring) {
+					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+					body[body.size() - size] |= 2u;
+				} else {
+					pass_on(dw, size, body_before, segs_before, in_place);
 				}
 				stats.dispatches++;
 				collect_refs();

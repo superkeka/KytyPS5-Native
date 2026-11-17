@@ -21,6 +21,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/directPresent.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/hmd2.h"
@@ -34,6 +35,7 @@
 #include <chrono>
 #include <fmt/format.h>
 #include <list>
+#include <mutex>
 #include <span>
 #include <thread>
 #include <unordered_map>
@@ -729,6 +731,72 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	return OK;
 }
 
+// Native rendering (KYTY_NATIVE_GPU_DISPLAY_COPY): the presenter takes the buffer from a plain copy that a pass on the
+// GPU fills right before each flip (ShadowAddDisplayCopy), so a buffer registered with DCC stays as the title made
+// it. Called before the buffer's first ImageInfo, which is where the buffer would lose its DCC otherwise.
+static void AddNativeDisplayCopy(const BufferAttributeGroup& group, const VideoOutBuffer& buffer, const uint64_t* label) {
+	const int  mode       = Graphics::NativeGpu::DisplayCopyMode();
+	const bool compressed = group.category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED && buffer.metadata_address != 0;
+	if (mode == 0 || (mode == 2 && !compressed)) {
+		return;
+	}
+	Graphics::VideoOutPixelFormatInfo format {};
+	if (!Graphics::DecodeVideoOutPixelFormat(group.attribute.pixel_format, format)) {
+		return;
+	}
+	Graphics::NativeGpu::NativeDisplaySurface s {};
+	// The channels as they lie in memory, so the copy is exact: sRGB is read and written as UNORM.
+	switch (format.guest_format) {
+		case Graphics::Prospero::BufferFormat::k8_8_8_8Srgb: s.format = static_cast<uint32_t>(Graphics::Prospero::BufferFormat::k8_8_8_8UNorm); break;
+		case Graphics::Prospero::BufferFormat::k10_10_10_2UNorm:
+		case Graphics::Prospero::BufferFormat::k16_16_16_16Float: s.format = static_cast<uint32_t>(format.guest_format); break;
+		default: return;
+	}
+	// The buffer's footprint is that of the same buffer registered without DCC.
+	BufferAttributeGroup plain_group                   = group;
+	plain_group.category                               = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED;
+	plain_group.attribute.dcc_control                  = 0;
+	plain_group.attribute.dcc_cb_register_clear_color = 0;
+	VideoOutBuffer plain_buffer                        = buffer;
+	plain_buffer.metadata_address                      = 0;
+	const auto info                                    = plain_group.ImageInfo(plain_buffer);
+	s.address                                          = buffer.data_address;
+	s.size                                             = info.data.size;
+	s.label                                            = reinterpret_cast<uint64_t>(label);
+	s.width                                            = group.attribute.width;
+	s.height                                           = group.attribute.height;
+	s.tile_mode                                        = static_cast<uint32_t>(info.tile_mode);
+	if (compressed) {
+		Graphics::TileSizeAlign meta {};
+		if (!Graphics::TileGetDccSize(group.attribute.width, group.attribute.height, 1, format.bytes_per_element, 1, info.tile_mode, meta)) {
+			return;
+		}
+		s.metadata      = buffer.metadata_address;
+		s.metadata_size = meta.size;
+	}
+	// One plain buffer per video-out buffer, kept for the process: its other registrations (a title registers one
+	// buffer under several indices, with different formats) and a later one with the same footprint share it.
+	struct Plain {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	static std::mutex                          mutex;
+	static std::unordered_map<uint64_t, Plain> plains;
+	std::lock_guard<std::mutex>                lock(mutex);
+	auto&                                      plain = plains[s.address];
+	if (plain.size != s.size) {
+		constexpr uint64_t align = 65536;
+		const uint64_t     base  = LibKernel::Memory::AllocateRuntimeMemory(0, s.size + align, Common::VirtualMemory::Mode::ReadWrite,
+		                                                                          "video_out_plain");
+		if (base == 0) {
+			return;
+		}
+		plain = {(base + align - 1u) & ~(align - 1u), s.size};
+	}
+	s.plain = plain.address;
+	(void)Graphics::NativeGpu::ShadowAddDisplayCopy(s);
+}
+
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
 	auto compression = Graphics::ClassifyVideoOutCompression(
 	    category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, buffer.metadata_address,
@@ -767,11 +835,6 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	// Natively rendered display buffers hold plain pixels (ShadowDisplayWithoutDcc).
 	if (compression != Graphics::VideoOutCompression::Uncompressed &&
 	    Graphics::NativeGpu::ShadowDisplayWithoutDcc(buffer.data_address, info.data.size)) {
-		// The title may still clear the buffer's DCC metadata and sample the buffer through a DCC T#.
-		if (Graphics::TileSizeAlign meta_size {}; buffer.metadata_address != 0 &&
-		    Graphics::TileGetDccSize(attribute.width, attribute.height, 1, pixel_format.bytes_per_element, 1, tile_mode, meta_size)) {
-			Graphics::NativeGpu::ShadowDisplayMetaUncompressed(buffer.metadata_address, meta_size.size, buffer.data_address, info.data.size);
-		}
 		compression = Graphics::VideoOutCompression::Uncompressed;
 	}
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {
@@ -1429,6 +1492,12 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(m_width, m_height,
 		                                       index == VIDEO_OUT_BUFFER_INDEX_BLACK, &buffer);
 	} else {
+		// Native rendering: the buffer's plain copy, which a pass on the GPU fills for this flip (the pass may run
+		// now and be waited for, so not under the port's lock).
+		if (uint64_t plain = 0; Graphics::NativeGpu::ShadowDisplayPlain(reinterpret_cast<uint64_t>(&cfg->labels[static_cast<size_t>(index)]),
+		                                                                EopFlipContext(request_id), &plain)) {
+			source_info.data.address = plain;
+		}
 		// BC-250 native GPU shadow path: dump and optionally show the natively rendered surface,
 		// which the shadow submit already left in guest memory. No-op unless shadow mode is on.
 		Graphics::NativeGpu::ShadowOnFlip(source_info.data.address, source_info.data.size,
@@ -2529,6 +2598,9 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 		    .data_address     = data_address,
 		    .metadata_address = metadata_address,
 		});
+		if (!headset) {
+			AddNativeDisplayCopy(group, registrations.back(), &ctx->labels[static_cast<size_t>(buffer_index_start + i)]);
+		}
 		(void)group.ImageInfo(registrations.back());
 	}
 
@@ -2624,8 +2696,10 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 		    .category  = current.category,
 		    .occupied  = true,
 		};
-		for (const auto& buffer: ctx->buffers) {
+		for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; i++) {
+			const auto& buffer = ctx->buffers[static_cast<size_t>(i)];
 			if (buffer.group_index == set_index) {
+				AddNativeDisplayCopy(replacement, buffer, &ctx->labels[static_cast<size_t>(i)]);
 				(void)replacement.ImageInfo(buffer);
 			}
 		}
@@ -2715,6 +2789,7 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 		ctx->groups[set_index] = BufferAttributeGroup {};
 		for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; i++) {
 			if (ctx->buffers[i].group_index == set_index) {
+				Graphics::NativeGpu::ShadowRemoveDisplayCopy(reinterpret_cast<uint64_t>(&ctx->labels[static_cast<size_t>(i)]));
 				ctx->buffers[i] = VideoOutBuffer {};
 				released[i]     = ctx->direct[i];
 				ctx->direct[i]  = DirectSlot {};
@@ -2840,6 +2915,11 @@ int VideoOutDriver::SubmitEopFlip(int handle, int index, int flip_mode, int64_t 
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
 			*ctx = EopFlipContext(request_id);
+			// Native rendering: the buffer this context's flip shows (ShadowAddDisplayCopy).
+			if (const auto* port = m_impl->Get(handle); port != nullptr) {
+				Graphics::NativeGpu::ShadowNoteFlipContext(
+				    *ctx, index >= 0 && index < VIDEO_OUT_BUFFER_NUM_MAX ? reinterpret_cast<uint64_t>(&port->labels[static_cast<size_t>(index)]) : 0);
+			}
 			return OK;
 		}
 		if (result != VIDEO_OUT_ERROR_FLIP_QUEUE_FULL || !wait_for_slot) {
