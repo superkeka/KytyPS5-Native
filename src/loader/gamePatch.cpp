@@ -8,6 +8,7 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <Zydis/Zydis.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -221,9 +222,88 @@ bool AllocateCave(Plan* plan, const Program& program, std::string* error) {
 	return true;
 }
 
+// Where the console loads a title's executable. A patch's writes are placed by their offsets, wherever the program
+// is loaded, but a number inside the patch's own code stays an address of the console's: the class of an object is
+// told by comparing its first word with one.
+constexpr uint64_t kConsoleBase = 0x400000;
+
+struct Moved {
+	uint32_t moved = 0;
+	uint32_t left  = 0;
+};
+
+// The addresses of the console's layout in the code of a write, moved to where the program is: a 64-bit immediate
+// whole, and a 32-bit one that is compared, which is the low half of a pointer. One that is loaded, or compared as
+// 64 bits, would need the upper half the program's address has here: left as written and counted. Bytes that do
+// not decode as instructions to their end are data and stay.
+void MoveConsoleAddresses(std::vector<uint8_t>* code, const Program& program, Moved* result) {
+	static const ZydisDecoder decoder = [] {
+		ZydisDecoder value {};
+		EXIT_IF(!ZYAN_SUCCESS(ZydisDecoderInit(&value, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)));
+		return value;
+	}();
+	struct Fix {
+		size_t   offset;
+		size_t   size;
+		uint64_t value;
+	};
+	std::vector<Fix> fixes;
+	uint32_t         left = 0;
+	const auto       in_console = [&](uint64_t value) { return value >= kConsoleBase && value - kConsoleBase < program.mapped_size; };
+	for (size_t at = 0; at < code->size();) {
+		ZydisDecodedInstruction instruction {};
+		ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+		if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, code->data() + at, code->size() - at, &instruction, operands))) {
+			return;
+		}
+		for (const auto& imm: instruction.raw.imm) {
+			if (imm.is_relative || (imm.size != 32 && imm.size != 64)) {
+				continue;
+			}
+			const uint64_t value = imm.size == 64 ? imm.value.u : (imm.value.u & 0xffffffffull);
+			if (!in_console(value)) {
+				continue;
+			}
+			const uint64_t here = program.base_vaddr + (value - kConsoleBase);
+			if (imm.size == 64) {
+				fixes.push_back({at + imm.offset, 8, here});
+			} else if (instruction.mnemonic == ZYDIS_MNEMONIC_CMP && instruction.operand_width == 32) {
+				fixes.push_back({at + imm.offset, 4, here & 0xffffffffull});
+			} else {
+				left++;
+			}
+		}
+		// An absolute address in a memory operand (no base, no index, not RIP-relative) has 32 bits only.
+		if (instruction.raw.disp.size == 32 && instruction.raw.modrm.mod == 0 &&
+		    ((instruction.raw.modrm.rm == 4 && instruction.raw.sib.base == 5 && instruction.raw.sib.index == 4)) &&
+		    in_console(static_cast<uint64_t>(instruction.raw.disp.value) & 0xffffffffull)) {
+			left++;
+		}
+		at += instruction.length;
+	}
+	for (const auto& fix: fixes) {
+		std::memcpy(code->data() + fix.offset, &fix.value, fix.size);
+	}
+	result->moved += static_cast<uint32_t>(fixes.size());
+	result->left += left;
+}
+
 bool ApplyWrites(Plan* plan, const Program& program, std::string* error) {
 	if (!AllocateCave(plan, program, error)) {
 		return false;
+	}
+
+	// The title's own executable is the one whose address on the console is known.
+	if (Common::EqualNoCase(program.file_name.filename().string(), plan->process) && program.base_vaddr != kConsoleBase) {
+		Moved moved;
+		for (auto& write: plan->writes) {
+			MoveConsoleAddresses(&write.on, program, &moved);
+		}
+		if (moved.moved != 0 || moved.left != 0) {
+			::printf("Game cheat: %u addresses of the console's layout in the patches' code moved to the game's here, %u left as "
+			         "written (they need the upper half of the address)\n",
+			         moved.moved, moved.left);
+		}
 	}
 
 	for (int external = 1; external >= 0; external--) {
