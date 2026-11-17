@@ -177,6 +177,96 @@ public:
 	}
 
 	[[nodiscard]] uint64_t ScratchVa() const { return m_ib_va + kIbSize - kScratchSize; }
+	// The display copy's code and descriptors (Pm4Translator::SetDisplayCopies): the 4 KiB right below the scratch
+	// area, in what S leaves of the gap. Like the rest of the IB buffer it is CPU-mapped, executable for the GPU and
+	// in every CS's BO list.
+	static constexpr uint64_t kDisplayCopySize = 4096;
+	static_assert(kCpShadowOffset + kCpShadowReserve <= kIbSize - kScratchSize - kDisplayCopySize, "the display copy area fits after S");
+	[[nodiscard]] uint64_t          DisplayCopyVa() const { return ScratchVa() - kDisplayCopySize; }
+	[[nodiscard]] volatile uint8_t* DisplayCopyCpu() const {
+		return static_cast<volatile uint8_t*>(m_ib_cpu) + kIbSize - kScratchSize - kDisplayCopySize;
+	}
+	// A job of the display copy's own, for a flip that came without the pass in a command buffer (a flip a title
+	// submits from the CPU): `ib`, a multiple of 8 dwords, runs on compute ring 0 of amdgpu's from the display copy
+	// area and is waited for. amdgpu ends the job with its fence, which comes after the job's shaders and writes
+	// the caches back. One at a time (the caller's lock).
+	static constexpr uint64_t kDisplayCopyIbOffset = 2304; // after the code (256 bytes) and 32 pairs of descriptors
+	static constexpr size_t   kDisplayCopyIbDwords = 256;
+	bool RunDisplayCopy(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles, double timeout_sec) {
+		if (ib.empty() || ib.size() > kDisplayCopyIbDwords || (ib.size() & 7u) != 0) {
+			return false;
+		}
+		auto* to = reinterpret_cast<volatile uint32_t*>(DisplayCopyCpu() + kDisplayCopyIbOffset);
+		for (size_t i = 0; i < ib.size(); i++) {
+			to[i] = ib[i];
+		}
+		__sync_synchronize();
+		drm_amdgpu_cs_chunk_ib info;
+		std::memset(&info, 0, sizeof(info));
+		info.va_start    = DisplayCopyVa() + kDisplayCopyIbOffset;
+		info.ib_bytes    = static_cast<uint32_t>(ib.size() * 4u);
+		info.ip_type     = AMDGPU_HW_IP_COMPUTE;
+		info.ip_instance = 0;
+		info.ring        = 0;
+		std::vector<drm_amdgpu_bo_list_entry> entries;
+		entries.reserve(bo_handles.size() + m_gds_handles.size() + 1);
+		drm_amdgpu_bo_list_entry e;
+		std::memset(&e, 0, sizeof(e));
+		e.bo_handle = m_ib_handle;
+		entries.push_back(e);
+		for (uint32_t h: m_gds_handles) {
+			e.bo_handle = h;
+			entries.push_back(e);
+		}
+		for (uint32_t h: bo_handles) {
+			e.bo_handle = h;
+			entries.push_back(e);
+		}
+		struct drm_amdgpu_bo_list_in list;
+		std::memset(&list, 0, sizeof(list));
+		list.operation    = ~0u;
+		list.list_handle  = ~0u;
+		list.bo_number    = static_cast<uint32_t>(entries.size());
+		list.bo_info_size = sizeof(entries[0]);
+		list.bo_info_ptr  = reinterpret_cast<uintptr_t>(entries.data());
+		std::array<drm_amdgpu_cs_chunk, 2> chunks;
+		std::memset(chunks.data(), 0, sizeof(chunks));
+		chunks[0].chunk_id   = AMDGPU_CHUNK_ID_IB;
+		chunks[0].length_dw  = sizeof(info) / 4;
+		chunks[0].chunk_data = reinterpret_cast<uintptr_t>(&info);
+		chunks[1].chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES;
+		chunks[1].length_dw  = sizeof(list) / 4;
+		chunks[1].chunk_data = reinterpret_cast<uintptr_t>(&list);
+		const std::array<uint64_t, 2> chunk_ptrs = {reinterpret_cast<uintptr_t>(&chunks[0]), reinterpret_cast<uintptr_t>(&chunks[1])};
+		union drm_amdgpu_cs cs;
+		std::memset(&cs, 0, sizeof(cs));
+		cs.in.ctx_id     = m_ctx;
+		cs.in.num_chunks = 2;
+		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs.data());
+		int r = 0;
+		for (int attempt = 0; attempt <= kCsRetries; attempt++) {
+			r = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CS, &cs);
+			if (r != -EFAULT) {
+				break;
+			}
+			struct timespec nap = {0, 500000};
+			nanosleep(&nap, nullptr);
+		}
+		if (r != 0) {
+			return false;
+		}
+		union drm_amdgpu_wait_cs w;
+		std::memset(&w, 0, sizeof(w));
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		w.in.handle  = cs.out.handle;
+		w.in.timeout = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec) +
+		               static_cast<uint64_t>(timeout_sec * 1e9);
+		w.in.ip_type = AMDGPU_HW_IP_COMPUTE;
+		w.in.ring    = 0;
+		w.in.ctx_id  = m_ctx;
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w) == 0 && w.out.status == 0;
+	}
 	[[nodiscard]] uint64_t CpShadowVa() const { return m_shadow_va != 0 ? m_shadow_va : m_ib_va + kCpShadowOffset; }
 	[[nodiscard]] volatile uint32_t* CpShadowCpu() const {
 		return reinterpret_cast<volatile uint32_t*>(m_shadow_cpu != nullptr ? static_cast<uint8_t*>(m_shadow_cpu)

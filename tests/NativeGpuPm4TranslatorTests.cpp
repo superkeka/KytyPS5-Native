@@ -1057,6 +1057,120 @@ bool IsTrackerPacket(const std::vector<uint32_t>& ib, uint32_t dw) {
 
 // A DMA_DATA without CP_SYNC gets a zero-byte DMA_DATA with CP_SYNC before the job ends (the IB's end, or with native
 // labels before the segment's tracker release); one with CP_SYNC, none, and KYTY_NATIVE_GPU_CP_DMA_IDLE=0 none.
+// SetDisplayCopies: a video-out buffer's plain copy is filled right before the buffer's flip.
+void TestDisplayCopy() {
+	constexpr uint64_t kCode   = 0x400003fed000ull;
+	constexpr uint64_t kTable  = 0x400003fed100ull;
+	constexpr uint64_t kLabel  = 0x7000001000ull;
+	constexpr uint64_t kSource = 0x2100800000ull;
+	constexpr uint64_t kPlain  = 0x2200000000ull;
+	constexpr uint64_t kDcc    = 0x2107c01000ull;
+	constexpr uint32_t kCtx    = 0x08000005u; // a flip's interrupt context: bit 27, the request's low byte
+	static uint64_t    noted[2] = {};
+	static uint32_t    words[2] = {};
+	const auto copies = [](Pm4Translator::DisplayCopy* out, size_t max) -> size_t {
+		Check(max >= 1, "room for the copies");
+		Pm4Translator::DisplayCopy c;
+		c.label     = kLabel;
+		c.source    = kSource;
+		c.size      = 32ull << 20u;
+		c.meta_size = 160ull << 10u;
+		c.plain     = kPlain;
+		c.table     = kTable;
+		c.width     = 3840;
+		c.height    = 2160;
+		out[0]      = c;
+		return 1;
+	};
+	const auto dcc = [](uint64_t source, uint64_t at, uint32_t dcc6, uint32_t dcc7) {
+		noted[0] = source;
+		noted[1] = at;
+		words[0] = dcc6;
+		words[1] = dcc7;
+	};
+	const auto flip_source = [](uint32_t ctx) -> uint64_t { return ctx == kCtx ? kLabel : 0; };
+	// libSceAgc's flip: a RELEASE_MEM into the buffer's label that raises the flip's interrupt context.
+	auto flip = [&](std::vector<uint32_t>& buffer, uint64_t label, bool compute) {
+		Append(buffer, 0x49u, {compute ? 0x0620062fu : 0x06200504u, 0x02010000u | (1u << 30u), static_cast<uint32_t>(label),
+		                       static_cast<uint32_t>(label >> 32u), 1u, 0u, kCtx},
+		       false);
+	};
+	auto user_data = [](const std::vector<Packet>& pkts) -> const Packet* {
+		for (const auto& p: pkts) {
+			if (p.op == IT_SET_SH_REG && p.body.size() == 5 && p.body[0] == 0x240u) {
+				return &p;
+			}
+		}
+		return nullptr;
+	};
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(0x2000001000ull);
+		t.SetDisplayCopies(kCode, copies, dcc, flip_source);
+		std::vector<uint32_t> dcb;
+		flip(dcb, kLabel, false);
+		auto          r    = t.Translate(dcb);
+		const auto    pkts = Decode(r.ib);
+		const Packet* d    = FindFirst(pkts, IT_DISPATCH_DIRECT);
+		const Packet* ud   = user_data(pkts);
+		Check(r.ok && r.stats.display_copies == 1 && r.display_copies == std::vector<uint32_t>({kCtx}), "a flip of a copied buffer carries the pass");
+		Check(d != nullptr && d->compute && d->body == std::vector<uint32_t>({480u, 270u, 1u, 0x45u}), "one group for every 8 x 8 texels");
+		Check(ud != nullptr && ud->body == std::vector<uint32_t>({0x240u, static_cast<uint32_t>(kTable), static_cast<uint32_t>(kTable >> 32u), 0u, 0u}),
+		      "the descriptors, and no DCC for a buffer the title has not drawn with it");
+		Check(HasRef(r.refs, kPlain, 32ull << 20u, false) && HasRef(r.refs, kSource, 32ull << 20u, false), "both buffers are referenced");
+		Check(ValidateNativeIb(r.ib, false, nullptr, NativeIbKind::Gfx), "it passes the gfx packet check");
+	}
+	{
+		// The title draws the buffer with DCC: the pass reads it through that metadata.
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(0x2000001000ull);
+		t.SetDisplayCopies(kCode, copies, dcc, flip_source);
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_SET_CONTEXT_REG, {0x318u, static_cast<uint32_t>(kSource >> 8u)}, false);
+		Append(dcb, IT_SET_CONTEXT_REG, {0x31Cu, 0x10008824u}, false); // 2_10_10_10, DCC_ENABLE
+		Append(dcb, IT_SET_CONTEXT_REG, {0x31Eu, 0x00080208u}, false); // blocks of 256 and 64 bytes
+		Append(dcb, IT_SET_CONTEXT_REG, {0x325u, static_cast<uint32_t>(kDcc >> 8u)}, false);
+		Append(dcb, IT_SET_CONTEXT_REG, {0x3B8u, 0x4dc6c000u}, false); // DCC_PIPE_ALIGNED
+		Append(dcb, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+		flip(dcb, 0x7000002000ull, false); // a label of the title's own: the context tells the buffer
+		auto          r    = t.Translate(dcb);
+		const auto    pkts = Decode(r.ib);
+		const Packet* ud   = user_data(pkts);
+		// MAX_UNCOMPRESSED 256, MAX_COMPRESSED 64, META_PIPE_ALIGNED, COMPRESSION_EN, ALPHA_IS_ON_MSB; the address.
+		constexpr uint32_t kDcc6 = (2u << 15u) | (1u << 19u) | (1u << 21u) | (1u << 22u) | (0x10u << 24u);
+		constexpr uint32_t kDcc7 = static_cast<uint32_t>(kDcc >> 16u);
+		Check(r.ok && r.stats.display_copies == 1 && ud != nullptr, "a flip into a label of the title's own carries the pass too");
+		Check(ud->body[3] == kDcc6 && ud->body[4] == kDcc7, "the source's DCC dwords follow the title's color target");
+		Check(noted[0] == kSource && noted[1] == kDcc && words[0] == kDcc6 && words[1] == kDcc7, "and are told to the other translators");
+		Check(HasRef(r.refs, kDcc, 160ull << 10u, false), "the metadata is referenced");
+	}
+	{
+		Pm4Translator t;
+		t.SetComputeRing(true);
+		t.SetDisplayCopies(kCode, copies, dcc, flip_source);
+		std::vector<uint32_t> acb;
+		flip(acb, kLabel, true);
+		auto       r    = t.Translate(acb);
+		const auto pkts = Decode(r.ib);
+		Check(r.ok && r.stats.display_copies == 1 && FindFirst(pkts, IT_DISPATCH_DIRECT) != nullptr, "a flip from a compute queue too");
+		Check(Count(pkts, IT_EVENT_WRITE) == 0, "without the graphics flushes");
+	}
+	{
+		Pm4Translator t;
+		TestOracle    o;
+		t.SetNativeLabels(&o, kTrackerVa);
+		t.SetFenceAddress(0x2000001000ull);
+		std::vector<uint32_t> dcb;
+		flip(dcb, kLabel, false);
+		auto r = t.Translate(dcb);
+		Check(r.ok && r.stats.display_copies == 0 && FindFirst(Decode(r.ib), IT_DISPATCH_DIRECT) == nullptr, "no copies set: the flip as it was");
+	}
+}
+
 void TestCpDmaIdle() {
 	constexpr uint32_t kIdleControl = (1u << 31u) | (3u << 20u) | (3u << 29u);
 	auto is_idle = [&](const Packet& p) { return p.op == 0x50u && p.body == std::vector<uint32_t>({kIdleControl, 0u, 0u, 0u, 0u, 0u}); };
@@ -6678,6 +6792,7 @@ int main() {
 	TestContextStatePushPop();
 	TestResetQueuePop();
 	TestWaitBarrier();
+	TestDisplayCopy();
 	TestCompactRefs();
 	TestGdsReleaseMem();
 	TestPs5RegOverrides();

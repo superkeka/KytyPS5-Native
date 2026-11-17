@@ -3754,7 +3754,54 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	// Color targets in a video-out buffer are drawn without DCC (AddDisplayRange). The shadow holds
 	// the value sent, so preambles agree; a slot that moves elsewhere gets the guest's value back.
+	// SetDisplayCopies: this translation's view of the video-out buffers presented from plain copies.
+	std::array<DisplayCopy, 32> display_copy_list;
+	const std::span<DisplayCopy> display_copies(
+	    display_copy_list.data(), m_display_copy_shader != 0 && m_display_copies_fn != nullptr
+	                                  ? m_display_copies_fn(display_copy_list.data(), display_copy_list.size())
+	                                  : 0);
 	auto fix_display_dcc = [&]() {
+		// SetDisplayCopies: how the title draws a copied buffer with DCC. The copy's pass reads the buffer the same way:
+		// the metadata at CB_COLORn_DCC_BASE, block sizes of DCC_CONTROL, pipe alignment of ATTRIB3.
+		for (uint32_t i = 0; i < 8 && !display_copies.empty(); i++) {
+			const uint32_t step = i * kCbColorStride;
+			const uint32_t info = reg(cx, kCbColor0Info + step);
+			if ((info & kCbDccEnable) == 0) {
+				continue;
+			}
+			const uint64_t addr = (static_cast<uint64_t>(reg(cx, kCbColor0Base + step)) << 8u) |
+			                      (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt + i) & 0xffu) << 40u);
+			const auto copy = std::find_if(display_copies.begin(), display_copies.end(),
+			                               [&](const DisplayCopy& c) { return c.source == addr && c.meta_size != 0; });
+			const uint64_t dcc = (static_cast<uint64_t>(reg(cx, kCbColor0DccBase + step)) << 8u) |
+			                     (static_cast<uint64_t>(reg(cx, kCbColor0DccExt + i) & 0xffu) << 40u);
+			if (addr == 0 || dcc == 0 || copy == display_copies.end()) {
+				continue;
+			}
+			const uint32_t attrib3 = reg(cx, kCbColor0Attrib3 + i);
+			const uint32_t control = reg(cx, kCbColor0Info + 2u + step); // CB_COLORn_DCC_CONTROL
+			// ALPHA_IS_ON_MSB: by the format (2_10_10_10 has it low) and, for the others, the component order.
+			const uint32_t format    = (info >> 2u) & 0x1fu;
+			const uint32_t swap      = (info >> 11u) & 0x3u;
+			const bool     alpha_msb = format == 9u || (format != 8u && swap <= 1u);
+			// MAX_UNCOMPRESSED_BLOCK_SIZE, MAX_COMPRESSED_BLOCK_SIZE, META_PIPE_ALIGNED, COMPRESSION_EN, ALPHA_IS_ON_MSB,
+			// then the metadata's address.
+			const uint32_t dcc6 = (((control >> 2u) & 3u) << 15u) | (((control >> 5u) & 3u) << 17u) | (((attrib3 >> 30u) & 1u) << 19u) |
+			                      (1u << 21u) | (alpha_msb ? 1u << 22u : 0u) | (static_cast<uint32_t>((dcc >> 8u) & 0xffu) << 24u);
+			const uint32_t dcc7 = static_cast<uint32_t>(dcc >> 16u);
+			if (copy->dcc != dcc || copy->dcc6 != dcc6 || copy->dcc7 != dcc7) {
+				copy->dcc  = dcc;
+				copy->dcc6 = dcc6;
+				copy->dcc7 = dcc7;
+				if (m_display_dcc_fn != nullptr) {
+					m_display_dcc_fn(addr, dcc, dcc6, dcc7);
+				}
+				std::fprintf(stderr,
+				             "native shadow: video-out buffer 0x%llx is drawn with DCC at 0x%llx (INFO %08x, ATTRIB3 %08x, DCC_CONTROL %08x): its "
+				             "copy reads it so\n",
+				             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(dcc), info, attrib3, control);
+			}
+		}
 		if (m_display_ranges.empty()) {
 			return;
 		}
@@ -4658,6 +4705,67 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		emit_barrier(pfp);
 		return std::nullopt;
 	};
+	// SetDisplayCopies: the pass that fills the plain copy of the video-out buffer a flip shows: the buffer (by its
+	// flip label) the flip's interrupt context was reserved for, or the one whose label this release writes.
+	auto emit_display_copy = [&](uint64_t label, uint32_t ctx) {
+		// A title registers one buffer under several indices, with different formats: the flip's own index decides.
+		const uint64_t reserved = m_display_flip_source != nullptr ? m_display_flip_source(ctx) : 0;
+		const uint64_t wanted   = reserved != 0 ? reserved : label;
+		const auto     copy     =
+		    std::find_if(display_copies.begin(), display_copies.end(), [&](const DisplayCopy& c) { return c.label == wanted; });
+		if (copy == display_copies.end()) {
+			NoteOnce(46, "a flip of a buffer without a plain copy");
+			return;
+		}
+		if (cond.active || (!m_compute_ring && m_fence_va == 0)) {
+			NoteOnce(48, "a flip inside a COND_EXEC range or without a barrier: the buffer's plain copy is not filled");
+			return;
+		}
+		// On the gfx ring the title's draws into the buffer, and their DCC, leave the color caches before the texture
+		// unit reads them: FLUSH_AND_INV_CB_META, then the barrier (CACHE_FLUSH_AND_INV_TS at the end of the pipe,
+		// waited for). A flip from a compute queue comes after the frame's graphics work by the title's own waits.
+		if (!m_compute_ring) {
+			body.push_back(Pkt3(IT_EVENT_WRITE, 1, false));
+			body.push_back(0x2eu);
+			emit_barrier(true);
+		}
+		auto set = [&](uint32_t off, std::initializer_list<uint32_t> v) {
+			body.push_back(Pkt3(IT_SET_SH_REG, 1u + static_cast<uint32_t>(v.size()), true));
+			body.push_back(off);
+			body.insert(body.end(), v.begin(), v.end());
+		};
+		set(0x20Cu, {static_cast<uint32_t>(m_display_copy_shader >> 8u), static_cast<uint32_t>(m_display_copy_shader >> 40u)}); // PGM_LO/HI
+		// RSRC1: 8 VGPRs, 32 SGPRs, denorms, DX10_CLAMP, MEM_ORDERED. RSRC2: four user SGPRs (the descriptors, the
+		// source's DCC dwords), then the group's x and y; the thread's x and y in v0 and v1.
+		set(0x212u, {1u | (3u << 6u) | (0xc0u << 12u) | (1u << 21u) | (1u << 30u), (4u << 1u) | (1u << 7u) | (1u << 8u) | (1u << 11u)});
+		set(0x204u, {0u, 0u, 0u, 8u, 8u, 1u}); // START_X..Z, NUM_THREAD_X..Z
+		set(0x240u, {static_cast<uint32_t>(copy->table), static_cast<uint32_t>(copy->table >> 32u), copy->dcc6, copy->dcc7}); // USER_DATA_0..3
+		body.push_back(Pkt3(IT_DISPATCH_DIRECT, 4, true));
+		// COMPUTE_SHADER_EN, FORCE_START_AT_0, ORDER_MODE.
+		body.insert(body.end(), {(copy->width + 7u) / 8u, (copy->height + 7u) / 8u, 1u, 1u | (1u << 2u) | (1u << 6u)});
+		// On the gfx ring, CS_PARTIAL_FLUSH: the stores are done before the release's write-back and the flip it raises.
+		// A compute queue's release comes at the end of the shaders before it (CS_DONE).
+		if (!m_compute_ring) {
+			body.push_back(Pkt3(IT_EVENT_WRITE, 1, false));
+			body.push_back(0x7u | (4u << 8u));
+		}
+		// The title's compute registers again, those it has written.
+		for (const uint32_t off:
+		     {0x20Cu, 0x20Du, 0x212u, 0x213u, 0x204u, 0x205u, 0x206u, 0x207u, 0x208u, 0x209u, 0x240u, 0x241u, 0x242u, 0x243u}) {
+			if (sh.count(off) != 0) {
+				EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, reg(sh, off)), true);
+			}
+		}
+		add_ref(copy->source, copy->size, false);
+		if (copy->dcc != 0) {
+			add_ref(copy->dcc, copy->meta_size, false);
+		}
+		add_ref(copy->plain, copy->size, false);
+		r.display_copies.push_back(ctx);
+		stats.display_copies++;
+		seg_effects = true;
+		NoteOnce(45, "video-out buffer copied to its plain buffer before a flip");
+	};
 	while (dw < dcb.size()) {
 		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
@@ -4666,6 +4774,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (cs_guards && body.size() - guard_from > 3000u) {
 			body_guards.push_back(EmitComputeExitGuard(body, m_exit_run_va));
 			guard_from = body.size();
+		}
+		// SetDisplayCopies: a flip of a registered video-out buffer comes next (libSceAgc's RELEASE_MEM into the buffer's
+		// label with a kernel interrupt context, bit 27). Its plain copy is filled first, in packets of their own.
+		if (!display_copies.empty() && (dcb[dw] >> 30u) == 3u && ((dcb[dw] >> 8u) & 0xffu) == IT_RELEASE_MEM && ((dcb[dw] >> 16u) & 0x3fffu) >= 6u && dw + 8u <= dcb.size() &&
+		    (dcb[dw + 7u] & (1u << 27u)) != 0) {
+			emit_display_copy(static_cast<uint64_t>(dcb[dw + 3u]) | (static_cast<uint64_t>(dcb[dw + 4u]) << 32u), dcb[dw + 7u] & 0x0fffffffu);
 		}
 		const size_t   body_before = body.size();
 		const size_t   segs_before = segs.size();
