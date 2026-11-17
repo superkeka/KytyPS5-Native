@@ -11,6 +11,49 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
 > Not affiliated with Sony Interactive Entertainment or PlayStation. No games or system software are
 > distributed. Use only game files you obtained legally.
 
+## Install
+
+### SteamOS (recommended), Bazzite, CachyOS Handheld: Decky plugin
+
+1. Install [Decky Loader](https://decky.xyz) and turn on its developer mode
+2. Download the latest `KytyPS5-Native-*-Decky.zip` from [Releases](https://github.com/superkeka/KytyPS5-Native/releases)
+3. Decky settings > Developer > Install Plugin from ZIP File
+4. In the plugin: Kernel config > Apply and reboot, then Install, then pick the games folder
+
+Games show up in the Steam library under Non-Steam as "Game (PS5)". The PS / Xbox button,
+Share+Options together or F10 open the in-game menu (resume, monitoring, exit game). The plugin
+keeps KytyPS5-Native and itself up to date.
+
+<table align="center">
+  <tr>
+    <td align="center">
+      <a href="docs/screenshots/steam-home.jpg"><img src="docs/screenshots/steam-home.jpg" width="300" alt="PS5 games on the Steam home screen"></a>
+    </td>
+    <td align="center">
+      <a href="docs/screenshots/plugin-game-page.jpg"><img src="docs/screenshots/plugin-game-page.jpg" width="300" alt="A game's page in the plugin"></a>
+    </td>
+  </tr>
+</table>
+
+Each game has a page in the plugin, also opened from the game's menu in the library
+(KytyPS5-Native...): its patches (cheats from the
+[HEN Cheats Collection](https://github.com/TeeKay87/HEN-Cheats-Collection) made for the game's exact
+version) and its add-ons, each with a switch.
+
+### Other systems
+
+Download the latest `KytyPS5-Native-*-Linux-x86_64.tar.gz` from
+[Releases](https://github.com/superkeka/KytyPS5-Native/releases) and unpack it.
+
+```bash
+sudo ./install-helper.sh   # the root helper as a service (LOD statistics, KFD TLB flushes)
+./kyty_launcher
+```
+
+On the BC-250 native mode turns on by itself; `KYTY_NATIVE_GPU=0` turns it off.
+`kyty_emulator --game /path/to/game` runs a game without the launcher, `kyty_emulator --help` lists
+the options.
+
 ## Status
 
 <table align="center">
@@ -45,33 +88,6 @@ presentation and as a fallback. It will likely run on a PS5 under Linux too.
     </td>
   </tr>
 </table>
-
-## Install
-
-### SteamOS (recommended), Bazzite, CachyOS Handheld: Decky plugin
-
-1. Install [Decky Loader](https://decky.xyz) and turn on its developer mode
-2. Download the latest `KytyPS5-Native-*-Decky.zip` from [Releases](https://github.com/superkeka/KytyPS5-Native/releases)
-3. Decky settings > Developer > Install Plugin from ZIP File
-4. In the plugin: Kernel config > Apply and reboot, then Install, then pick the games folder
-
-Games show up in the Steam library under Non-Steam as "Game (PS5)". The PS / Xbox button,
-Share+Options together or F10 open the in-game menu (resume, monitoring, exit game). The plugin
-keeps KytyPS5-Native and itself up to date.
-
-### Other systems
-
-Download the latest `KytyPS5-Native-*-Linux-x86_64.tar.gz` from
-[Releases](https://github.com/superkeka/KytyPS5-Native/releases) and unpack it.
-
-```bash
-sudo ./install-helper.sh   # the root helper as a service (LOD statistics, KFD TLB flushes)
-./kyty_launcher
-```
-
-On the BC-250 native mode turns on by itself; `KYTY_NATIVE_GPU=0` turns it off.
-`kyty_emulator --game /path/to/game` runs a game without the launcher, `kyty_emulator --help` lists
-the options.
 
 ## Troubleshooting
 
