@@ -13,6 +13,8 @@
 # forever (Ghost of Yotei stays on a black loading screen without its two).
 # <game folder>/addcont: a folder of add-on packages (each with its sce_sys/param.json), passed as
 # --addcont-dir, the way the launcher's add-ons folder setting does.
+# ~/.config/KytyPS5-Native/present-mode/<title id> holds the game's present mode while it is not Kyty's
+# default (Mailbox): the word Fifo or Immediate on its first line. The plugin's game page writes it.
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -56,6 +58,16 @@ if [ -f "$PATCH" ]; then
 	game_version=$(printf '%s' "$PARAM" | version_of contentVersion)
 	patch_version=$(version_of version < "$PATCH")
 	[ -n "$patch_version" ] && [ "$patch_version" = "$game_version" ] && PATCH_ARGS=(--game-patch "$PATCH")
+fi
+# The game's present mode, when its page in the Decky plugin sets one; Kyty's default otherwise.
+PRESENT_ARGS=()
+PRESENT=$CONFIG/present-mode/$TITLE
+present_mode=
+if [ -f "$PRESENT" ]; then
+	present_mode=$(head -1 "$PRESENT" | tr -d '[:space:]')
+	case $present_mode in
+	Fifo | Mailbox | Immediate) PRESENT_ARGS=(--present-mode "$present_mode") ;;
+	esac
 fi
 # Games run on the gamescope Xwayland Steam gives them, the base layer is set on the root one (:0).
 export DISPLAY=${DISPLAY:-:1}
@@ -190,9 +202,14 @@ front "$GAME_APPID"
 	elif [ -f "$PATCH" ]; then
 		echo "patches in $PATCH are for version '$patch_version', the game is '$game_version': left out"
 	fi
+	if [ ${#PRESENT_ARGS[@]} -gt 0 ]; then
+		echo "present mode from $PRESENT: $present_mode"
+	elif [ -f "$PRESENT" ]; then
+		echo "present mode in $PRESENT is '$present_mode', not Fifo, Mailbox or Immediate: left out"
+	fi
 	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" KYTY_GAMESCOPE_APPID=$GAME_APPID "$EMU" --game "$GAME" \
 		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS $LANGUAGE_ARGS \
-		"${ADDCONT_ARGS[@]}" "${PATCH_ARGS[@]}"
+		"${ADDCONT_ARGS[@]}" "${PATCH_ARGS[@]}" "${PRESENT_ARGS[@]}"
 	echo "== exit=$?"
 } >> "$LOG" 2>&1 &
 EMUPID=$!

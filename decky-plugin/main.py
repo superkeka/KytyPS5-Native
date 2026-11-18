@@ -48,6 +48,11 @@ ADDCONT_HEAD = "# Add-ons Kyty tells this game it has. Switch them in the Decky 
 # A game's patches (cheats), a file per title id that the launch wrapper gives Kyty with --game-patch:
 # there while any of them is switched on. They come from a public collection, a file per game version.
 PATCHES_DIR = os.path.join(CONFIG_DIR, "patches")
+# A game's present mode, a file per title id holding the one word, there only while the game does not
+# use Kyty's default: the launch wrapper gives it to Kyty with --present-mode. The first is the default;
+# the wrapper also takes Immediate, written by hand.
+PRESENT_DIR = os.path.join(CONFIG_DIR, "present-mode")
+PRESENT_MODES = ("Mailbox", "Fifo")
 PATCH_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "patches")
 PATCH_SOURCE = "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
@@ -600,6 +605,34 @@ def _addcont_write(tid, entry):
     with open(path + ".tmp", "w") as f:
         f.write(ADDCONT_HEAD + "".join(l + "\n" for l in lines))
     os.replace(path + ".tmp", path)
+    os.lchown(path, *_ids())
+
+
+def _present_mode(tid):
+    """The game's present mode: the word in its file when the launch wrapper takes it, else the default."""
+    try:
+        with open(os.path.join(PRESENT_DIR, tid)) as f:
+            word = "".join(f.readline().split())
+    except OSError:
+        return PRESENT_MODES[0]
+    return word if word in PRESENT_MODES + ("Immediate",) else PRESENT_MODES[0]
+
+
+def _present_mode_write(tid, mode):
+    """The file the wrapper reads; none for the default."""
+    path = os.path.join(PRESENT_DIR, tid)
+    if mode == PRESENT_MODES[0]:
+        if os.path.lexists(path):
+            os.remove(path)
+        return
+    _mkdir_user(PRESENT_DIR)
+    tmp = path + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    # Root writes in the user's folder: never through a link put there.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w") as f:
+        f.write(mode + "\n")
+    os.replace(tmp, path)
     os.lchown(path, *_ids())
 
 
@@ -1231,6 +1264,7 @@ class Plugin:
             "addons": _addons(title_id, entry),
             # False while the game's executable is still being read for the first time.
             "addons_known": bool(entry) and entry.get("key") == _addon_key(g["path"]),
+            "present_mode": _present_mode(title_id),
             "game_running": _game_running(),
         }
 
@@ -1245,6 +1279,17 @@ class Plugin:
             await asyncio.to_thread(_addcont_write, title_id, entry)
         except OSError as e:
             decky.logger.exception("add-ons file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def set_present_mode(self, title_id, mode):
+        # The title id names the file: one of a game here, never a path.
+        if mode not in PRESENT_MODES or not title_id or os.path.basename(title_id) != title_id or title_id in (".", ".."):
+            return {"ok": False, "log": "not a present mode of a game"}
+        try:
+            await asyncio.to_thread(_present_mode_write, title_id, mode)
+        except OSError as e:
+            decky.logger.exception("present mode file")
             return {"ok": False, "log": str(e)}
         return {"ok": True}
 

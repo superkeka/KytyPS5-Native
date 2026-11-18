@@ -38,7 +38,8 @@ keeps KytyPS5-Native and itself up to date.
 Each game has a page in the plugin, also opened from the game's menu in the library
 (KytyPS5-Native...): its patches (cheats from the
 [HEN Cheats Collection](https://github.com/TeeKay87/HEN-Cheats-Collection) made for the game's exact
-version) and its add-ons, each with a switch.
+version) and its add-ons, each with a switch, and the game's own settings: its present mode
+(Mailbox by default; FIFO suits a game that runs faster than the display).
 
 ### Other systems
 

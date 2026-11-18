@@ -1,9 +1,10 @@
 // A game's page, laid out as Steam's own page of a game: the artwork on top with the name over it,
-// then what Kyty adds to the game in tabs: its patches, its add-ons, what it is.
+// then what Kyty adds to the game in tabs: its patches, its add-ons, its settings, what it is.
 import {
   DialogBody,
   DialogButton,
   DialogControlsSection,
+  DropdownItem,
   Field,
   Focusable,
   GamepadButton,
@@ -15,7 +16,7 @@ import {
   useParams,
 } from "@decky/ui";
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
-import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setPatch, toast } from "./api";
+import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setPatch, setPresentMode, toast } from "./api";
 
 // Sizes and colours are those of Steam's page of a game, so the two read as one.
 const CSS = `
@@ -37,8 +38,13 @@ const CSS = `
 .kyty-body { padding: 0 2.8vw 2.5em; }
 `;
 
-type TabId = "patches" | "addons" | "about";
-const TABS: TabId[] = ["patches", "addons", "about"];
+type TabId = "patches" | "addons" | "settings" | "about";
+const TABS: TabId[] = ["patches", "addons", "settings", "about"];
+// The present modes offered, the first Kyty's default: [the word Kyty takes, its name here].
+const PRESENT_MODES: [string, string][] = [
+  ["Mailbox", "Mailbox (default)"],
+  ["Fifo", "FIFO"],
+];
 
 const steamStore = () => (window as any).appStore;
 // The game's Steam shortcut, as Steam knows it.
@@ -119,6 +125,7 @@ export function GamePage() {
   const titles: Record<TabId, [string, string]> = {
     patches: ["Patches", patchesAll ? `${patchesOn}/${patchesAll}` : ""],
     addons: ["Add-ons", game.addons.length ? `${addonsOn}/${game.addons.length}` : ""],
+    settings: ["Settings", ""],
     about: ["About", ""],
   };
 
@@ -187,6 +194,7 @@ export function GamePage() {
             <DialogBody>
               {shown === "patches" && <PatchesTab game={game} patches={patches} setPatches={setPatches} />}
               {shown === "addons" && <AddonsTab game={game} setGame={setGame} />}
+              {shown === "settings" && <SettingsTab game={game} setGame={setGame} />}
               {shown === "about" && <AboutTab game={game} app={app} />}
             </DialogBody>
           </div>
@@ -351,6 +359,37 @@ function AddonsTab(props: { game: GameInfo; setGame: Dispatch<SetStateAction<Gam
           }}
         />
       )}
+    </DialogControlsSection>
+  );
+}
+
+function SettingsTab(props: { game: GameInfo; setGame: Dispatch<SetStateAction<GameInfo | null | undefined>> }) {
+  const { game, setGame } = props;
+  // A mode set by hand in the game's file that is not offered here still shows as the game's.
+  const modes = PRESENT_MODES.some(([mode]) => mode === game.present_mode)
+    ? PRESENT_MODES
+    : [...PRESENT_MODES, [game.present_mode, game.present_mode] as [string, string]];
+  const change = async (mode: string) => {
+    setGame((g) => g && { ...g, present_mode: mode });
+    const r = await setPresentMode(game.title_id, mode);
+    if (!r.ok) {
+      toast(r.log || "failed", game.name);
+      setGame(await getGame(game.title_id));
+    }
+  };
+  return (
+    <DialogControlsSection>
+      <DropdownItem
+        label="Present mode"
+        description={
+          "How finished frames reach the display. Mailbox shows the newest one and never holds the game back. " +
+          "FIFO waits for the display on every frame: steadier for a game that runs faster than the display, " +
+          "slower for one that only just keeps up. Applies from the game's next start"
+        }
+        rgOptions={modes.map(([data, label]) => ({ data, label }))}
+        selectedOption={game.present_mode}
+        onChange={(option) => change(option.data)}
+      />
     </DialogControlsSection>
   );
 }

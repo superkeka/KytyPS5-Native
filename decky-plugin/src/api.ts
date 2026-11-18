@@ -70,6 +70,8 @@ export interface GameInfo {
   patches_on: number;
   addons: Addon[];
   addons_known: boolean;
+  // How Kyty hands the game's frames to the display: Mailbox (Kyty's default), Fifo, or Immediate set by hand.
+  present_mode: string;
   game_running: boolean;
 }
 
@@ -112,6 +114,7 @@ const setArtVersion = callable<[version: number], void>("set_art_version");
 export const getGame = callable<[titleId: string], GameInfo | null>("get_game");
 export const setAddon = callable<[titleId: string, label: string, on: boolean], Result>("set_addon");
 export const findAddons = callable<[titleId: string], Result>("find_addons");
+export const setPresentMode = callable<[titleId: string, mode: string], Result>("set_present_mode");
 export const getPatches = callable<[titleId: string, again: boolean], Patches>("get_patches");
 // With no name and `on` false: all of them off.
 export const setPatch = callable<[titleId: string, name: string, on: boolean], Result>("set_patch");
