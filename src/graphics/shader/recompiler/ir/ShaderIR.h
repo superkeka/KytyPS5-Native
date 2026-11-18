@@ -159,6 +159,7 @@ struct ImageResource {
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
+	bool                          sample_access_only     = true; // Every use is a sample.
 	bool                          depth_compare     = false;
 	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;
@@ -495,6 +496,7 @@ struct Bindings {
 	uint64_t descriptor_mask = 0;
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
+	uint32_t ray_query_dword       = PushData::NoStart; // Device address of the context.
 	uint32_t memory_offset_dword = 0;
 
 	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
@@ -529,6 +531,8 @@ struct ShaderInfo {
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
+	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
+	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
@@ -547,6 +551,7 @@ struct ShaderInfo {
 	bool                            bvh                           = false;
 	bool                            bvh8                          = false;
 	bool                            bvh_stack                     = false;
+	bool                            ray_query                     = false;
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;

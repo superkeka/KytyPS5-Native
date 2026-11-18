@@ -1096,16 +1096,6 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	return packet_size_dw - 1u;
 }
 
-KYTY_CP_OP_PARSER(CpOpFlip) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
-
-	cp.Flip(static_cast<int>(buffer[0]), static_cast<int>(buffer[1]), static_cast<int>(buffer[2]),
-	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
-	return 5;
-}
-
 KYTY_CP_OP_PARSER(CpOpPssr) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1555,6 +1545,9 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
+	// libSceAgc's markers. The packets that follow one do its work here: a flip block's RELEASE_MEM
+	// raises the flip's interrupt, a wait block's padding holds the wait, a queue reset writes the
+	// register tables and pops a pushed context itself.
 	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
@@ -1576,19 +1569,6 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	}
 
 	return SetRegisters(cp, g_hw_uc_indirect_func, cmd_id, cmd_offset, buffer + 1, num_dw - dw);
-}
-
-KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0051018);
-
-	auto video_out_handle     = buffer[0];
-	auto display_buffer_index = buffer[1];
-
-	cp.WaitFlipDone(video_out_handle, display_buffer_index);
-
-	return 6;
 }
 
 bool CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index, uint64_t watermark,

@@ -212,6 +212,7 @@ private:
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
+	void V_MSAD_U8(const Decoder::Instruction& inst);
 	void S_BITSET_B32(const Decoder::Instruction& inst, bool set);
 	void S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
@@ -228,6 +229,7 @@ private:
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
 	void    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
 	void    V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset);
+	void    V_PERM_B32(const Decoder::Instruction& inst);
 	void    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 

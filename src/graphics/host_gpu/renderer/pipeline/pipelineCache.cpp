@@ -243,7 +243,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
-	        .relaxed_float          = Config::RelaxedShaderFloatEnabled()};
+	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
+	        .ray_query              = graphics.ray_query_enabled};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -691,6 +692,15 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
+		// Guest geometry shaders run as host mesh shaders, which cannot follow tessellation.
+		if ((context.GetShaderStages() & 0x20u) != 0) {
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: dropping tessellation draws with a geometry shader.\n");
+			}
+			return;
+		}
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 		// Reflection decodes both programs; the key also covers the VGT fields in tess.
 		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
@@ -765,7 +775,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 			const auto& rt = context.GetRenderTarget(slot);
 			if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
 				target_export_mapping[slot] =
-				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+				    TextureGetRenderTargetFormat(m_graphics, rt.info.format, rt.info.channel_type,
 				                                 rt.info.channel_order)
 				        .export_mapping;
 			}

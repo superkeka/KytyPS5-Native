@@ -145,15 +145,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		{
-			std::lock_guard lock(m_bda_sync_mutex);
-			m_dma_accessed.ForEachInRange(
-			    buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
-				    for (auto address = begin; address < end; address += CACHING_PAGESIZE) {
-					    addresses[buffer.Offset(address) >> CACHING_PAGEBITS] += BDA_ACCESSED;
-				    }
-			    });
-		}
 		// A lean page table (native primary mode) covers no guest pages: nothing Kyty runs reads it.
 		if (table_offset + addresses.size() * sizeof(vk::DeviceAddress) <= m_bda_pagetable_buffer.Size()) {
 			WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
@@ -312,7 +303,7 @@ BufferCache::~BufferCache() {
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-	QueueBdaSync(vaddr, size, true);
+	QueueBdaSync(vaddr, size);
 }
 
 void BufferCache::DiscardGpuCopies(uint64_t vaddr, uint64_t size) {
@@ -345,7 +336,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			QueueBdaSync(vaddr, size, true);
+			QueueBdaSync(vaddr, size);
 		}
 	});
 }
@@ -862,49 +853,11 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	std::lock_guard lock(m_bda_sync_mutex);
-	if (!is_write) {
-		m_bda_sync.Add(begin, end - begin);
-		return;
-	}
-	m_dma_accessed.ForEachInRange(begin, end - begin, [this](uint64_t first, uint64_t last) {
-		m_bda_sync.Add(first, last - first);
-	});
-}
-
-void BufferCache::MarkDmaAccess(const RangeSet& pages) {
-	{
-		std::lock_guard lock(m_bda_sync_mutex);
-		pages.ForEach([this](uint64_t begin, uint64_t end) {
-			m_dma_accessed.Add(begin, end - begin);
-			m_bda_sync.Add(begin, end - begin);
-		});
-	}
-	RangeSet                       unbacked;
-	std::vector<vk::DeviceAddress> entries;
-	pages.ForEach([&](uint64_t begin, uint64_t end) {
-		entries.clear();
-		for (auto address = begin; address < end; address += CACHING_PAGESIZE) {
-			const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
-			if (owner == nullptr || !*owner) {
-				LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
-				unbacked.Add(address, CACHING_PAGESIZE);
-				entries.push_back(0);
-				continue;
-			}
-			const auto& buffer = m_slot_buffers[*owner];
-			entries.push_back(buffer.BufferDeviceAddress() + buffer.Offset(address) + BDA_ACCESSED);
-		}
-		if (!unbacked.Contains(begin, end - begin)) {
-			WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(begin) * sizeof(vk::DeviceAddress),
-			                entries.data(), entries.size() * sizeof(vk::DeviceAddress));
-		}
-	});
-	unbacked.ForEach(
-	    [this](uint64_t start, uint64_t end) { (void)FindBuffer(start, end - start); });
+	m_bda_sync.Add(begin, end - begin);
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {

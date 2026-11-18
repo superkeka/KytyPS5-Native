@@ -399,6 +399,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
 	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+	                   vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
 	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
 	                   vk::PhysicalDeviceRayQueryFeaturesKHR,
 	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
@@ -406,8 +407,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
-	       image_atomic_int64, conditional_rendering, barycentric, acceleration_structure,
-	       ray_query, cooperative_matrix, float8] = supported;
+	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
+	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 #if defined(__linux__)
 	// Importing the BC-250 native path's buffers (dma-bufs) for zero-copy presentation.
@@ -451,6 +452,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
+	}
+	if (!add(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
 	}
 	// Ray queries take all three extensions or none.
 	const bool ray_query_extensions =
@@ -539,12 +543,18 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
+	graphics.ray_query_enabled                = ray_query_enabled;
 	// A coarser alignment rounds the range up past the guest's last byte.
 	graphics.robust_buffer_access_enabled =
 	    robustness2.robustBufferAccess2 &&
 	    robustness2_props.robustStorageBufferAccessSizeAlignment == 1u;
 	graphics.r8_srgb_views   = graphics.SamplesFiltered(vk::Format::eR8Srgb);
 	graphics.r8g8_srgb_views = graphics.SamplesFiltered(vk::Format::eR8G8Srgb);
+	constexpr auto blended_target = vk::FormatFeatureFlagBits::eColorAttachment |
+	                                vk::FormatFeatureFlagBits::eColorAttachmentBlend;
+	graphics.r4g4b4a4_render_targets =
+	    (graphics.GetFormatProperties(vk::Format::eR4G4B4A4UnormPack16).optimalTilingFeatures &
+	     blended_target) == blended_target;
 	// The device clock ticks at timestampPeriod nanoseconds.
 	if (shader_clock.shaderDeviceClock) {
 		graphics.device_clock_period_ps = static_cast<uint32_t>(
@@ -651,7 +661,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    barycentric,
 	    vk::PhysicalDeviceMeshShaderFeaturesEXT {.taskShader = VK_TRUE, .meshShader = VK_TRUE},
 	    feedback_layout, feedback_dynamic, provoking_vertex, image_atomic_int64, maintenance8,
-	    shader_clock, conditional_rendering,
+	    shader_clock, conditional_rendering, compute_derivatives,
 	    vk::PhysicalDeviceAccelerationStructureFeaturesKHR {.accelerationStructure = VK_TRUE},
 	    vk::PhysicalDeviceRayQueryFeaturesKHR {.rayQuery = VK_TRUE}, cooperative_matrix, float8,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
@@ -687,6 +697,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!graphics.conditional_rendering_enabled) {
 		create.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
+	}
+	if (!compute_derivatives.computeDerivativeGroupQuads) {
+		create.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
 	}
 	if (!extended_dynamic_state) {
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();

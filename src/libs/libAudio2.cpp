@@ -731,27 +731,24 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 
 int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
+	if (queue_level == nullptr && available_queues == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	Common::LockGuard lock(g_audioout2_state_mutex);
+	auto*             state = audioout2_find_context_locked(ctx);
+	if (state == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	audioout2_update_context_locked(state);
+	// Grains Advance latched and Push has not played yet are in the queue too.
+	const auto level = state->queued + static_cast<uint32_t>(state->advanced.size());
 	if (queue_level != nullptr) {
-		*queue_level = 0;
+		*queue_level = level;
 	}
 	if (available_queues != nullptr) {
-		*available_queues = 4;
+		*available_queues = (level < state->queue_depth ? state->queue_depth - level : 0);
 	}
-
-	g_audioout2_state_mutex.Lock();
-	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
-		const auto level = state->queued + static_cast<uint32_t>(state->advanced.size());
-		if (queue_level != nullptr) {
-			*queue_level = level;
-		}
-		if (available_queues != nullptr) {
-			*available_queues = (level < state->queue_depth ? state->queue_depth - level : 0);
-		}
-	}
-	g_audioout2_state_mutex.Unlock();
-
-	return OK;
+	return level < state->queue_depth ? OK : AUDIO_OUT2_ERROR_NOT_READY;
 }
 
 // PPSA28180 calls this with rsp off the 16-byte alignment; the host device open needs it.

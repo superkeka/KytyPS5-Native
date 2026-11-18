@@ -3,21 +3,23 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-// Turns guest BVHs (header version 1), which the guest builds and refits on the GPU, into the
-// inputs of host acceleration structure builds. A guest TLAS instance names a pair (BLAS, subtree
-// root), mirrored over the prim-record range the subtree covers, which must be contiguous.
-// Refits rewrite neither child links nor prim records, so hashes of those tell a rebuild apart.
+// Turns guest BVHs (header formats 1, 3, 6 and 10), which the guest builds and refits on the GPU,
+// into the inputs of host acceleration structure builds. A guest TLAS instance names a pair (BLAS,
+// subtree root), mirrored over the prim-record range the subtree covers, which must be contiguous,
+// or at the BLAS root over the header's records, whose fillers hold no triangle. Refits rewrite
+// neither child links nor prim records, so hashes of those tell a rebuild apart.
 // Mode 0 (built with WALK), a workgroup per listed pair: walks the subtree, reporting its record
 // range, the box nodes it visited and a hash of their links.
 // Mode 1, a thread per BLAS prim record: writes the record's triangle and sums hashes of the BLAS
 // records (topology) and triangles (geometry).
 // Mode 2, a thread per box node a pair's walk visited: sums the hash of its links again.
-// Mode 3, a thread per TLAS instance slot: writes the host instance, and clears the context's
-// valid word unless every visible instance has a mirror of its pair as the guest holds it now.
+// Mode 3, a thread per TLAS instance slot: writes the host instance, marks its pair used, and
+// clears the context's valid word unless every visible instance has a mirror of its pair as the
+// guest holds it now.
 
 layout(local_size_x = 64) in;
 
-// Guest page -> host device address of the page, plus 1 once a DMA access synchronized it.
+// Guest page -> host device address of the page, or 0 when no buffer backs it.
 layout(std430, binding = 0) readonly buffer PageTable { uint64_t pages[]; };
 layout(std430, binding = 1) buffer Faults { uint faults[]; };
 
@@ -33,8 +35,9 @@ struct Pair {
 	uint64_t boxes;     // Box nodes the walk visited.
 	uint     blas;
 	uint     root;
-	uint     first;    // Walked range.
-	uint     topology; // BLAS topology hash at the walk.
+	uint     first;    // Mirrored range.
+	uint     count;
+	uint     topology; // BLAS topology hash of the range.
 	uint     links;    // Link hash of the walk.
 	uint     box_count;
 	uint     box_capacity;
@@ -43,8 +46,9 @@ struct Pair {
 };
 const uint PAIR_GEOMETRY = 1u; // `geometry` is known.
 const uint PAIR_UPDATED  = 2u; // Built or updated after this dispatch.
+const uint PAIR_REBUILT  = 4u; // Built after this dispatch over the header's records.
 
-const uint STATE_ABSENT    = 1u; // A page was not synchronized yet.
+const uint STATE_ABSENT    = 1u; // The job met a page no buffer backs.
 const uint STATE_MALFORMED = 2u;
 struct BlasState {
 	uint topology;
@@ -57,6 +61,7 @@ struct BlasState {
 struct PairState {
 	uint links;
 	uint fail;
+	uint used;
 };
 
 layout(buffer_reference, std430) readonly buffer Blases { Blas blases[]; };
@@ -72,6 +77,7 @@ layout(buffer_reference, std430) buffer Context {
 	uint     instances; // Guest instance count, ~0 when the header is unreadable.
 	uint     missing_count;
 	uint64_t structure;
+	uint64_t records; // Guest instance array.
 };
 layout(buffer_reference, std430) buffer BlasStates { BlasState states[]; };
 layout(buffer_reference, std430) buffer PairStates { PairState states[]; };
@@ -111,8 +117,8 @@ const uvec3 FAN[4] = uvec3[4](uvec3(0u, 1u, 2u), uvec3(1u, 3u, 2u), uvec3(2u, 3u
 
 bool g_present = true;
 
-// The host address of guest `address`, or 0 when its page is not synchronized yet. A 64-byte
-// node or an 8-byte record lies in one page.
+// The host address of guest `address`, or 0 when no buffer backs its page yet. A 64-byte node or
+// an 8-byte record lies in one page.
 uint64_t Host(uint64_t address) {
 	const uint64_t packed = address >= params.extended_base ? address - params.fold : address;
 	const uint64_t page   = packed >> params.page_bits;
@@ -121,12 +127,12 @@ uint64_t Host(uint64_t address) {
 		return 0ul;
 	}
 	const uint64_t entry = pages[uint(page)];
-	if ((entry & 1ul) == 0ul) {
+	if (entry == 0ul) {
 		atomicOr(faults[uint(page >> 5)], 1u << uint(page & 31ul));
 		g_present = false;
 		return 0ul;
 	}
-	return entry - 1ul + (address & ((1ul << params.page_bits) - 1ul));
+	return entry + (address & ((1ul << params.page_bits) - 1ul));
 }
 
 uint Read(uint64_t host, uint offset) {
@@ -141,10 +147,18 @@ uint64_t Load64(uint64_t address) {
 	return uint64_t(Load(address)) | uint64_t(Load(address + 4ul)) << 32;
 }
 
-bool IsHeader(uint64_t header, bool blas) {
-	// "PSR_BVHL", version 1, bottom-level property.
-	return Load(header) == 0x5f525350u && Load(header + 4ul) == 0x4c485642u &&
-	       Load(header + 0xfcul) == 1u && ((Load(header + 0x18ul) & 0x40u) != 0u) == blas;
+// The format of a "PSR_BVHL" header at the given level (bottom-level property 0x40), or 0.
+// Formats 3 and 6 move the TLAS instance count to +0x74; format 10 moves the instance offset, node
+// count and record bounds 8 bytes higher. Format 10 is read only in its base layout: not Trinity
+// (property 0x40000), BVH8 (0x80000), three-level (0x100000) or depopulated (0x20000000), nor a
+// GPU-sized TLAS (0x80000000), whose count covers slots the build leaves unwritten.
+uint Format(uint64_t header, bool blas) {
+	const uint version    = Load(header + 0xfcul);
+	const uint properties = Load(header + 0x18ul);
+	const bool known      = version == 1u || version == 3u || version == 6u ||
+	                        (version == 10u && (properties & 0xa01c0000u) == 0u);
+	const bool magic      = Load(header) == 0x5f525350u && Load(header + 4ul) == 0x4c485642u;
+	return magic && known && ((properties & 0x40u) != 0u) == blas ? version : 0u;
 }
 
 uint Mix(uint hash, uint word) {
@@ -161,13 +175,14 @@ struct BlasHeader {
 
 BlasHeader ReadBlas(uint64_t blas) {
 	BlasHeader     header;
-	const bool     magic = IsHeader(blas, true);
-	const uint64_t size  = Load64(blas + 0x10ul);
-	const uint64_t nodes = Load64(blas + 0x50ul), end = Load64(blas + 0x58ul);
+	const uint     format = Format(blas, true);
+	const uint64_t fields = blas + (format == 10u ? 8ul : 0ul);
+	const uint64_t size   = Load64(blas + 0x10ul);
+	const uint64_t nodes = Load64(fields + 0x50ul), end = Load64(fields + 0x58ul);
 	header.nodes = uint(nodes);
-	header.begin = Load(blas + 0x84ul);
+	header.begin = Load(fields + 0x84ul);
 	header.end   = uint(end);
-	header.valid = magic && size < (1ul << 32) && nodes * 64ul <= size &&
+	header.valid = format != 0u && size < (1ul << 32) && nodes * 64ul <= size &&
 	               end * 8ul <= size && header.begin <= header.end;
 	return header;
 }
@@ -378,18 +393,21 @@ void WriteInstance(uint slot) {
 	const uint64_t tlas    = params.tlas;
 	// Words are read 4-byte aligned only.
 	bool     header  = (tlas & 3ul) == 0ul;
+	uint     format  = 0u;
 	uint64_t records = 0ul;
 	uint     guest   = 0u;
 	if (header) {
-		header = IsHeader(tlas, false);
+		format = Format(tlas, false);
+		header = format != 0u;
 	}
 	if (header) {
-		records = tlas + Load64(tlas + 0x28ul);
-		guest   = Load(tlas + 0x70ul);
+		records = tlas + Load64(tlas + (format == 10u ? 0x30ul : 0x28ul));
+		guest   = Load(tlas + (format == 3u || format == 6u ? 0x74ul : 0x70ul));
 		header  = (records & 3ul) == 0ul;
 	}
 	if (slot == 0u) {
 		context.instances = header && g_present ? guest : ~0u;
+		context.records   = records;
 		if (!header || !g_present || guest > params.instance_slots) {
 			context.valid = 0u;
 		}
@@ -403,9 +421,13 @@ void WriteInstance(uint slot) {
 	}
 	if (header && slot < guest) {
 		const uint64_t record = records + uint64_t(slot) * 128ul;
-		const uint64_t blas   = Load64(record);
+		// Format 10 holds BLAS >> 3 at +48 under flags at bit 54, the mask in bits 24..31 and
+		// object-to-world rows; the others the BLAS at +0, the mask in bits 8..15 and columns.
+		const bool     v10  = format == 10u;
+		const uint64_t blas = v10 ? (Load64(record + 48ul) & ((1ul << 54) - 1ul)) << 3
+		                          : Load64(record);
 		const uint     root = Load(record + 56ul), flags = Load(record + 60ul);
-		const uint     mask = (flags >> 8) & 0xffu;
+		const uint     mask = v10 ? flags >> 24 : (flags >> 8) & 0xffu;
 		// Instances without a BLAS, with an empty root (kinds 6, 7) or mask are never hit.
 		if (blas != 0ul && (root & 6u) != 6u && mask != 0u) {
 			const uvec3 key  = uvec3(unpackUint2x32(blas), root);
@@ -417,28 +439,31 @@ void WriteInstance(uint slot) {
 			if (mirrored && pair == ~0u) {
 				params.missing.keys[atomicAdd(context.missing_count, 1u)] = uvec4(key, 0u);
 			} else if (mirrored) {
+				params.pair_states.states[pair].used = 1u;
 				const Pair      known    = params.pairs.pairs[pair];
 				const BlasState state    = params.blas_states.states[known.blas];
 				const PairState rehashed = params.pair_states.states[pair];
+				// A rebuild over the header's records holds them if the header kept their range.
+				const bool rebuilt = (known.flags & PAIR_REBUILT) != 0u;
 				ok = known.structure != 0ul && state.fail == 0u && rehashed.fail == 0u &&
-				     state.topology == known.topology && rehashed.links == known.links &&
-				     ((known.flags & PAIR_UPDATED) != 0u ||
-				      ((known.flags & PAIR_GEOMETRY) != 0u && state.geometry == known.geometry));
+				     (rebuilt ? state.begin == known.first && state.end - state.begin == known.count
+				              : state.topology == known.topology && rehashed.links == known.links &&
+				                    ((known.flags & PAIR_UPDATED) != 0u ||
+				                     ((known.flags & PAIR_GEOMETRY) != 0u &&
+				                      state.geometry == known.geometry)));
 				if (ok) {
-					// VkTransformMatrixKHR rows from the object-to-world columns at +64.
+					// VkTransformMatrixKHR rows from the object-to-world matrix at +64.
 					for (uint row = 0u; row < 3u; ++row) {
 						for (uint column = 0u; column < 4u; ++column) {
-							words[row * 4u + column] =
-							    Load(record + 64ul + column * 12ul + row * 4ul);
+							const uint at = v10 ? row * 16u + column * 4u : column * 12u + row * 4u;
+							words[row * 4u + column] = Load(record + 64ul + at);
 						}
 					}
-					// Bit 0 without bit 1 forces every primitive opaque; else all are non-opaque
-					// candidates, whose prim records hold their opacity.
-					const uint opacity = (flags & 3u) == 1u ? 4u : 0u;
-					words[12]          = slot | mask << 24;
-					words[13]          = known.first | (1u | opacity) << 24;
-					words[14]          = uint(known.structure);
-					words[15]          = uint(known.structure >> 32);
+					// Every primitive is a non-opaque candidate: the traversal decides opacity.
+					words[12] = slot | mask << 24;
+					words[13] = known.first | 1u << 24;
+					words[14] = uint(known.structure);
+					words[15] = uint(known.structure >> 32);
 				}
 			}
 			if (!ok) {

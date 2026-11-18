@@ -69,6 +69,7 @@ public:
 	KYTY_CLASS_NO_COPY(CommandProcessor);
 
 	void Reset();
+	void ResetQueue(uint32_t op);
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
@@ -105,7 +106,6 @@ public:
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
-	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	// libSceAgc's WaitUntilSafeForRendering (Pm4::KYTY_WAIT_FLIP_PAD_MAGIC): only flip requests older
 	// than `watermark` (NextFlipRequestId() when the wait was recorded) hold the buffer, and of the GPU
 	// (SetFlip) flips only those whose release ran before the wait: VideoOut's EopFlipOrder() <= `eop_mark`

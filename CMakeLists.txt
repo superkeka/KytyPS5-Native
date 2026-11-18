@@ -598,6 +598,15 @@ add_executable(rtc_tests EXCLUDE_FROM_ALL
 target_link_libraries(rtc_tests common kyty_test_gtest)
 target_include_directories(rtc_tests PRIVATE ${inc_headers})
 
+add_executable(playgo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayGoTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPlayGo.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/systemContent.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
+target_include_directories(playgo_tests PRIVATE ${inc_headers})
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
@@ -684,7 +693,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
-target_link_libraries(gpu_blit_shader_tests kyty_test_gtest)
+target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
@@ -742,6 +751,7 @@ if(BUILD_TESTING)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME rtc COMMAND $<TARGET_FILE:rtc_tests>)
+	add_test(NAME playgo COMMAND $<TARGET_FILE:playgo_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -865,6 +875,7 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 		rtc_tests
+		playgo_tests
 	)
 endif()
 
