@@ -6,8 +6,8 @@
 # big PS5 game needs (Gran Turismo 7 uses ~12.6 of 14.8 GB). It comes back on any exit. --keep-steam
 # leaves Steam running (enough for smaller games; its overlay and menu stay).
 # ~/.config/KytyPS5-Native/boot.webm plays before the game and exit.webm when the game is left from the
-# in-game menu (PS button). A missing file plays nothing. ~/.config/KytyPS5-Native/hdr (the plugin's HDR
-# toggle) lets the game run in HDR when gamescope outputs it.
+# in-game menu (PS button). A missing file plays nothing. Games run in HDR when gamescope outputs it;
+# ~/.config/KytyPS5-Native/sdr (the plugin's HDR toggle turned off) keeps them in SDR.
 # ~/.config/KytyPS5-Native/addcont/<title id> lists the game's add-ons (DLC and licences), a line each:
 # <label> or <label>=<folder with its data>; a # starts a comment. A game can wait for one of them
 # forever (Ghost of Yotei stays on a black loading screen without its two).
@@ -175,12 +175,13 @@ done
 	notice "KytyPS5-Native update available" "$(head -1 "$CONFIG/update-available"): update it in the Decky plugin"
 [ -n "$NOTICE_TITLES" ] && export KYTY_NOTICE_TITLE="$NOTICE_TITLES" KYTY_NOTICE_TEXT="$NOTICE_TEXTS"
 
-# HDR, when the Decky plugin's HDR toggle is on ($CONFIG/hdr; off by default: ASTRO BOT looks washed out
-# in HDR, issue #7): when gamescope outputs HDR (Steam's display setting), Kyty gets an HDR10 swapchain.
+# HDR, unless the Decky plugin's HDR toggle is off ($CONFIG/sdr; on by default again since ASTRO BOT's
+# washed-out HDR, issue #7, was fixed in c7fe8da4): when gamescope outputs HDR (Steam's display setting),
+# Kyty gets an HDR10 swapchain.
 # With Steam stopped, the gamescope WSI layer (which offers the HDR10 formats) is asked for here; Kyty
 # falls back to SDR when the surface offers no HDR10 format.
 HDR_ARGS=
-if [ -e "$CONFIG/hdr" ] &&
+if [ ! -e "$CONFIG/sdr" ] &&
 	[ "$(DISPLAY=$ROOT_DISPLAY xprop -root GAMESCOPE_DISPLAY_HDR_ENABLED 2>/dev/null | awk '{print $NF}')" = 1 ]; then
 	# The layer talks to gamescope over its own Wayland socket: Steam gives a game its name, this
 	# unit (Steam stopped) reads it where gamescope-session leaves its environment.

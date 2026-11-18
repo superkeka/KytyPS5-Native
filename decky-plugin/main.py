@@ -38,9 +38,12 @@ ART_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "art")
 # Present (holding the release tag) while a newer release is out: the launch wrapper has Kyty say so
 # when a game starts.
 UPDATE_FLAG = os.path.join(CONFIG_DIR, "update-available")
-# Present while games may run in HDR: the launch wrapper then passes --hdr when gamescope outputs HDR
-# (Steam's display setting). Absent, as by default, games run in SDR.
-HDR_FLAG = os.path.join(CONFIG_DIR, "hdr")
+# Present while games run in SDR (the HDR toggle off). Absent, as by default, the launch wrapper passes
+# --hdr when gamescope outputs HDR (Steam's display setting).
+SDR_FLAG = os.path.join(CONFIG_DIR, "sdr")
+# Before HDR became the default, the toggle turned it on with this flag; it is removed when the toggle
+# is used and does nothing any more.
+OLD_HDR_FLAG = os.path.join(CONFIG_DIR, "hdr")
 # A game's add-ons (DLC and licences), a file per title id with a label on each line: the launch
 # wrapper tells Kyty the game has them. A game can wait forever for one it was sold with.
 ADDCONT_DIR = os.path.join(CONFIG_DIR, "addcont")
@@ -1004,7 +1007,7 @@ class Plugin:
             "games": games,
             "gone": {k: v for k, v in known.items() if k not in {g["title_id"] for g in games} and v.get("appid")},
             "videos": {k: os.path.exists(os.path.join(CONFIG_DIR, k + ".webm")) for k in VIDEOS},
-            "hdr": os.path.exists(HDR_FLAG),
+            "hdr": not os.path.exists(SDR_FLAG),
             "ps5_apu": _ps5_apu(),
             "kernel": _kernel_status(),
             "game_running": _game_running(),
@@ -1378,12 +1381,14 @@ class Plugin:
     async def set_hdr(self, on):
         try:
             _mkdir_user(CONFIG_DIR)
-            if on:
+            if not on:
                 # Root writes in the user's folder: never through a link put there.
-                os.close(os.open(HDR_FLAG, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644))
-                _chown(HDR_FLAG)
-            elif os.path.exists(HDR_FLAG):
-                os.remove(HDR_FLAG)
+                os.close(os.open(SDR_FLAG, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644))
+                _chown(SDR_FLAG)
+            elif os.path.lexists(SDR_FLAG):
+                os.remove(SDR_FLAG)
+            if os.path.lexists(OLD_HDR_FLAG):
+                os.remove(OLD_HDR_FLAG)
             return {"ok": True}
         except OSError as e:
             decky.logger.error("hdr: %s", e)

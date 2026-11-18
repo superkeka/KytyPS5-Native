@@ -126,7 +126,7 @@ function DisplayTab({ view, state }: { view: PluginView; state: State }) {
         <DialogControlsSectionHeader>Display</DialogControlsSectionHeader>
         <ToggleField
           label="HDR"
-          description="HDR10 when Steam's display outputs HDR. Applies from the next game start"
+          description="HDR10 when Steam's display outputs HDR (on by default). Applies from the next game start"
           checked={state.hdr}
           disabled={!!busy}
           onChange={(on) =>
