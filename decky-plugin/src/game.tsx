@@ -16,7 +16,7 @@ import {
   useParams,
 } from "@decky/ui";
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
-import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setPatch, setPresentMode, toast } from "./api";
+import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setDisplayCopy, setPatch, setPresentMode, toast } from "./api";
 
 // Sizes and colours are those of Steam's page of a game, so the two read as one.
 const CSS = `
@@ -44,6 +44,12 @@ const TABS: TabId[] = ["patches", "addons", "settings", "about"];
 const PRESENT_MODES: [string, string][] = [
   ["Mailbox", "Mailbox (default)"],
   ["Fifo", "FIFO"],
+];
+
+const DISPLAY_COPY_MODES: [string, string][] = [
+  ["2", "Default (copy buffers with DCC)"],
+  ["0", "No copy"],
+  ["1", "Copy every buffer"],
 ];
 
 const steamStore = () => (window as any).appStore;
@@ -377,8 +383,27 @@ function SettingsTab(props: { game: GameInfo; setGame: Dispatch<SetStateAction<G
       setGame(await getGame(game.title_id));
     }
   };
+  const changeCopy = async (mode: string) => {
+    setGame((g) => g && { ...g, display_copy: mode });
+    const r = await setDisplayCopy(game.title_id, mode);
+    if (!r.ok) {
+      toast(r.log || "failed", game.name);
+      setGame(await getGame(game.title_id));
+    }
+  };
   return (
     <DialogControlsSection>
+      <DropdownItem
+        label="Display buffer copy"
+        description={
+          "Whether each frame is copied before it is shown. No copy is lighter on the GPU, which can cut stutter " +
+          "at high resolutions, but a game that draws with DCC may then show black frames. " +
+          "Applies from the game's next start"
+        }
+        rgOptions={DISPLAY_COPY_MODES.map(([data, label]) => ({ data, label }))}
+        selectedOption={game.display_copy}
+        onChange={(option) => changeCopy(option.data)}
+      />
       <DropdownItem
         label="Present mode"
         description={
