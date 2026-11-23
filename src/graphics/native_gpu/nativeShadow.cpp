@@ -2135,13 +2135,18 @@ public:
 			return false;
 		}
 		auto& slot = m_display_copies[index];
+		// A buffer registered again at its address keeps how the title drew it with DCC: that is learned when the
+		// title next sets up the target, which a title that only changes its mode may not do after registering.
+		const bool     same  = slot.surface.address == s.address;
+		const uint64_t dcc   = same ? slot.dcc.load(std::memory_order_relaxed) : 0;
+		const uint64_t dcc67 = same ? slot.dcc67.load(std::memory_order_relaxed) : 0;
 		slot.seq.fetch_add(1, std::memory_order_acq_rel);
 		slot.source.store(0, std::memory_order_release);
 		slot.surface   = s;
 		slot.installed = false;
 		slot.resident.store(false, std::memory_order_relaxed);
-		slot.dcc.store(0, std::memory_order_relaxed);
-		slot.dcc67.store(0, std::memory_order_relaxed);
+		slot.dcc.store(dcc, std::memory_order_relaxed);
+		slot.dcc67.store(dcc67, std::memory_order_relaxed);
 		slot.plain.store(s.plain, std::memory_order_relaxed);
 		slot.label.store(s.label, std::memory_order_relaxed);
 		InstallDisplayCopyLocked(index);
