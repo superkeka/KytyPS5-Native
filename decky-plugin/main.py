@@ -56,6 +56,11 @@ PATCHES_DIR = os.path.join(CONFIG_DIR, "patches")
 # the wrapper also takes Immediate, written by hand.
 PRESENT_DIR = os.path.join(CONFIG_DIR, "present-mode")
 PRESENT_MODES = ("Mailbox", "Fifo")
+# The audio output's channels (KYTY_AUDIO_CHANNELS): 2, 6, 8 or auto, in audio-default and, for a game, in
+# audio/<title id>, which wins.
+AUDIO_DEFAULT = os.path.join(CONFIG_DIR, "audio-default")
+AUDIO_DIR = os.path.join(CONFIG_DIR, "audio")
+AUDIO_MODES = ("auto", "2", "6", "8")
 PATCH_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "patches")
 PATCH_SOURCE = "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
@@ -621,6 +626,33 @@ def _present_mode(tid):
     return word if word in PRESENT_MODES + ("Immediate",) else PRESENT_MODES[0]
 
 
+def _audio_read(path):
+    """The audio setting in this file, or None when there is none (or it is not one of the modes)."""
+    try:
+        with open(path) as f:
+            word = "".join(f.readline().split())
+    except OSError:
+        return None
+    return word if word in AUDIO_MODES else None
+
+
+def _audio_write(path, mode):
+    """The file the wrapper reads; none when mode is None."""
+    if mode is None:
+        if os.path.lexists(path):
+            os.remove(path)
+        return
+    _mkdir_user(os.path.dirname(path))
+    tmp = path + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    # Root writes in the user's folder: never through a link put there.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w") as f:
+        f.write(mode + "\n")
+    os.replace(tmp, path)
+    os.lchown(path, *_ids())
+
+
 def _present_mode_write(tid, mode):
     """The file the wrapper reads; none for the default."""
     path = os.path.join(PRESENT_DIR, tid)
@@ -1008,6 +1040,7 @@ class Plugin:
             "gone": {k: v for k, v in known.items() if k not in {g["title_id"] for g in games} and v.get("appid")},
             "videos": {k: os.path.exists(os.path.join(CONFIG_DIR, k + ".webm")) for k in VIDEOS},
             "hdr": not os.path.exists(SDR_FLAG),
+            "audio": _audio_read(AUDIO_DEFAULT) or "auto",
             "ps5_apu": _ps5_apu(),
             "kernel": _kernel_status(),
             "game_running": _game_running(),
@@ -1268,6 +1301,7 @@ class Plugin:
             # False while the game's executable is still being read for the first time.
             "addons_known": bool(entry) and entry.get("key") == _addon_key(g["path"]),
             "present_mode": _present_mode(title_id),
+            "audio": _audio_read(os.path.join(AUDIO_DIR, title_id)) or "global",
             "game_running": _game_running(),
         }
 
@@ -1293,6 +1327,26 @@ class Plugin:
             await asyncio.to_thread(_present_mode_write, title_id, mode)
         except OSError as e:
             decky.logger.exception("present mode file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def set_audio(self, title_id, mode):
+        if mode not in AUDIO_MODES + ("global",) or not title_id or os.path.basename(title_id) != title_id or title_id in (".", ".."):
+            return {"ok": False, "log": "not an audio setting of a game"}
+        try:
+            await asyncio.to_thread(_audio_write, os.path.join(AUDIO_DIR, title_id), None if mode == "global" else mode)
+        except OSError as e:
+            decky.logger.exception("audio file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def set_audio_default(self, mode):
+        if mode not in AUDIO_MODES:
+            return {"ok": False, "log": "not an audio setting"}
+        try:
+            await asyncio.to_thread(_audio_write, AUDIO_DEFAULT, None if mode == "auto" else mode)
+        except OSError as e:
+            decky.logger.exception("audio default file")
             return {"ok": False, "log": str(e)}
         return {"ok": True}
 

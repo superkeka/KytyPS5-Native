@@ -16,8 +16,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
+#include <mutex>
 #include <vector>
 
 namespace Libs::Audio {
@@ -67,6 +69,94 @@ static bool audio_out_port_type_is_valid(int type) {
 }
 
 } // namespace
+
+static std::atomic_int g_device_channels {0};
+static std::atomic_int g_open_streams {0};
+
+// SDL opens the physical device with the format of the first stream on it (stereo, for the game's
+// first port): this device, opened first at the host's channels, keeps later streams from being mixed to 2.
+static std::mutex         g_holder_mutex;
+static SDL_AudioDeviceID  g_holder = 0;
+
+static void ReleaseHolder() {
+	std::lock_guard lock(g_holder_mutex);
+	if (g_holder != 0) {
+		SDL_CloseAudioDevice(g_holder);
+		g_holder = 0;
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	}
+}
+
+static void EnsureHolder(int freq) {
+	std::lock_guard lock(g_holder_mutex);
+	const int       host = g_device_channels.load(std::memory_order_relaxed);
+	if (g_holder != 0 || host <= 2 || !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+		return;
+	}
+	SDL_AudioSpec hold {};
+	hold.freq     = freq;
+	hold.format   = SDL_AUDIO_F32;
+	hold.channels = host;
+	g_holder      = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &hold);
+	LOGF("AudioOut: output held open at %d ch: %s\n", host, g_holder != 0 ? "ok" : SDL_GetError());
+	if (g_holder == 0) {
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	}
+}
+
+static int ForcedOutputChannels() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_AUDIO_CHANNELS");
+		const int   n     = value != nullptr ? std::atoi(value) : 0;
+		if (n == 2 || n == 6 || n == 8) {
+			LOGF("AudioOut: output channels forced to %d (KYTY_AUDIO_CHANNELS)\n", n);
+			return n;
+		}
+		return 0;
+	}();
+	return forced;
+}
+
+int DetectedOutputChannels(bool refresh) {
+	if (const int forced = ForcedOutputChannels(); forced > 0) {
+		g_device_channels.store(forced, std::memory_order_relaxed);
+		EnsureHolder(48000);
+		return forced;
+	}
+
+	const int cached = g_device_channels.load(std::memory_order_relaxed);
+	if (cached > 0 && (!refresh || g_open_streams.load(std::memory_order_relaxed) > 0)) {
+		return cached;
+	}
+	if (refresh) {
+		ReleaseHolder();
+	}
+
+	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+		return g_device_channels.load(std::memory_order_relaxed);
+	}
+	SDL_AudioSpec spec {};
+	int           frames = 0;
+	int           found  = 0;
+	if (SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, &frames)) {
+		found = spec.channels;
+	}
+	SDL_QuitSubSystem(SDL_INIT_AUDIO);
+
+	if (found > 0) {
+		g_device_channels.store(found, std::memory_order_relaxed);
+		EnsureHolder(48000);
+	}
+	return found;
+}
+
+int ReportedOutputChannels() {
+	const int device = DetectedOutputChannels();
+	if (device <= 0) {
+		return 2;
+	}
+	return device >= 6 ? 8 : device;
+}
 
 class Audio {
 public:
@@ -224,6 +314,7 @@ void Initialize() {
 	EXIT_IF(g_audio != nullptr);
 
 	g_audio = new Audio;
+	(void)DetectedOutputChannels();
 }
 
 void Shutdown() {
@@ -276,6 +367,10 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		return false;
 	}
 
+	(void)DetectedOutputChannels();
+
+	EnsureHolder(static_cast<int>(port->freq));
+
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(port->format);
@@ -288,6 +383,7 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return false;
 	}
+	g_open_streams.fetch_add(1, std::memory_order_relaxed);
 	if (!SDL_ResumeAudioStreamDevice(port->stream)) {
 		LOGF("AudioOut: SDL_ResumeAudioStreamDevice failed: %s\n", SDL_GetError());
 		CloseSdlDevice(port);
@@ -315,6 +411,7 @@ void Audio::CloseSdlDevice(PortOut* port) {
 	if (port->stream != nullptr) {
 		SDL_DestroyAudioStream(port->stream);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+		g_open_streams.fetch_sub(1, std::memory_order_relaxed);
 	}
 	port->stream = nullptr;
 }
@@ -987,7 +1084,8 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 		case AUDIO_OUT_PORT_TYPE_BGM:
 		case AUDIO_OUT_PORT_TYPE_AUDIO3D:
 			state->output  = 1;
-			state->channel = (channels_num > 2 ? 2 : channels_num);
+			// The speakers the host really has, so a game on a 5.1/7.1 device mixes for them.
+			state->channel = std::min(channels_num, ReportedOutputChannels());
 			break;
 		case AUDIO_OUT_PORT_TYPE_VOICE:
 		case AUDIO_OUT_PORT_TYPE_PERSONAL:

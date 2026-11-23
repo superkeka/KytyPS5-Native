@@ -41,6 +41,8 @@ bool                                 pad_connected = false, pad_bluetooth = fals
 uint64_t                             pad_queue_us = 0;
 const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
+int                                  device_channels = 2; // What the fake device reports.
+int                                  held_open = 0, held_channels = 0;
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -118,9 +120,19 @@ SDL_AudioDeviceID GetAudioStreamDevice(SDL_AudioStream*) {
 }
 
 bool GetAudioDeviceFormat(SDL_AudioDeviceID, SDL_AudioSpec* spec, int* sample_frames) {
-	*spec          = {SDL_AUDIO_F32, 2, 48000};
+	*spec          = {SDL_AUDIO_F32, device_channels, 48000};
 	*sample_frames = device_period != 0 ? static_cast<int>(device_period) : 1024;
 	return true;
+}
+
+SDL_AudioDeviceID OpenAudioDevice(SDL_AudioDeviceID, const SDL_AudioSpec* spec) {
+	held_open++;
+	held_channels = spec->channels;
+	return 2;
+}
+
+void CloseAudioDevice(SDL_AudioDeviceID) {
+	held_open--;
 }
 
 bool ClearAudioStream(SDL_AudioStream* stream) {
@@ -151,6 +163,8 @@ inline void SleepMicro(uint32_t micros) {
 #define SDL_ClearAudioStream        Fake::ClearAudioStream
 #define SDL_GetAudioStreamDevice    Fake::GetAudioStreamDevice
 #define SDL_GetAudioDeviceFormat    Fake::GetAudioDeviceFormat
+#define SDL_OpenAudioDevice         Fake::OpenAudioDevice
+#define SDL_CloseAudioDevice        Fake::CloseAudioDevice
 #include "libs/audio.cpp"
 #undef Thread
 #undef SDL_InitSubSystem
@@ -163,6 +177,8 @@ inline void SleepMicro(uint32_t micros) {
 #undef SDL_ClearAudioStream
 #undef SDL_GetAudioStreamDevice
 #undef SDL_GetAudioDeviceFormat
+#undef SDL_OpenAudioDevice
+#undef SDL_CloseAudioDevice
 
 namespace Libs::Controller {
 int GetActiveControllerId() {
@@ -584,6 +600,20 @@ void TestChannelGains() {
 	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
 	      "connected controller did not receive channel gains");
 }
+void TestHostChannelsAreHeldFromBeforeTheFirstStream() {
+	device_channels = 6;
+	Check(Libs::Audio::DetectedOutputChannels(true) == 6, "5.1 device not detected");
+	Check(held_open == 1 && held_channels == 6, "output not held at the host's channels before any stream");
+	{
+		Fixture f;
+		f.Open(256, 0);
+		device_channels = 2; // An open stream makes SDL report its own format.
+		Check(Libs::Audio::DetectedOutputChannels(true) == 6, "host channels read again from an open stream");
+		Check(Libs::Audio::ReportedOutputChannels() == 8, "5.1 device not reported as 8 channels");
+	}
+	Check(Libs::Audio::DetectedOutputChannels(true) == 2, "stereo device not detected once the ports closed");
+	Check(held_open == 0, "output still held at the old host channels");
+}
 } // namespace
 
 int main() {
@@ -601,6 +631,7 @@ int main() {
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();
+	TestHostChannelsAreHeldFromBeforeTheFirstStream();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }
