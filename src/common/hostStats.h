@@ -24,6 +24,8 @@ struct HostStats {
 
 	// Processing.
 	std::optional<double>    process_cpu_percent; // Share of all logical cores, 0-100.
+	std::vector<double>      core_percent;        // Each logical core, 0-100 (Linux).
+	std::optional<double>    cpu_temp_c;          // Linux.
 	std::optional<double>    system_cpu_percent;  // Whole machine, 0-100.
 	std::optional<uint32_t>  thread_count;
 	std::vector<ThreadUsage> busiest_threads; // Busiest first.
@@ -49,6 +51,7 @@ struct HostStats {
 	std::optional<uint64_t> swap_used;
 	std::optional<uint64_t> swap_total;
 	MemoryPressure          memory_pressure = MemoryPressure::Unknown;
+	std::optional<double>   memory_stall_percent; // Share of the last 10 s a task waited on memory (Linux).
 
 	// Disk I/O of the emulator process.
 	std::optional<double> disk_read_per_s;
@@ -63,6 +66,9 @@ struct HostStats {
 	std::optional<uint64_t> gpu_memory_in_use; // System memory the GPU driver has in use.
 	std::optional<uint64_t> gpu_memory_allocated;
 	std::optional<uint64_t> gpu_recoveries; // GPU resets since boot.
+	std::optional<double>   gpu_temp_c;     // amdgpu on Linux.
+	std::optional<double>   gpu_clock_mhz;
+	std::optional<double>   gpu_power_w;
 };
 
 // May block for a few milliseconds (thread enumeration, OS registry reads), so call it off the
@@ -75,6 +81,9 @@ public:
 	HostStatsSampler& operator=(const HostStatsSampler&) = delete;
 
 	[[nodiscard]] HostStats Sample();
+
+	// The GPU's busy share (Linux, AMD) is sampled by a thread of its own only while it is wanted.
+	void SetGpuLoadWanted(bool wanted);
 
 private:
 	struct Impl;

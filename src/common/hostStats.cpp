@@ -4,6 +4,7 @@
 #include "common/timer.h"
 
 #include <algorithm>
+#include <array>
 #include <thread>
 #include <unordered_map>
 
@@ -23,9 +24,13 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #else
+#include <atomic>
+#include <chrono>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -59,6 +64,8 @@ uint64_t FileTimeTo100Ns(const FILETIME& time) {
 }
 
 struct PlatformState {};
+
+void WantGpuLoad(PlatformState& /*state*/, bool /*wanted*/) {}
 
 void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	const auto process = GetCurrentProcess();
@@ -275,6 +282,8 @@ void SampleThreads(HostStats& stats, Counters& now) {
 	vm_deallocate(task, reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_act_t));
 }
 
+void WantGpuLoad(PlatformState& /*state*/, bool /*wanted*/) {}
+
 void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	SampleRusage(now);
 
@@ -384,7 +393,97 @@ std::optional<uint64_t> Find(const ProcValues& values, const char* key) {
 	return it != values.end() ? std::optional(it->second) : std::nullopt;
 }
 
-struct PlatformState {};
+// The GPU's busy share from GRBM_STATUS (GUI_ACTIVE), as radeontop reads it: the kernel reports no load on every
+// GPU (the BC-250's does not). A thread of its own samples it, and only while it is wanted.
+struct GpuBusy {
+	struct Query { // drm_amdgpu_info with its read_mmr_reg member
+		uint64_t return_pointer;
+		uint32_t return_size;
+		uint32_t query;
+		uint32_t dword_offset;
+		uint32_t count;
+		uint32_t instance;
+		uint32_t flags;
+	};
+
+	std::atomic<uint64_t> busy {0};
+	std::atomic<uint64_t> total {0};
+	std::atomic<bool>     wanted {false};
+	std::jthread          thread;
+	bool                  tried = false;
+
+	static bool ReadStatus(int fd, uint32_t* value) {
+		Query query {reinterpret_cast<uintptr_t>(value), 4, 0x15 /* AMDGPU_INFO_READ_MMR_REG */, 0x2004 /* GRBM_STATUS */, 1,
+		             0xffffffffu, 0};
+		return ioctl(fd, _IOW('d', 0x45, Query), &query) == 0;
+	}
+
+	static int Open() {
+		for (int i = 128; i < 192; i++) {
+			std::string   vendor;
+			std::ifstream vendor_file("/sys/class/drm/renderD" + std::to_string(i) + "/device/vendor");
+			vendor_file >> vendor;
+			if (vendor != "0x1002") {
+				continue;
+			}
+			const int fd = ::open(("/dev/dri/renderD" + std::to_string(i)).c_str(), O_RDWR | O_CLOEXEC);
+			if (fd < 0) {
+				continue;
+			}
+			uint32_t value = 0;
+			if (ReadStatus(fd, &value)) {
+				return fd;
+			}
+			::close(fd);
+		}
+		return -1;
+	}
+
+	void Want(bool on) {
+		wanted.store(on, std::memory_order_relaxed);
+		if (!on || tried) {
+			return;
+		}
+		tried        = true;
+		const int fd = Open();
+		if (fd < 0) {
+			return;
+		}
+		thread = std::jthread([this, fd](const std::stop_token& stop) {
+			while (!stop.stop_requested()) {
+				if (wanted.load(std::memory_order_relaxed)) {
+					uint32_t value = 0;
+					if (ReadStatus(fd, &value)) {
+						total.fetch_add(1, std::memory_order_relaxed);
+						if (((value >> 31u) & 1u) != 0) {
+							busy.fetch_add(1, std::memory_order_relaxed);
+						}
+					}
+					std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				} else {
+					std::this_thread::sleep_for(std::chrono::milliseconds(200));
+				}
+			}
+			::close(fd);
+		});
+	}
+
+	// The share since the last call, 200 samples a second; nothing until there are enough.
+	std::optional<double> Take() {
+		const uint64_t samples = total.exchange(0, std::memory_order_relaxed);
+		const uint64_t active  = busy.exchange(0, std::memory_order_relaxed);
+		return samples >= 20 ? std::optional(100.0 * static_cast<double>(active) / static_cast<double>(samples)) : std::nullopt;
+	}
+};
+
+struct PlatformState {
+	std::vector<std::array<uint64_t, 2>> cores; // Each core's total and busy ticks at the last sample.
+	GpuBusy                              gpu;
+};
+
+void WantGpuLoad(PlatformState& state, bool wanted) {
+	state.gpu.Want(wanted);
+}
 
 void SampleThreads(HostStats& stats, Counters& now) {
 	static const double ns_per_tick = 1e9 / static_cast<double>(std::max(sysconf(_SC_CLK_TCK), 1L));
@@ -424,7 +523,7 @@ void SampleThreads(HostStats& stats, Counters& now) {
 	}
 }
 
-void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
+void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	SampleRusage(now);
 
 	std::ifstream cpu_file("/proc/stat");
@@ -441,6 +540,68 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 		}
 		now.system_total = total;
 		now.system_busy  = total - idle;
+	}
+
+	// Each logical core's share since the previous sample, from the "cpuN" lines.
+	{
+		std::ifstream cores("/proc/stat");
+		std::string   core_line;
+		size_t        index = 0;
+		while (std::getline(cores, core_line)) {
+			if (core_line.size() < 4 || core_line.rfind("cpu", 0) != 0 || core_line[3] < '0' || core_line[3] > '9') {
+				continue;
+			}
+			std::istringstream fields(core_line);
+			std::string        name;
+			fields >> name;
+			uint64_t total = 0;
+			uint64_t idle  = 0;
+			uint64_t value = 0;
+			for (int i = 0; i < 8 && fields >> value; i++) {
+				total += value;
+				if (i == 3 || i == 4) {
+					idle += value;
+				}
+			}
+			const uint64_t busy = total - idle;
+			if (index < state.cores.size() && total > state.cores[index][0] && busy >= state.cores[index][1]) {
+				stats.core_percent.push_back(std::clamp(static_cast<double>(busy - state.cores[index][1]) /
+				                                            static_cast<double>(total - state.cores[index][0]) * 100.0,
+				                                        0.0, 100.0));
+			}
+			if (index >= state.cores.size()) {
+				state.cores.resize(index + 1);
+			}
+			state.cores[index] = {total, busy};
+			index++;
+		}
+	}
+
+	// Temperatures, clock and power from the hwmon nodes of the CPU (k10temp) and the GPU (amdgpu).
+	{
+		std::error_code error;
+		for (std::filesystem::directory_iterator it("/sys/class/hwmon", error), end; !error && it != end;
+		     it.increment(error)) {
+			std::string   name;
+			std::ifstream name_file(it->path() / "name");
+			name_file >> name;
+			const auto number = [&](const char* file, double divisor) -> std::optional<double> {
+				std::ifstream node(it->path() / file);
+				double        value = 0.0;
+				if (node >> value) {
+					return value / divisor;
+				}
+				return std::nullopt;
+			};
+			if (name == "k10temp") {
+				stats.cpu_temp_c = number("temp1_input", 1000.0);
+			} else if (name == "amdgpu") {
+				stats.gpu_temp_c   = number("temp1_input", 1000.0);
+				stats.gpu_power_w  = number("power1_average", 1e6);
+				stats.gpu_clock_mhz = number("freq1_input", 1e6);
+			}
+		}
+		stats.gpu_percent = state.gpu.Take();
 	}
 
 	const auto status         = ReadProcValues("/proc/self/status");
@@ -479,6 +640,7 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	double        stalled = 0.0;
 	if (pressure >> kind >> average && kind == "some" && average.rfind("avg10=", 0) == 0 &&
 	    std::istringstream(average.substr(6)) >> stalled) {
+		stats.memory_stall_percent = stalled;
 		stats.memory_pressure = stalled >= 20.0  ? MemoryPressure::Critical
 		                        : stalled >= 5.0 ? MemoryPressure::Warning
 		                                         : MemoryPressure::Normal;
@@ -509,6 +671,10 @@ struct HostStatsSampler::Impl {
 HostStatsSampler::HostStatsSampler(): m_impl(std::make_unique<Impl>()) {}
 
 HostStatsSampler::~HostStatsSampler() = default;
+
+void HostStatsSampler::SetGpuLoadWanted(bool wanted) {
+	WantGpuLoad(m_impl->state, wanted);
+}
 
 HostStats HostStatsSampler::Sample() {
 	HostStats stats;
