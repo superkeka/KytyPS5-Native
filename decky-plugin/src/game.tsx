@@ -16,7 +16,7 @@ import {
   useParams,
 } from "@decky/ui";
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
-import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setPatch, setPresentMode, toast } from "./api";
+import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setPatch, setPresentMode, setVblank, toast } from "./api";
 
 // Sizes and colours are those of Steam's page of a game, so the two read as one.
 const CSS = `
@@ -44,6 +44,14 @@ const TABS: TabId[] = ["patches", "addons", "settings", "about"];
 const PRESENT_MODES: [string, string][] = [
   ["Mailbox", "Mailbox (default)"],
   ["Fifo", "FIFO"],
+];
+
+// The refresh rates offered for a game: [what the plugin's backend takes, its name here].
+const VBLANK_RATES: [string, string][] = [
+  ["global", "Global setting"],
+  ["60", "60 Hz"],
+  ["90", "90 Hz"],
+  ["120", "120 Hz"],
 ];
 
 const steamStore = () => (window as any).appStore;
@@ -377,8 +385,26 @@ function SettingsTab(props: { game: GameInfo; setGame: Dispatch<SetStateAction<G
       setGame(await getGame(game.title_id));
     }
   };
+  const changeVblank = async (rate: string) => {
+    setGame((g) => g && { ...g, vblank: rate });
+    const r = await setVblank(game.title_id, rate);
+    if (!r.ok) {
+      toast(r.log || "failed", game.name);
+      setGame(await getGame(game.title_id));
+    }
+  };
   return (
     <DialogControlsSection>
+      <DropdownItem
+        label="Refresh rate"
+        description={
+          "The rate Kyty gives this game and paces its frames on: match the screen, 120 Hz on a 120 Hz one. " +
+          "Applies from the game's next start"
+        }
+        rgOptions={VBLANK_RATES.map(([data, label]) => ({ data, label }))}
+        selectedOption={game.vblank}
+        onChange={(option) => changeVblank(option.data)}
+      />
       <DropdownItem
         label="Present mode"
         description={

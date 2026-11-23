@@ -5,6 +5,7 @@ import {
   DialogButton,
   DialogControlsSection,
   DialogControlsSectionHeader,
+  DropdownItem,
   Field,
   Tabs,
   ToggleField,
@@ -19,6 +20,7 @@ import {
   gigabytes,
   setGamesDir,
   setHdr,
+  setVblankDefault,
   setVideo,
   toast,
   usePlugin,
@@ -118,6 +120,13 @@ function GamesTab({ view, state }: { view: PluginView; state: State }) {
   );
 }
 
+// The refresh rates offered for every game: [what the wrapper takes, its name here].
+const VBLANK_RATES: [string, string][] = [
+  ["60", "60 Hz (default)"],
+  ["90", "90 Hz"],
+  ["120", "120 Hz"],
+];
+
 function DisplayTab({ view, state }: { view: PluginView; state: State }) {
   const { busy, run } = view;
   return (
@@ -132,6 +141,22 @@ function DisplayTab({ view, state }: { view: PluginView; state: State }) {
           onChange={(on) =>
             run("HDR", async () => {
               const r = await setHdr(on);
+              if (!r.ok) toast(r.log || "failed");
+            })
+          }
+        />
+        <DropdownItem
+          label="Refresh rate"
+          description={
+            "The rate Kyty gives games, for every game (a game's page can set its own). Kyty paces the frames on it: " +
+            "match the screen, 120 Hz on a 120 Hz one. Applies from the next game start"
+          }
+          rgOptions={VBLANK_RATES.map(([data, label]) => ({ data, label }))}
+          selectedOption={state.vblank}
+          disabled={!!busy}
+          onChange={(option) =>
+            run("Refresh rate", async () => {
+              const r = await setVblankDefault(option.data);
               if (!r.ok) toast(r.log || "failed");
             })
           }
