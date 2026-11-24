@@ -32,6 +32,8 @@ export interface State {
   gone: Record<string, { appid: number }>;
   videos: Record<string, boolean>;
   hdr: boolean;
+  // The other Decky plugins: `keep` is on when one is left running while a game plays (the others are turned off).
+  plugins: { name: string; keep: boolean }[];
   kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "limine" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
   game_running: boolean;
 }
@@ -110,6 +112,7 @@ export const reboot = callable<[], void>("reboot");
 export const setGamesDir = callable<[path: string], void>("set_games_dir");
 export const setVideo = callable<[kind: string, on: boolean], Result>("set_video");
 export const setHdr = callable<[on: boolean], Result>("set_hdr");
+export const setPluginKeep = callable<[name: string, keep: boolean], Result>("set_plugin_keep");
 const setArtVersion = callable<[version: number], void>("set_art_version");
 export const getGame = callable<[titleId: string], GameInfo | null>("get_game");
 export const setAddon = callable<[titleId: string, label: string, on: boolean], Result>("set_addon");

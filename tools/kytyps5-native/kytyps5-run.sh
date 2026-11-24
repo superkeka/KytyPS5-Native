@@ -5,6 +5,9 @@
 # By default Steam is unloaded while the game runs: Steam and its web helpers hold 2-3 GB of RAM that a
 # big PS5 game needs (Gran Turismo 7 uses ~12.6 of 14.8 GB). It comes back on any exit. --keep-steam
 # leaves Steam running (enough for smaller games; its overlay and menu stay).
+# With Steam unloaded, Decky's plugins are turned off too, through Decky's own disable call (the one its
+# plugin menu makes), and back on when the game is left: kytyps5-decky.py. ~/.config/KytyPS5-Native/keep-plugins
+# lists plugin names to leave on (one a line; * leaves them all on). KytyPS5-Native itself always stays on.
 # ~/.config/KytyPS5-Native/boot.webm plays before the game and exit.webm when the game is left from the
 # in-game menu (PS button). A missing file plays nothing. Games run in HDR when gamescope outputs it;
 # ~/.config/KytyPS5-Native/sdr (the plugin's HDR toggle turned off) keeps them in SDR.
@@ -96,9 +99,12 @@ fi
 
 APPID=${SteamAppId:-${SteamGameId:-0}}
 if [ -n "${KYTYPS5_DETACHED:-}" ]; then
+	# The plugins come back first, so that Steam's frontend finds them when it connects to Decky. The
+	# timeout keeps a Decky that does not answer from holding Steam back.
 	restore_steam() {
 		systemd-run --user --collect --quiet /bin/sh -c \
-			'systemctl --user unmask --runtime steam-launcher.service; systemctl --user start steam-launcher.service'
+			'timeout 90 python3 "$1" enable >> "$2" 2>&1; systemctl --user unmask --runtime steam-launcher.service; systemctl --user start steam-launcher.service' \
+			sh "$HERE/kytyps5-decky.py" "$LOG"
 	}
 	trap restore_steam EXIT
 	# A stop sends SIGTERM, on which bash may skip the EXIT trap: restore there too.
@@ -112,6 +118,10 @@ if [ -n "${KYTYPS5_DETACHED:-}" ]; then
 	systemctl --user mask --runtime steam-launcher.service
 	systemctl --user stop steam-launcher.service
 	systemctl --user stop gamescope-mangoapp.service 2>/dev/null
+	# Decky and its plugins run without Steam and hold memory the game needs: Decky turns them off, as
+	# its plugin menu does (see kytyps5-decky.py), and they come back when the game is left. Steam is
+	# stopped by now, so no frontend holds Decky's websocket.
+	timeout 90 python3 "$HERE/kytyps5-decky.py" disable >> "$LOG" 2>&1
 fi
 
 # The window is fullscreen at the connected display's native mode, so the swapchain matches the screen.
