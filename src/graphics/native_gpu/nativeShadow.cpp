@@ -6209,6 +6209,9 @@ private:
 		}
 		// Video-out buffers presented from plain copies (ShadowAddDisplayCopy).
 		StartDisplayCopiesLocked();
+		if (StaleCheckOn()) {
+			SetStaleCheckReader([](uint64_t va, void* dst, uint64_t bytes) { return Shadow::Instance().ReadGuest(va, dst, bytes); });
+		}
 		// KYTY_NATIVE_GPU_FIND=0xADDR:0xSIZE: log the draws/dispatches whose resources reach that range.
 		if (const char* find = std::getenv("KYTY_NATIVE_GPU_FIND"); find != nullptr) {
 			char*          end  = nullptr;

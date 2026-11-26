@@ -770,6 +770,11 @@ struct SourcePiece {
 // top level calls or chains to begins and ends (the title's own segments of the command buffer).
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
                             std::vector<SourcePiece>* pieces = nullptr, std::vector<uint32_t>* marks = nullptr);
+// KYTY_NATIVE_GPU_STALE_CHECK=MS (diagnostics): FlattenIndirectBuffers keeps what it took from guest memory and reads it
+// again MS ms later through `reader` (bytes copied), logging what the title changed in between.
+using StaleCheckReader = uint64_t (*)(uint64_t va, void* dst, uint64_t bytes);
+void SetStaleCheckReader(StaleCheckReader reader);
+bool StaleCheckOn();
 // Where the CP would stop in a graphics buffer: at a REWIND of its top level the title has not set valid yet
 // (`next` == nullptr: the buffer runs up to `at`, the rest from `at` on once the REWIND is valid), or at an
 // INDIRECT_BUFFER of its top level to a buffer that stops so (`next`, `next_size`: its target, which runs after

@@ -6,10 +6,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -2223,6 +2225,171 @@ bool FindRewindStop(std::span<const uint32_t> in, RewindStop* out) {
 	return StopsAtRewind(in, out, 64);
 }
 
+namespace {
+
+std::atomic<StaleCheckReader> g_stale_reader {nullptr};
+
+// KYTY_NATIVE_GPU_STALE_CHECK=MS (diagnostics): the command dwords the translator took from guest memory (a buffer and
+// everything its chains and calls reach) are read again MS ms later. A dword that changed in between was still being
+// written by the title when it was translated: the CP, which reads a buffer as it runs it, would have run the new one.
+// Changes are logged with the packet they fall in; a summary line every 2 s.
+class StaleCheck {
+public:
+	static StaleCheck* Get() {
+		static StaleCheck* check = []() -> StaleCheck* {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_STALE_CHECK");
+			if (v == nullptr || v[0] == '\0' || v[0] == '0') {
+				return nullptr;
+			}
+			return new StaleCheck(std::strtod(v, nullptr));
+		}();
+		return check;
+	}
+
+	void Record(std::span<const uint32_t> content, std::span<const SourcePiece> pieces) {
+		const double due = Now() + m_delay_ms / 1000.0;
+		std::lock_guard<std::mutex> lock(m_mutex);
+		const uint64_t              buffer = m_buffers++;
+		for (const auto& p: pieces) {
+			if (p.len == 0 || p.dw + static_cast<uint64_t>(p.len) > content.size()) {
+				continue;
+			}
+			if (m_queue.size() >= 65536) {
+				m_dropped++;
+				continue;
+			}
+			m_queue.push_back({due, p.va, buffer, std::vector<uint32_t>(content.begin() + p.dw, content.begin() + p.dw + p.len)});
+		}
+	}
+
+private:
+	struct Snapshot {
+		double                due;
+		uint64_t              va;
+		uint64_t              buffer;
+		std::vector<uint32_t> dw;
+	};
+
+	explicit StaleCheck(double delay_ms): m_delay_ms(delay_ms) {
+		std::fprintf(stderr, "native stale check: translated command dwords read again %.1f ms later\n", delay_ms);
+		std::thread([this] { Run(); }).detach();
+	}
+
+	static double Now() {
+		return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	void Run() {
+		double next_summary = Now() + 2.0;
+		for (;;) {
+			Snapshot s;
+			bool     have = false;
+			{
+				std::lock_guard<std::mutex> lock(m_mutex);
+				if (!m_queue.empty()) {
+					s = std::move(m_queue.front());
+					m_queue.pop_front();
+					have = true;
+				}
+			}
+			if (!have) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			} else {
+				if (const double wait = s.due - Now(); wait > 0) {
+					std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+				}
+				Compare(s);
+			}
+			if (Now() >= next_summary) {
+				next_summary = Now() + 2.0;
+				std::lock_guard<std::mutex> lock(m_mutex);
+				std::string ops;
+				for (const auto& [op, n]: m_ops) {
+					char one[32];
+					std::snprintf(one, sizeof(one), " 0x%02x:%llu", op, static_cast<unsigned long long>(n));
+					ops += one;
+				}
+				std::fprintf(stderr,
+				             "native stale check: %llu buffers, %llu pieces checked, %llu changed (%llu dwords), %llu unreadable, %llu "
+				             "dropped; changed dwords by packet:%s\n",
+				             static_cast<unsigned long long>(m_buffers), static_cast<unsigned long long>(m_checked),
+				             static_cast<unsigned long long>(m_changed), static_cast<unsigned long long>(m_changed_dw),
+				             static_cast<unsigned long long>(m_unreadable), static_cast<unsigned long long>(m_dropped), ops.c_str());
+			}
+		}
+	}
+
+	void Compare(const Snapshot& s) {
+		std::vector<uint32_t> now(s.dw.size());
+		const auto            reader = g_stale_reader.load(std::memory_order_acquire);
+		const bool            read   = reader != nullptr && reader(s.va, now.data(), now.size() * 4) == now.size() * 4;
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_checked++;
+		if (!read) {
+			m_unreadable++;
+			return;
+		}
+		uint32_t first = UINT32_MAX, n = 0;
+		for (uint32_t i = 0; i < now.size(); i++) {
+			if (now[i] != s.dw[i]) {
+				first = std::min(first, i);
+				n++;
+			}
+		}
+		if (n == 0) {
+			return;
+		}
+		m_changed++;
+		m_changed_dw += n;
+		// The packets the changed dwords fall in (the piece starts at a packet).
+		uint32_t first_op = 0, first_at = 0;
+		for (uint32_t j = 0, i = 0; j < s.dw.size();) {
+			const uint32_t h    = s.dw[j];
+			const uint32_t size = (h >> 30u) == 3u ? PacketSizeDw(h) : 1u;
+			const uint32_t op   = (h >> 30u) == 3u ? (h >> 8u) & 0xffu : 0x100u;
+			for (; i < now.size() && i < j + size; i++) {
+				if (now[i] != s.dw[i]) {
+					m_ops[op]++;
+					if (i == first) {
+						first_op = op;
+						first_at = i - j;
+					}
+				}
+			}
+			j += size;
+		}
+		if (m_logged++ < 200) {
+			std::fprintf(stderr,
+			             "native stale check: buffer %llu piece 0x%llx (%zu dw): %u dwords changed, first at dw %u (0x%08x -> 0x%08x), "
+			             "dw %u of a packet 0x%02x\n",
+			             static_cast<unsigned long long>(s.buffer), static_cast<unsigned long long>(s.va), s.dw.size(), n, first, s.dw[first],
+			             now[first], first_at, first_op);
+		}
+	}
+
+	double                       m_delay_ms;
+	std::mutex                   m_mutex;
+	std::deque<Snapshot>         m_queue;
+	std::map<uint32_t, uint64_t> m_ops;
+	uint64_t                     m_buffers    = 0;
+	uint64_t                     m_checked    = 0;
+	uint64_t                     m_changed    = 0;
+	uint64_t                     m_changed_dw = 0;
+	uint64_t                     m_unreadable = 0;
+	uint64_t                     m_dropped    = 0;
+	uint32_t                     m_logged     = 0;
+};
+
+} // namespace
+
+void SetStaleCheckReader(StaleCheckReader reader) {
+	g_stale_reader.store(reader, std::memory_order_release);
+}
+
+bool StaleCheckOn() {
+	return StaleCheck::Get() != nullptr;
+}
+
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why,
                             std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
 	out->clear();
@@ -2232,12 +2399,25 @@ bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>*
 	if (marks != nullptr) {
 		marks->clear();
 	}
+	StaleCheck*              stale = StaleCheck::Get();
+	std::vector<SourcePiece> own_pieces;
+	if (stale != nullptr && pieces == nullptr) {
+		pieces = &own_pieces;
+	}
 	if (FlattenInto(in, out, 0, why, pieces, marks) <= 0) {
 		out->clear();
 		if (pieces != nullptr) {
 			pieces->clear();
 		}
+		if (stale != nullptr && (why == nullptr || why->empty())) {
+			// Nothing to inline: the buffer is translated as it sits in guest memory.
+			const SourcePiece whole {0, static_cast<uint32_t>(in.size()), reinterpret_cast<uint64_t>(in.data())};
+			stale->Record(in, std::span<const SourcePiece>(&whole, 1));
+		}
 		return false;
+	}
+	if (stale != nullptr) {
+		stale->Record(*out, *pieces);
 	}
 	return true;
 }
