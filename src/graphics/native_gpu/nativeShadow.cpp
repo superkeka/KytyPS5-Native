@@ -1360,7 +1360,16 @@ public:
 	// Reads guest memory through the backing (clipped to the view holding `addr`); 0 when unavailable.
 	uint64_t ReadGuest(uint64_t addr, void* dst, uint64_t size) {
 #if KYTY_GEM_BACKING_SUPPORTED
-		return m_gem != nullptr ? m_gem->ReadGuest(addr, dst, size) : 0;
+		// Across views: a surface the title mapped page by page (AMM) is a view per page.
+		uint64_t done = 0;
+		while (m_gem != nullptr && done < size) {
+			const uint64_t n = m_gem->ReadGuest(addr + done, static_cast<uint8_t*>(dst) + done, size - done);
+			if (n == 0) {
+				break;
+			}
+			done += n;
+		}
+		return done;
 #else
 		(void)addr;
 		(void)dst;
