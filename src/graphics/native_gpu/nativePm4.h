@@ -899,6 +899,8 @@ struct Pm4TranslateResult {
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
 	std::vector<LodBankScan>      lod_scans;      // SetLodBankScan: one per GET_LOD_STATS packet
 	std::vector<uint32_t>         display_copies; // SetDisplayCopies: the flips (their interrupt contexts) with a copy pass
+	// SetDrawLog: the flips this buffer raises (kernel interrupt contexts, bit 27) and draw_log's size at each.
+	std::vector<std::pair<uint32_t, uint32_t>> flip_marks;
 	struct UnmetWait {
 		uint64_t addr;
 		uint64_t ref;

@@ -5055,9 +5055,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		// SetDisplayCopies: a flip of a registered video-out buffer comes next (libSceAgc's RELEASE_MEM into the buffer's
 		// label with a kernel interrupt context, bit 27). Its plain copy is filled first, in packets of their own.
-		if (!display_copies.empty() && (dcb[dw] >> 30u) == 3u && ((dcb[dw] >> 8u) & 0xffu) == IT_RELEASE_MEM && ((dcb[dw] >> 16u) & 0x3fffu) >= 6u && dw + 8u <= dcb.size() &&
+		if ((dcb[dw] >> 30u) == 3u && ((dcb[dw] >> 8u) & 0xffu) == IT_RELEASE_MEM && ((dcb[dw] >> 16u) & 0x3fffu) >= 6u && dw + 8u <= dcb.size() &&
 		    (dcb[dw + 7u] & (1u << 27u)) != 0) {
-			emit_display_copy(static_cast<uint64_t>(dcb[dw + 3u]) | (static_cast<uint64_t>(dcb[dw + 4u]) << 32u), dcb[dw + 7u] & 0x0fffffffu);
+			if (!display_copies.empty()) {
+				emit_display_copy(static_cast<uint64_t>(dcb[dw + 3u]) | (static_cast<uint64_t>(dcb[dw + 4u]) << 32u), dcb[dw + 7u] & 0x0fffffffu);
+			}
+			if (m_draw_log) {
+				r.flip_marks.emplace_back(dcb[dw + 7u] & 0x0fffffffu, static_cast<uint32_t>(r.draw_log.size()));
+			}
 		}
 		const size_t   body_before = body.size();
 		const size_t   segs_before = segs.size();

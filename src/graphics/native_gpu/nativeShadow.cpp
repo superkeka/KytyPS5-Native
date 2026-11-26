@@ -1467,6 +1467,21 @@ public:
 		m_frame_buffers = 0;
 		return out;
 	}
+	// The draws translated before the release that raises flip `ctx` and after the previous flip's: that flip's
+	// frame, however far submission runs ahead of the display. Without such a release (a CPU flip), those since the last.
+	std::vector<FrameDraw> TakeFlipDraws(uint32_t ctx) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::vector<FrameDraw>      out;
+		auto&                       slot = m_flip_draws[ctx & 0xffu];
+		if (slot.ctx == ctx) {
+			out.swap(slot.draws);
+			slot.ctx = 0;
+		} else {
+			out.swap(m_frame_draws); // a flip from the CPU: the draws since the last
+			m_frame_buffers = 0;
+		}
+		return out;
+	}
 
 	// The color targets the DCBs bound since the last call, for the flip dump.
 	std::vector<RenderTargetInfo> TakeFrameTargets() {
@@ -1867,10 +1882,22 @@ public:
 			}
 		}
 		SubmitTrace::Instance().Translated(t_trace_job, acb, result.draw_log);
-		if (!result.draw_log.empty() && m_draw_log_frames) {
+		if ((!result.draw_log.empty() || !result.flip_marks.empty()) && m_draw_log_frames) {
 			const uint32_t buffer = m_frame_buffers++;
-			for (const auto& d: result.draw_log) {
-				m_frame_draws.push_back(FrameDraw {acb, buffer, d});
+			size_t         i      = 0;
+			// The draws up to a flip's release in this buffer are that flip's frame (TakeFlipDraws), whenever the flip
+			// is shown.
+			for (const auto& [ctx, upto]: result.flip_marks) {
+				for (; i < upto && i < result.draw_log.size(); i++) {
+					m_frame_draws.push_back(FrameDraw {acb, buffer, result.draw_log[i]});
+				}
+				auto& slot = m_flip_draws[ctx & 0xffu];
+				slot.ctx   = ctx;
+				slot.draws.swap(m_frame_draws);
+				m_frame_draws.clear();
+			}
+			for (; i < result.draw_log.size(); i++) {
+				m_frame_draws.push_back(FrameDraw {acb, buffer, result.draw_log[i]});
 			}
 		}
 		if (m_collect_targets) {
@@ -7119,6 +7146,11 @@ private:
 	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
 	bool                                 m_draw_log_frames = false; // KYTY_NATIVE_GPU_CTL keeps them for the flip dump
 	std::vector<FrameDraw>               m_frame_draws;   // KYTY_NATIVE_GPU_CTL: draws since the last flip
+	struct FlipDraws {
+		uint32_t               ctx = 0;
+		std::vector<FrameDraw> draws;
+	};
+	std::array<FlipDraws, 256> m_flip_draws; // KYTY_NATIVE_GPU_CTL: the draws of each pending flip (TakeFlipDraws)
 	uint32_t                             m_frame_buffers = 0;
 	std::atomic<uint64_t> m_frames {0}; // the ACB thread reads it for the hang tests
 	uint64_t      m_completed      = 0;
@@ -9236,7 +9268,16 @@ void ShadowRemoveDisplayCopy(uint64_t label) {
 	}
 }
 
+namespace {
+// Diagnostics (flip dumps, KYTY_CMD_TRAP/PROBE records): the frame a title is building is the number of flips it has
+// reserved so far (sceVideoOutSubmitEopFlip, when it writes the frame's last command buffer); a flip shows the frame
+// its reservation closed.
+std::atomic<uint64_t>                       g_frames_reserved {0};
+std::array<std::atomic<uint64_t>, 256>      g_frame_of_ctx {};
+} // namespace
+
 void ShadowNoteFlipContext(uint32_t ctx, uint64_t label) {
+	g_frame_of_ctx[ctx & 0xffu].store(g_frames_reserved.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
 	if (DisplayCopyMode() != 0) {
 		Shadow::Instance().NoteFlipContext(ctx, label);
 	}
@@ -9528,9 +9569,10 @@ namespace {
 // (EFLAGS.TF) with its page open. A write that completes a SET_SH_REG_INDIRECT whose table sets SPI_SHADER_PGM_LO_PS
 // (or, with KYTY_CMD_TRAP_RANGE=lo:hi, leaves a dword in [lo, hi)) is recorded with the writer's pc, the pixel shader,
 // the table and the return addresses on its stack into the program (the loader sets its range, CmdTrapSetCode).
-// Needs KYTY_CMD_TRAP=1, which notes the command pages. cmdtrap.txt in KYTY_NATIVE_GPU_DUMP_DIR when the window closes.
+// Needs KYTY_CMD_TRAP=1, which notes the command pages. cmdtrap_<first flip>.txt in KYTY_NATIVE_GPU_DUMP_DIR when the window closes.
 struct CmdTrapRecord {
 	uint64_t flip;
+	uint64_t frame; // g_frames_reserved
 	uint64_t pc;
 	uint64_t vaddr;
 	uint32_t value[8];
@@ -9587,21 +9629,30 @@ bool CmdTrapPage(uint64_t page) {
 }
 
 // KYTY_CMD_PROBE="ADDR[:REG+OFF,...]/..." (program offsets in hex, diagnostics): while a "wtrap" window is open, a breakpoint at
-// each ADDR (a hardware breakpoint, up to 4) records the flip, the thread, rdi rsi rdx rcx r8, 8 bytes at each REG+OFF and
-// the frame-pointer chain.
+// each ADDR (a hardware breakpoint, up to 4) records the flip, the thread, rdi rsi rdx rcx r8, 8 bytes at each REG[+REG2]+OFF and
+// the frame-pointer chain. "wADDR" (an absolute address) watches the 8 bytes there for writes instead: the record has the
+// writing instruction's successor (pc) and the value written. "ADDR:...@REG+OFF" also watches REG+OFF for writes from the
+// next flip on, as of the first hit where the 8 bytes there are not 0 (one such watch per window, in the slot after the last).
 struct CmdProbe {
-	uint64_t addr = 0;
+	uint64_t addr  = 0;
+	bool     write = false;
+	int      arm_reg = -1;
+	int64_t  arm_off = 0;
 	uint32_t nmem = 0;
 	int      reg[8] {};
+	int      reg2[8] {-1, -1, -1, -1, -1, -1, -1, -1};
 	int64_t  off[8] {};
 };
 struct CmdProbeRecord {
 	uint64_t flip;
+	uint64_t frame; // g_frames_reserved
 	uint32_t tid;
 	uint32_t probe;
 	uint64_t regs[10]; // rdi rsi rdx rcx r8 rax r12 r13 r14 r15
 	uint64_t mem[8];
 	uint64_t ret[6];
+	uint64_t pc;
+	uint64_t value; // a write watch: the watched 8 bytes after the write
 };
 constexpr uint32_t    kCmdProbeRecords = 1u << 18;
 CmdProbe              g_cp[16];
@@ -9628,15 +9679,19 @@ uint64_t CmdProbeRead(uint64_t a) {
 	return ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == 8 ? v : 0xdeaddeaddeaddeadull;
 }
 
-std::vector<int> g_cp_fds;
+std::vector<int>      g_cp_fds;
+std::atomic<uint64_t> g_cp_arm_addr {0}; // "@REG+OFF": the address to watch, 1 once armed
+uint32_t              g_cp_armed_slots = 0; // flip thread: the slots it added
 
-// Hardware execution breakpoints (perf, sigtrap) on every thread there is now: the program's code stays as it is.
-void CmdProbeSet(bool on) {
+// Hardware execution breakpoints (perf, sigtrap) on every thread there is now: the program's code stays as it is. `only`:
+// just that slot.
+void CmdProbeSet(bool on, int only = -1) {
 	if (!on) {
 		for (const int fd: g_cp_fds) {
 			::close(fd);
 		}
 		g_cp_fds.clear();
+		g_cp_arm_addr.store(0);
 		return;
 	}
 	std::vector<int> tids;
@@ -9650,13 +9705,16 @@ void CmdProbeSet(bool on) {
 	}
 	uint32_t failed = 0;
 	for (uint32_t i = 0; i < g_cp_n && i < 4; i++) {
+		if (only >= 0 && i != static_cast<uint32_t>(only)) {
+			continue;
+		}
 		for (const int tid: tids) {
 			perf_event_attr a {};
 			a.type           = PERF_TYPE_BREAKPOINT;
 			a.size           = sizeof(a);
-			a.bp_type        = HW_BREAKPOINT_X;
+			a.bp_type        = g_cp[i].write ? HW_BREAKPOINT_W : HW_BREAKPOINT_X;
 			a.bp_addr        = g_cp[i].addr;
-			a.bp_len         = sizeof(long);
+			a.bp_len         = g_cp[i].write ? HW_BREAKPOINT_LEN_8 : sizeof(long);
 			a.sample_period  = 1;
 			a.exclude_kernel = 1;
 			a.exclude_hv     = 1;
@@ -9694,6 +9752,7 @@ bool CmdProbeTrap(siginfo_t* info, ucontext_t* uc) {
 	}
 	CmdProbeRecord& r = g_cp_records[idx];
 	r.flip            = g_ct_flip.load(std::memory_order_relaxed);
+	r.frame           = g_frames_reserved.load(std::memory_order_relaxed);
 	r.tid             = static_cast<uint32_t>(::syscall(SYS_gettid));
 	r.probe           = i;
 	r.regs[0]         = g[REG_RDI];
@@ -9706,10 +9765,20 @@ bool CmdProbeTrap(siginfo_t* info, ucontext_t* uc) {
 	r.regs[7]         = g[REG_R13];
 	r.regs[8]         = g[REG_R14];
 	r.regs[9]         = g[REG_R15];
+	r.pc              = static_cast<uint64_t>(g[REG_RIP]);
+	r.value           = g_cp[i].write ? *reinterpret_cast<const volatile uint64_t*>(g_cp[i].addr) : 0;
+	if (g_cp[i].arm_reg >= 0 && g_cp_arm_addr.load(std::memory_order_relaxed) == 0) {
+		const uint64_t a = static_cast<uint64_t>(g[g_cp[i].arm_reg]) + g_cp[i].arm_off;
+		if (*reinterpret_cast<const volatile uint64_t*>(a) != 0) {
+			uint64_t none = 0;
+			g_cp_arm_addr.compare_exchange_strong(none, a);
+		}
+	}
 	for (uint32_t k = 0; k < 8; k++) {
 		// Read in place: guest memory backed by GPU buffers is not readable with process_vm_readv. The probe names
 		// fields of objects the probed code itself uses.
-		r.mem[k] = k < g_cp[i].nmem ? *reinterpret_cast<const volatile uint64_t*>(static_cast<uint64_t>(g[g_cp[i].reg[k]]) + g_cp[i].off[k]) : 0;
+		const uint64_t base2 = k < g_cp[i].nmem && g_cp[i].reg2[k] >= 0 ? static_cast<uint64_t>(g[g_cp[i].reg2[k]]) : 0;
+		r.mem[k] = k < g_cp[i].nmem ? *reinterpret_cast<const volatile uint64_t*>(static_cast<uint64_t>(g[g_cp[i].reg[k]]) + base2 + g_cp[i].off[k]) : 0;
 	}
 	uint64_t fp = static_cast<uint64_t>(g[REG_RBP]);
 	for (uint32_t k = 0; k < 6; k++) {
@@ -9725,17 +9794,29 @@ void CmdProbeParse(uint64_t base) {
 	for (const char* p = v; p != nullptr && *p != '\0' && g_cp_n < 16;) {
 		char*     end = nullptr;
 		CmdProbe& c   = g_cp[g_cp_n];
-		c.addr        = base + std::strtoull(p, &end, 16);
+		c.write       = *p == 'w';
+		if (c.write) {
+			p++;
+		}
+		c.addr = (c.write ? 0 : base) + std::strtoull(p, &end, 16);
 		if (end == p) {
 			break;
 		}
 		p = end;
 		if (*p == ':') {
 			p++;
-			while (*p != '\0' && *p != '/' && c.nmem < 8) {
+			while (*p != '\0' && *p != '/' && *p != '@' && c.nmem < 8) {
 				const int r = CmdProbeReg(p);
-				while (*p != '\0' && *p != '+' && *p != '-' && *p != ',' && *p != '/') {
+				while (*p != '\0' && *p != '+' && *p != '-' && *p != ',' && *p != '/' && *p != '@') {
 					p++;
+				}
+				int r2 = -1; // "REG+REG2+OFF"
+				if (*p == '+' && p[1] == 'r') {
+					p++;
+					r2 = CmdProbeReg(p);
+					while (*p != '\0' && *p != '+' && *p != '-' && *p != ',' && *p != '/' && *p != '@') {
+						p++;
+					}
 				}
 				const int64_t o = (*p == '+' || *p == '-') ? std::strtoll(p, &end, 16) : 0;
 				if (*p == '+' || *p == '-') {
@@ -9743,11 +9824,23 @@ void CmdProbeParse(uint64_t base) {
 				}
 				if (r >= 0) {
 					c.reg[c.nmem]   = r;
+					c.reg2[c.nmem]  = r2;
 					c.off[c.nmem++] = o;
 				}
 				if (*p == ',') {
 					p++;
 				}
+			}
+		}
+		if (*p == '@') {
+			p++;
+			c.arm_reg = CmdProbeReg(p);
+			while (*p != '\0' && *p != '+' && *p != '-' && *p != '/') {
+				p++;
+			}
+			if (*p == '+' || *p == '-') {
+				c.arm_off = std::strtoll(p, &end, 16);
+				p         = end;
 			}
 		}
 		g_cp_n++;
@@ -9819,6 +9912,7 @@ void CmdTrapStep(int sig, siginfo_t* info, void* native_context) {
 		if (idx < kCmdTrapRecords) {
 			CmdTrapRecord& r = g_ct_records[idx];
 			r.flip           = g_ct_flip.load(std::memory_order_relaxed);
+			r.frame          = g_frames_reserved.load(std::memory_order_relaxed);
 			r.pc             = t_ct_pc;
 			r.vaddr          = t_ct_vaddr;
 			std::memcpy(r.value, v, sizeof(v));
@@ -9874,6 +9968,16 @@ void CmdTrapOnFlip(uint64_t n) {
 	if (!g_ct_on) {
 		return;
 	}
+	// A probe's "@REG+OFF" found its address: a write watch on it in the next slot, from now to the window's end.
+	if (const uint64_t a = g_cp_arm_addr.load(); a > 1 && g_cp_on.load() && g_cp_n < 4) {
+		g_cp[g_cp_n] = CmdProbe {a, true};
+		g_cp_n++;
+		g_cp_armed_slots++;
+		CmdProbeSet(true, static_cast<int>(g_cp_n - 1));
+		g_cp_arm_addr.store(1);
+		std::fprintf(stderr, "native shadow: write watch on 0x%llx from flip %llu\n", static_cast<unsigned long long>(a),
+		             static_cast<unsigned long long>(n));
+	}
 	if (g_ct_flips_left > 0) {
 		if (--g_ct_flips_left > 0) {
 			return;
@@ -9883,19 +9987,25 @@ void CmdTrapOnFlip(uint64_t n) {
 		if (g_cp_on.exchange(false)) {
 			CmdProbeSet(false);
 		}
+		while (g_cp_n > 0 && g_cp[g_cp_n - 1].write && g_cp[g_cp_n - 1].arm_reg < 0 && g_cp_armed_slots > 0) {
+			g_cp_n--;
+			g_cp_armed_slots--;
+		}
 		const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
 		char        path[512];
-		std::snprintf(path, sizeof(path), "%s/cmdtrap.txt", dir != nullptr && dir[0] != '\0' ? dir : ".");
+		std::snprintf(path, sizeof(path), "%s/cmdtrap_%llu.txt", dir != nullptr && dir[0] != '\0' ? dir : ".",
+		              static_cast<unsigned long long>(g_ct_arm_flip));
 		const uint32_t count = std::min(g_ct_next.load(), kCmdTrapRecords);
 		if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
 			std::fprintf(f, "# armed at flip %llu, closed at %llu, %u pages, %llu write faults, %u records; code 0x%llx-0x%llx\n",
 			             static_cast<unsigned long long>(g_ct_arm_flip), static_cast<unsigned long long>(n), g_ct_pages_n.load(),
 			             static_cast<unsigned long long>(g_ct_faults.load()), count,
 			             static_cast<unsigned long long>(g_ct_code_lo.load()), static_cast<unsigned long long>(g_ct_code_hi.load()));
-			std::fprintf(f, "# flip tid pc vaddr v0..v7 ps pkt table | returns\n");
+			std::fprintf(f, "# flip/frame tid pc vaddr v0..v7 ps pkt table | returns (frame: flips reserved before, flip_N.txt)\n");
 			for (uint32_t i = 0; i < count; i++) {
 				const CmdTrapRecord& r = g_ct_records[i];
-				std::fprintf(f, "%llu %u %llx %llx", static_cast<unsigned long long>(r.flip), r.tid, static_cast<unsigned long long>(r.pc),
+				std::fprintf(f, "%llu/%llu %u %llx %llx", static_cast<unsigned long long>(r.flip), static_cast<unsigned long long>(r.frame), r.tid,
+				             static_cast<unsigned long long>(r.pc),
 				             static_cast<unsigned long long>(r.vaddr));
 				for (uint32_t k = 0; k < 8; k++) {
 					std::fprintf(f, " %08x", r.value[k]);
@@ -9907,10 +10017,10 @@ void CmdTrapOnFlip(uint64_t n) {
 				std::fprintf(f, "\n");
 			}
 			const uint32_t pn = std::min(g_cp_next.load(), kCmdProbeRecords);
-			std::fprintf(f, "# probes: P flip tid probe rdi rsi rdx rcx r8 rax r12 r13 r14 r15 | mem0..7 | rbp chain returns (%u records)\n", pn);
+			std::fprintf(f, "# probes: P flip/frame tid probe rdi rsi rdx rcx r8 rax r12 r13 r14 r15 | mem0..7 | rbp chain returns | pc value (%u records)\n", pn);
 			for (uint32_t i = 0; i < pn; i++) {
 				const CmdProbeRecord& r = g_cp_records[i];
-				std::fprintf(f, "P %llu %u %u", static_cast<unsigned long long>(r.flip), r.tid, r.probe);
+				std::fprintf(f, "P %llu/%llu %u %u", static_cast<unsigned long long>(r.flip), static_cast<unsigned long long>(r.frame), r.tid, r.probe);
 				for (uint64_t x: r.regs) {
 					std::fprintf(f, " %llx", static_cast<unsigned long long>(x));
 				}
@@ -9922,7 +10032,7 @@ void CmdTrapOnFlip(uint64_t n) {
 				for (uint64_t x: r.ret) {
 					std::fprintf(f, " %llx", static_cast<unsigned long long>(x));
 				}
-				std::fprintf(f, "\n");
+				std::fprintf(f, " | %llx %llx\n", static_cast<unsigned long long>(r.pc), static_cast<unsigned long long>(r.value));
 			}
 			std::fclose(f);
 		}
@@ -9951,7 +10061,11 @@ void CmdTrapOnFlip(uint64_t n) {
 	std::sort(pages.begin(), pages.end());
 	auto* arr = new uint64_t[pages.size() + 1];
 	std::copy(pages.begin(), pages.end(), arr);
-	g_ct_records = new CmdTrapRecord[kCmdTrapRecords];
+	if (g_ct_records == nullptr) {
+		g_ct_records = new CmdTrapRecord[kCmdTrapRecords];
+	}
+	g_ct_next.store(0);
+	g_cp_next.store(0);
 	g_ct_pages   = arr;
 	g_ct_pages_n.store(static_cast<uint32_t>(pages.size()), std::memory_order_release);
 	static const bool installed = [] {
@@ -10023,6 +10137,7 @@ void CmdTrapHleRecord(uint32_t ps, uint32_t kind, uint64_t table, const uint32_t
 	}
 	CmdTrapRecord& r = g_ct_records[idx];
 	r.flip           = g_ct_flip.load(std::memory_order_relaxed);
+	r.frame          = g_frames_reserved.load(std::memory_order_relaxed);
 	r.pc             = kind;
 	r.vaddr          = table;
 	std::memset(r.value, 0, sizeof(r.value));
@@ -10229,7 +10344,7 @@ void DumpRenderTargets(const char* dir, unsigned long long flip,
 } // namespace
 
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
-                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
+                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode, uint32_t flip_ctx,
                   const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
@@ -10257,9 +10372,10 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	if ((list == nullptr && !on_demand) || address == 0 || size == 0 || !Shadow::Instance().Active()) {
 		return;
 	}
+	auto take_draws = [flip_ctx]() { return Shadow::Instance().TakeFlipDraws(flip_ctx); };
 	if (!wanted) {
 		(void)Shadow::Instance().TakeFrameTargets(); // keep only the dumped frame's targets
-		(void)Shadow::Instance().TakeFrameDraws();
+		(void)take_draws();
 		return;
 	}
 	if (demand_left > 0) {
@@ -10283,7 +10399,8 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			WriteFile(path, reinterpret_cast<const void*>(address), size);
 		}
 		DumpRenderTargets(dir, flip, download_region);
-	} else if (PrimaryRendering() && (EnvOn("KYTY_NATIVE_GPU_DUMP_RTS") || on_demand)) {
+	} else if (const char* rts = std::getenv("KYTY_NATIVE_GPU_DUMP_RTS");
+	           PrimaryRendering() && (rts != nullptr ? rts[0] != '0' : on_demand)) { // =0: the presented surface alone
 		DumpRenderTargets(dir, flip, nullptr);
 	}
 	// KYTY_NATIVE_GPU_DUMP_RANGES=0xADDR:0xSIZE[,...]: guest ranges saved next to the flip, e.g. a
@@ -10304,7 +10421,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 		}
 	}
 	// Every draw and dispatch of the frame, with the arguments of indirect ones as the GPU left them.
-	if (const auto draws = Shadow::Instance().TakeFrameDraws(); !draws.empty()) {
+	if (const auto draws = take_draws(); !draws.empty()) {
 		std::snprintf(path, sizeof(path), "%s/flip_%llu.draws.txt", dir, flip);
 		if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
 			std::fprintf(f, "# q buf idx op count inst ps gs cb0 zbase ud_hash gs_hash indirect args\n");
@@ -10344,9 +10461,10 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
 		std::fprintf(f,
 		             "address 0x%llx\nsize %llu\nwidth %u\nheight %u\nbytes_per_pixel %u\n"
-		             "pixel_format %u\ntile_mode 0x%x\nvulkan_images %u\n",
+		             "pixel_format %u\ntile_mode 0x%x\nvulkan_images %u\nctx 0x%x\nframe %llu\n",
 		             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-		             width, height, bytes_per_pixel, pixel_format, tile_mode, vulkan_images);
+		             width, height, bytes_per_pixel, pixel_format, tile_mode, vulkan_images, flip_ctx,
+		             static_cast<unsigned long long>(g_frame_of_ctx[flip_ctx & 0xffu].load(std::memory_order_relaxed)));
 		std::fclose(f);
 	}
 	std::fprintf(stderr, "native shadow: dumped flip %llu (%ux%u) native%s to %s\n", flip, width,
