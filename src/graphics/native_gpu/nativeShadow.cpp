@@ -1935,6 +1935,24 @@ public:
 					std::fprintf(stderr, "\n");
 				}
 			}
+			// KYTY_NATIVE_GPU_DUMP_REFUSED=N (diagnostics): the first N refused buffers as translated, to
+			// refused_<kind>_<frame>.bin in KYTY_NATIVE_GPU_DUMP_DIR.
+			static const uint32_t dump_refused = [] {
+				const char* v = std::getenv("KYTY_NATIVE_GPU_DUMP_REFUSED");
+				return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+			}();
+			if (m_refused_dumped < dump_refused) {
+				m_refused_dumped++;
+				const char*       dir  = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+				const std::string path = std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") + "/refused_" + kind + "_" +
+				                         std::to_string(frame) + ".bin";
+				if (std::FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+					std::fwrite(dcb.data(), 4, dcb.size(), f);
+					std::fclose(f);
+					std::fprintf(stderr, "native shadow: refused %s %llu written to %s (%zu dwords)\n", kind,
+					             static_cast<unsigned long long>(frame), path.c_str(), dcb.size());
+				}
+			}
 			m_refused++;
 			return false;
 		}
@@ -7155,6 +7173,7 @@ private:
 	std::atomic<uint64_t> m_frames {0}; // the ACB thread reads it for the hang tests
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
+	uint32_t      m_refused_dumped = 0;
 	uint64_t      m_flattened      = 0; // buffers FlattenIndirectBuffers inlined
 	uint64_t                m_verbatim_dw   = 0; // Pm4TranslateStats::verbatim_dw over the flips being summed
 	uint64_t                m_total_dw      = 0;

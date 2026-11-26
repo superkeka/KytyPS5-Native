@@ -32,6 +32,19 @@ constexpr uint32_t IT_COPY_DATA                = 0x40;
 constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_ATOMIC_MEM               = 0x1E;
 constexpr uint32_t IT_COND_EXEC                = 0x22;
+// Why a title's COND_EXEC was refused (Pm4TranslateResult::unknown_detail, the dword after the packet).
+enum CondRefuse : uint32_t {
+	kCondOff          = 1, // KYTY_NATIVE_GPU_COND_EXEC=0, or on MEC KYTY_NATIVE_GPU_ACB_COND_EXEC=0
+	kCondNested       = 2, // inside another one's range
+	kCondPacket       = 3, // not the five-dword form, address 0 or EXEC_COUNT above 14 bits
+	kCondPastBuffer   = 4, // the range runs past the buffer
+	kCondCpuFlag      = 5, // its flag is a store the tracker does on the CPU
+	kCondLeftStream   = 6, // something inside the range left the GPU's stream
+	kCondEndsInPacket = 7, // the range ends inside a packet
+	kCondTooLong      = 8, // the translated range is longer than EXEC_COUNT can say
+	kCondRegister     = 9, // a register inside the range only the GPU knows afterwards, without CP shadowing in load mode
+	kCondPushOpen     = 10, // a context push left open past the range, or a push or pop inside it of one made before it
+};
 constexpr uint32_t IT_SET_BASE                 = 0x11;
 constexpr uint32_t IT_SET_PREDICATION          = 0x20;
 constexpr uint32_t IT_INDEX_BUFFER_SIZE        = 0x13;
@@ -1311,6 +1324,84 @@ static bool AcbCondExec() {
 		return v == nullptr || v[0] != '0';
 	}();
 	return on;
+}
+
+// Registers written inside a title's COND_EXEC range are settled when it ends (the translator's cond_settle_regs).
+// KYTY_NATIVE_GPU_COND_EXEC_REGS=0 refuses any register write inside one, as before.
+static bool CondExecRegs() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_COND_EXEC_REGS");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
+// KYTY_NATIVE_GPU_COND_LOG=1 (diagnostics): each title COND_EXEC translated, by its flag's address and EXEC_COUNT as
+// written: how often, with its flag set when translated (the CPU's view of the dword the CP reads), and how often a flag
+// seen set earlier was found clear again (a range that clears its own flag ran on the GPU), the registers settled when
+// its range ended, and the refusals. The first four of each and every 256th after are logged.
+struct CondLogEntry {
+	uint64_t seen = 0, set = 0, cleared = 0, settled = 0, refused = 0;
+	uint32_t last = 0;
+	bool     armed = false; // seen set and not yet seen clear again
+};
+static bool CondLogOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_COND_LOG");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+// The flags of the COND_EXECs logged, sampled at every translation from then on: a flag the CPU or the GPU sets and the
+// range's own write clears (as the title's draw with its own context does) goes 0 -> 1 -> 0 once per run of its range.
+struct CondFlagSample {
+	uint32_t last = 0;
+	uint64_t sets = 0, clears = 0;
+};
+static std::mutex                                                 g_cond_log_mutex;
+static std::map<uint64_t, CondFlagSample>                         g_cond_flags;
+static void CondLogSample() {
+	std::lock_guard<std::mutex> lock(g_cond_log_mutex);
+	for (auto& [addr, f]: g_cond_flags) {
+		const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(addr);
+		if ((v != 0) == (f.last != 0)) {
+			continue;
+		}
+		(v != 0 ? f.sets : f.clears)++;
+		f.last = v;
+		if (f.sets + f.clears <= 32 || (f.sets + f.clears) % 256 == 0) {
+			std::fprintf(stderr, "native cond: flag 0x%llx went %s (set %llu times, cleared %llu times)\n", static_cast<unsigned long long>(addr),
+			             v != 0 ? "set" : "clear", static_cast<unsigned long long>(f.sets), static_cast<unsigned long long>(f.clears));
+		}
+	}
+}
+static void CondLog(uint64_t addr, uint32_t count, bool compute, int settled, bool refused) {
+	static std::map<std::tuple<uint64_t, uint32_t, bool>, CondLogEntry> entries;
+	std::lock_guard<std::mutex>                                       lock(g_cond_log_mutex);
+	if (g_cond_flags.count(addr) == 0) {
+		g_cond_flags[addr].last = *reinterpret_cast<const volatile uint32_t*>(addr);
+	}
+	CondLogEntry&  e    = entries[{addr, count, compute}];
+	const uint32_t flag = *reinterpret_cast<const volatile uint32_t*>(addr);
+	e.seen++;
+	e.last = flag;
+	if (flag != 0) {
+		e.set++;
+		e.armed = true;
+	} else if (e.armed) {
+		e.cleared++;
+		e.armed = false;
+	}
+	e.settled += settled > 0 ? static_cast<uint64_t>(settled) : 0u;
+	e.refused += refused ? 1u : 0u;
+	if (e.seen <= 4 || e.seen % 256 == 0 || refused) {
+		std::fprintf(stderr,
+		             "native cond: %s COND_EXEC flag 0x%llx count 0x%x: seen %llu, flag set %llu (now 0x%x), cleared after a set %llu, "
+		             "registers settled %llu, refused %llu\n",
+		             compute ? "ACB" : "DCB", static_cast<unsigned long long>(addr), count, static_cast<unsigned long long>(e.seen),
+		             static_cast<unsigned long long>(e.set), flag, static_cast<unsigned long long>(e.cleared),
+		             static_cast<unsigned long long>(e.settled), static_cast<unsigned long long>(e.refused));
+	}
 }
 
 // An ACB's ATOMIC_MEM on memory the GPU may write goes to MEC as written (probe atomicops and mecplain, 2.11; see the
@@ -3214,6 +3305,9 @@ LodStatsHandoff& LodStatsReports() {
 }
 
 Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
+	if (CondLogOn()) {
+		CondLogSample();
+	}
 	Pm4TranslateResult             r;
 	const std::vector<SourcePiece> source = std::move(m_source); // SetSource is for this buffer only
 	m_source.clear();
@@ -4646,9 +4740,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// dwords, which on the PS5 are the title's own. The translated range differs in length (patched packets, inserted
 	// waits and stores), so the COND_EXEC goes as written with its count set to the translated range once the walk
 	// reaches the range's end. Inside the range nothing may happen outside the GPU's stream: no direct runs (the IB2s
-	// change the length again), no segment cut, no tracker store but a wake, no CPU-tail packet, no barrier on our fence, and no
-	// register write (the shadow copy would take it as done when the CP may skip it). Label writes in it are recorded as
-	// unknown once the range ends: the CP may have skipped them.
+	// change the length again), no segment cut, no tracker store but a wake, no CPU-tail packet, and no barrier on our fence.
+	// Label writes in it are recorded as unknown once the range ends: the CP may have skipped them; registers written in it
+	// are settled then (cond_settle_regs).
 	struct CondExecRange {
 		bool     active        = false;
 		uint32_t dw            = 0; // the COND_EXEC in the buffer
@@ -4661,6 +4755,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		size_t   seg_writes    = 0; // segs.back().writes when it began
 		uint32_t fence_seq     = 0;
 		size_t   guards        = 0; // body_guards when it began (a compute ring's exit guards), the one before it included
+		// The registers when it began (register writes inside the range), with their writers and the push state.
+		RegFile                             cx, sh, uc;
+		std::array<uint8_t, RegFile::kDense> wcx {}, wsh {}, wuc {};
+		bool                                pushed = false;
+		uint32_t                            why    = 0; // a CondRefuse cond_close gave
+		uint64_t                            addr   = 0; // its flag (KYTY_NATIVE_GPU_COND_LOG)
+		uint32_t                            count  = 0; // EXEC_COUNT as written
+		int                                 settled = 0; // registers only the GPU knows after it
 	} cond;
 	// False when something left the GPU's stream inside the range (see above). A wake that comes anyway is harmless, also
 	// as a tracker store inside the range (the points a GPU wait there flushes first): the tracker passes a point once
@@ -4675,9 +4777,94 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		return std::all_of(segs.back().points.begin() + static_cast<std::ptrdiff_t>(cond.seg_points), segs.back().points.end(), wake) &&
 		       std::all_of(queued_points.begin(), queued_points.end(), wake);
 	};
+	// Why a range was refused, for the log (Pm4TranslateResult::unknown_detail): the COND_EXEC as written, the reason
+	// (CondRefuse), where in the range, that packet's header, and what left the GPU's stream (bits, as cond_clean checks).
+	auto cond_detail = [&](uint32_t why, uint32_t at) {
+		uint32_t left = 0;
+		if (cond.active) {
+			left |= segs.size() != cond.segs ? 1u : 0u;
+			left |= segs.size() == cond.segs && segs.back().points.size() < cond.seg_points ? 2u : 0u;
+			left |= r.cpu_tail.size() != cond.tail ? 4u : 0u;
+			left |= m_fence_seq != cond.fence_seq ? 8u : 0u;
+			const auto wake = [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Wake; };
+			if (segs.size() == cond.segs && segs.back().points.size() >= cond.seg_points &&
+			    (!std::all_of(segs.back().points.begin() + static_cast<std::ptrdiff_t>(cond.seg_points), segs.back().points.end(), wake) ||
+			     !std::all_of(queued_points.begin(), queued_points.end(), wake))) {
+				left |= 16u;
+			}
+		}
+		if (cond.active && CondLogOn()) {
+			CondLog(cond.addr, cond.count, m_compute_ring, 0, true);
+		}
+		const uint32_t c = cond.active ? cond.dw : at;
+		r.unknown_detail.clear();
+		for (uint32_t i = 0; i < 5u && c + i < dcb.size(); i++) {
+			r.unknown_detail.push_back(dcb[c + i]);
+		}
+		r.unknown_detail.push_back(why);
+		r.unknown_detail.push_back(at - c);
+		r.unknown_detail.push_back(at < dcb.size() ? dcb[at] : 0u);
+		r.unknown_detail.push_back(left);
+	};
+	// Registers written inside the range (title SETs, its indirect loads, a context push or pop): the CP runs them or skips them
+	// with the range, as on the PS5, so afterwards the GPU holds either the values they had when the range began or the ones
+	// the walk left. Where the two are the same (a push and its pop, a write of the value already there) the copy knows the
+	// GPU's value. Where they differ only the GPU knows it: with CP shadowing in load mode S keeps what the CP ran, the
+	// preambles LOAD from S, and such a register is the GPU's (RegWriter::Gpu, as a late table's), so no decision of the
+	// CPU takes the copy's value for the GPU's; without, the buffer is refused. A push left open past the range's end, or a
+	// push or pop inside one of a push made before it, is refused too (a pop the CP may skip would leave the copy's push
+	// state wrong).
+	auto cond_settle_regs = [&]() {
+		if (cx_pushed != cond.pushed) {
+			cond.why = kCondPushOpen;
+			return false;
+		}
+		const auto gpu_kind = [](uint8_t k) {
+			return k == static_cast<uint8_t>(RegWriter::Table) || k == static_cast<uint8_t>(RegWriter::Gpu);
+		};
+		bool       ok       = true;
+		const auto settle   = [&](const RegFile& now, const RegFile& then, std::array<uint8_t, RegFile::kDense>& w,
+                                const std::array<uint8_t, RegFile::kDense>& w0) {
+            const auto differs = [&](uint32_t off, uint32_t value, const RegFile& other) {
+                const uint32_t* o = other.Find(off);
+                return o == nullptr || *o != value;
+            };
+            auto mark = [&](uint32_t off) {
+                if (!shadow_load) {
+                    ok = false;
+                    return;
+                }
+                writer(w, off, RegWriter::Gpu);
+                cond.settled++;
+            };
+            for (const auto& [off, value]: now) {
+                if (differs(off, value, then)) {
+                    mark(off);
+                } else if (off < RegFile::kDense && gpu_kind(w0[off]) && !gpu_kind(w[off])) {
+                    w[off] = w0[off]; // a value only the GPU knew before the range stays the GPU's
+                }
+            }
+            for (const auto& entry: then) {
+                if (now.count(entry.first) == 0) {
+                    mark(entry.first);
+                }
+            }
+		};
+		settle(cx, cond.cx, wcx, cond.wcx);
+		settle(sh, cond.sh, wsh, cond.wsh);
+		settle(uc, cond.uc, wuc, cond.wuc);
+		if (!ok) {
+			cond.why = kCondRegister;
+		}
+		return ok;
+	};
 	auto cond_close = [&]() {
 		const size_t count = body.size() - (cond.count_at + 1u);
 		if (count > 0x3fffu) {
+			cond.why = kCondTooLong;
+			return false;
+		}
+		if (!cond_settle_regs()) {
 			return false;
 		}
 		body[cond.count_at] = (body[cond.count_at] & ~0x3fffu) | static_cast<uint32_t>(count);
@@ -4700,6 +4887,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		cond.active = false;
 		direct      = direct_base;
+		if (CondLogOn()) {
+			CondLog(cond.addr, cond.count, m_compute_ring, cond.settled, false);
+		}
 		return true;
 	};
 	// SetInjectWait (KYTY_NATIVE_GPU_INJECT_HANG): a wait nobody satisfies where the body starts, after the preamble, so
@@ -5052,6 +5242,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	while (dw < dcb.size()) {
 		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
+			cond_detail(!cond_clean() ? kCondLeftStream : dw != cond.end ? kCondEndsInPacket : cond.why, dw);
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
 		}
 		// A compute ring's guards skip a few thousand dwords at most: one more before the next packet.
@@ -5495,6 +5686,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					}
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
+					if (cond.active && cond.pushed && bptr[0] >= 1u && bptr[0] <= 3u) {
+						cond_detail(kCondPushOpen, dw);
+						return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
+					}
 					context_state_op(bptr[0]);
 					reg_write = true;
 				}
@@ -6794,6 +6989,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					});
 					if (!m_cond_exec || (m_compute_ring && !AcbCondExec()) || cond.active || body_count != 4 || addr == 0 ||
 					    (bptr[3] & ~0x3fffu) != 0 || next + bptr[3] > dcb.size() || cpu_flag) {
+						cond_detail(!m_cond_exec || (m_compute_ring && !AcbCondExec()) ? kCondOff
+						            : cond.active                                      ? kCondNested
+						            : body_count != 4 || addr == 0 || (bptr[3] & ~0x3fffu) != 0 ? kCondPacket
+						            : next + bptr[3] > dcb.size()                      ? kCondPastBuffer
+						                                                               : kCondCpuFlag,
+						            dw);
 						return fail(op, dw, RefuseWhy::CondExecForm);
 					}
 					// The points queued before the range (an interrupt, a store the GPU cannot do) go before it, not inside
@@ -6827,6 +7028,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					cond.writes     = local_writes.size();
 					cond.seg_writes = segs.back().writes.size();
 					cond.fence_seq  = m_fence_seq;
+					cond.cx         = cx;
+					cond.sh         = sh;
+					cond.uc         = uc;
+					cond.wcx        = wcx;
+					cond.wsh        = wsh;
+					cond.wuc        = wuc;
+					cond.pushed     = cx_pushed;
+					cond.why        = 0;
+					cond.addr       = addr;
+					cond.count      = bptr[3];
+					cond.settled    = 0;
 					direct          = false;
 					stats.cond_execs++;
 					break;
@@ -6850,6 +7062,10 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// PS5's CP does with register shadowing the kernel sets up. The shadow does them here.
 				reg_write = true;
 				if (body_count >= 1 && (bptr[0] & 0xfu) != 0) {
+					if (cond.active && cond.pushed && (bptr[0] & 0xfu) >= 1u && (bptr[0] & 0xfu) <= 3u) {
+						cond_detail(kCondPushOpen, dw);
+						return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
+					}
 					context_state_op(bptr[0] & 0xfu);
 					break;
 				}
@@ -6910,8 +7126,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (cp_shadow && reg_write) {
 			seg_effects = true;
 		}
-		if (cond.active && dw != cond.dw && reg_write) {
-			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // a register write the CP may skip
+		if (cond.active && dw != cond.dw && reg_write && !CondExecRegs()) {
+			cond_detail(kCondRegister, dw);
+			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // KYTY_NATIVE_GPU_COND_EXEC_REGS=0
 		}
 		const bool same_seg = segs.size() == segs_before;
 		if (!same_seg && segs.back().held) {
@@ -6963,6 +7180,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		dw += size;
 	}
 	if (cond.active && (!cond_clean() || dw != cond.end || !cond_close())) {
+		cond_detail(!cond_clean() ? kCondLeftStream : dw != cond.end ? kCondPastBuffer : cond.why, dw);
 		return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // the range runs past the buffer
 	}
 	end_run();

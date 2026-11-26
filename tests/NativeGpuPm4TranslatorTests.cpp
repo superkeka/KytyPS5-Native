@@ -38,6 +38,12 @@ using Libs::Graphics::NativeGpu::WaitFlipGroupDw;
 using Libs::Graphics::NativeGpu::SetWaitFlipMarks;
 using Libs::Graphics::NativeGpu::AppendKernelReleases;
 
+// KYTY_CMD_TRAP lives in nativeShadow.cpp, which this test does not build: off here.
+namespace Libs::Graphics::NativeGpu {
+bool CmdTrapOn() { return false; }
+void CmdTrapNote(uint64_t /*va*/, uint64_t /*bytes*/) {}
+} // namespace Libs::Graphics::NativeGpu
+
 namespace {
 
 void Check(bool value, const char* message) {
@@ -3543,6 +3549,9 @@ struct ToyCp {
 	// region when amdgpu resets the queue); `waits` counts them.
 	bool                        waits_unshadowed = false;
 	uint32_t                    waits            = 0;
+	// A title's COND_EXEC flag in host memory (flag_va, *flag): read by its COND_EXEC, cleared by its DMA_DATA of data.
+	uint64_t                    flag_va = 0;
+	uint32_t*                   flag    = nullptr;
 
 	bool InS(uint64_t va) const { return va >= kTestShadowVa && va < kTestShadowVa + 4ull * s.size(); }
 	static uint32_t Bit(int c) { return c == kCtx ? 1u << 1u : c == kUc ? 1u << 15u : c == kGsh ? 1u << 16u : 1u << 24u; }
@@ -3634,6 +3643,10 @@ struct ToyCp {
 				case 0x50u: { // DMA_DATA: memory to memory, only inside S and P here
 					const uint64_t src = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
 					const uint64_t dst = b[3] | (static_cast<uint64_t>(b[4]) << 32u);
+					if (flag != nullptr && dst == flag_va && ((b[0] >> 29u) & 3u) == 2u) { // the title's flag, from data
+						*flag = b[1];
+						break;
+					}
 					const uint32_t len = b[5] & 0x3ffffffu;
 					Check(src >= kTestShadowVa && dst >= kTestShadowVa && src + len <= kTestShadowVa + 4ull * s.size() &&
 					          dst + len <= kTestShadowVa + 4ull * s.size(),
@@ -3645,6 +3658,9 @@ struct ToyCp {
 				}
 				case 0x1Eu: { // ATOMIC_MEM: the display-DCC fix's AND on a word in S's area
 					const uint64_t at = b[1] | (static_cast<uint64_t>(b[2]) << 32u);
+					if (!InS(at) && (b[0] & 0x7fu) == 0x67u) {
+						break; // libSceAgc's swap of its push and pop flags, in the title's memory
+					}
 					Check((b[0] & 0x7fu) == 0x55u && InS(at), "toy CP: an ATOMIC_MEM AND in S's area");
 					s[(at - kTestShadowVa) / 4u] &= b[3];
 					break;
@@ -3659,7 +3675,8 @@ struct ToyCp {
 				case 0x22u: { // COND_EXEC: on a word in S's area as the CP does; an exit guard's abort word is 0 (no stop
 				             // armed), so the dwords it guards are skipped
 					const uint64_t at = b[0] | (static_cast<uint64_t>(b[1]) << 32u);
-					if (!InS(at) || s[(at - kTestShadowVa) / 4u] == 0u) {
+					const bool     on = flag != nullptr && at == flag_va ? *flag != 0u : InS(at) && s[(at - kTestShadowVa) / 4u] != 0u;
+					if (!on) {
 						dw += b[3];
 					}
 					break;
@@ -5762,12 +5779,12 @@ void TestCondExecRecount() {
 		      "a range the translation lengthens gets the longer count");
 	}
 
-	// A register write, or a range past the buffer, refuses; so does MEC.
+	// A register write that leaves a value only the GPU knows (no CP shadowing here), or a range past the buffer, refuses.
 	std::vector<uint32_t> reg;
 	cond_exec(reg, 3);
 	Append(reg, IT_SET_CONTEXT_REG, {0x9u, 0x5u}, false);
 	reg.insert(reg.end(), after.begin(), after.end());
-	Check(!t.Translate(reg).ok, "a register write inside the range refuses");
+	Check(!t.Translate(reg).ok, "a register write inside the range refuses without CP shadowing");
 	std::vector<uint32_t> past;
 	cond_exec(past, 100);
 	past.insert(past.end(), after.begin(), after.end());
@@ -5779,9 +5796,249 @@ void TestCondExecRecount() {
 	Check(!t.Translate(split).ok, "a segment cut inside the range refuses");
 }
 
+// A title's COND_EXEC over a draw with its own context (as a title writes it with libSceAgc): a push then clear, the draw's
+// context, SH and UCONFIG registers from tables, the draw, the pop, and the flag cleared by DMA_DATA. The CP runs or skips
+// the whole range, as on the PS5: the context is the one before the range either way, the SH and UCONFIG registers are
+// the table's or the old ones. With CP shadowing in load mode S holds what the CP ran and the next preamble LOADs it, so
+// the GPU then has the PS5's values whichever way the flag went; without it a register only the GPU knows refuses the
+// buffer, and a range whose registers end as they began translates anyway. A pop inside the range of a push made before
+// it refuses.
+void TestCondExecRegisters() {
+	static uint32_t agc_flags[2] = {0, 1}; // libSceAgc's push and pop flags
+	static uint32_t title_flag   = 0;
+	const uint64_t  af           = reinterpret_cast<uint64_t>(agc_flags);
+	const uint64_t  tf           = reinterpret_cast<uint64_t>(&title_flag);
+	static const std::vector<uint32_t> defaults = {0x10Fu, 0xCu};  // the clear's context (verbatim table)
+	static const std::vector<uint32_t> sh_table = {0x00Cu, 0xB0u}; // the draw's SH registers
+	static const std::vector<uint32_t> uc_table = {0x24Au, 0x7u};  // and UCONFIG
+	auto piece = [&](std::vector<uint32_t>& d, uint32_t op) { // libSceAgc's check and flag swap around a push or pop
+		const uint64_t f = af + (op == 2 ? 4u : 0u);
+		d.insert(d.end(), {0xc0032200u, static_cast<uint32_t>(f), static_cast<uint32_t>(f >> 32u), 0u, 8u});
+		d.insert(d.end(), {0xc0064900u, 0x28u | (5u << 8u) | (3u << 25u), (1u << 16u) | (4u << 24u), 0u, 0u, 0u, 0u, 0x08100000u | op});
+		d.insert(d.end(), {0xc0071e00u, 0x40000267u, static_cast<uint32_t>(af), static_cast<uint32_t>(af >> 32u), op == 2 ? 0u : 1u,
+		                   op == 2 ? 1u : 0u, 0u, 0u, 6u});
+	};
+	auto range = [&](bool sh_uc) {
+		std::vector<uint32_t> d;
+		piece(d, 3);
+		d.insert(d.end(), {0xc0012800u, 0u, 0x80018001u, 0xc0001200u, 1u}); // CONTEXT_CONTROL, push
+		AppendIndirect(d, IT_SET_CONTEXT_REG_INDIRECT, defaults, 0x80000000u);
+		if (sh_uc) {
+			AppendIndirect(d, IT_SET_SH_REG_INDIRECT, sh_table, 0x80000000u);
+			AppendIndirect(d, IT_SET_UCONFIG_REG_INDIRECT, uc_table, 0x80000000u);
+		}
+		Append(d, IT_EVENT_WRITE, {0x2eu}, false);
+		Append(d, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+		d.insert(d.end(), {0xc0012800u, 0u, 0x80018003u});
+		piece(d, 2);
+		d.insert(d.end(), {0xc0001200u, 2u}); // pop
+		d.insert(d.end(), {0xc0055000u, 0xc0300000u, 0u, 0u, static_cast<uint32_t>(tf), static_cast<uint32_t>(tf >> 32u), 0x40000004u});
+		return d;
+	};
+	const std::vector<uint32_t> after = {Pkt3(IT_DRAW_INDEX_AUTO, 2, false), 3u, 2u};
+	auto dcb_of = [&](bool sh_uc) {
+		const auto            in = range(sh_uc);
+		std::vector<uint32_t> d;
+		Append(d, IT_COND_EXEC_T, {static_cast<uint32_t>(tf), static_cast<uint32_t>(tf >> 32u), 0u, static_cast<uint32_t>(in.size())}, false);
+		d.insert(d.end(), in.begin(), in.end());
+		d.insert(d.end(), after.begin(), after.end());
+		return d;
+	};
+	auto make = [&](CpShadowMode mode, bool gpu_pushpop) {
+		auto t = std::make_unique<Pm4Translator>();
+		static TestOracle o;
+		t->SetNativeLabels(&o, kTrackerVa);
+		t->SetFenceAddress(kFenceVa);
+		t->SetCpShadow(mode == CpShadowMode::Off ? 0u : kTestShadowVa, mode);
+		t->SetCpShadowPushPop(gpu_pushpop);
+		t->SetCondExec(true);
+		t->SetAudit(true);
+		Start(*t, {{0x10Fu, 0xAu}}, {{0x00Cu, 0xA0u}}, {{0x24Au, 0x3u}});
+		return t;
+	};
+	for (const bool gpu_pushpop: {false, true}) {
+		for (const uint32_t flag: {0u, 1u}) {
+			auto  t   = make(CpShadowMode::Load, gpu_pushpop);
+			ToyCp cp;
+			cp.Seed(*t);
+			cp.flag_va = tf;
+			cp.flag    = &title_flag;
+			title_flag = flag;
+			const auto dcb = dcb_of(true);
+			auto       r   = t->Translate(dcb);
+			Check(r.ok && r.stats.cond_execs == 1, "a title's COND_EXEC over a draw with its own context translates");
+			if (!r.ok) {
+				std::fprintf(stderr, "    refused at dw %u, detail:", r.unknown_dw);
+				for (uint32_t v: r.unknown_detail) {
+					std::fprintf(stderr, " 0x%08x", v);
+				}
+				std::fprintf(stderr, "\n");
+				continue;
+			}
+			size_t at = 0;
+			for (size_t i = 0; i + 5 <= r.ib.size(); i++) {
+				if (r.ib[i] == Pkt3(IT_COND_EXEC_T, 4, false) && r.ib[i + 1] == static_cast<uint32_t>(tf)) {
+					at = i;
+				}
+			}
+			Check(at != 0 && at + 5 + r.ib[at + 4] + after.size() <= r.ib.size() &&
+			          std::equal(after.begin(), after.end(), r.ib.begin() + static_cast<std::ptrdiff_t>(at + 5 + r.ib[at + 4])),
+			      "its count reaches exactly the translated range's end");
+			SetCpShadowValidation(kTestShadowVa);
+			Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "the range passes both packet checks");
+			SetCpShadowValidation(0);
+			cp.Job(AsJob(r.ib));
+			Check(title_flag == 0u, "the range ran or was skipped as a whole: the flag is clear either way");
+			Check(cp.cx[0x10F] == 0xAu, "the context is the one before the range either way");
+			Check(cp.sh[0x00C] == (flag != 0 ? 0xB0u : 0xA0u) && cp.uc[0x24A] == (flag != 0 ? 0x7u : 0x3u),
+			      flag != 0 ? "run: the table's SH and UCONFIG registers" : "skipped: the old SH and UCONFIG registers");
+			// The next buffer starts with a preamble: what it gives the GPU comes from S, the CP's own record.
+			std::vector<uint32_t> next;
+			Append(next, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+			auto rn = t->Translate(next);
+			Check(rn.ok, "the next buffer translates");
+			cp.Foreign();
+			cp.Job(AsJob(rn.ib));
+			Check(cp.cx[0x10F] == 0xAu && cp.sh[0x00C] == (flag != 0 ? 0xB0u : 0xA0u) && cp.uc[0x24A] == (flag != 0 ? 0x7u : 0x3u),
+			      "after the next preamble the GPU has the PS5's registers whichever way the flag went");
+		}
+	}
+	{
+		auto t = make(CpShadowMode::Off, false);
+		auto r = t->Translate(dcb_of(true));
+		Check(!r.ok && RefusedFor(r, RefuseWhy::CondExecForm), "without CP shadowing a register only the GPU knows refuses");
+		auto t2 = make(CpShadowMode::Off, false);
+		auto r2 = t2->Translate(dcb_of(false));
+		Check(r2.ok && r2.stats.cond_execs == 1, "a range whose registers end as they began translates without CP shadowing too");
+	}
+	{
+		auto                  t = make(CpShadowMode::Load, false);
+		std::vector<uint32_t> d = {0xc0001200u, 1u}; // a push before the range
+		std::vector<uint32_t> in = {0xc0001200u, 2u};
+		Append(d, IT_COND_EXEC_T, {static_cast<uint32_t>(tf), static_cast<uint32_t>(tf >> 32u), 0u, static_cast<uint32_t>(in.size())}, false);
+		d.insert(d.end(), in.begin(), in.end());
+		d.insert(d.end(), after.begin(), after.end());
+		auto r = t->Translate(d);
+		Check(!r.ok && RefusedFor(r, RefuseWhy::CondExecForm), "a pop inside the range of a push made before it refuses");
+	}
+}
+
+// The title's COND_EXEC as it wrote it (the refused buffer of the crash, its range dword for dword): EXEC_COUNT 0x69 on its
+// flag, over libSceAgc's push then clear, the draw's context, SH and UCONFIG tables, the draw, the pop and the flag
+// cleared by DMA_DATA. Only the tables' addresses are moved to this test's memory; the flag keeps its address (the toy CP
+// reads it from a word here). Translated with CP shadowing in load mode, the CPU or the GPU doing the push and pop, run with
+// the flag set and clear: the count reaches the translated range's end and the GPU ends with the PS5's registers.
+void TestCondExecTitleForm() {
+	static const uint32_t kRange[] = {
+	    0xc0032200u, 0x1bdcff0cu, 0x00000010u, 0x00000000u, 0x00000069u, 0xc0032200u, 0x0013e000u, 0x00000002u,
+	    0x00000000u, 0x00000008u, 0xc0064900u, 0x06000528u, 0x04010000u, 0x00000000u, 0x00000000u, 0x00000000u,
+	    0x00000000u, 0x08100003u, 0xc0071e00u, 0x40000267u, 0x0013e000u, 0x00000002u, 0x00000001u, 0x00000000u,
+	    0x00000000u, 0x00000000u, 0x00000006u, 0xc0012800u, 0x00000000u, 0x80018001u, 0xc0001200u, 0x00000001u,
+	    0xc0039f00u, 0x0013c000u, 0x00000002u, 0x80000000u, 0x00000400u, 0xc0004600u, 0x0000002eu, 0xc0039f00u,
+	    0x4b2513b8u, 0x00000010u, 0x80000000u, 0x00000046u, 0xc0036300u, 0x0a3f3748u, 0x00000009u, 0x80000000u,
+	    0x00000006u, 0xc0039f00u, 0x0a3f3778u, 0x00000009u, 0x80000000u, 0x0000000au, 0xc0036300u, 0x0a3f38a8u,
+	    0x00000009u, 0x80000000u, 0x00000006u, 0xc0039f00u, 0x0a3f38d8u, 0x00000009u, 0x80000000u, 0x00000009u,
+	    0xc0036400u, 0x4b2503b8u, 0x00000010u, 0x80000000u, 0x00000005u, 0xc0002f00u, 0x00000001u, 0xc0012d00u,
+	    0x00000003u, 0x00000002u, 0xc0002f00u, 0x00000001u, 0xc0012800u, 0x00000000u, 0x80018003u, 0xc0032200u,
+	    0x0013e004u, 0x00000002u, 0x00000000u, 0x00000008u, 0xc0064900u, 0x06000528u, 0x04010000u, 0x00000000u,
+	    0x00000000u, 0x00000000u, 0x00000000u, 0x08100002u, 0xc0071e00u, 0x40000267u, 0x0013e000u, 0x00000002u,
+	    0x00000000u, 0x00000001u, 0x00000000u, 0x00000000u, 0x00000006u, 0xc0001200u, 0x00000002u, 0xc0055000u,
+	    0xc0300000u, 0x00000000u, 0x00000000u, 0x1bdcff0cu, 0x00000010u, 0x40000004u,
+	};
+	constexpr uint64_t kFlag = 0x101bdcff0cull;
+	static uint32_t    flag  = 0;
+	static_assert(sizeof(kRange) / 4u == 5u + 0x69u, "the COND_EXEC and its 0x69 dwords");
+	// The seven tables: where their packet is in the range, and their pairs (as many as the packet loads).
+	auto pairs_of = [](uint32_t n, uint32_t first, uint32_t value) {
+		std::vector<uint32_t> p;
+		for (uint32_t i = 0; i < n; i++) {
+			p.push_back(first + i);
+			p.push_back(value + i);
+		}
+		return p;
+	};
+	static std::vector<uint32_t> defaults = [&] {
+		auto p = pairs_of(0x400u, 0u, 0u); // the clear's context: every register 0 but the viewport's
+		p[2u * 0x10Fu + 1u] = 0xCu;
+		return p;
+	}();
+	static std::vector<uint32_t> cx1 = pairs_of(0x46u, 0x110u, 0x3f000000u);
+	static std::vector<uint32_t> sh1 = pairs_of(6u, 0x00Cu, 0xB0u);
+	static std::vector<uint32_t> cx2 = pairs_of(10u, 0x191u, 0x20u);
+	static std::vector<uint32_t> sh2 = pairs_of(6u, 0x08Cu, 0xC0u);
+	static std::vector<uint32_t> cx3 = pairs_of(9u, 0x1A0u, 0x30u);
+	static std::vector<uint32_t> uc  = {0x242u, 4u, 0x24Au, 0x7u, 0x24Bu, 0u, 0x25Bu, 0u, 0x262u, 0u};
+	const std::pair<uint32_t, const std::vector<uint32_t>*> tables[] = {{32u, &defaults}, {39u, &cx1}, {44u, &sh1}, {49u, &cx2},
+	                                                                   {54u, &sh2},       {59u, &cx3}, {64u, &uc}};
+	std::vector<uint32_t> range(std::begin(kRange), std::end(kRange));
+	for (const auto& [at, t]: tables) {
+		Check(t->size() / 2u == range[at + 4u], "a test table as long as the packet loads");
+		const auto va    = reinterpret_cast<uint64_t>(t->data());
+		range[at + 1u] = static_cast<uint32_t>(va);
+		range[at + 2u] = static_cast<uint32_t>(va >> 32u);
+	}
+	const std::vector<uint32_t> after = {Pkt3(IT_DRAW_INDEX_AUTO, 2, false), 3u, 2u};
+	std::vector<uint32_t>       dcb   = range;
+	dcb.insert(dcb.end(), after.begin(), after.end());
+	for (const bool gpu_pushpop: {false, true}) {
+		for (const uint32_t set: {0u, 1u}) {
+			auto       t = std::make_unique<Pm4Translator>();
+			TestOracle o;
+			t->SetNativeLabels(&o, kTrackerVa);
+			t->SetFenceAddress(kFenceVa);
+			t->SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+			t->SetCpShadowPushPop(gpu_pushpop);
+			t->SetCondExec(true);
+			t->SetAudit(true);
+			Start(*t, {{0x10Fu, 0xAu}}, {{0x00Cu, 0xA0u}}, {{0x24Au, 0x3u}});
+			ToyCp cp;
+			cp.Seed(*t);
+			cp.flag_va = kFlag;
+			cp.flag    = &flag;
+			flag       = set;
+			auto r     = t->Translate(dcb);
+			Check(r.ok && r.stats.cond_execs == 1, "the title's COND_EXEC as written translates");
+			if (!r.ok) {
+				std::fprintf(stderr, "    refused at dw %u, detail:", r.unknown_dw);
+				for (uint32_t v: r.unknown_detail) {
+					std::fprintf(stderr, " 0x%08x", v);
+				}
+				std::fprintf(stderr, "\n");
+				continue;
+			}
+			size_t at = 0;
+			for (size_t i = 0; i + 5 <= r.ib.size(); i++) {
+				if (r.ib[i] == 0xc0032200u && r.ib[i + 1] == 0x1bdcff0cu && r.ib[i + 2] == 0x10u) {
+					at = i;
+				}
+			}
+			Check(at != 0 && r.ib[at + 3] == 0u && at + 5 + r.ib[at + 4] + after.size() <= r.ib.size() &&
+			          std::equal(after.begin(), after.end(), r.ib.begin() + static_cast<std::ptrdiff_t>(at + 5 + r.ib[at + 4])),
+			      "as written, its count the translated range's");
+			SetCpShadowValidation(kTestShadowVa);
+			Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "it passes both packet checks");
+			SetCpShadowValidation(0);
+			cp.Job(AsJob(r.ib));
+			Check(flag == 0u, "the flag is clear after it either way");
+			Check(cp.cx[0x10F] == 0xAu, "the context is the one before it either way");
+			Check(set != 0 || (cp.cx[0x110] == ToyCp::Csb(0x110) && cp.cx[0x191] == ToyCp::Csb(0x191)), "skipped: no context write of it reaches the GPU");
+			Check(cp.sh[0x00C] == (set != 0 ? 0xB0u : 0xA0u) && cp.sh[0x08C] == (set != 0 ? 0xC0u : 0u) &&
+			          cp.uc[0x24A] == (set != 0 ? 0x7u : 0x3u),
+			      set != 0 ? "run: the draw's SH and UCONFIG registers" : "skipped: the old ones");
+			std::vector<uint32_t> next;
+			Append(next, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+			auto rn = t->Translate(next);
+			cp.Foreign();
+			cp.Job(AsJob(rn.ib));
+			Check(rn.ok && cp.cx[0x10F] == 0xAu && cp.sh[0x00C] == (set != 0 ? 0xB0u : 0xA0u) && cp.uc[0x24A] == (set != 0 ? 0x7u : 0x3u),
+			      "after the next preamble too");
+		}
+	}
+}
+
 // A title's COND_EXEC in an ACB (SetCondExec) goes to MEC as written, plain header and count recomputed (probe condexec
 // 31.10, mecplain 2.11). Exit guards inside its range get one right after it, so none skips past the range's end, and
-// SplitIbAtPackets keeps the range in one IB. No PFP_SYNC_ME on MEC; a register write inside still refuses.
+// SplitIbAtPackets keeps the range in one IB. No PFP_SYNC_ME on MEC; a register write inside still refuses (no CP shadowing there).
 void TestCondExecMec() {
 	using Libs::Graphics::NativeGpu::SplitIbAtPackets;
 	constexpr uint64_t kAbort = 0x400000fff808ull, kRun = 0x400000fff80cull, kStub = 0x400000ffffe0ull;
@@ -5862,7 +6119,7 @@ void TestCondExecMec() {
 	}
 	Check(!cut_in, "SplitIbAtPackets keeps the range in one IB");
 
-	// A register write inside the range still refuses on MEC.
+	// A register write inside the range still refuses on MEC (no CP shadowing there).
 	std::vector<uint32_t> reg;
 	Append(reg, IT_COND_EXEC_T, {static_cast<uint32_t>(fa), static_cast<uint32_t>(fa >> 32u), 0u, 3u}, false);
 	Append(reg, IT_SET_SH_REG, {0x240u, 0x5u}, false);
@@ -6865,6 +7122,8 @@ int main() {
 	TestMemSemaphoreAnd3A();
 	TestMultiInst();
 	TestCondExecRecount();
+	TestCondExecRegisters();
+	TestCondExecTitleForm();
 	TestCondExecMec();
 	TestFlattenCondExecCount();
 	TestCopyDataForms();
