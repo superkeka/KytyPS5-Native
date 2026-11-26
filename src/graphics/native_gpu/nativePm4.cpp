@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #if defined(__linux__)
@@ -1948,6 +1950,37 @@ void LogBranch(std::FILE* f, std::span<const uint32_t> in, size_t dw, uint32_t l
 	std::fflush(f);
 }
 
+// A REWIND holds the CP until the title sets its valid bit, which it does once it has written what comes after
+// (the next chunk and the chain to it): the inlining waits the same way, up to KYTY_NATIVE_GPU_REWIND_WAIT_MS
+// (10000 by default).
+static bool WaitRewindValid(const uint32_t* control) {
+	auto valid = [control] { return (__atomic_load_n(control, __ATOMIC_ACQUIRE) & 0x80000000u) != 0; };
+	if (valid()) {
+		return true;
+	}
+	static const int64_t limit_us = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_REWIND_WAIT_MS");
+		return (v != nullptr && v[0] != '\0' ? std::strtoll(v, nullptr, 10) : 10000) * 1000;
+	}();
+	static std::atomic<uint32_t> logged {0};
+	const auto                   start = std::chrono::steady_clock::now();
+	int64_t                      waited_us = 0;
+	while (!valid()) {
+		waited_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+		if (waited_us >= limit_us) {
+			std::fprintf(stderr, "native flatten: REWIND at %p still not valid after %lld ms\n", static_cast<const void*>(control - 1),
+			             static_cast<long long>(waited_us / 1000));
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::microseconds(50));
+	}
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+		std::fprintf(stderr, "native flatten: REWIND at %p became valid after %.3f ms\n", static_cast<const void*>(control - 1),
+		             static_cast<double>(waited_us) / 1000.0);
+	}
+	return true;
+}
+
 // 1: inlined something, 0: nothing to inline, -1: cannot.
 int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int depth, std::string* why,
                 std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
@@ -2026,7 +2059,7 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			conds.push_back({out->size() + (dw - run) + 4u, dw + len + (in[dw + 4] & 0x3fffu)});
 		}
 		if ((header >> 30u) == 3u && op == kRewind && len == 2) {
-			if ((in[dw + 1] & 0x80000000u) == 0) {
+			if (!WaitRewindValid(&in[dw + 1])) {
 				return stop("REWIND not valid yet", dw);
 			}
 			if (!flush(dw)) {
