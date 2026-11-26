@@ -7626,6 +7626,12 @@ private:
 					if (FindRewindStop(std::span<const uint32_t>(job.buffer, job.size_dw), &stop)) {
 						Job rest = job;
 						if (stop.next != nullptr) {
+							if (stop.call && stop.at + 4u < job.size_dw) {
+								Job back = job; // the caller's dwords after the call, once the target is done
+								back.buffer  = job.buffer + stop.at + 4u;
+								back.size_dw = job.size_dw - stop.at - 4u;
+								m_round.push_front(std::move(back));
+							}
 							rest.buffer  = stop.next;
 							rest.size_dw = stop.next_size;
 							m_round.push_front(std::move(rest));

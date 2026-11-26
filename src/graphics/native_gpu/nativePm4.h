@@ -771,13 +771,15 @@ struct SourcePiece {
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
                             std::vector<SourcePiece>* pieces = nullptr, std::vector<uint32_t>* marks = nullptr);
 // Where the CP would stop in a graphics buffer: at a REWIND of its top level the title has not set valid yet
-// (`next` == nullptr: the buffer runs up to `at`, the rest from `at` on once the REWIND is valid), or at a chain
-// of its top level to a buffer that stops so (`next`, `next_size`: the chain's target, which runs after `at`).
+// (`next` == nullptr: the buffer runs up to `at`, the rest from `at` on once the REWIND is valid), or at an
+// INDIRECT_BUFFER of its top level to a buffer that stops so (`next`, `next_size`: its target, which runs after
+// `at`; `call`: the CP comes back after it to the dwords behind the packet, else it was a chain and does not).
 // False when it runs through, or when the stop is inside a COND_EXEC's range (inlining then waits for it).
 struct RewindStop {
 	uint32_t        at        = 0;
 	const uint32_t* next      = nullptr;
 	uint32_t        next_size = 0;
+	bool            call      = false;
 };
 bool FindRewindStop(std::span<const uint32_t> in, RewindStop* out);
 // A line in `f` for each always-taken AgcCbBranch (COND_INDIRECT_BUFFER) FlattenIndirectBuffers inlines as a call, once

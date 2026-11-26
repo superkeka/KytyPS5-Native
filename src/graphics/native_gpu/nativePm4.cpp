@@ -2196,19 +2196,23 @@ static bool StopsAtRewind(std::span<const uint32_t> in, RewindStop* out, int hop
 			*out = {static_cast<uint32_t>(dw), nullptr, 0};
 			return true;
 		}
-		if ((header >> 30u) == 3u && op == kIndirect && len == 4 && (in[dw + 3] & (1u << 20u)) != 0) {
-			// A chain: the CP goes on in its target and never comes back.
+		if ((header >> 30u) == 3u && op == kIndirect && len == 4) {
+			// A chain: the CP goes on in its target and never comes back. A call: it comes back after the target.
+			const bool     chain  = (in[dw + 3] & (1u << 20u)) != 0;
 			const auto*    target = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[dw + 2]) << 32u) | (in[dw + 1] & ~3u));
 			const uint32_t size   = in[dw + 3] & 0xfffffu;
 			RewindStop     inner;
-			if (target == nullptr || size == 0 || hops == 0 || !StopsAtRewind({target, size}, &inner, hops - 1)) {
+			const bool     stops  = target != nullptr && size != 0 && hops != 0 && StopsAtRewind({target, size}, &inner, hops - 1);
+			if (stops) {
+				if (dw < cond_end) {
+					return false;
+				}
+				*out = {static_cast<uint32_t>(dw), target, size, !chain};
+				return true;
+			}
+			if (chain) {
 				return false;
 			}
-			if (dw < cond_end) {
-				return false;
-			}
-			*out = {static_cast<uint32_t>(dw), target, size};
-			return true;
 		}
 		dw += len;
 	}
