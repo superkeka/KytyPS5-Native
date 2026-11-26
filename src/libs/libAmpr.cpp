@@ -825,6 +825,16 @@ static uint64_t WriteAddressRecordSize(uint64_t value) {
 	return value <= 3 ? 8 : value < (uint64_t {1} << 34) ? 12 : 16;
 }
 
+// A counter write on completion: one dword, the value's low 12 bits in it; a second dword for the rest.
+static uint64_t WriteCounterOnCompletionRecordSize(uint32_t value) {
+	return value < 0x1000u ? 4 : 8;
+}
+
+// Application counters are the first 128.
+static bool IsApplicationCounter(uint8_t index) {
+	return index < 0x80u;
+}
+
 static uint64_t AprReadGatherRecordSize(uint64_t file_offset) {
 	return file_offset > 0x3ffffu ? READ_GATHER_RECORD_SIZE_EXT : READ_GATHER_RECORD_SIZE;
 }
@@ -1612,11 +1622,13 @@ MeasureCommandSizeWriteAddressFromCounterPairOnCompletion(volatile uint64_t*, ui
 	return 0x20;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t, uint8_t, uint64_t,
-                                                                         uint8_t) {
+static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t index, uint32_t value) {
 	PRINT_NAME();
 
-	return 0x20;
+	if (!IsApplicationCounter(index)) {
+		return static_cast<uint32_t>(LibKernel::KERNEL_ERROR_EINVAL);
+	}
+	return WriteCounterOnCompletionRecordSize(value);
 }
 
 static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMap(uint64_t, uint64_t, int32_t, int32_t) {
@@ -1962,11 +1974,28 @@ static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
-                                                               uint8_t, uint64_t, uint8_t) {
+// Writes `value` to counter `index` once the commands before it are done (the engine runs them in order); a stream of
+// the other engine can wait for it (CommandBufferWaitOnCounter).
+static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t index, uint32_t value) {
 	PRINT_NAME();
 
-	return AppendNoOpCommand(command_buffer, 0x20);
+	if (command_buffer == nullptr) {
+		return LibKernel::KERNEL_ERROR_EPERM;
+	}
+	if (!IsApplicationCounter(index)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	uint32_t type = 0;
+	if (!AprShared::ReadGuest(reinterpret_cast<uint64_t>(command_buffer) + COMMAND_BUFFER_TYPE_OFFSET, &type)) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if ((type & APR_TYPE_MAP_ACTIVE) != 0) {
+		return LibKernel::KERNEL_ERROR_EPERM;
+	}
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), CommandBufferState::WriteCounterCommand {index, value},
+	                           WriteCounterOnCompletionRecordSize(value))
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
