@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1212,7 +1213,152 @@ struct Submission {
 	size_t                 error_index   = std::numeric_limits<size_t>::max(); // the first command that failed
 	int                    error         = 0;
 	bool                   busy          = false; // a worker runs the command at the cursor
+	uint64_t               seq           = 0;     // the submit order across the AMM and APR queues
+	double                 held          = 0;     // when the order between the queues first held the command at the cursor
+	bool                   warned        = false;
 };
+
+// The AMM and APR queues as one consumer in submit order: a submit takes a number from one sequence for both.
+// - A read of an APR stream is not issued while a mapper submit numbered below the stream still has a record to run
+//   that changes the mapping or protection of the read's destination: the read lands where the map submitted first put
+//   it.
+// - A mapper record that changes a range does not run while an APR stream numbered below the mapper submit has a read
+//   into an overlapping range not done (pending from its submit): a later map never pulls the memory from under an
+//   earlier read.
+// Only overlapping ranges wait. KYTY_AMM_APR_ORDER=0 turns both off.
+static bool QueueOrderOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_AMM_APR_ORDER");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
+class QueueOrder {
+public:
+	// Takes the submit's number and publishes its ranges: the map records of a mapper submit, the reads of a stream.
+	uint64_t Register(bool mapper, const std::vector<CommandBufferState::Command>& commands) {
+		Entry e;
+		if (QueueOrderOn()) {
+			for (size_t i = 0; i < commands.size(); i++) {
+				uint64_t start = 0;
+				uint64_t size  = 0;
+				if (const auto* m = std::get_if<CommandBufferState::AmmMapCommand>(&commands[i].data); mapper && m != nullptr) {
+					start = m->va;
+					size  = m->size;
+				} else if (const auto* r = std::get_if<CommandBufferState::ReadFileCommand>(&commands[i].data); !mapper && r != nullptr) {
+					start = r->destination;
+					size  = r->size;
+				}
+				if (size == 0) {
+					continue;
+				}
+				const uint64_t end = start + size < start ? UINT64_MAX : start + size;
+				e.ranges.push_back({i, start, end, false});
+				e.lo = std::min(e.lo, start);
+				e.hi = std::max(e.hi, end);
+			}
+		}
+		std::scoped_lock lock(m_mutex);
+		const uint64_t   seq = ++m_seq;
+		if (!e.ranges.empty()) {
+			(mapper ? m_mappers : m_streams).emplace(seq, std::move(e));
+		}
+		return seq;
+	}
+
+	// The mapper submit `seq` has run its commands before `cursor`.
+	void MapperRan(uint64_t seq, size_t cursor) {
+		std::scoped_lock lock(m_mutex);
+		if (auto it = m_mappers.find(seq); it != m_mappers.end()) {
+			auto& e = it->second;
+			while (e.next < e.ranges.size() && e.ranges[e.next].index < cursor) {
+				e.next++;
+			}
+			if (e.next == e.ranges.size()) {
+				m_mappers.erase(it);
+			}
+		}
+	}
+
+	// The read at command `index` of the stream `seq` is done.
+	void ReadDone(uint64_t seq, size_t index) {
+		std::scoped_lock lock(m_mutex);
+		if (auto it = m_streams.find(seq); it != m_streams.end()) {
+			auto& e = it->second;
+			for (auto& r: e.ranges) {
+				if (r.index == index && !r.done) {
+					r.done = true;
+					e.next++; // here: the count of reads done
+					break;
+				}
+			}
+			if (e.next == e.ranges.size()) {
+				m_streams.erase(it);
+			}
+		}
+	}
+
+	// A submit that ended, also by a failed command, holds nothing.
+	void Done(bool mapper, uint64_t seq) {
+		std::scoped_lock lock(m_mutex);
+		(mapper ? m_mappers : m_streams).erase(seq);
+	}
+
+	// The mapper submit numbered below `before` with a record left to run that changes [start, end), 0 for none.
+	uint64_t MapperHolds(uint64_t before, uint64_t start, uint64_t end) {
+		std::scoped_lock lock(m_mutex);
+		for (auto it = m_mappers.begin(); it != m_mappers.end() && it->first < before; ++it) {
+			const auto& e = it->second;
+			if (e.hi <= start || e.lo >= end) {
+				continue;
+			}
+			for (size_t i = e.next; i < e.ranges.size(); i++) {
+				if (e.ranges[i].start < end && start < e.ranges[i].end) {
+					return it->first;
+				}
+			}
+		}
+		return 0;
+	}
+
+	// The APR stream numbered below `before` with a read into [start, end) not done, 0 for none.
+	uint64_t ReadHolds(uint64_t before, uint64_t start, uint64_t end) {
+		std::scoped_lock lock(m_mutex);
+		for (auto it = m_streams.begin(); it != m_streams.end() && it->first < before; ++it) {
+			const auto& e = it->second;
+			if (e.hi <= start || e.lo >= end) {
+				continue;
+			}
+			for (const auto& r: e.ranges) {
+				if (!r.done && r.start < end && start < r.end) {
+					return it->first;
+				}
+			}
+		}
+		return 0;
+	}
+
+private:
+	struct Range {
+		size_t   index;
+		uint64_t start;
+		uint64_t end;
+		bool     done;
+	};
+	struct Entry {
+		std::vector<Range> ranges;
+		size_t             next = 0; // a mapper: the first record not run; a stream: the count of reads done
+		uint64_t           lo   = UINT64_MAX;
+		uint64_t           hi   = 0;
+	};
+	std::mutex                m_mutex;
+	uint64_t                  m_seq = 0;
+	std::map<uint64_t, Entry> m_mappers;
+	std::map<uint64_t, Entry> m_streams;
+};
+
+static QueueOrder g_queue_order;
 
 // KYTY_LOG_AMM=1: every command as the engine runs it, with the CLOCK_MONOTONIC time.
 static bool LogAmm() {
@@ -1265,7 +1411,8 @@ public:
 	static constexpr size_t   kMaxPendingReads = 64;
 	static constexpr uint64_t kMaxPendingBytes = 64ull * 1024 * 1024;
 
-	CommandEngine(size_t priorities, uint32_t workers, const char* name): m_queues(priorities), m_pieces(priorities) {
+	CommandEngine(size_t priorities, uint32_t workers, const char* name, bool mapper)
+	    : m_mapper(mapper), m_queues(priorities), m_pieces(priorities) {
 		for (uint32_t i = 0; i < workers; i++) {
 			m_workers.emplace_back([this, name](std::stop_token stop) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
@@ -1313,6 +1460,7 @@ private:
 	}
 
 	void Complete(const Submission& submission, int result, uint32_t error_offset) {
+		g_queue_order.Done(m_mapper, submission.seq);
 		AprShared::WriteResult(submission.result, result, error_offset);
 		AprShared::SetSubmissionComplete(submission.id);
 		if (LogAmm()) {
@@ -1332,10 +1480,15 @@ private:
 
 	// Under m_mutex: issues the reads at the cursor that may go, as pieces. False when the read at the cursor waits
 	// (the pending limits, an overlap) or failed.
-	bool IssueReads(Submission& s, std::deque<Piece>& pieces) {
+	bool IssueReads(Submission& s, std::deque<Piece>& pieces, bool* waiting) {
 		while (s.cursor < s.commands.size() && IsRead(s, s.cursor)) {
 			const auto& r = Read(s, s.cursor);
 			if (s.in_flight.size() >= kMaxPendingReads || (s.pending_bytes != 0 && s.pending_bytes + r.size > kMaxPendingBytes)) {
+				return false;
+			}
+			if (r.size != 0 && QueueOrderOn() &&
+			    Held(s, g_queue_order.MapperHolds(s.seq, r.destination, r.destination + r.size), r.destination, r.size)) {
+				*waiting = true;
 				return false;
 			}
 			for (size_t k: s.in_flight) {
@@ -1388,7 +1541,7 @@ private:
 				return nullptr;
 			}
 			if (s.error_index == kNone) {
-				IssueReads(s, pieces);
+				IssueReads(s, pieces, waiting);
 			}
 			if (!s.in_flight.empty()) {
 				return nullptr; // a barrier, the end or a failure waits for the reads before it
@@ -1411,6 +1564,12 @@ private:
 				*waiting = true;
 				return nullptr;
 			}
+			if (const auto* m = std::get_if<CommandBufferState::AmmMapCommand>(&s.commands[s.cursor].data);
+			    m_mapper && m != nullptr && m->size != 0 && QueueOrderOn() &&
+			    Held(s, g_queue_order.ReadHolds(s.seq, m->va, m->va + m->size), m->va, m->size)) {
+				*waiting = true;
+				return nullptr;
+			}
 			s.busy = true;
 			return &s;
 		}
@@ -1430,6 +1589,7 @@ private:
 		}
 		const auto& r = Read(s, piece.read);
 		std::erase(s.in_flight, piece.read);
+		g_queue_order.ReadDone(s.seq, piece.read);
 		s.pending_bytes -= r.size;
 		LogCommand(s.commands[piece.read], state.result, s.priority);
 		static std::atomic<uint32_t> s_logged_dlc_reads {0};
@@ -1465,6 +1625,9 @@ private:
 					Fail(*barrier, barrier->cursor, result);
 				}
 				barrier->cursor++;
+				if (m_mapper) {
+					g_queue_order.MapperRan(barrier->seq, barrier->cursor);
+				}
 				m_cv.notify_all();
 				continue;
 			}
@@ -1489,6 +1652,39 @@ private:
 			PieceDone(piece, result, bytes_read);
 			m_cv.notify_all();
 		}
+	}
+
+	// Under m_mutex: whether the command at the cursor of `s` (on [va, va + size)) waits for the submit `holder` of the
+	// other queue (0: none). Logs the hold and its end with KYTY_LOG_AMM=1, and always a hold over 1 s.
+	bool Held(Submission& s, uint64_t holder, uint64_t va, uint64_t size) const {
+		if (holder == 0 && s.held == 0) {
+			return false;
+		}
+		const double now = NowSeconds();
+		if (holder == 0) {
+			if (LogAmm()) {
+				std::fprintf(stderr, "amq %.6f %s seq %llu va 0x%llx released after %.3f ms\n", now, m_mapper ? "map" : "read",
+				             static_cast<unsigned long long>(s.seq), static_cast<unsigned long long>(va), (now - s.held) * 1000.0);
+			}
+			s.held   = 0;
+			s.warned = false;
+			return false;
+		}
+		if (s.held == 0) {
+			s.held = now;
+			if (LogAmm()) {
+				std::fprintf(stderr, "amq %.6f %s seq %llu va 0x%llx size 0x%llx held by %s seq %llu\n", now, m_mapper ? "map" : "read",
+				             static_cast<unsigned long long>(s.seq), static_cast<unsigned long long>(va),
+				             static_cast<unsigned long long>(size), m_mapper ? "read" : "map", static_cast<unsigned long long>(holder));
+			}
+		} else if (!s.warned && now - s.held > 1.0) {
+			s.warned = true;
+			std::fprintf(stderr, "amm: %s of submit %llu at 0x%llx (+0x%llx) held over 1 s by %s submit %llu\n",
+			             m_mapper ? "mapper record" : "APR read", static_cast<unsigned long long>(s.seq),
+			             static_cast<unsigned long long>(va), static_cast<unsigned long long>(size), m_mapper ? "APR" : "mapper",
+			             static_cast<unsigned long long>(holder));
+		}
+		return true;
 	}
 
 	void LogCommand(const CommandBufferState::Command& entry, int result, uint32_t priority) const {
@@ -1521,6 +1717,7 @@ private:
 		}
 	}
 
+	const bool                          m_mapper;
 	std::mutex                          m_mutex;
 	std::condition_variable             m_cv;
 	std::vector<std::deque<Submission>> m_queues;
@@ -1559,9 +1756,14 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
 	}
-	static CommandEngine apr_engine(7, 8, "kyty-apr");
-	static CommandEngine amm_engine(3, 1, "kyty-amm");
+	static CommandEngine apr_engine(7, 8, "kyty-apr", false);
+	static CommandEngine amm_engine(3, 1, "kyty-amm", true);
 	Submission submission;
+	submission.seq = g_queue_order.Register(amm, state.commands);
+	if (LogAmm()) {
+		std::fprintf(stderr, "amq %.6f %s seq %llu prio %u %zu commands\n", NowSeconds(), amm ? "submit-amm" : "submit-apr",
+		             static_cast<unsigned long long>(submission.seq), priority, state.commands.size());
+	}
 	submission.commands  = std::move(state.commands);
 	submission.result    = result;
 	submission.id        = id;
