@@ -202,6 +202,17 @@ bool TakeLodStatsBanks(uint64_t addr, std::bitset<256>& banks);
 // its PC and single-steps it before closing the pages again.
 void LodStatsTrapArm(uint64_t addr, uint64_t size);
 bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context);
+// KYTY_CMD_TRAP=1 with the control socket's "wtrap N" (diagnostics): CPU writes to guest command memory traced for N
+// flips (see CmdTrapOnFlip); =hle traces libSceAgc's SH register setters instead. KYTY_CMD_PROBE adds hardware
+// breakpoints on program code for the same window. CmdTrapNote: a range FlattenIndirectBuffers read as commands; CmdTrapSetCode: the program's code.
+bool CmdTrapOn();
+void CmdTrapDemand(uint32_t flips);
+void CmdTrapNote(uint64_t va, uint64_t bytes);
+void CmdTrapSetCode(uint64_t lo, uint64_t hi);
+bool CmdTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context);
+// KYTY_CMD_TRAP=hle: libSceAgc's register setters report a pixel shader they set (0: none found; `first`: the first pairs).
+bool CmdTrapHleArmed();
+void CmdTrapHleRecord(uint32_t ps, uint32_t kind, uint64_t table, const uint32_t* first, uint32_t first_n);
 
 // Called at every video-out flip with the guest surface about to be presented. For the flips
 // listed in KYTY_NATIVE_GPU_DUMP_FLIPS ("300,600" or a range "300-2000/10"), writes to

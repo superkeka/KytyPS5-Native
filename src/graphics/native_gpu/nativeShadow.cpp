@@ -54,9 +54,13 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <dirent.h>
+#include <linux/hw_breakpoint.h>
+#include <linux/perf_event.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -1066,6 +1070,9 @@ void StartControlSocket() {
 					count = count != 0 ? count : 8u;
 					DemandedDumps().store(count);
 					std::snprintf(reply, sizeof(reply), "ok dumping the next %u flips\n", count);
+				} else if (std::sscanf(line.c_str(), "wtrap %u", &count) == 1) {
+					CmdTrapDemand(count);
+					std::snprintf(reply, sizeof(reply), "ok trapping command writes for %u flips (KYTY_CMD_TRAP=1)\n", count);
 				} else if (line == "cpshadow") {
 					DemandedCpShadowCheck().store(true);
 					std::snprintf(reply, sizeof(reply), "ok comparing the CP shadow with the CPU copy when the gfx ring is next idle (cpshadow_N.txt)\n");
@@ -9514,6 +9521,586 @@ bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_con
 	return false;
 }
 
+namespace {
+
+// Control socket "wtrap N" (KYTY_NATIVE_GPU_CTL, diagnostics): for N flips from the next one, the pages of guest command
+// memory (what FlattenIndirectBuffers read in the last 240 flips) are read-only. Each CPU write there is single-stepped
+// (EFLAGS.TF) with its page open. A write that completes a SET_SH_REG_INDIRECT whose table sets SPI_SHADER_PGM_LO_PS
+// (or, with KYTY_CMD_TRAP_RANGE=lo:hi, leaves a dword in [lo, hi)) is recorded with the writer's pc, the pixel shader,
+// the table and the return addresses on its stack into the program (the loader sets its range, CmdTrapSetCode).
+// Needs KYTY_CMD_TRAP=1, which notes the command pages. cmdtrap.txt in KYTY_NATIVE_GPU_DUMP_DIR when the window closes.
+struct CmdTrapRecord {
+	uint64_t flip;
+	uint64_t pc;
+	uint64_t vaddr;
+	uint32_t value[8];
+	uint32_t nret;
+	uint32_t tid;
+	uint64_t pkt;   // the SET_SH_REG_INDIRECT's address
+	uint64_t table; // its table
+	uint32_t ps;    // the PGM_LO_PS the table sets
+	uint64_t ret[32];
+};
+constexpr uint32_t        kCmdTrapRecords = 1u << 17;
+CmdTrapRecord*            g_ct_records    = nullptr;
+std::atomic<uint32_t>     g_ct_next {0};
+std::atomic<bool>         g_ct_armed {false};
+const uint64_t*           g_ct_pages   = nullptr; // sorted host pages, fixed once published
+std::atomic<uint32_t>     g_ct_pages_n {0};
+std::atomic<uint64_t>     g_ct_flip {0};
+std::atomic<uint64_t>     g_ct_faults {0};
+std::atomic<uint32_t>     g_ct_demand {0};
+uint32_t                  g_ct_flips_left = 0; // flip thread only
+uint64_t                  g_ct_arm_flip   = 0;
+uint32_t                  g_ct_lo = 0, g_ct_hi = 0; // KYTY_CMD_TRAP_RANGE
+std::atomic<uint64_t>     g_ct_code_lo {0}, g_ct_code_hi {0};
+std::mutex                g_ct_seen_mutex;
+std::unordered_map<uint64_t, uint64_t> g_ct_seen; // page -> last flip it was read as commands
+const bool                g_ct_on = EnvOn("KYTY_CMD_TRAP");
+// KYTY_CMD_TRAP=hle: no pages are trapped; libSceAgc's register setters report the pixel shaders they set
+// (CmdTrapHleRecord) with their callers.
+const bool                g_ct_hle = [] {
+	const char* v = std::getenv("KYTY_CMD_TRAP");
+	return v != nullptr && std::strcmp(v, "hle") == 0;
+}();
+struct sigaction          g_ct_prev_trap {};
+thread_local uint64_t     t_ct_page[4] = {};
+thread_local uint32_t     t_ct_npages  = 0;
+thread_local uint64_t     t_ct_vaddr = 0, t_ct_pc = 0, t_ct_rsp = 0;
+
+bool CmdTrapPage(uint64_t page) {
+	const uint32_t n = g_ct_pages_n.load(std::memory_order_acquire);
+	const uint64_t* p = g_ct_pages;
+	if (n == 0 || p == nullptr) {
+		return false;
+	}
+	uint32_t lo = 0, hi = n;
+	while (lo < hi) {
+		const uint32_t mid = (lo + hi) / 2;
+		if (p[mid] < page) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return lo < n && p[lo] == page;
+}
+
+// KYTY_CMD_PROBE="ADDR[:REG+OFF,...]/..." (program offsets in hex, diagnostics): while a "wtrap" window is open, a breakpoint at
+// each ADDR (a hardware breakpoint, up to 4) records the flip, the thread, rdi rsi rdx rcx r8, 8 bytes at each REG+OFF and
+// the frame-pointer chain.
+struct CmdProbe {
+	uint64_t addr = 0;
+	uint32_t nmem = 0;
+	int      reg[8] {};
+	int64_t  off[8] {};
+};
+struct CmdProbeRecord {
+	uint64_t flip;
+	uint32_t tid;
+	uint32_t probe;
+	uint64_t regs[10]; // rdi rsi rdx rcx r8 rax r12 r13 r14 r15
+	uint64_t mem[8];
+	uint64_t ret[6];
+};
+constexpr uint32_t    kCmdProbeRecords = 1u << 18;
+CmdProbe              g_cp[16];
+uint32_t              g_cp_n       = 0;
+std::atomic<bool>     g_cp_on {false};
+CmdProbeRecord*       g_cp_records = nullptr;
+std::atomic<uint32_t> g_cp_next {0};
+
+int CmdProbeReg(const char* name) {
+	static const char* const names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r12", "r13", "r14", "r15"};
+	static const int         regs[]  = {REG_RAX, REG_RBX, REG_RCX, REG_RDX, REG_RSI, REG_RDI, REG_RBP, REG_RSP, REG_R8, REG_R9, REG_R12, REG_R13, REG_R14, REG_R15};
+	for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		if (std::strncmp(name, names[i], std::strlen(names[i])) == 0) {
+			return regs[i];
+		}
+	}
+	return -1;
+}
+
+uint64_t CmdProbeRead(uint64_t a) {
+	uint64_t v = 0;
+	iovec    local {&v, 8};
+	iovec    remote {reinterpret_cast<void*>(a), 8};
+	return ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == 8 ? v : 0xdeaddeaddeaddeadull;
+}
+
+std::vector<int> g_cp_fds;
+
+// Hardware execution breakpoints (perf, sigtrap) on every thread there is now: the program's code stays as it is.
+void CmdProbeSet(bool on) {
+	if (!on) {
+		for (const int fd: g_cp_fds) {
+			::close(fd);
+		}
+		g_cp_fds.clear();
+		return;
+	}
+	std::vector<int> tids;
+	if (DIR* d = ::opendir("/proc/self/task"); d != nullptr) {
+		while (const dirent* e = ::readdir(d)) {
+			if (e->d_name[0] != '.') {
+				tids.push_back(std::atoi(e->d_name));
+			}
+		}
+		::closedir(d);
+	}
+	uint32_t failed = 0;
+	for (uint32_t i = 0; i < g_cp_n && i < 4; i++) {
+		for (const int tid: tids) {
+			perf_event_attr a {};
+			a.type           = PERF_TYPE_BREAKPOINT;
+			a.size           = sizeof(a);
+			a.bp_type        = HW_BREAKPOINT_X;
+			a.bp_addr        = g_cp[i].addr;
+			a.bp_len         = sizeof(long);
+			a.sample_period  = 1;
+			a.exclude_kernel = 1;
+			a.exclude_hv     = 1;
+			a.sigtrap        = 1;
+			a.remove_on_exec = 1;
+			a.sig_data       = i;
+			const int fd = static_cast<int>(::syscall(SYS_perf_event_open, &a, tid, -1, -1, PERF_FLAG_FD_CLOEXEC));
+			if (fd >= 0) {
+				g_cp_fds.push_back(fd);
+			} else {
+				failed++;
+			}
+		}
+	}
+	std::fprintf(stderr, "native shadow: code probes: %zu breakpoints on %zu threads, %u failed (%s)\n", g_cp_fds.size(), tids.size(),
+	             failed, failed != 0 ? std::strerror(errno) : "-");
+}
+
+// From CmdTrapStep: a breakpoint of ours. True when handled.
+bool CmdProbeTrap(siginfo_t* info, ucontext_t* uc) {
+	// TRAP_PERF (6) with the event's sig_data in si_perf_data, the word after si_addr (older glibc names neither).
+	if (info == nullptr || info->si_code != 6) {
+		return false;
+	}
+	uint64_t perf_data = 0;
+	std::memcpy(&perf_data, reinterpret_cast<const uint8_t*>(info) + 24, 8);
+	auto&          g = uc->uc_mcontext.gregs;
+	const uint32_t i = static_cast<uint32_t>(perf_data);
+	if (i >= g_cp_n || g_cp_records == nullptr || !g_cp_on.load(std::memory_order_acquire)) {
+		return true;
+	}
+	const uint32_t idx = g_cp_next.fetch_add(1, std::memory_order_relaxed);
+	if (idx >= kCmdProbeRecords) {
+		return true;
+	}
+	CmdProbeRecord& r = g_cp_records[idx];
+	r.flip            = g_ct_flip.load(std::memory_order_relaxed);
+	r.tid             = static_cast<uint32_t>(::syscall(SYS_gettid));
+	r.probe           = i;
+	r.regs[0]         = g[REG_RDI];
+	r.regs[1]         = g[REG_RSI];
+	r.regs[2]         = g[REG_RDX];
+	r.regs[3]         = g[REG_RCX];
+	r.regs[4]         = g[REG_R8];
+	r.regs[5]         = g[REG_RAX];
+	r.regs[6]         = g[REG_R12];
+	r.regs[7]         = g[REG_R13];
+	r.regs[8]         = g[REG_R14];
+	r.regs[9]         = g[REG_R15];
+	for (uint32_t k = 0; k < 8; k++) {
+		// Read in place: guest memory backed by GPU buffers is not readable with process_vm_readv. The probe names
+		// fields of objects the probed code itself uses.
+		r.mem[k] = k < g_cp[i].nmem ? *reinterpret_cast<const volatile uint64_t*>(static_cast<uint64_t>(g[g_cp[i].reg[k]]) + g_cp[i].off[k]) : 0;
+	}
+	uint64_t fp = static_cast<uint64_t>(g[REG_RBP]);
+	for (uint32_t k = 0; k < 6; k++) {
+		r.ret[k]          = fp != 0 ? CmdProbeRead(fp + 8) : 0;
+		const uint64_t up = fp != 0 ? CmdProbeRead(fp) : 0;
+		fp                = up > fp ? up : 0;
+	}
+	return true;
+}
+
+void CmdProbeParse(uint64_t base) {
+	const char* v = std::getenv("KYTY_CMD_PROBE");
+	for (const char* p = v; p != nullptr && *p != '\0' && g_cp_n < 16;) {
+		char*     end = nullptr;
+		CmdProbe& c   = g_cp[g_cp_n];
+		c.addr        = base + std::strtoull(p, &end, 16);
+		if (end == p) {
+			break;
+		}
+		p = end;
+		if (*p == ':') {
+			p++;
+			while (*p != '\0' && *p != '/' && c.nmem < 8) {
+				const int r = CmdProbeReg(p);
+				while (*p != '\0' && *p != '+' && *p != '-' && *p != ',' && *p != '/') {
+					p++;
+				}
+				const int64_t o = (*p == '+' || *p == '-') ? std::strtoll(p, &end, 16) : 0;
+				if (*p == '+' || *p == '-') {
+					p = end;
+				}
+				if (r >= 0) {
+					c.reg[c.nmem]   = r;
+					c.off[c.nmem++] = o;
+				}
+				if (*p == ',') {
+					p++;
+				}
+			}
+		}
+		g_cp_n++;
+		if (*p == '/') {
+			p++;
+		}
+	}
+}
+
+void CmdTrapStep(int sig, siginfo_t* info, void* native_context) {
+	auto* uc = static_cast<ucontext_t*>(native_context);
+	if (t_ct_npages == 0 && CmdProbeTrap(info, uc)) {
+		return;
+	}
+	if (t_ct_npages == 0) {
+		if ((g_ct_prev_trap.sa_flags & SA_SIGINFO) != 0 && g_ct_prev_trap.sa_sigaction != nullptr) {
+			g_ct_prev_trap.sa_sigaction(sig, info, native_context);
+		} else if (g_ct_prev_trap.sa_handler != SIG_DFL && g_ct_prev_trap.sa_handler != SIG_IGN && g_ct_prev_trap.sa_handler != nullptr) {
+			g_ct_prev_trap.sa_handler(sig);
+		}
+		return;
+	}
+	uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
+	// What the write left: up to 8 dwords from its address, within its page.
+	const uint64_t a    = t_ct_vaddr & ~3ull;
+	const uint64_t end  = (a & ~0xfffull) + 0x1000;
+	uint32_t       v[8] = {};
+	const uint32_t nv   = static_cast<uint32_t>(std::min<uint64_t>(8, (end - a) / 4));
+	std::memcpy(v, reinterpret_cast<const void*>(a), nv * 4);
+	bool match = false;
+	for (uint32_t i = 0; i < nv; i++) {
+		match = match || (v[i] >= g_ct_lo && v[i] < g_ct_hi);
+	}
+	// A SET_SH_REG_INDIRECT around the write (6 dwords before it to 10 after) whose table sets PGM_LO_PS (SH 0x08).
+	uint64_t pkt = 0, table = 0;
+	uint32_t ps  = 0;
+	{
+		uint32_t       win[16] = {};
+		const uint64_t from    = a - 24;
+		iovec          local {win, sizeof(win)};
+		iovec          remote {reinterpret_cast<void*>(from), sizeof(win)};
+		if (::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(sizeof(win))) {
+			for (uint32_t i = 0; i + 4 < 16 && ps == 0; i++) {
+				if ((win[i] & 0xffffff00u) != 0xC0036300u || win[i + 2] > 0xffffu) {
+					continue;
+				}
+				const uint64_t t   = (win[i + 1] & ~3ull) | (static_cast<uint64_t>(win[i + 2]) << 32u);
+				const uint32_t num = std::min<uint32_t>(win[i + 4] & 0x3fffu, 64u);
+				uint32_t       pairs[128];
+				iovec          l2 {pairs, num * 8ull};
+				iovec          r2 {reinterpret_cast<void*>(t), num * 8ull};
+				if (num == 0 || ::process_vm_readv(::getpid(), &l2, 1, &r2, 1, 0) != static_cast<ssize_t>(num * 8ull)) {
+					continue;
+				}
+				for (uint32_t k = 0; k < num; k++) {
+					if (pairs[2 * k] == 0x08u) {
+						ps    = pairs[2 * k + 1];
+						table = t;
+						pkt   = from + i * 4ull;
+						break;
+					}
+				}
+			}
+		}
+	}
+	match = match || ps != 0;
+	if (match && g_ct_records != nullptr) {
+		const uint32_t idx = g_ct_next.fetch_add(1, std::memory_order_relaxed);
+		if (idx < kCmdTrapRecords) {
+			CmdTrapRecord& r = g_ct_records[idx];
+			r.flip           = g_ct_flip.load(std::memory_order_relaxed);
+			r.pc             = t_ct_pc;
+			r.vaddr          = t_ct_vaddr;
+			std::memcpy(r.value, v, sizeof(v));
+			r.pkt   = pkt;
+			r.table = table;
+			r.ps    = ps;
+			r.tid  = static_cast<uint32_t>(::syscall(SYS_gettid));
+			r.nret = 0;
+			const uint64_t clo = g_ct_code_lo.load(std::memory_order_relaxed);
+			const uint64_t chi = g_ct_code_hi.load(std::memory_order_relaxed);
+			uint64_t       buf[64];
+			for (uint64_t off = 0; off < 32768 && r.nret < 32; off += sizeof(buf)) {
+				iovec local {buf, sizeof(buf)};
+				iovec remote {reinterpret_cast<void*>(t_ct_rsp + off), sizeof(buf)};
+				const ssize_t got = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+				if (got <= 0) {
+					break;
+				}
+				for (size_t i = 0; i < static_cast<size_t>(got) / 8 && r.nret < 32; i++) {
+					if (buf[i] >= clo && buf[i] < chi) {
+						r.ret[r.nret++] = buf[i];
+					}
+				}
+				if (got != static_cast<ssize_t>(sizeof(buf))) {
+					break;
+				}
+			}
+		}
+	}
+	if (g_ct_armed.load(std::memory_order_acquire)) {
+		for (uint32_t i = 0; i < t_ct_npages; i++) {
+			::mprotect(reinterpret_cast<void*>(t_ct_page[i]), 0x1000, PROT_READ);
+		}
+	}
+	t_ct_npages = 0;
+}
+
+void CmdTrapProtect(int prot) {
+	const uint32_t n = g_ct_pages_n.load();
+	for (uint32_t i = 0; i < n;) {
+		uint32_t j = i + 1;
+		while (j < n && g_ct_pages[j] == g_ct_pages[j - 1] + 0x1000) {
+			j++;
+		}
+		::mprotect(reinterpret_cast<void*>(g_ct_pages[i]), (j - i) * 0x1000ull, prot);
+		i = j;
+	}
+}
+
+// At every flip (the flip thread): arms a demanded window, closes one that has run its flips.
+void CmdTrapOnFlip(uint64_t n) {
+	g_ct_flip.store(n, std::memory_order_relaxed);
+	if (!g_ct_on) {
+		return;
+	}
+	if (g_ct_flips_left > 0) {
+		if (--g_ct_flips_left > 0) {
+			return;
+		}
+		g_ct_armed.store(false, std::memory_order_release);
+		CmdTrapProtect(PROT_READ | PROT_WRITE);
+		if (g_cp_on.exchange(false)) {
+			CmdProbeSet(false);
+		}
+		const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+		char        path[512];
+		std::snprintf(path, sizeof(path), "%s/cmdtrap.txt", dir != nullptr && dir[0] != '\0' ? dir : ".");
+		const uint32_t count = std::min(g_ct_next.load(), kCmdTrapRecords);
+		if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+			std::fprintf(f, "# armed at flip %llu, closed at %llu, %u pages, %llu write faults, %u records; code 0x%llx-0x%llx\n",
+			             static_cast<unsigned long long>(g_ct_arm_flip), static_cast<unsigned long long>(n), g_ct_pages_n.load(),
+			             static_cast<unsigned long long>(g_ct_faults.load()), count,
+			             static_cast<unsigned long long>(g_ct_code_lo.load()), static_cast<unsigned long long>(g_ct_code_hi.load()));
+			std::fprintf(f, "# flip tid pc vaddr v0..v7 ps pkt table | returns\n");
+			for (uint32_t i = 0; i < count; i++) {
+				const CmdTrapRecord& r = g_ct_records[i];
+				std::fprintf(f, "%llu %u %llx %llx", static_cast<unsigned long long>(r.flip), r.tid, static_cast<unsigned long long>(r.pc),
+				             static_cast<unsigned long long>(r.vaddr));
+				for (uint32_t k = 0; k < 8; k++) {
+					std::fprintf(f, " %08x", r.value[k]);
+				}
+				std::fprintf(f, " %08x %llx %llx |", r.ps, static_cast<unsigned long long>(r.pkt), static_cast<unsigned long long>(r.table));
+				for (uint32_t k = 0; k < r.nret && k < 32; k++) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(r.ret[k]));
+				}
+				std::fprintf(f, "\n");
+			}
+			const uint32_t pn = std::min(g_cp_next.load(), kCmdProbeRecords);
+			std::fprintf(f, "# probes: P flip tid probe rdi rsi rdx rcx r8 rax r12 r13 r14 r15 | mem0..7 | rbp chain returns (%u records)\n", pn);
+			for (uint32_t i = 0; i < pn; i++) {
+				const CmdProbeRecord& r = g_cp_records[i];
+				std::fprintf(f, "P %llu %u %u", static_cast<unsigned long long>(r.flip), r.tid, r.probe);
+				for (uint64_t x: r.regs) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(x));
+				}
+				std::fprintf(f, " |");
+				for (uint32_t k = 0; k < g_cp[r.probe].nmem; k++) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(r.mem[k]));
+				}
+				std::fprintf(f, " |");
+				for (uint64_t x: r.ret) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(x));
+				}
+				std::fprintf(f, "\n");
+			}
+			std::fclose(f);
+		}
+		std::fprintf(stderr, "native shadow: write trap closed at flip %llu: %llu write faults, %u records -> %s\n",
+		             static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_ct_faults.load()), count, path);
+		return;
+	}
+	const uint32_t want = g_ct_demand.exchange(0);
+	if (want == 0 || g_ct_pages_n.load() != 0) {
+		return;
+	}
+	if (const char* r = std::getenv("KYTY_CMD_TRAP_RANGE"); r != nullptr) {
+		char* end = nullptr;
+		g_ct_lo   = static_cast<uint32_t>(std::strtoul(r, &end, 0));
+		g_ct_hi   = *end == ':' ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0)) : g_ct_lo + 1;
+	}
+	std::vector<uint64_t> pages;
+	if (!g_ct_hle) {
+		std::lock_guard<std::mutex> lock(g_ct_seen_mutex);
+		for (const auto& [page, last]: g_ct_seen) {
+			if (last + 240 >= n) {
+				pages.push_back(page);
+			}
+		}
+	}
+	std::sort(pages.begin(), pages.end());
+	auto* arr = new uint64_t[pages.size() + 1];
+	std::copy(pages.begin(), pages.end(), arr);
+	g_ct_records = new CmdTrapRecord[kCmdTrapRecords];
+	g_ct_pages   = arr;
+	g_ct_pages_n.store(static_cast<uint32_t>(pages.size()), std::memory_order_release);
+	static const bool installed = [] {
+		struct sigaction sa {};
+		sa.sa_sigaction = CmdTrapStep;
+		sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+		sigemptyset(&sa.sa_mask);
+		return ::sigaction(SIGTRAP, &sa, &g_ct_prev_trap) == 0;
+	}();
+	if (!installed) {
+		return;
+	}
+	g_ct_arm_flip   = n;
+	g_ct_flips_left = want;
+	g_ct_armed.store(true, std::memory_order_release);
+	CmdTrapProtect(PROT_READ);
+	if (static bool parsed = false; !parsed) {
+		parsed = true;
+		CmdProbeParse(g_ct_code_lo.load());
+		g_cp_records = new CmdProbeRecord[kCmdProbeRecords];
+	}
+	if (g_cp_n > 0) {
+		CmdProbeSet(true);
+		g_cp_on.store(true, std::memory_order_release);
+		std::fprintf(stderr, "native shadow: %u code probes set\n", g_cp_n);
+	}
+	std::fprintf(stderr, "native shadow: write trap (%s) armed at flip %llu for %u flips over %zu pages of command memory\n",
+	             g_ct_hle ? "libSceAgc setters" : "pages", static_cast<unsigned long long>(n), want, pages.size());
+}
+
+} // namespace
+
+bool CmdTrapOn() {
+	return g_ct_on && !g_ct_hle;
+}
+
+void CmdTrapDemand(uint32_t flips) {
+	g_ct_demand.store(flips);
+}
+
+void CmdTrapSetCode(uint64_t lo, uint64_t hi) {
+	g_ct_code_lo.store(lo);
+	g_ct_code_hi.store(hi);
+}
+
+void CmdTrapNote(uint64_t va, uint64_t bytes) {
+	if (!CmdTrapOn() || bytes == 0) {
+		return;
+	}
+	const uint64_t flip = g_ct_flip.load(std::memory_order_relaxed);
+	std::lock_guard<std::mutex> lock(g_ct_seen_mutex);
+	for (uint64_t p = va & ~0xfffull; p < va + bytes; p += 0x1000) {
+		g_ct_seen[p] = flip;
+	}
+}
+
+bool CmdTrapHleArmed() {
+	return g_ct_hle && g_ct_armed.load(std::memory_order_relaxed);
+}
+
+void CmdTrapHleRecord(uint32_t ps, uint32_t kind, uint64_t table, const uint32_t* first, uint32_t first_n) {
+	static std::atomic<uint32_t> misses {0};
+	if (!CmdTrapHleArmed() || g_ct_records == nullptr || (ps == 0 && misses.fetch_add(1) >= 4000)) {
+		return;
+	}
+	const uint32_t idx = g_ct_next.fetch_add(1, std::memory_order_relaxed);
+	if (idx >= kCmdTrapRecords) {
+		return;
+	}
+	CmdTrapRecord& r = g_ct_records[idx];
+	r.flip           = g_ct_flip.load(std::memory_order_relaxed);
+	r.pc             = kind;
+	r.vaddr          = table;
+	std::memset(r.value, 0, sizeof(r.value));
+	std::memcpy(r.value, first, std::min<uint32_t>(first_n, 8) * 4);
+	r.tid   = static_cast<uint32_t>(::syscall(SYS_gettid));
+	r.pkt   = 0;
+	r.table = table;
+	r.ps    = ps;
+	r.nret  = 0;
+	const uint64_t clo = g_ct_code_lo.load(std::memory_order_relaxed);
+	const uint64_t chi = g_ct_code_hi.load(std::memory_order_relaxed);
+	// The program's frames by their frame pointers: the first return into the program on the stack is the setter's
+	// caller; the guest frame pointer a host frame saved below it starts a chain of (saved rbp, return) pairs.
+	const auto            sp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+	std::vector<uint64_t> buf(16384);
+	iovec                 local {buf.data(), buf.size() * 8};
+	iovec                 remote {reinterpret_cast<void*>(sp), buf.size() * 8};
+	const ssize_t         got = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+	const size_t          n   = got > 0 ? static_cast<size_t>(got) / 8 : 0;
+	size_t                top = n;
+	for (size_t i = 0; i < n; i++) {
+		if (buf[i] >= clo && buf[i] < chi) {
+			top = i;
+			break;
+		}
+	}
+	if (top == n) {
+		return;
+	}
+	r.ret[r.nret++] = buf[top];
+	const uint64_t s  = sp + top * 8;
+	const uint64_t hi = sp + n * 8;
+	auto at           = [&](uint64_t a) -> uint64_t { return a >= sp && a + 8 <= hi ? buf[(a - sp) / 8] : 0; };
+	auto in_code      = [&](uint64_t v) { return v >= clo && v < chi; };
+	uint64_t best     = 0;
+	for (size_t i = 0; i < top; i++) {
+		const uint64_t v = buf[i];
+		if (v > s && v < hi && (v & 7) == 0 && in_code(at(v + 8)) && (best == 0 || v < best)) {
+			best = v;
+		}
+	}
+	for (uint64_t fp = best; fp != 0 && r.nret < 32;) {
+		const uint64_t ret = at(fp + 8);
+		if (!in_code(ret)) {
+			break;
+		}
+		r.ret[r.nret++]   = ret;
+		const uint64_t up = at(fp);
+		if (up <= fp) {
+			break;
+		}
+		fp = up;
+	}
+}
+
+bool CmdTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context) {
+	const uint64_t page = vaddr & ~0xfffull;
+	if (!CmdTrapPage(page)) {
+		return false;
+	}
+	::mprotect(reinterpret_cast<void*>(page), 0x1000, PROT_READ | PROT_WRITE);
+	if (!write || native_context == nullptr || !g_ct_armed.load(std::memory_order_acquire)) {
+		return true;
+	}
+	g_ct_faults.fetch_add(1, std::memory_order_relaxed);
+	auto* uc = static_cast<ucontext_t*>(native_context);
+	if (t_ct_npages == 0) {
+		t_ct_vaddr = vaddr;
+		t_ct_pc    = pc;
+		t_ct_rsp   = static_cast<uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
+	}
+	if (t_ct_npages < 4) {
+		t_ct_page[t_ct_npages++] = page;
+	}
+	uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;
+	return true;
+}
+
 bool PrimaryRendering() {
 	static const bool primary = EnvOn("KYTY_NATIVE_GPU_PRIMARY");
 	// KYTY_NATIVE_GPU_NULL=1: nothing renders at all, natively or through Vulkan, while the game and
@@ -9647,6 +10234,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
 	SubmitTrace::Instance().Flip();
+	CmdTrapOnFlip(n);
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
 	}

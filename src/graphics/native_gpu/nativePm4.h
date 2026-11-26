@@ -768,6 +768,9 @@ struct SourcePiece {
 };
 // `pieces`, when given, gets where each stretch of `out` came from; `marks`, where in `out` each buffer the
 // top level calls or chains to begins and ends (the title's own segments of the command buffer).
+// KYTY_CMD_TRAP (nativeShadow.cpp, diagnostics): the command memory FlattenIndirectBuffers reads.
+bool CmdTrapOn();
+void CmdTrapNote(uint64_t va, uint64_t bytes);
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
                             std::vector<SourcePiece>* pieces = nullptr, std::vector<uint32_t>* marks = nullptr);
 // KYTY_NATIVE_GPU_STALE_CHECK=MS (diagnostics): FlattenIndirectBuffers keeps what it took from guest memory and reads it

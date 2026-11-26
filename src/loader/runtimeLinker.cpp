@@ -726,6 +726,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		                                                 access == GpuAccess::Write, info->native_context)) {
 			return true;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		// KYTY_CMD_TRAP: CPU writes to guest command memory, traced (diagnostics).
+		if (Libs::Graphics::NativeGpu::CmdTrapFault(info->access_violation_vaddr, info->exception_address,
+		                                            access == GpuAccess::Write, info->native_context)) {
+			return true;
+		}
+#endif
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
@@ -2423,6 +2430,9 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 	EXIT_IF(program->tls.handler_vaddr == 0);
 
 	g_tls_main_program = program;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	Libs::Graphics::NativeGpu::CmdTrapSetCode(program->base_vaddr, program->base_vaddr + program->base_size_aligned);
+#endif
 
 	auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
 

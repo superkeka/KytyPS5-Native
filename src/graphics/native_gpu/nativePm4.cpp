@@ -2401,7 +2401,8 @@ bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>*
 	}
 	StaleCheck*              stale = StaleCheck::Get();
 	std::vector<SourcePiece> own_pieces;
-	if (stale != nullptr && pieces == nullptr) {
+	const bool               trap = CmdTrapOn();
+	if ((stale != nullptr || trap) && pieces == nullptr) {
 		pieces = &own_pieces;
 	}
 	if (FlattenInto(in, out, 0, why, pieces, marks) <= 0) {
@@ -2409,12 +2410,20 @@ bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>*
 		if (pieces != nullptr) {
 			pieces->clear();
 		}
+		if (trap) {
+			CmdTrapNote(reinterpret_cast<uint64_t>(in.data()), in.size() * 4ull);
+		}
 		if (stale != nullptr && (why == nullptr || why->empty())) {
 			// Nothing to inline: the buffer is translated as it sits in guest memory.
 			const SourcePiece whole {0, static_cast<uint32_t>(in.size()), reinterpret_cast<uint64_t>(in.data())};
 			stale->Record(in, std::span<const SourcePiece>(&whole, 1));
 		}
 		return false;
+	}
+	if (trap) {
+		for (const auto& p: *pieces) {
+			CmdTrapNote(p.va, p.len * 4ull);
+		}
 	}
 	if (stale != nullptr) {
 		stale->Record(*out, *pieces);
