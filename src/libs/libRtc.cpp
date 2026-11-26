@@ -17,16 +17,15 @@ LIB_VERSION("Rtc", 1, "Rtc", 1, 1);
 
 namespace Rtc {
 
-constexpr int RTC_ERROR_DATETIME_UNINITIALIZED = 0x7ffef9fe;
-constexpr int RTC_ERROR_INVALID_POINTER        = -2135621630; /* 0x80B50002 */
-constexpr int RTC_ERROR_INVALID_VALUE          = -2135621629; /* 0x80B50003 */
-constexpr int RTC_ERROR_INVALID_YEAR           = -2135621624; /* 0x80B50008 */
-constexpr int RTC_ERROR_INVALID_MONTH          = -2135621623; /* 0x80B50009 */
-constexpr int RTC_ERROR_INVALID_DAY            = -2135621622; /* 0x80B5000A */
-constexpr int RTC_ERROR_INVALID_HOUR           = -2135621621; /* 0x80B5000B */
-constexpr int RTC_ERROR_INVALID_MINUTE         = -2135621620; /* 0x80B5000C */
-constexpr int RTC_ERROR_INVALID_SECOND         = -2135621619; /* 0x80B5000D */
-constexpr int RTC_ERROR_INVALID_MICROSECOND    = -2135621618; /* 0x80B5000E */
+constexpr int RTC_ERROR_INVALID_POINTER     = -2135621630; /* 0x80B50002 */
+constexpr int RTC_ERROR_INVALID_VALUE       = -2135621629; /* 0x80B50003 */
+constexpr int RTC_ERROR_INVALID_YEAR        = -2135621624; /* 0x80B50008 */
+constexpr int RTC_ERROR_INVALID_MONTH       = -2135621623; /* 0x80B50009 */
+constexpr int RTC_ERROR_INVALID_DAY         = -2135621622; /* 0x80B5000A */
+constexpr int RTC_ERROR_INVALID_HOUR        = -2135621621; /* 0x80B5000B */
+constexpr int RTC_ERROR_INVALID_MINUTE      = -2135621620; /* 0x80B5000C */
+constexpr int RTC_ERROR_INVALID_SECOND      = -2135621619; /* 0x80B5000D */
+constexpr int RTC_ERROR_INVALID_MICROSECOND = -2135621618; /* 0x80B5000E */
 
 constexpr uint64_t RTC_UNIX_EPOCH_TICKS           = 0xdcbffeff2bc000ull;
 constexpr uint64_t RTC_WIN32_FILETIME_EPOCH_TICKS = 0xb36168b6a58000ull;
@@ -221,8 +220,9 @@ static int KYTY_SYSV_ABI RtcGetTick(const RtcDateTime* time, RtcTick* tick) {
 static int KYTY_SYSV_ABI RtcGetCurrentTick(RtcTick* tick) {
 	PRINT_NAME();
 
+	// The console refuses a null output with SCE_RTC_ERROR_INVALID_POINTER, like every getter here.
 	if (tick == nullptr) {
-		return RTC_ERROR_DATETIME_UNINITIALIZED;
+		return RTC_ERROR_INVALID_POINTER;
 	}
 
 	const auto now_us =
@@ -243,7 +243,7 @@ static int KYTY_SYSV_ABI RtcGetCurrentClock(RtcDateTime* time, int time_zone_min
 	PRINT_NAME();
 
 	if (time == nullptr) {
-		return RTC_ERROR_DATETIME_UNINITIALIZED;
+		return RTC_ERROR_INVALID_POINTER;
 	}
 
 	RtcTick tick {};
