@@ -16,6 +16,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -1282,6 +1284,7 @@ private:
 			if (submission.cursor < submission.commands.size()) {
 				const auto& command = submission.commands[submission.cursor++];
 				result              = ExecuteCommand(command);
+				LogCommand(command, result);
 				if (result != OK) {
 					error_offset = static_cast<uint32_t>(command.record_offset);
 				}
@@ -1295,6 +1298,38 @@ private:
 			if (complete) {
 				ready->pop_front();
 			}
+		}
+	}
+
+	// KYTY_LOG_AMM=1: every command as the engine runs it, with the CLOCK_MONOTONIC time.
+	void LogCommand(const CommandBufferState::Command& entry, int result) const {
+		static const bool on = [] {
+			const char* v = std::getenv("KYTY_LOG_AMM");
+			return v != nullptr && v[0] == '1';
+		}();
+		if (!on) {
+			return;
+		}
+		const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		if (const auto* m = std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p map kind %u va 0x%llx size 0x%llx dmem 0x%llx type %d prot 0x%x -> 0x%x\n", t,
+			             static_cast<const void*>(this), static_cast<unsigned>(m->kind), static_cast<unsigned long long>(m->va),
+			             static_cast<unsigned long long>(m->size), static_cast<unsigned long long>(m->dmem_offset), m->type,
+			             static_cast<unsigned>(m->prot), static_cast<unsigned>(result));
+		} else if (const auto* w = std::get_if<CommandBufferState::WaitCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p wait %s 0x%llx cmp %u value 0x%llx\n", t, static_cast<const void*>(this),
+			             w->is_counter ? "counter" : "address", static_cast<unsigned long long>(w->source), static_cast<unsigned>(w->compare),
+			             static_cast<unsigned long long>(w->value));
+		} else if (const auto* a = std::get_if<CommandBufferState::WriteAddressCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p write 0x%llx = 0x%llx\n", t, static_cast<const void*>(this),
+			             static_cast<unsigned long long>(a->address), static_cast<unsigned long long>(a->value));
+		} else if (const auto* c = std::get_if<CommandBufferState::WriteCounterCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p counter %u = 0x%x\n", t, static_cast<const void*>(this), static_cast<unsigned>(c->index),
+			             c->value);
+		} else if (const auto* r = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p read file 0x%x dst 0x%llx size 0x%llx -> 0x%x\n", t, static_cast<const void*>(this),
+			             r->file_id, static_cast<unsigned long long>(r->destination), static_cast<unsigned long long>(r->size),
+			             static_cast<unsigned>(result));
 		}
 	}
 
