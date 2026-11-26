@@ -2387,6 +2387,32 @@ static void LogDirectMemory(const char* what, uint64_t addr, uint64_t len, int m
 	}
 }
 
+#if KYTY_GEM_BACKING_SUPPORTED
+// Allocation-time residency (GemBacking::ResidencyAtAlloc) for direct memory [addr, addr + len).
+static void PromoteDirectMemory(Libs::Graphics::NativeGpu::GemBacking* gem, uint64_t addr, uint64_t len) {
+	if (!gem->PromoteBackingAtAlloc(addr, len) && gem->AllocFailed()) {
+		static std::atomic<bool> told {false};
+		if (!told.exchange(true)) {
+			Libs::Dialog::SystemDialog::HostNotice(
+			    "Not enough memory",
+			    "The game's memory could not be reserved: expect stutter and lower performance.\n"
+			    "Close other apps and launch the game without --keep-steam.");
+		}
+	}
+}
+
+// The memory of the automatic pool (AMM) gets its pages when AMM maps them (MapAutomaticMemory), not when the pool is
+// given: the pool is a budget the title hands to AMM, much of it never mapped, and which pages back it is not
+// observable. KYTY_AMM_POOL_EAGER=1 makes the whole pool resident at once, as other direct memory.
+static bool AutomaticPoolEager() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_AMM_POOL_EAGER");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+#endif
+
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic) {
 
@@ -2424,15 +2450,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	if (auto* gem = GetGemBacking(); gem != nullptr) {
 		gem->SetMemoryType(addr, len, memory_type);
 		// PS5 residency: direct memory is the GPU's from its allocation (KYTY_NATIVE_GPU_RESIDENCY=alloc).
-		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc() && !gem->PromoteBackingAtAlloc(addr, len) &&
-		    gem->AllocFailed()) {
-			static std::atomic<bool> told {false};
-			if (!told.exchange(true)) {
-				Libs::Dialog::SystemDialog::HostNotice(
-				    "Not enough memory",
-				    "The game's memory could not be reserved: expect stutter and lower performance.\n"
-				    "Close other apps and launch the game without --keep-steam.");
-			}
+		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc() && (!automatic || AutomaticPoolEager())) {
+			PromoteDirectMemory(gem, addr, len);
 		}
 	}
 #endif
@@ -2753,6 +2772,13 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
 	uint64_t mapped = 0;
 	for (const auto& [offset, length]: ranges) {
 		void* address = reinterpret_cast<void*>(vaddr + mapped);
+#if KYTY_GEM_BACKING_SUPPORTED
+		// The pool's pages become resident as AMM first maps them, with the allocation's residency (no map budget).
+		if (auto* gem = GetGemBacking(); gem != nullptr && Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc() &&
+		                                 !AutomaticPoolEager()) {
+			PromoteDirectMemory(gem, offset, length);
+		}
+#endif
 		EXIT_IF(MapDirectMemory(&address, length, prot, 0x10, static_cast<int64_t>(offset),
 		                        page_size, "", type) != OK);
 		mapped += length;
