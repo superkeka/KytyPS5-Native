@@ -103,6 +103,121 @@ bool EnvOn(const char* name) {
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
+// Diagnostic. KYTY_NATIVE_GPU_SUBMIT_TRACE=path: one line per guest submission (E: time, id, queue, buffers of each
+// kind still unfinished), per translated buffer (X: id, kind, draws, draws whose pixel shader or compute shader is in
+// KYTY_NATIVE_GPU_TRACE_PS=0xADDR,..., the first draw's shader) and per finished buffer (D: time, id).
+// KYTY_NATIVE_GPU_SUBMIT_SYNC=1: a graphics buffer's submission returns once it and every buffer submitted before it
+// are finished (at most KYTY_NATIVE_GPU_SUBMIT_SYNC_MS later, 50 by default: a buffer may wait for something the
+// title does later), so the title never sees work it submitted earlier still running.
+class SubmitTrace {
+public:
+	static SubmitTrace& Instance() {
+		static SubmitTrace t;
+		return t;
+	}
+	bool On() const { return m_file != nullptr || m_sync; }
+	bool Logging() const { return m_file != nullptr; }
+
+	uint64_t Enqueued(uint32_t queue, bool acb, uint32_t size_dw) {
+		if (!On()) {
+			return 0;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		const uint64_t id = ++m_next;
+		m_pending.emplace(id, acb);
+		(acb ? m_open_acb : m_open_dcb)++;
+		if (m_file != nullptr) {
+			std::fprintf(m_file, "E %.6f %llu %x %u %u %u\n", NowSecShadow(), static_cast<unsigned long long>(id), queue, size_dw,
+			             m_open_dcb, m_open_acb);
+		}
+		return id;
+	}
+	void Translated(uint64_t id, bool acb, const std::vector<DrawRecord>& draws) {
+		if (m_file == nullptr || id == 0) {
+			return;
+		}
+		uint32_t marked = 0;
+		for (const auto& d: draws) {
+			marked += m_marks.count(d.ps) != 0 ? 1u : 0u;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::fprintf(m_file, "X %.6f %llu %c %zu %u 0x%llx\n", NowSecShadow(), static_cast<unsigned long long>(id), acb ? 'a' : 'd',
+		             draws.size(), marked, draws.empty() ? 0ull : static_cast<unsigned long long>(draws.front().ps));
+	}
+	void Done(uint64_t id) {
+		if (id == 0) {
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			auto it = m_pending.find(id);
+			if (it == m_pending.end()) {
+				return;
+			}
+			(it->second ? m_open_acb : m_open_dcb)--;
+			m_pending.erase(it);
+			if (m_file != nullptr) {
+				std::fprintf(m_file, "D %.6f %llu\n", NowSecShadow(), static_cast<unsigned long long>(id));
+			}
+		}
+		m_cv.notify_all();
+	}
+	void Flip() {
+		if (m_file == nullptr) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::fprintf(m_file, "F %.6f\n", NowSecShadow());
+		std::fflush(m_file);
+	}
+	// KYTY_NATIVE_GPU_SUBMIT_SYNC: blocks until every buffer up to `id` is finished or the timeout passes.
+	void Wait(uint64_t id, bool acb) {
+		if (!m_sync || id == 0 || acb) {
+			return;
+		}
+		std::unique_lock<std::mutex> lock(m_mutex);
+		const bool done = m_cv.wait_for(lock, std::chrono::milliseconds(m_sync_ms),
+		                                [&] { return m_pending.empty() || m_pending.begin()->first > id; });
+		m_waits++;
+		m_timeouts += done ? 0u : 1u;
+		if ((m_waits & (m_waits - 1)) == 0) {
+			std::fprintf(stderr, "native shadow: submit sync: %llu waits, %llu timed out\n", static_cast<unsigned long long>(m_waits),
+			             static_cast<unsigned long long>(m_timeouts));
+		}
+	}
+
+private:
+	SubmitTrace() {
+		if (const char* path = std::getenv("KYTY_NATIVE_GPU_SUBMIT_TRACE"); path != nullptr && path[0] != '\0') {
+			m_file = std::fopen(path, "w");
+		}
+		m_sync = EnvOn("KYTY_NATIVE_GPU_SUBMIT_SYNC");
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_SUBMIT_SYNC_MS"); v != nullptr) {
+			m_sync_ms = std::strtoul(v, nullptr, 0);
+		}
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_TRACE_PS"); v != nullptr) {
+			for (const char* p = v; *p != '\0';) {
+				char* end = nullptr;
+				m_marks.insert(std::strtoull(p, &end, 0));
+				if (end == p) {
+					break;
+				}
+				p = *end == ',' ? end + 1 : end;
+			}
+		}
+	}
+	std::FILE*                         m_file = nullptr;
+	bool                               m_sync = false;
+	uint32_t                           m_sync_ms = 50;
+	std::set<uint64_t>                 m_marks;
+	std::mutex                         m_mutex;
+	std::condition_variable            m_cv;
+	std::map<uint64_t, bool>           m_pending; // id -> ACB
+	uint64_t                           m_next = 0, m_waits = 0, m_timeouts = 0;
+	uint32_t                           m_open_dcb = 0, m_open_acb = 0;
+};
+thread_local uint64_t t_trace_job = 0; // the submission the worker is translating
+
 // KYTY_NATIVE_GPU_AUDIT=1: log-only measurements, summed over the whole run. CPU clocks (CLOCK_MONOTONIC) and counters
 // only: nothing the GPU runs changes (no packet is added, removed or altered, no segment or point moves, no buffer is
 // refused that was not; KYTY_NATIVE_GPU_FLIP_TRACE=gpu and KYTY_NATIVE_GPU_STATS change the IBs and play no part). How
@@ -1744,7 +1859,8 @@ public:
 				}
 			}
 		}
-		if (!result.draw_log.empty()) {
+		SubmitTrace::Instance().Translated(t_trace_job, acb, result.draw_log);
+		if (!result.draw_log.empty() && m_draw_log_frames) {
 			const uint32_t buffer = m_frame_buffers++;
 			for (const auto& d: result.draw_log) {
 				m_frame_draws.push_back(FrameDraw {acb, buffer, d});
@@ -6033,6 +6149,11 @@ private:
 			StartControlSocket();
 			m_translator.SetDrawLog(true);
 			m_acb_translator.SetDrawLog(true);
+			m_draw_log_frames = true;
+		}
+		if (SubmitTrace::Instance().Logging()) {
+			m_translator.SetDrawLog(true);
+			m_acb_translator.SetDrawLog(true);
 		}
 		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
 			StartWatchdog();
@@ -6989,6 +7110,7 @@ private:
 	bool          m_collect_targets = false;           // flip dumps compare render targets too
 	bool          m_collect_refs    = true;            // the translators collect per-draw references (SyncCollectRefs)
 	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
+	bool                                 m_draw_log_frames = false; // KYTY_NATIVE_GPU_CTL keeps them for the flip dump
 	std::vector<FrameDraw>               m_frame_draws;   // KYTY_NATIVE_GPU_CTL: draws since the last flip
 	uint32_t                             m_frame_buffers = 0;
 	std::atomic<uint64_t> m_frames {0}; // the ACB thread reads it for the hang tests
@@ -7309,8 +7431,15 @@ public:
 	}
 
 	void Enqueue(const uint32_t* buffer, uint32_t size_dw, uint32_t queue, Then then) {
+		const uint64_t trace = buffer != nullptr ? SubmitTrace::Instance().Enqueued(queue, IsGuestComputeQueue(queue), size_dw) : 0;
+		EnqueueJob(buffer, size_dw, queue, std::move(then), trace);
+		SubmitTrace::Instance().Wait(trace, IsGuestComputeQueue(queue));
+	}
+
+	void EnqueueJob(const uint32_t* buffer, uint32_t size_dw, uint32_t queue, Then then, uint64_t trace) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		Job job {buffer, size_dw, queue, std::move(then), NowSecShadow()};
+		job.trace = trace;
 		if (m_acb_thread && buffer != nullptr && IsGuestComputeQueue(queue)) {
 			job.gate = m_acb_gate.EnqueueCompute();
 			m_acb_jobs.push_back(std::move(job));
@@ -7398,7 +7527,8 @@ private:
 		uint32_t        queue;
 		Then            then;
 		double          enqueued;
-		uint64_t        gate = 0; // m_acb_gate's stamp, with the ACB thread: compute buffers and Kyty's own submissions
+		uint64_t        gate  = 0; // m_acb_gate's stamp, with the ACB thread: compute buffers and Kyty's own submissions
+		uint64_t        trace = 0; // SubmitTrace's id
 	};
 	// What runs once a buffer is done.
 	struct Done {
@@ -7412,6 +7542,7 @@ private:
 		bool                  gfx      = false; // a guest DCB (FlipTrace times it)
 		bool                  acb      = false; // a guest ACB
 		int                   joins    = 1;     // the queues it is in: Finish runs it once the last one reaches it
+		uint64_t              trace    = 0;     // SubmitTrace's id
 	};
 	// KYTY_NATIVE_GPU_CHUNK_DW=N: graphics buffers longer than N dwords go to the GPU in chunks of about N
 	// (TranslateChunks) instead of at the title's segments.
@@ -7713,7 +7844,12 @@ private:
 	}
 
 	void Translate(Job& job, double picked) {
+		struct TraceScope {
+			uint64_t outer;
+			~TraceScope() { t_trace_job = outer; }
+		} trace_scope {std::exchange(t_trace_job, job.trace)};
 		auto done      = std::make_shared<Done>();
+		done->trace    = job.trace;
 		done->then     = std::move(job.then);
 		done->buffer   = job.buffer;
 		done->size_dw  = job.size_dw;
@@ -7877,6 +8013,8 @@ private:
 	AcbReady TranslateAcbJob(Job& job) {
 		const double now = NowSecShadow();
 		auto         done = std::make_shared<Done>();
+		done->trace       = job.trace;
+		t_trace_job       = job.trace;
 		done->then        = std::move(job.then);
 		done->buffer      = job.buffer;
 		done->size_dw     = job.size_dw;
@@ -8873,6 +9011,7 @@ private:
 		if (--done.joins > 0) {
 			return;
 		}
+		SubmitTrace::Instance().Done(done.trace);
 		const double start = NowSecShadow();
 		if (done.whole) {
 			// A buffer Kyty's command processor runs whole: its WaitUntilSafeForRendering paddings take the EOP flips
@@ -9507,6 +9646,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
                   const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
+	SubmitTrace::Instance().Flip();
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
 	}
