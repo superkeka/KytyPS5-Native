@@ -550,6 +550,10 @@ constexpr uint64_t APR_MAP_END_RECORD_SIZE       = 0x04;
 constexpr uint64_t AMM_MAP_RECORD_SIZE           = 0x20;
 constexpr uint64_t AMM_MAP_DIRECT_RECORD_SIZE    = 0x30;
 constexpr uint64_t AMM_UNMAP_RECORD_SIZE         = 0x20;
+constexpr uint64_t AMM_MAP_PRT_RECORD_SIZE       = 0x0c;
+constexpr uint64_t AMM_ALLOCATE_PRT_RECORD_SIZE  = 0x10;
+constexpr uint64_t AMM_UNMAP_TO_PRT_RECORD_SIZE  = 0x0c;
+constexpr int      AMM_PRT_PROT_MASK             = 0x3f3;
 constexpr uint64_t AMM_PAGE_SIZE                 = 0x4000;
 constexpr int      AMM_MAP_FIXED                 = 0x10;
 constexpr int      AMM_USAGE_DIRECT              = 0;
@@ -574,6 +578,9 @@ enum class AmmCommandKind : uint32_t {
 	MapAuto,
 	MapDirect,
 	Unmap,
+	MapPrt,      // addresses without pages
+	AllocatePrt, // pages for a PRT range
+	UnmapToPrt,  // pages released, the addresses stay PRT
 };
 
 struct CommandBufferState {
@@ -1082,9 +1089,18 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	if (command.kind == AmmCommandKind::MapAuto) {
-		return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
-		                                             NormalizeAmmProtection(command.prot));
+	switch (command.kind) {
+		case AmmCommandKind::MapAuto:
+			return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
+			                                             NormalizeAmmProtection(command.prot));
+		case AmmCommandKind::Unmap: return LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
+		case AmmCommandKind::MapPrt:
+		case AmmCommandKind::UnmapToPrt:
+			return LibKernel::Memory::ReserveAmmMemory(command.va, command.size);
+		case AmmCommandKind::AllocatePrt:
+			return LibKernel::Memory::CommitAmmMemory(command.va, command.size, command.type,
+			                                          NormalizeAmmProtection(command.prot));
+		case AmmCommandKind::MapDirect: break;
 	}
 
 	void* addr = reinterpret_cast<void*>(command.va);
@@ -1162,12 +1178,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		g_counters[command->index].store(command->value, std::memory_order_release);
 	} else if (const auto* payload = std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
 		const auto& command = *payload;
-		int         result  = OK;
-		if (command.kind == AmmCommandKind::Unmap) {
-			result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
-		} else {
-			result = ExecuteAmmMapCommand(command);
-		}
+		const int   result  = ExecuteAmmMapCommand(command);
 
 		if (result != OK) {
 			LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64 " dmem=0x%016" PRIx64
@@ -2279,6 +2290,52 @@ static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
+static int AppendAmmPrtCommand(void* command_buffer, AmmCommandKind kind, uint64_t va,
+                               uint64_t size, int32_t type, int32_t prot, uint64_t record_size) {
+	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = kind;
+	command.va   = va;
+	command.size = size;
+	command.type = type;
+	command.prot = prot;
+
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command, record_size)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferMapAsPrt(void* command_buffer, uint64_t va,
+                                                  uint64_t size) {
+	PRINT_NAME();
+
+	return AppendAmmPrtCommand(command_buffer, AmmCommandKind::MapPrt, va, size, 0, 0,
+	                           AMM_MAP_PRT_RECORD_SIZE);
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferAllocatePaForPrt(void* command_buffer, uint64_t va,
+                                                          uint64_t size, int32_t type,
+                                                          int32_t prot) {
+	PRINT_NAME();
+
+	if ((prot & ~AMM_PRT_PROT_MASK) != 0) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	return AppendAmmPrtCommand(command_buffer, AmmCommandKind::AllocatePrt, va, size, type, prot,
+	                           AMM_ALLOCATE_PRT_RECORD_SIZE);
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferUnmapToPrt(void* command_buffer, uint64_t va,
+                                                    uint64_t size) {
+	PRINT_NAME();
+
+	return AppendAmmPrtCommand(command_buffer, AmmCommandKind::UnmapToPrt, va, size, 0, 0,
+	                           AMM_UNMAP_TO_PRT_RECORD_SIZE);
+}
+
 static int KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t search_end,
                                              uint64_t size, uint64_t align, int32_t usage,
                                              int64_t* dmem_offset) {
@@ -2462,6 +2519,9 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("8TBE+9XCZbI", Ampr::AmmCommandBufferMapDirect);
 	LIB_FUNC("kOfZlhbVAkc", Ampr::AmmCommandBufferMapDirectWithGpuMaskId);
 	LIB_FUNC("M-VFI2DJWQA", Ampr::AmmCommandBufferUnmap);
+	LIB_FUNC("ZJCgt+aPHAU", Ampr::AmmCommandBufferMapAsPrt);
+	LIB_FUNC("d3lKWPM6odc", Ampr::AmmCommandBufferAllocatePaForPrt);
+	LIB_FUNC("3A2X6OCHtnA", Ampr::AmmCommandBufferUnmapToPrt);
 	LIB_FUNC("lwS-7y3jcBI", Ampr::AmmSubmitCommandBuffer);
 	LIB_FUNC("NnKhlMJtIsI", Ampr::AmmSubmitCommandBufferAndGetId);
 	LIB_FUNC("OJf3vCckPAM", Ampr::AmmSubmitCommandBufferAndGetResult);

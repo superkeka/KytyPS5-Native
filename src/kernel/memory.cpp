@@ -3341,6 +3341,37 @@ int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int
 	return ProtectMemory(addr, len, prot);
 }
 
+// A PRT range has addresses but no pages: the GPU reads it as zeros and drops writes to it.
+int ReserveAmmMemory(uint64_t vaddr, size_t size) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
+	return ReplaceFixedRangeWithReserved(vaddr, size);
+}
+
+// The parts of the range without pages get them; the parts with pages keep their contents and
+// take the new protection.
+int CommitAmmMemory(uint64_t vaddr, size_t size, int type, int prot) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
+
+	std::vector<VirtualRanges::Range> ranges;
+	g_virtual_ranges->QueryFragments(vaddr, size, &ranges);
+	auto commit = [&](uint64_t start, uint64_t length) {
+		return length == 0 ? OK : MapAutomaticMemory(start, length, type, prot);
+	};
+	uint64_t cursor = vaddr;
+	for (const auto& range: ranges) {
+		if (!IsCommittedRangeType(range.type)) continue;
+		if (int result = commit(cursor, range.start - cursor); result != OK) return result;
+		if (int result = ProtectMemory(reinterpret_cast<const void*>(range.start), range.size, prot);
+		    result != OK) {
+			return result;
+		}
+		cursor = range.start + range.size;
+	}
+	return commit(cursor, vaddr + size - cursor);
+}
+
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
                                   int* num_entries_out, int flags) {
 	PRINT_NAME();
