@@ -37,6 +37,7 @@
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
 #include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -1263,9 +1264,16 @@ public:
 	static constexpr size_t   kMaxPendingReads = 64;
 	static constexpr uint64_t kMaxPendingBytes = 64ull * 1024 * 1024;
 
-	CommandEngine(size_t priorities, uint32_t workers): m_queues(priorities), m_pieces(priorities) {
+	CommandEngine(size_t priorities, uint32_t workers, const char* name): m_queues(priorities), m_pieces(priorities) {
 		for (uint32_t i = 0; i < workers; i++) {
-			m_workers.emplace_back([this](std::stop_token stop) { Run(stop); });
+			m_workers.emplace_back([this, name](std::stop_token stop) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+				pthread_setname_np(pthread_self(), name);
+#else
+				(void)name;
+#endif
+				Run(stop);
+			});
 		}
 	}
 
@@ -1550,8 +1558,8 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
 	}
-	static CommandEngine apr_engine(7, 8);
-	static CommandEngine amm_engine(3, 1);
+	static CommandEngine apr_engine(7, 8, "kyty-apr");
+	static CommandEngine amm_engine(3, 1, "kyty-amm");
 	Submission submission;
 	submission.commands  = std::move(state.commands);
 	submission.result    = result;
