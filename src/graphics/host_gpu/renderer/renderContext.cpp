@@ -3,10 +3,13 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -139,6 +142,21 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
+	}
+	// The AMM window under native rendering: draws, dispatches and DMA of the title run on the GPU natively, so
+	// Kyty's own caches never take ranges there, and an unmap does not wait for the GPU thread (it may be busy
+	// with a whole frame's tail: AMM unmaps, and AMM maps, which clear their target first, waited 20-60 ms each,
+	// behind them the title's whole APR ring).
+	// KYTY_AMM_UNMAP_SYNC=1 sends these through the GPU thread as before.
+	static const bool unmap_sync = [] {
+		const char* v = std::getenv("KYTY_AMM_UNMAP_SYNC");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (!unmap_sync && NativeGpu::PrimaryRendering() && vaddr >= LibKernel::Memory::kExtendedMemoryBase &&
+	    vaddr + size <= LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize) {
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Subtract(vaddr, size);
+		return;
 	}
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
