@@ -1232,15 +1232,16 @@ static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
 	                           ? g_counters[wait.source].load(std::memory_order_acquire)
 	                           : std::atomic_ref(*reinterpret_cast<uint64_t*>(wait.source))
 	                                 .load(std::memory_order_acquire);
-	const uint64_t sign = uint64_t {1} << (wait.is_counter ? 31 : 63);
+	// The compare modes of WaitOnCounter and WaitOnAddress, on 64-bit values (a counter reads as its 32 bits).
 	switch (wait.compare) {
 		case 0: return value == wait.value;
 		case 1: return value > wait.value;
 		case 2: return value < wait.value;
 		case 3: return value != wait.value;
-		case 4: return ((value - wait.value) & sign) == 0;
-		case 5: return (value ^ sign) > (wait.value ^ sign);
-		default: return (value ^ sign) < (wait.value ^ sign);
+		case 4: return ((value - wait.value) >> 63u) == 0;
+		case 5: return static_cast<int64_t>(value) > static_cast<int64_t>(wait.value);
+		case 6: return static_cast<int64_t>(value) < static_cast<int64_t>(wait.value);
+		default: return false;
 	}
 }
 
