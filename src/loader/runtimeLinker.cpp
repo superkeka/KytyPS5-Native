@@ -45,6 +45,8 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <asm/prctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -668,8 +670,40 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+static KYTY_MS_ABI uint8_t* TlsMainGetAddr();
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+// `mov <reg>, gs:[0]` (PatchProgram's form of the guest's fs:[0] read) on a thread whose gs base is not
+// set yet: the base becomes the thread's TCB, whose first qword points to itself, and the read runs again.
+static bool SetGuestThreadPointer(const Common::HostException::ExceptionInfo& info) {
+	if (info.type != Common::HostException::ExceptionType::AccessViolation || g_tls_main_program == nullptr) {
+		return false;
+	}
+	const auto* code = reinterpret_cast<const uint8_t*>(info.exception_address);
+	if (!g_tls_main_program->elf || info.exception_address < g_tls_main_program->base_vaddr ||
+	    info.exception_address >= g_tls_main_program->base_vaddr + g_tls_main_program->base_size_aligned) {
+		return false;
+	}
+	if (code[0] != 0x65 || (code[1] != 0x48 && code[1] != 0x4C) || code[2] != 0x8B || (code[3] & 0xc7u) != 0x04u ||
+	    code[4] != 0x25 || (code[5] | code[6] | code[7] | code[8]) != 0) {
+		return false;
+	}
+	uint64_t base = 0;
+	if (syscall(SYS_arch_prctl, ARCH_GET_GS, &base) != 0 || base != 0) {
+		return false;
+	}
+	return syscall(SYS_arch_prctl, ARCH_SET_GS, reinterpret_cast<uint64_t>(TlsMainGetAddr())) == 0;
+}
+#endif
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (SetGuestThreadPointer(*info)) {
+		return true;
+	}
+#endif
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
@@ -1083,6 +1117,23 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		}
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// mov <reg>, qword ptr fs:[0] -> mov <reg>, qword ptr gs:[0]: the gs base is the guest thread's TCB
+	// (SetGuestThreadPointer). The instruction stays what it was: a call in its place would push its return
+	// address into the red zone a leaf function keeps its locals in.
+	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 && size >= 9) {
+		auto* start_ptr = reinterpret_cast<uint8_t*>(address);
+		auto* end_ptr   = start_ptr + size - 9;
+		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
+			if (ptr[0] == 0x64 && (ptr[1] == 0x48 || ptr[1] == 0x4C) && ptr[2] == 0x8B && (ptr[3] & 0xc7u) == 0x04u &&
+			    ptr[4] == 0x25 && (ptr[5] | ptr[6] | ptr[7] | ptr[8]) == 0) {
+				EXIT_NOT_IMPLEMENTED(((ptr[3] >> 3u) & 7u) == 4u && ptr[1] == 0x48); // rsp
+				ptr[0] = 0x65;
+				ptr += 8;
+			}
+		}
+	}
+#else
 	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
 	    size >= Jit::Call9::GetSize()) {
 		// Replace:
@@ -1133,6 +1184,7 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 			}
 		}
 	}
+#endif
 }
 
 uint64_t RuntimeLinker::GetEntry() {
@@ -1835,6 +1887,11 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (thread_id == Common::Thread::GetThreadIdUnique() && program == g_tls_main_program) {
+		syscall(SYS_arch_prctl, ARCH_SET_GS, 0ull);
+	}
+#endif
 
 	Common::LockGuard lock(program->tls.mutex);
 
