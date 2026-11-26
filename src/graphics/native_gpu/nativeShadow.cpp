@@ -10349,6 +10349,16 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
 	SubmitTrace::Instance().Flip();
+	// KYTY_COUNT_HLE with KYTY_COUNT_HLE_EVERY=N (diagnostics): the counted HLE calls of every N flips.
+	if (static const uint64_t every = [] {
+		    const char* v = std::getenv("KYTY_COUNT_HLE_EVERY");
+		    return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+	    }();
+	    every != 0 && Libs::CountHleList() != nullptr && n % every == 0) {
+		std::fprintf(stderr, "flip %llu %llu ms: ", static_cast<unsigned long long>(n),
+		             static_cast<unsigned long long>(Loader::Timer::GetTimeMs()));
+		Libs::DumpHleCounts(stderr, 1.0, 400);
+	}
 	CmdTrapOnFlip(n);
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
@@ -10455,6 +10465,75 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 				             args[0], args[1], args[2], args[3], args[4]);
 			}
 			std::fclose(f);
+		}
+		// KYTY_NATIVE_GPU_DUMP_UD=1 (diagnostics): each draw's and dispatch's first 16 user-data registers, the code of
+		// each shader, and 64 bytes at each user-data pair that looks like a GPU address, once per shader and user data.
+		if (const char* ud = std::getenv("KYTY_NATIVE_GPU_DUMP_UD"); ud != nullptr && ud[0] == '1') {
+			std::snprintf(path, sizeof(path), "%s/flip_%llu.ud.txt", dir, flip);
+			if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+				auto hex = [&](uint64_t addr, uint64_t bytes) {
+					std::vector<uint32_t> v(bytes / 4);
+					const uint64_t        got = Shadow::Instance().ReadGuest(addr, v.data(), bytes);
+					std::fprintf(f, "  mem 0x%llx %llu:", static_cast<unsigned long long>(addr),
+					             static_cast<unsigned long long>(got));
+					for (uint64_t i = 0; i < got / 4; i++) {
+						std::fprintf(f, " %08x", v[i]);
+					}
+					std::fprintf(f, "\n");
+				};
+				std::vector<uint64_t> shaders;
+				std::vector<std::pair<uint64_t, uint32_t>> seen;
+				for (const auto& fd: draws) {
+					const auto& d = fd.draw;
+					std::fprintf(f, "%s %u %u 0x%02x ps 0x%llx ud", fd.acb ? "acb" : "dcb", fd.buffer, d.index, d.op,
+					             static_cast<unsigned long long>(d.ps));
+					for (uint32_t i = 0; i < 16; i++) {
+						std::fprintf(f, " %08x", d.ud[i]);
+					}
+					std::fprintf(f, "\n");
+					if (std::find(shaders.begin(), shaders.end(), d.ps) == shaders.end() && d.ps != 0) {
+						shaders.push_back(d.ps);
+						hex(d.ps, 2048);
+					}
+					// KYTY_NATIVE_GPU_DUMP_UD_PS=ADDR: for that shader, 0x600 bytes at each user-data address and at each
+					// address found in them (two levels).
+					static const uint64_t deep_ps = [] {
+						const char* v = std::getenv("KYTY_NATIVE_GPU_DUMP_UD_PS");
+						return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+					}();
+					if (deep_ps != 0 && d.ps == deep_ps) {
+						for (uint32_t i = 0; i + 1 < 16; i += 2) {
+							const uint64_t a = (static_cast<uint64_t>(d.ud[i + 1]) << 32u) | d.ud[i];
+							if (a < 0x1000000000ull || a >= 0x11000000000ull || (a & 3u) != 0) {
+								continue;
+							}
+							std::vector<uint64_t> t(0x600 / 8);
+							const uint64_t        got = Shadow::Instance().ReadGuest(a, t.data(), 0x600);
+							hex(a, 0x600);
+							for (uint64_t k = 0; k < got / 8; k++) {
+								const uint64_t b = t[k] & 0xffffffffffffull;
+								if (b >= 0x1000000000ull && b < 0x11000000000ull && (b & 3u) == 0 && (t[k] >> 48u) == 0) {
+									std::fprintf(f, "  at 0x%llx+0x%llx\n", static_cast<unsigned long long>(a),
+									             static_cast<unsigned long long>(k * 8));
+									hex(b, 0x600);
+								}
+							}
+						}
+					}
+					const std::pair<uint64_t, uint32_t> key {d.ps, d.ud_hash};
+					if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+						continue;
+					}
+					seen.push_back(key);
+					for (uint32_t i = 0; i + 1 < 16; i++) {
+						const uint32_t hi = d.ud[i + 1] & 0xffffu;
+						if (hi != 0 && hi < 0x100u && (d.ud[i + 1] >> 16u) == 0 && (d.ud[i] & 3u) == 0) {
+							hex((static_cast<uint64_t>(hi) << 32u) | d.ud[i], 64);
+						}
+					}
+				}
+				std::fclose(f);
+			}
 		}
 	}
 	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, flip);

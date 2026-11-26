@@ -527,6 +527,7 @@ struct DrawRecord {
 	uint64_t indirect  = 0;
 	uint32_t ud_hash   = 0; // FNV of the PS (or compute) user data
 	uint32_t gs_hash   = 0; // FNV of the GS user data
+	uint32_t ud[16] {};     // the first PS (or compute) user-data registers
 };
 
 // A draw or dispatch whose resources point into the range given to SetFindRange: directly from a

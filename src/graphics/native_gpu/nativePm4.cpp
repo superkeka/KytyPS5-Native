@@ -4019,6 +4019,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (dispatch) {
 			d.ps      = (static_cast<uint64_t>(reg(sh, 0x20C)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20D)) << 40u);
 			d.ud_hash = fnv(0x240);
+			for (uint32_t i = 0; i < 16; i++) {
+				d.ud[i] = reg(sh, 0x240 + i);
+			}
 		} else {
 			d.instances = log_instances;
 			d.ps        = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
@@ -4027,6 +4030,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			d.zbase     = (static_cast<uint64_t>(reg(cx, kDbZReadBase)) << 8u) | (static_cast<uint64_t>(reg(cx, kDbZReadBaseHi) & 0xffu) << 40u);
 			d.ud_hash   = fnv(0x00C);
 			d.gs_hash   = fnv(0x08C);
+			for (uint32_t i = 0; i < 16; i++) {
+				d.ud[i] = reg(sh, 0x00C + i);
+			}
 		}
 		r.draw_log.push_back(d);
 	};
