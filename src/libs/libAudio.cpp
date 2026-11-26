@@ -423,9 +423,12 @@ int KYTY_SYSV_ABI VoiceDisconnectIPortFromOPort(uint32_t input_port_id, uint32_t
 int KYTY_SYSV_ABI VoiceDeletePort(uint32_t port_id) {
 	PRINT_NAME();
 
-	if (auto* port = get_voice_port(port_id); port != nullptr) {
-		*port = {};
+	// A port that was never created (or is already deleted) is refused, SCE_VOICE_ERROR_PORT_INVALID.
+	auto* port = get_voice_port(port_id);
+	if (port == nullptr) {
+		return -2142369788;
 	}
+	*port = {};
 
 	return 0;
 }
