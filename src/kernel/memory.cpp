@@ -691,6 +691,7 @@ public:
 	PhysicalMemory() {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 		m_free.emplace(0, Size());
+		m_mapped_refs.emplace(0, 0);
 	}
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
@@ -723,6 +724,8 @@ public:
 private:
 	void                                  ReclaimAutomatic(uint64_t start, uint64_t size);
 	std::map<uint64_t, Mapping>::iterator SplitMapping(uint64_t vaddr);
+	std::map<uint64_t, uint32_t>::iterator SplitMappedRefs(uint64_t phys_addr);
+	void                                  AddMappedRefs(uint64_t phys_addr, uint64_t size, int delta);
 
 	std::map<uint64_t, AllocatedBlock> m_physical;
 	std::map<uint64_t, uint64_t>       m_free;
@@ -730,6 +733,10 @@ private:
 	// Track backing ownership while a transaction changes views before publishing VirtualRanges.
 	// Names, protections and memory types live only in VirtualRanges. Physical offsets may alias.
 	std::map<uint64_t, Mapping> m_mappings;
+	// How many of m_mappings cover each physical byte: the count of [key, next key). An unmap gives the automatic
+	// pool back what no other mapping covers without walking every mapping (the title's mapper maps and unmaps
+	// hundreds of ranges a second among tens of thousands).
+	std::map<uint64_t, uint32_t> m_mapped_refs;
 };
 
 class FlexibleMemory {
@@ -1418,13 +1425,47 @@ void PhysicalMemory::ReclaimAutomatic(uint64_t start, uint64_t size) {
 		automatic = true;
 	}
 	if (automatic) {
-		for (const auto& [vaddr, mapping]: m_mappings) {
-			const auto first = std::max(start, mapping.start_addr);
-			const auto last  = std::min(end, mapping.start_addr + mapping.size);
-			if (first < last) {
+		// What a mapping still covers stays out of the pool.
+		auto segment = m_mapped_refs.upper_bound(start);
+		--segment; // the first key is 0
+		for (; segment != m_mapped_refs.end() && segment->first < end; ++segment) {
+			const auto next  = std::next(segment);
+			const auto first = std::max(start, segment->first);
+			const auto last  = std::min(end, next != m_mapped_refs.end() ? next->first : end);
+			if (segment->second != 0 && first < last) {
 				RemoveFreeRange(m_automatic_free, first, last - first);
 			}
 		}
+	}
+}
+
+// The segment of m_mapped_refs that begins at `phys_addr`, splitting the one containing it.
+std::map<uint64_t, uint32_t>::iterator PhysicalMemory::SplitMappedRefs(uint64_t phys_addr) {
+	auto next = m_mapped_refs.upper_bound(phys_addr);
+	auto prev = std::prev(next); // the first key is 0
+	if (prev->first == phys_addr) {
+		return prev;
+	}
+	return m_mapped_refs.emplace_hint(next, phys_addr, prev->second);
+}
+
+void PhysicalMemory::AddMappedRefs(uint64_t phys_addr, uint64_t size, int delta) {
+	if (size == 0) {
+		return;
+	}
+	const auto end   = phys_addr + size;
+	auto       first = SplitMappedRefs(phys_addr);
+	const auto last  = SplitMappedRefs(end);
+	for (auto it = first; it != last; ++it) {
+		EXIT_IF(delta < 0 && it->second < static_cast<uint32_t>(-delta));
+		it->second = static_cast<uint32_t>(static_cast<int64_t>(it->second) + delta);
+	}
+	// Neighbours with the same count merge, so the map stays as small as the distinct coverage.
+	if (last != m_mapped_refs.end() && std::prev(last)->second == last->second) {
+		m_mapped_refs.erase(last);
+	}
+	if (first != m_mapped_refs.begin() && std::prev(first)->second == first->second) {
+		m_mapped_refs.erase(first);
 	}
 }
 
@@ -1470,6 +1511,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
 	}
 
 	m_mappings.emplace_hint(next, vaddr, Mapping {phys_addr, len});
+	AddMappedRefs(phys_addr, len, 1);
 	RemoveFreeRange(m_automatic_free, phys_addr, len);
 	return true;
 }
@@ -1566,6 +1608,7 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	while (first != last) {
 		const auto removed = first->second;
 		first              = m_mappings.erase(first);
+		AddMappedRefs(removed.start_addr, removed.size, -1);
 		ReclaimAutomatic(removed.start_addr, removed.size);
 	}
 	return true;
