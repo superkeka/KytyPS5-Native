@@ -21,6 +21,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -1242,6 +1243,102 @@ static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
 	}
 }
 
+// Consecutive file reads of a command buffer are independent of each other: the reads run together, as the
+// I/O hardware keeps many in flight, and the next command that is not a read starts once they are all done.
+class ReadPool {
+public:
+	static constexpr uint32_t kThreads = 8;
+
+	static ReadPool& Instance() {
+		static ReadPool pool;
+		return pool;
+	}
+
+	// Calls fn(i) for each i in [0, n), on the pool's threads and the caller's, and returns when all are done.
+	template <typename F>
+	void Run(size_t n, F&& fn) {
+		std::scoped_lock run_lock(m_run_mutex);
+		Batch            batch;
+		batch.fn = [&fn](size_t i) { fn(i); };
+		batch.n  = n;
+		{
+			std::scoped_lock lock(m_mutex);
+			m_batch = &batch;
+			m_generation++;
+		}
+		m_cv.notify_all();
+		Work(batch);
+		std::unique_lock lock(m_mutex);
+		m_batch = nullptr;
+		m_done_cv.wait(lock, [&] { return batch.done == batch.n && batch.users == 0; });
+	}
+
+private:
+	struct Batch {
+		std::function<void(size_t)> fn;
+		size_t                      n = 0;
+		std::atomic<size_t>         next {0};
+		std::atomic<size_t>         done {0};
+		uint32_t                    users = 0; // pool threads inside the batch, under m_mutex
+	};
+
+	ReadPool() {
+		for (uint32_t i = 0; i < kThreads; i++) {
+			m_threads.emplace_back([this](std::stop_token stop) { Loop(stop); });
+		}
+	}
+	~ReadPool() {
+		{
+			std::scoped_lock lock(m_mutex);
+			for (auto& t: m_threads) {
+				t.request_stop();
+			}
+		}
+		m_cv.notify_all();
+	}
+
+	void Work(Batch& batch) {
+		for (;;) {
+			const size_t i = batch.next.fetch_add(1);
+			if (i >= batch.n) {
+				return;
+			}
+			batch.fn(i);
+			if (batch.done.fetch_add(1) + 1 == batch.n) {
+				std::scoped_lock lock(m_mutex);
+				m_done_cv.notify_all();
+			}
+		}
+	}
+
+	void Loop(const std::stop_token& stop) {
+		uint64_t         seen = 0;
+		std::unique_lock lock(m_mutex);
+		while (!stop.stop_requested()) {
+			m_cv.wait(lock, [&] { return stop.stop_requested() || (m_batch != nullptr && m_generation != seen); });
+			if (stop.stop_requested()) {
+				return;
+			}
+			seen        = m_generation;
+			Batch* batch = m_batch;
+			batch->users++;
+			lock.unlock();
+			Work(*batch);
+			lock.lock();
+			batch->users--;
+			m_done_cv.notify_all();
+		}
+	}
+
+	std::mutex                m_run_mutex;
+	std::mutex                m_mutex;
+	std::condition_variable   m_cv;
+	std::condition_variable   m_done_cv;
+	Batch*                    m_batch      = nullptr;
+	uint64_t                  m_generation = 0;
+	std::vector<std::jthread> m_threads;
+};
+
 class CommandEngine {
 public:
 	explicit CommandEngine(size_t priorities)
@@ -1265,7 +1362,8 @@ private:
 		AprShared::SetSubmissionComplete(submission.id);
 		if (LogAmm()) {
 			const double t = NowSeconds();
-			std::fprintf(stderr, "amm %.6f %p done %zu commands %.3f ms after submit\n", t, static_cast<const void*>(this),
+			std::fprintf(stderr, "amm %.6f %llu ms %p done %zu commands %.3f ms after submit\n", t,
+			             static_cast<unsigned long long>(Loader::Timer::GetTimeMs()), static_cast<const void*>(this),
 			             submission.commands.size(), (t - submission.submitted) * 1000.0);
 		}
 	}
@@ -1306,11 +1404,37 @@ private:
 			int      result       = OK;
 			uint32_t error_offset = 0;
 			if (submission.cursor < submission.commands.size()) {
-				const auto& command = submission.commands[submission.cursor++];
-				result              = ExecuteCommand(command);
-				LogCommand(command, result);
-				if (result != OK) {
-					error_offset = static_cast<uint32_t>(command.record_offset);
+				// The reads from the cursor up to the next other command, together.
+				constexpr size_t kMaxReads = 64;
+				const size_t     first     = submission.cursor;
+				size_t           last      = first;
+				while (last < submission.commands.size() && last - first < kMaxReads &&
+				       std::holds_alternative<CommandBufferState::ReadFileCommand>(submission.commands[last].data)) {
+					last++;
+				}
+				if (last - first > 1) {
+					std::vector<int> results(last - first, OK);
+					ReadPool::Instance().Run(last - first, [&](size_t i) {
+						results[i] = ExecuteCommand(submission.commands[first + i]);
+					});
+					submission.cursor = last;
+					for (size_t i = 0; i < results.size(); i++) {
+						const auto& command = submission.commands[first + i];
+						LogCommand(command, results[i]);
+						if (results[i] != OK) {
+							result            = results[i];
+							error_offset      = static_cast<uint32_t>(command.record_offset);
+							submission.cursor = first + i + 1;
+							break;
+						}
+					}
+				} else {
+					const auto& command = submission.commands[submission.cursor++];
+					result              = ExecuteCommand(command);
+					LogCommand(command, result);
+					if (result != OK) {
+						error_offset = static_cast<uint32_t>(command.record_offset);
+					}
 				}
 			}
 			const bool complete = result != OK || submission.cursor == submission.commands.size();
@@ -1345,10 +1469,12 @@ private:
 			std::fprintf(stderr, "amm %.6f %p counter %u = 0x%x\n", t, static_cast<const void*>(this), static_cast<unsigned>(c->index),
 			             c->value);
 		} else if (const auto* r = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
-			std::fprintf(stderr, "amm %.6f %p read file 0x%x dst 0x%llx size 0x%llx -> 0x%x off 0x%llx\n", t,
-			             static_cast<const void*>(this), r->file_id, static_cast<unsigned long long>(r->destination),
+			std::filesystem::path host_path;
+			AprShared::TryGetHostPath(r->file_id, &host_path);
+			std::fprintf(stderr, "amm %.6f %llu ms %p read file 0x%x dst 0x%llx size 0x%llx -> 0x%x off 0x%llx %s\n", t,
+			             static_cast<unsigned long long>(Loader::Timer::GetTimeMs()), static_cast<const void*>(this), r->file_id, static_cast<unsigned long long>(r->destination),
 			             static_cast<unsigned long long>(r->size), static_cast<unsigned>(result),
-			             static_cast<unsigned long long>(r->file_offset));
+			             static_cast<unsigned long long>(r->file_offset), host_path.filename().string().c_str());
 		}
 	}
 
