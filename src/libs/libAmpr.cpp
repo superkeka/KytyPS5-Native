@@ -1206,10 +1206,24 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 
 struct Submission {
 	std::vector<CommandBufferState::Command> commands;
-	size_t                                   cursor = 0;
-	void*                                    result = nullptr;
-	uint32_t                                 id     = 0;
+	size_t                                   cursor    = 0;
+	void*                                    result    = nullptr;
+	uint32_t                                 id        = 0;
+	double                                   submitted = 0;
 };
+
+// KYTY_LOG_AMM=1: every command as the engine runs it, with the CLOCK_MONOTONIC time.
+static bool LogAmm() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_LOG_AMM");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+static double NowSeconds() {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
 	const uint64_t value = wait.is_counter
@@ -1246,6 +1260,16 @@ public:
 	}
 
 private:
+	void Complete(const Submission& submission, int result, uint32_t error_offset) {
+		AprShared::WriteResult(submission.result, result, error_offset);
+		AprShared::SetSubmissionComplete(submission.id);
+		if (LogAmm()) {
+			const double t = NowSeconds();
+			std::fprintf(stderr, "amm %.6f %p done %zu commands %.3f ms after submit\n", t, static_cast<const void*>(this),
+			             submission.commands.size(), (t - submission.submitted) * 1000.0);
+		}
+	}
+
 	void Run(std::stop_token stop) {
 		std::unique_lock lock(m_mutex);
 		while (!stop.stop_requested()) {
@@ -1291,8 +1315,7 @@ private:
 			}
 			const bool complete = result != OK || submission.cursor == submission.commands.size();
 			if (complete) {
-				AprShared::WriteResult(submission.result, result, error_offset);
-				AprShared::SetSubmissionComplete(submission.id);
+				Complete(submission, result, error_offset);
 			}
 			lock.lock();
 			if (complete) {
@@ -1301,16 +1324,11 @@ private:
 		}
 	}
 
-	// KYTY_LOG_AMM=1: every command as the engine runs it, with the CLOCK_MONOTONIC time.
 	void LogCommand(const CommandBufferState::Command& entry, int result) const {
-		static const bool on = [] {
-			const char* v = std::getenv("KYTY_LOG_AMM");
-			return v != nullptr && v[0] == '1';
-		}();
-		if (!on) {
+		if (!LogAmm()) {
 			return;
 		}
-		const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		const double t = NowSeconds();
 		if (const auto* m = std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
 			std::fprintf(stderr, "amm %.6f %p map kind %u va 0x%llx size 0x%llx dmem 0x%llx type %d prot 0x%x -> 0x%x\n", t,
 			             static_cast<const void*>(this), static_cast<unsigned>(m->kind), static_cast<unsigned long long>(m->va),
@@ -1327,9 +1345,10 @@ private:
 			std::fprintf(stderr, "amm %.6f %p counter %u = 0x%x\n", t, static_cast<const void*>(this), static_cast<unsigned>(c->index),
 			             c->value);
 		} else if (const auto* r = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
-			std::fprintf(stderr, "amm %.6f %p read file 0x%x dst 0x%llx size 0x%llx -> 0x%x\n", t, static_cast<const void*>(this),
-			             r->file_id, static_cast<unsigned long long>(r->destination), static_cast<unsigned long long>(r->size),
-			             static_cast<unsigned>(result));
+			std::fprintf(stderr, "amm %.6f %p read file 0x%x dst 0x%llx size 0x%llx -> 0x%x off 0x%llx\n", t,
+			             static_cast<const void*>(this), r->file_id, static_cast<unsigned long long>(r->destination),
+			             static_cast<unsigned long long>(r->size), static_cast<unsigned>(result),
+			             static_cast<unsigned long long>(r->file_offset));
 		}
 	}
 
@@ -1373,7 +1392,7 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	static CommandEngine apr_engine(7);
 	static CommandEngine amm_engine(3);
 	(amm ? amm_engine : apr_engine)
-	    .Submit(priority, {std::move(state.commands), 0, result, id});
+	    .Submit(priority, {std::move(state.commands), 0, result, id, LogAmm() ? NowSeconds() : 0.0});
 	return OK;
 }
 
