@@ -1968,8 +1968,15 @@ static bool WaitRewindValid(const uint32_t* control) {
 	while (!valid()) {
 		waited_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
 		if (waited_us >= limit_us) {
-			std::fprintf(stderr, "native flatten: REWIND at %p still not valid after %lld ms\n", static_cast<const void*>(control - 1),
-			             static_cast<long long>(waited_us / 1000));
+			std::fprintf(stderr, "native flatten: REWIND at %p still not valid after %lld ms; the 16 dwords before it:",
+			             static_cast<const void*>(control - 1), static_cast<long long>(waited_us / 1000));
+			const auto page = reinterpret_cast<uint64_t>(control - 1) & ~uint64_t {0xfff};
+			for (int i = -17; i < -1; i++) {
+				if (reinterpret_cast<uint64_t>(control + i) >= page) {
+					std::fprintf(stderr, " 0x%08x", control[i]);
+				}
+			}
+			std::fprintf(stderr, "\n");
 			return false;
 		}
 		std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -2165,6 +2172,51 @@ void SetFlattenBranchLog(std::FILE* f) {
 	std::lock_guard<std::mutex> lock(g_branch_log_mutex);
 	g_branches_logged.clear();
 	g_branch_log.store(f, std::memory_order_relaxed);
+}
+
+// The top level of `in` and of the buffers it chains to, `hops` deep at most.
+static bool StopsAtRewind(std::span<const uint32_t> in, RewindStop* out, int hops) {
+	constexpr uint32_t kRewind = 0x59, kIndirect = 0x3f;
+	size_t             cond_end = 0; // the end of the last COND_EXEC's range
+	for (size_t dw = 0; dw < in.size();) {
+		const uint32_t header = in[dw];
+		const uint32_t len    = (header >> 30u) == 3u ? PacketSizeDw(header) : 1u;
+		if (dw + len > in.size()) {
+			return false;
+		}
+		const uint32_t op = (header >> 8u) & 0xffu;
+		if ((header >> 30u) == 3u && op == IT_COND_EXEC && len == 5) {
+			cond_end = std::max(cond_end, dw + len + (in[dw + 4] & 0x3fffu));
+		}
+		if ((header >> 30u) == 3u && op == kRewind && len == 2 &&
+		    (__atomic_load_n(&in[dw + 1], __ATOMIC_ACQUIRE) & 0x80000000u) == 0) {
+			if (dw < cond_end) {
+				return false;
+			}
+			*out = {static_cast<uint32_t>(dw), nullptr, 0};
+			return true;
+		}
+		if ((header >> 30u) == 3u && op == kIndirect && len == 4 && (in[dw + 3] & (1u << 20u)) != 0) {
+			// A chain: the CP goes on in its target and never comes back.
+			const auto*    target = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[dw + 2]) << 32u) | (in[dw + 1] & ~3u));
+			const uint32_t size   = in[dw + 3] & 0xfffffu;
+			RewindStop     inner;
+			if (target == nullptr || size == 0 || hops == 0 || !StopsAtRewind({target, size}, &inner, hops - 1)) {
+				return false;
+			}
+			if (dw < cond_end) {
+				return false;
+			}
+			*out = {static_cast<uint32_t>(dw), target, size};
+			return true;
+		}
+		dw += len;
+	}
+	return false;
+}
+
+bool FindRewindStop(std::span<const uint32_t> in, RewindStop* out) {
+	return StopsAtRewind(in, out, 64);
 }
 
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why,

@@ -770,6 +770,16 @@ struct SourcePiece {
 // top level calls or chains to begins and ends (the title's own segments of the command buffer).
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
                             std::vector<SourcePiece>* pieces = nullptr, std::vector<uint32_t>* marks = nullptr);
+// Where the CP would stop in a graphics buffer: at a REWIND of its top level the title has not set valid yet
+// (`next` == nullptr: the buffer runs up to `at`, the rest from `at` on once the REWIND is valid), or at a chain
+// of its top level to a buffer that stops so (`next`, `next_size`: the chain's target, which runs after `at`).
+// False when it runs through, or when the stop is inside a COND_EXEC's range (inlining then waits for it).
+struct RewindStop {
+	uint32_t        at        = 0;
+	const uint32_t* next      = nullptr;
+	uint32_t        next_size = 0;
+};
+bool FindRewindStop(std::span<const uint32_t> in, RewindStop* out);
 // A line in `f` for each always-taken AgcCbBranch (COND_INDIRECT_BUFFER) FlattenIndirectBuffers inlines as a call, once
 // per branch, target and tail: where the target ends (a chain back to the parent's tail, elsewhere, none) and what the
 // parent runs after it. nullptr: KYTY_NATIVE_GPU_LOG_BRANCHES=1 decides (to stderr; off by default). Logging only.

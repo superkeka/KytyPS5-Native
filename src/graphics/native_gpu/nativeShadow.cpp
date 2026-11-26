@@ -7587,9 +7587,10 @@ private:
 		for (;;) {
 			{
 				std::unique_lock<std::mutex> lock(m_mutex);
-				if (m_held > 0) {
+				if (m_held > 0 || m_rewind_rest) {
 					// A label with no GPU writer shows up in memory when the tracker writes it, or when
-					// the GPU does and the fence (or this timeout) says so. Not a 50 us poll.
+					// the GPU does and the fence (or this timeout) says so. Not a 50 us poll. A REWIND's valid
+					// bit only shows up in memory.
 					m_cv.wait_for(lock, std::chrono::milliseconds(2), [this] { return !m_jobs.empty() || m_wake || !m_acb_done.empty(); });
 					m_wake = false;
 				} else {
@@ -7598,10 +7599,53 @@ private:
 				m_round.swap(m_jobs);
 			}
 			const double picked = NowSecShadow();
+			if (m_rewind_rest && (__atomic_load_n(&m_rewind_rest->buffer[1], __ATOMIC_ACQUIRE) & 0x80000000u) != 0) {
+				// The title set the REWIND valid: the rest of its buffer, then what waited behind it, then the new jobs.
+				std::deque<Job> round;
+				round.push_back(std::move(*m_rewind_rest));
+				m_rewind_rest.reset();
+				for (auto& behind: m_rewind_behind) {
+					round.push_back(std::move(behind));
+				}
+				m_rewind_behind.clear();
+				for (auto& next: m_round) {
+					round.push_back(std::move(next));
+				}
+				m_round.swap(round);
+			}
 			while (!m_round.empty()) {
 				// Out of the deque first: TranslateComputeAhead takes jobs from the middle of it.
 				Job job = std::move(m_round.front());
 				m_round.pop_front();
+				if (m_rewind_rest && !IsGuestComputeQueue(job.queue)) {
+					m_rewind_behind.push_back(std::move(job));
+					continue;
+				}
+				if (job.buffer != nullptr && job.queue == 0) {
+					RewindStop stop;
+					if (FindRewindStop(std::span<const uint32_t>(job.buffer, job.size_dw), &stop)) {
+						Job rest = job;
+						if (stop.next != nullptr) {
+							rest.buffer  = stop.next;
+							rest.size_dw = stop.next_size;
+							m_round.push_front(std::move(rest));
+						} else {
+							rest.buffer  = job.buffer + stop.at;
+							rest.size_dw = job.size_dw - stop.at;
+							if (m_rewind_stops++ < 4) {
+								std::fprintf(stderr,
+								             "native shadow: graphics buffer %p stops at a REWIND the title has not set valid (dw %u of %u): "
+								             "what comes before it runs, the rest and the graphics jobs after it wait for the REWIND\n",
+								             static_cast<const void*>(job.buffer), stop.at, job.size_dw);
+							}
+							m_rewind_rest = std::move(rest);
+						}
+						job.size_dw = stop.at;
+						if (job.size_dw == 0) {
+							continue;
+						}
+					}
+				}
 				const bool own_submission = m_acb_thread && job.buffer == nullptr;
 				if (own_submission) {
 					WaitForAcbsBefore(job);
@@ -8878,6 +8922,11 @@ private:
 	bool                                    m_acb_busy = false; // it holds a job
 	AcbNullGate                             m_acb_gate;
 	std::deque<Job>                         m_round; // what the worker took from m_jobs and has not translated yet (its thread only)
+	// The rest of a graphics buffer from a REWIND the title has not set valid yet (FindRewindStop), and the graphics
+	// jobs submitted after it: they wait for the REWIND as the CP would, compute queues go on (worker thread only).
+	std::optional<Job>                      m_rewind_rest;
+	std::deque<Job>                         m_rewind_behind;
+	uint32_t                                m_rewind_stops = 0;
 	bool                                    m_native  = false;
 	bool                                    m_acb_rings = false;
 	uint32_t                                m_compute_mask = 0;
