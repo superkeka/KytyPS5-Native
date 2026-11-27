@@ -19,6 +19,9 @@ export interface State {
   kyty_dir: string;
   runner: string;
   kyty_version: string;
+  // The tag of the Kyty the last install replaced, kept for rollback; empty without one.
+  kyty_previous: string;
+  channel: Channel;
   kyty_installed: boolean;
   helper: boolean;
   plugin_version: string;
@@ -36,8 +39,12 @@ export interface State {
   game_running: boolean;
 }
 
+// Stable: the latest release, built from main. Nightly: prereleases built from dev.
+export type Channel = "stable" | "nightly";
+
 export interface Release {
   tag: string;
+  channel?: Channel;
   kyty_url?: string;
   plugin_url?: string;
   error?: string;
@@ -101,8 +108,11 @@ export async function getState(): Promise<State> {
   setMenuGames(s.games);
   return s;
 }
-export const latestRelease = callable<[], Release>("latest_release");
+// Without a channel: the one set.
+export const latestRelease = callable<[channel?: Channel], Release>("latest_release");
+export const setChannel = callable<[channel: Channel], Release>("set_channel");
 export const installKyty = callable<[url: string, tag: string], Result>("install_kyty");
+export const rollbackKyty = callable<[], Result & { tag?: string }>("rollback_kyty");
 const installPlugin = callable<[url: string, tag: string], Result>("install_plugin");
 export const kernelApply = callable<[], Result>("kernel_apply");
 export const kernelRevert = callable<[], Result>("kernel_revert");
@@ -120,8 +130,9 @@ export const getPatches = callable<[titleId: string, again: boolean], Patches>("
 export const setPatch = callable<[titleId: string, name: string, on: boolean], Result>("set_patch");
 
 export const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({ title, body });
-// Release tags without the project name: 2026-10-29-6957c86.
+// Release tags without the project name: 2026-10-29-6957c86 (nightly-2026-10-29-6957c86 stays as is).
 export const short = (tag: string) => tag.replace(/^KytyPS5-Native-/, "");
+export const tagChannel = (tag: string): Channel | "" => (!tag ? "" : tag.startsWith("nightly-") ? "nightly" : "stable");
 export const gigabytes = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB`;
 
 // Decky's own installer (as its store): asks, swaps the files and reloads this plugin alone. Without

@@ -35,6 +35,12 @@ KYTY_DIR = os.path.join(SHARE, "kyty")
 CONFIG_DIR = os.path.join(HOME, ".config/KytyPS5-Native")
 SETTINGS = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "settings.json")
 ART_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "art")
+# The release channels: stable (the latest release, from main) and nightly (prereleases from dev,
+# tagged nightly-YYYY-MM-DD-<sha>). Kyty and the plugin update from the channel set in the settings.
+CHANNELS = ("stable", "nightly")
+NIGHTLY_PREFIX = "nightly-"
+# The Kyty an install replaced, one copy: rollback_kyty swaps it back.
+KYTY_PREV = KYTY_DIR + ".prev"
 # Present (holding the release tag) while a newer release is out: the launch wrapper has Kyty say so
 # when a game starts.
 UPDATE_FLAG = os.path.join(CONFIG_DIR, "update-available")
@@ -175,6 +181,49 @@ def _helper_missing():
 
 def _game_running():
     return _run("pgrep", "-x", "kyty_emulator")[0] == 0
+
+
+def _channel():
+    c = _load().get("channel")
+    return c if c in CHANNELS else "stable"
+
+
+def _tag_channel(tag):
+    return "nightly" if tag.startswith(NIGHTLY_PREFIX) else "stable" if tag else ""
+
+
+def _release_info(rel):
+    assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
+    kyty = next((u for n, u in assets.items() if n.endswith("-Linux-x86_64.tar.gz")), "")
+    plugin = next((u for n, u in assets.items() if n.endswith("-Decky.zip")), "")
+    return {"tag": rel.get("tag_name", ""), "kyty_url": kyty, "plugin_url": plugin}
+
+
+def _fetch_release(channel):
+    """The newest release of the channel: stable is GitHub's latest release, nightly the newest
+    prerelease tagged nightly-."""
+    if channel != "nightly":
+        return _release_info(json.loads(_get(f"https://api.github.com/repos/{REPO}/releases/latest")))
+    rels = json.loads(_get(f"https://api.github.com/repos/{REPO}/releases?per_page=30"))
+    rels = [r for r in rels if r.get("prerelease") and not r.get("draft")
+            and r.get("tag_name", "").startswith(NIGHTLY_PREFIX)]
+    if not rels:
+        raise RuntimeError("no nightly release")
+    rels.sort(key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
+    return _release_info(rels[0])
+
+
+def _update_flag(tag, newer):
+    try:
+        if newer:
+            _mkdir_user(CONFIG_DIR)
+            with open(UPDATE_FLAG, "w") as f:
+                f.write(tag + "\n")
+            _chown(UPDATE_FLAG)
+        elif os.path.exists(UPDATE_FLAG):
+            os.remove(UPDATE_FLAG)
+    except OSError as e:
+        decky.logger.error("update flag: %s", e)
 
 
 # --- kernel ---------------------------------------------------------------------------------------
@@ -996,6 +1045,9 @@ class Plugin:
             "kyty_dir": KYTY_DIR,
             "runner": os.path.join(KYTY_DIR, "kytyps5-run.sh"),
             "kyty_version": _read(os.path.join(KYTY_DIR, "VERSION")),
+            "kyty_previous": _read(os.path.join(KYTY_PREV, "VERSION"))
+            if os.access(os.path.join(KYTY_PREV, "kyty_emulator"), os.X_OK) else "",
+            "channel": _channel(),
             "kyty_installed": os.access(os.path.join(KYTY_DIR, "kyty_emulator"), os.X_OK),
             "helper": _run("systemctl", "is-active", "kyty-lodhw.service")[1] == "active",
             "plugin_version": decky.DECKY_PLUGIN_VERSION,
@@ -1013,33 +1065,31 @@ class Plugin:
             "game_running": _game_running(),
         }
 
-    async def latest_release(self):
-        def fetch():
-            rel = json.loads(_get(f"https://api.github.com/repos/{REPO}/releases/latest"))
-            assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
-            kyty = next((u for n, u in assets.items() if n.endswith("-Linux-x86_64.tar.gz")), "")
-            plugin = next((u for n, u in assets.items() if n.endswith("-Decky.zip")), "")
-            return {"tag": rel.get("tag_name", ""), "kyty_url": kyty, "plugin_url": plugin}
+    async def latest_release(self, channel=None):
+        channel = channel if channel in CHANNELS else _channel()
         try:
-            rel = await asyncio.to_thread(fetch)
+            rel = await asyncio.to_thread(_fetch_release, channel)
         except Exception as e:
-            decky.logger.error("latest release: %s", e)
-            return {"tag": "", "error": str(e)}
+            decky.logger.error("latest %s release: %s", channel, e)
+            return {"tag": "", "channel": channel, "error": str(e)}
+        rel["channel"] = channel
+        # Any other tag is an update, older ones too: switching the channel goes to its release.
         kyty = _read(os.path.join(KYTY_DIR, "VERSION"))
         plugin = _read(os.path.join(decky.DECKY_PLUGIN_DIR, "RELEASE"))
         newer = (kyty and rel["kyty_url"] and rel["tag"] != kyty) or \
                 (plugin and rel["plugin_url"] and rel["tag"] != plugin)
-        try:
-            if newer:
-                _mkdir_user(CONFIG_DIR)
-                with open(UPDATE_FLAG, "w") as f:
-                    f.write(rel["tag"] + "\n")
-                _chown(UPDATE_FLAG)
-            elif os.path.exists(UPDATE_FLAG):
-                os.remove(UPDATE_FLAG)
-        except OSError as e:
-            decky.logger.error("update flag: %s", e)
+        # Only the set channel's release is offered when a game starts.
+        if channel == _channel():
+            _update_flag(rel["tag"], newer)
         return rel
+
+    async def set_channel(self, channel):
+        if channel not in CHANNELS:
+            return {"tag": "", "channel": _channel(), "error": f"unknown channel {channel}"}
+        s = _load()
+        s["channel"] = channel
+        _save(s)
+        return await self.latest_release(channel)
 
     # --- KytyPS5-Native ---------------------------------------------------------------------------
 
@@ -1069,12 +1119,17 @@ class Plugin:
                         os.symlink(os.path.join("..", "data", d), os.path.join(new, d))
                 _chown(os.path.join(SHARE, "data"))
                 _chown(new)
-                old = KYTY_DIR + ".old"
-                shutil.rmtree(old, ignore_errors=True)
-                if os.path.exists(KYTY_DIR):
-                    os.rename(KYTY_DIR, old)
+                # The installed Kyty stays as the previous one (a single copy) for rollback_kyty.
+                if os.access(os.path.join(KYTY_DIR, "kyty_emulator"), os.X_OK):
+                    old = KYTY_PREV + ".old"
+                    shutil.rmtree(old, ignore_errors=True)
+                    if os.path.lexists(KYTY_PREV):
+                        os.rename(KYTY_PREV, old)
+                    os.rename(KYTY_DIR, KYTY_PREV)
+                    shutil.rmtree(old, ignore_errors=True)
+                else:
+                    shutil.rmtree(KYTY_DIR, ignore_errors=True)
                 os.rename(new, KYTY_DIR)
-                shutil.rmtree(old, ignore_errors=True)
             if os.path.exists(UPDATE_FLAG):
                 os.remove(UPDATE_FLAG)
             if not _ps5_apu():
@@ -1086,6 +1141,34 @@ class Plugin:
         except Exception as e:
             decky.logger.exception("install")
             return {"ok": False, "log": str(e)}
+
+    async def rollback_kyty(self):
+        """Back to the Kyty the last install replaced; the one installed now becomes the previous."""
+        if _game_running():
+            return {"ok": False, "log": "a game is running"}
+        if not os.access(os.path.join(KYTY_PREV, "kyty_emulator"), os.X_OK):
+            return {"ok": False, "log": "no previous version"}
+
+        def work():
+            swap = KYTY_DIR + ".swap"
+            shutil.rmtree(swap, ignore_errors=True)
+            if os.path.lexists(KYTY_DIR):
+                os.rename(KYTY_DIR, swap)
+            os.rename(KYTY_PREV, KYTY_DIR)
+            if os.path.lexists(swap):
+                os.rename(swap, KYTY_PREV)
+            tag = _read(os.path.join(KYTY_DIR, "VERSION"))
+            if not _ps5_apu():
+                return {"ok": True, "log": "", "tag": tag}
+            code, out = _install_helper()
+            return {"ok": code == 0, "log": out, "tag": tag}
+        try:
+            r = await asyncio.to_thread(work)
+        except Exception as e:
+            decky.logger.exception("rollback")
+            return {"ok": False, "log": str(e)}
+        await self.latest_release()
+        return r
 
     async def install_plugin(self, url, tag):
         def work():
