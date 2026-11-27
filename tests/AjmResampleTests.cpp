@@ -46,10 +46,18 @@ struct Fixture {
 		return &batch;
 	}
 
+	// Jobs run once their batch starts.
+	void Run() {
+		uint32_t id = 0;
+		Check(AjmBatchStart(1, &batch, 0, nullptr, &id) == OK, "start batch");
+		Check(AjmBatchWait(1, id, 0xffffffffu, nullptr) == OK, "wait for batch");
+	}
+
 	void Initialize(int32_t expected = OK) {
 		AjmDecOpusInitializeParameters params {channels, 48000, mapping_family};
 		AjmSidebandResult              result {};
 		AjmBatchJobInitialize(Batch(), instance, &params, sizeof(params), &result);
+		Run();
 		Check(result.result == expected, "initialize Opus instance");
 	}
 
@@ -60,6 +68,7 @@ struct Fixture {
 		} else {
 			AjmBatchJobSetResampleParameters(Batch(), instance, ratio, flags, &result);
 		}
+		Run();
 		Check(result.result == OK, "set resampling parameters");
 	}
 
@@ -69,6 +78,7 @@ struct Fixture {
 			AjmSidebandResampleInfo info;
 		} result {};
 		AjmBatchJobGetResampleInfo(Batch(), instance, &result);
+		Run();
 		Check(result.result.result == OK, "get resampling info");
 		return result.info;
 	}
@@ -77,12 +87,14 @@ struct Fixture {
 		AjmSidebandGaplessDecode params {samples, skip, 0};
 		AjmSidebandResult        result {};
 		AjmBatchJobSetGaplessDecode(Batch(), instance, &params, 1, &result);
+		Run();
 		Check(result.result == OK, "set gapless parameters");
 	}
 
 	DecodeResult Decode(const void* input, size_t size, void* output, size_t capacity) {
 		DecodeResult result {};
 		AjmBatchJobDecode(Batch(), instance, input, size, output, capacity, &result);
+		Run();
 		Check((result.result.result & ~(AJM_RESULT_NOT_ENOUGH_ROOM | AJM_RESULT_PARTIAL_INPUT)) ==
 		          0,
 		      "decode returned unexpected error");
@@ -282,6 +294,7 @@ void UnbufferedAndSplit(const std::vector<uint8_t>& packet) {
 	AjmBuffer    output[] {{pcm.data(), 257}, {pcm.data() + 257, 767}};
 	DecodeResult result {};
 	AjmBatchJobDecodeSplit(f.Batch(), f.instance, input, 2, output, 2, &result);
+	f.Run();
 	Check(result.stream.size_produced == 1024 &&
 	          result.stream.size_consumed == static_cast<int>(packet.size()),
 	      "split buffers retain PCM across jobs");
@@ -297,6 +310,7 @@ void FormatChangeRequiresReset() {
 	f.Initialize();
 	DecodeResult result {};
 	AjmBatchJobDecode(f.Batch(), f.instance, nullptr, 0, pcm.data(), pcm.size(), &result);
+	f.Run();
 	Check(result.result.result == AJM_RESULT_INVALID_PARAMETER && result.stream.size_produced == 0,
 	      "format change cannot reinterpret retained PCM with a different channel stride");
 	f.Parameters(1, 3);

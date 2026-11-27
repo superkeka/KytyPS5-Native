@@ -39,7 +39,11 @@ public:
 	AjmOpusDecoder(uint32_t max_channels, AjmSampleEncoding encoding)
 	    : AjmDecoder(0, 48000, encoding), m_max_channels(max_channels) {}
 
-	~AjmOpusDecoder() override { avcodec_free_context(&m_context); }
+	~AjmOpusDecoder() override {
+		avcodec_free_context(&m_context);
+		av_packet_free(&m_packet);
+		av_frame_free(&m_frame);
+	}
 
 	AjmDecodeResult Initialize(const void* parameters, size_t parameters_size) override {
 		avcodec_free_context(&m_context);
@@ -153,13 +157,12 @@ public:
 				break;
 			}
 
-			AVFrame* frame = DecodePacket(data, packet_size, &result);
+			const AVFrame* frame = DecodePacket(data, packet_size, &result);
 			if (frame == nullptr) {
 				break;
 			}
 			if (frame->nb_samples != static_cast<int>(samples) ||
 			    frame->ch_layout.nb_channels != static_cast<int>(m_channels)) {
-				av_frame_free(&frame);
 				result.result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 				result.internal_result = 0x1043;
 				break;
@@ -168,7 +171,6 @@ public:
 				std::memcpy(static_cast<uint8_t*>(output) + result.output_written,
 				            frame->data[0] + skip * sample_bytes, output_bytes);
 			}
-			av_frame_free(&frame);
 			if (gapless != nullptr) {
 				gapless->current.skip_samples -= static_cast<uint16_t>(skip);
 				gapless->current.skipped_samples = static_cast<uint16_t>(
@@ -224,37 +226,43 @@ private:
 		return true;
 	}
 
-	AVFrame* DecodePacket(const uint8_t* data, uint32_t size, AjmDecodeResult* result) {
-		AVPacket* packet = av_packet_alloc();
-		AVFrame*  frame  = av_frame_alloc();
-		if (packet == nullptr || frame == nullptr ||
-		    av_new_packet(packet, static_cast<int>(size)) < 0) {
-			av_packet_free(&packet);
-			av_frame_free(&frame);
+	// The packet, the decoded frame and the converter are kept from packet to packet.
+	const AVFrame* DecodePacket(const uint8_t* data, uint32_t size, AjmDecodeResult* result) {
+		if (m_packet == nullptr) {
+			m_packet = av_packet_alloc();
+		}
+		if (m_frame == nullptr) {
+			m_frame = av_frame_alloc();
+		}
+		if (m_packet == nullptr || m_frame == nullptr ||
+		    av_new_packet(m_packet, static_cast<int>(size)) < 0) {
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 			return nullptr;
 		}
-		std::memcpy(packet->data, data, size);
-		int rc = avcodec_send_packet(m_context, packet);
-		av_packet_free(&packet);
+		std::memcpy(m_packet->data, data, size);
+		int rc = avcodec_send_packet(m_context, m_packet);
+		av_packet_unref(m_packet);
 		if (rc >= 0) {
-			rc = avcodec_receive_frame(m_context, frame);
+			rc = avcodec_receive_frame(m_context, m_frame);
 		}
 		if (rc < 0) {
-			av_frame_free(&frame);
+			av_frame_unref(m_frame);
 			result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 			result->internal_result = 0x1043;
 			return nullptr;
 		}
 		// A family 255 head leaves the layout unspecified, which sample conversion rejects.
-		av_channel_layout_default(&frame->ch_layout, frame->ch_layout.nb_channels);
-		AVFrame* converted = AjmConvertFfmpegFrame(frame, m_sample_encoding, result);
-		av_frame_free(&frame);
+		av_channel_layout_default(&m_frame->ch_layout, m_frame->ch_layout.nb_channels);
+		const AVFrame* converted = m_converter.Convert(m_frame, m_sample_encoding, result);
+		av_frame_unref(m_frame);
 		return converted;
 	}
 
-	AVCodecContext* m_context = nullptr;
-	const uint32_t  m_max_channels;
+	AVCodecContext*    m_context = nullptr;
+	AVPacket*          m_packet  = nullptr;
+	AVFrame*           m_frame   = nullptr;
+	AjmFfmpegConverter m_converter;
+	const uint32_t     m_max_channels;
 	uint32_t        m_frames_per_packet = 0;
 };
 

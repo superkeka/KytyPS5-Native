@@ -723,7 +723,7 @@ LIB_DEFINE(InitAudio_1_Ajm) {
 	LIB_FUNC("bkRHEYG6lEM", Ajm::AjmMemoryRegister);
 	LIB_FUNC("pIpGiaYkHkM", Ajm::AjmMemoryUnregister);
 	LIB_FUNC("MmpF1XsQiHw", Ajm::AjmBatchInitialize);
-	LIB_FUNC("5tOfnaClcqM", Ajm::AjmBatchStart);
+	LIB_FUNC("5tOfnaClcqM", ::Libs::LibKernel::OnHostStack<&Ajm::AjmBatchStart>::Call);
 	LIB_FUNC("-qLsfDAywIY", Ajm::AjmBatchWait);
 	LIB_FUNC("NVDXiUesSbA", Ajm::AjmBatchCancel);
 	LIB_FUNC("WfAiBW8Wcek", Ajm::AjmBatchErrorDump);

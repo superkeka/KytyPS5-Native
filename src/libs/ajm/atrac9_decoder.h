@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 extern "C" {
@@ -28,6 +29,13 @@ struct AjmAt9Config {
 };
 
 using AjmAt9Handle = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>;
+
+// LibAtrac9 fills its shared tables on every decoder init; instances initialize from several threads.
+inline int AjmAt9Init(void* handle, const uint8_t* config_data) {
+	static std::mutex mutex;
+	std::scoped_lock  lock(mutex);
+	return Atrac9InitDecoder(handle, const_cast<uint8_t*>(config_data));
+}
 
 inline int AjmAt9InitDecoder(void* handle, const uint8_t* config_data, AjmAt9Config& config) {
 	config = {};
@@ -55,7 +63,7 @@ inline int AjmAt9InitDecoder(void* handle, const uint8_t* config_data, AjmAt9Con
 		// Translate only the channel field, preserving the other configuration bits.
 		config.decoder_data[1] -= 6u << 1u;
 	}
-	const int initialized = Atrac9InitDecoder(handle, config.decoder_data.data());
+	const int initialized = AjmAt9Init(handle, config.decoder_data.data());
 	if (initialized != 0) {
 		return initialized;
 	}
@@ -350,7 +358,7 @@ private:
 				return false;
 			}
 			const int initialized =
-			    Atrac9InitDecoder(m_streams[i].handle.get(), config.decoder_data.data());
+			    AjmAt9Init(m_streams[i].handle.get(), config.decoder_data.data());
 			if (initialized != 0) {
 				result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 				result->internal_result = initialized;

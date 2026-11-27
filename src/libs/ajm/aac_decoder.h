@@ -48,7 +48,11 @@ public:
 		}
 	}
 
-	~AjmAacDecoder() override { Release(); }
+	~AjmAacDecoder() override {
+		Release();
+		av_packet_free(&m_packet);
+		av_frame_free(&m_frame);
+	}
 
 	AjmDecodeResult Initialize(const void* codec_parameters,
 	                           size_t      codec_parameters_size) override {
@@ -288,9 +292,14 @@ private:
 			return true;
 		}
 
-		AVPacket* packet = av_packet_alloc();
-		if (packet == nullptr || av_new_packet(packet, packet_size) < 0) {
-			av_packet_free(&packet);
+		if (m_packet == nullptr) {
+			m_packet = av_packet_alloc();
+		}
+		if (m_frame == nullptr) {
+			m_frame = av_frame_alloc();
+		}
+		AVPacket* packet = m_packet;
+		if (packet == nullptr || m_frame == nullptr || av_new_packet(packet, packet_size) < 0) {
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 			return false;
 		}
@@ -303,7 +312,7 @@ private:
 			                          : std::clamp(m_max_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
 			auto* extradata = av_packet_new_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, 2);
 			if (extradata == nullptr) {
-				av_packet_free(&packet);
+				av_packet_unref(packet);
 				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 				return false;
 			}
@@ -316,7 +325,7 @@ private:
 		}
 
 		int rc = avcodec_send_packet(m_codec_context, packet);
-		av_packet_free(&packet);
+		av_packet_unref(packet);
 		if (rc == AVERROR_INVALIDDATA) {
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 			return false;
@@ -327,32 +336,26 @@ private:
 		}
 
 		for (;;) {
-			AVFrame* frame = av_frame_alloc();
-			if (frame == nullptr) {
-				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
-				return false;
-			}
-
-			rc = avcodec_receive_frame(m_codec_context, frame);
+			AVFrame* frame = m_frame;
+			rc             = avcodec_receive_frame(m_codec_context, frame);
 			if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
-				av_frame_free(&frame);
+				av_frame_unref(frame);
 				return true;
 			}
 			if (rc < 0) {
-				av_frame_free(&frame);
+				av_frame_unref(frame);
 				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 				return false;
 			}
 
-			AVFrame* converted = AjmConvertFfmpegFrame(frame, m_sample_encoding, result);
-			av_frame_free(&frame);
+			const AVFrame* converted = m_converter.Convert(frame, m_sample_encoding, result);
+			av_frame_unref(frame);
 			if (converted == nullptr) {
 				return false;
 			}
 
 			const bool ok =
 			    WriteFrame(converted, output, output_size, output_offset, gapless, result);
-			av_frame_free(&converted);
 			if (!ok) {
 				return false;
 			}
@@ -369,6 +372,10 @@ private:
 	uint32_t        m_bitrate             = 0;
 	bool            m_is_initialized      = false;
 	bool            m_raw_configured      = false;
+
+	AVPacket*          m_packet = nullptr;
+	AVFrame*           m_frame  = nullptr;
+	AjmFfmpegConverter m_converter;
 };
 
 } // namespace Libs::Audio::Ajm
