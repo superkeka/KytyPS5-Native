@@ -684,6 +684,11 @@ static bool SetGuestThreadPointer(const Common::HostException::ExceptionInfo& in
 	    info.exception_address >= g_tls_main_program->base_vaddr + g_tls_main_program->base_size_aligned) {
 		return false;
 	}
+	// The fault address is the instruction's first byte: operand-size prefixes a compiler pads the read with
+	// (66 66 66 64 48 8b 04 25 ...) come before the segment prefix.
+	for (int i = 0; i < 4 && code[0] == 0x66; i++) {
+		code++;
+	}
 	if (code[0] != 0x65 || (code[1] != 0x48 && code[1] != 0x4C) || code[2] != 0x8B || (code[3] & 0xc7u) != 0x04u ||
 	    code[4] != 0x25 || (code[5] | code[6] | code[7] | code[8]) != 0) {
 		return false;
