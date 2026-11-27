@@ -3,7 +3,8 @@ name: Build KytyPS5-Native
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    # main and master publish the stable release, dev the nightly prerelease.
+    branches: [ main, master, dev ]
   pull_request:
 
 concurrency:
@@ -21,13 +22,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.release_tag.outputs.value }}
+      channel: ${{ steps.release_tag.outputs.channel }}
 
     steps:
       - name: Generate release tag
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-Native-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF" = refs/heads/dev ]; then
+            echo "channel=nightly" >> "$GITHUB_OUTPUT"
+            echo "value=nightly-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "value=KytyPS5-Native-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
 
   linux:
     name: Build KytyPS5 (Linux)
@@ -226,6 +234,7 @@ jobs:
       contents: write
     env:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+      CHANNEL: ${{ needs.metadata.outputs.channel }}
 
     steps:
       - name: Download Linux build
@@ -265,9 +274,31 @@ jobs:
           if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$RELEASE_NAME" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           else
+            # Nightly builds are prereleases and leave the latest (stable) release as it is.
+            if [ "$CHANNEL" = nightly ]; then
+              kind=(--prerelease --latest=false)
+            else
+              kind=(--latest)
+            fi
             gh release create "$RELEASE_NAME" "${assets[@]}" \
+              "${kind[@]}" \
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_NAME"
           fi
+
+      - name: Prune nightly releases
+        if: needs.metadata.outputs.channel == 'nightly'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The 10 newest nightly prereleases stay; older ones go with their tags.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.prerelease and (.tag_name | startswith("nightly-"))) | [.created_at, .tag_name] | @tsv' |
+            sort -r | tail -n +11 | cut -f2 |
+            while read -r tag; do
+              echo "removing $tag"
+              gh release delete "$tag" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY"
+            done
