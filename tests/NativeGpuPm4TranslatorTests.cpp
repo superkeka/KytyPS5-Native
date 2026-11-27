@@ -5923,12 +5923,10 @@ void TestCondExecRegisters() {
 	}
 }
 
-// The title's COND_EXEC as it wrote it (the refused buffer of the crash, its range dword for dword): EXEC_COUNT 0x69 on its
-// flag, over libSceAgc's push then clear, the draw's context, SH and UCONFIG tables, the draw, the pop and the flag
-// cleared by DMA_DATA. Only the tables' addresses are moved to this test's memory; the flag keeps its address (the toy CP
-// reads it from a word here). Translated with CP shadowing in load mode, the CPU or the GPU doing the push and pop, run with
-// the flag set and clear: the count reaches the translated range's end and the GPU ends with the PS5's registers.
-void TestCondExecTitleForm() {
+// The title's COND_EXEC over a draw with its own context as it wrote it (the refused buffer of the crash, its range dword
+// for dword): EXEC_COUNT 0x69 on its flag, over libSceAgc's push then clear, the draw's context, SH and UCONFIG tables, the
+// draw, the pop and the flag cleared by DMA_DATA. Only the tables' addresses are moved to this test's memory.
+std::vector<uint32_t> CondTitleRange() {
 	static const uint32_t kRange[] = {
 	    0xc0032200u, 0x1bdcff0cu, 0x00000010u, 0x00000000u, 0x00000069u, 0xc0032200u, 0x0013e000u, 0x00000002u,
 	    0x00000000u, 0x00000008u, 0xc0064900u, 0x06000528u, 0x04010000u, 0x00000000u, 0x00000000u, 0x00000000u,
@@ -5945,8 +5943,6 @@ void TestCondExecTitleForm() {
 	    0x00000000u, 0x00000001u, 0x00000000u, 0x00000000u, 0x00000006u, 0xc0001200u, 0x00000002u, 0xc0055000u,
 	    0xc0300000u, 0x00000000u, 0x00000000u, 0x1bdcff0cu, 0x00000010u, 0x40000004u,
 	};
-	constexpr uint64_t kFlag = 0x101bdcff0cull;
-	static uint32_t    flag  = 0;
 	static_assert(sizeof(kRange) / 4u == 5u + 0x69u, "the COND_EXEC and its 0x69 dwords");
 	// The seven tables: where their packet is in the range, and their pairs (as many as the packet loads).
 	auto pairs_of = [](uint32_t n, uint32_t first, uint32_t value) {
@@ -5977,6 +5973,16 @@ void TestCondExecTitleForm() {
 		range[at + 1u] = static_cast<uint32_t>(va);
 		range[at + 2u] = static_cast<uint32_t>(va >> 32u);
 	}
+	return range;
+}
+
+// The title's COND_EXEC as it wrote it (CondTitleRange); the flag keeps its address (the toy CP reads it from a word here).
+// Translated with CP shadowing in load mode, the CPU or the GPU doing the push and pop, run with the flag set and clear: the
+// count reaches the translated range's end and the GPU ends with the PS5's registers.
+void TestCondExecTitleForm() {
+	constexpr uint64_t          kFlag = 0x101bdcff0cull;
+	static uint32_t             flag  = 0;
+	const std::vector<uint32_t> range = CondTitleRange();
 	const std::vector<uint32_t> after = {Pkt3(IT_DRAW_INDEX_AUTO, 2, false), 3u, 2u};
 	std::vector<uint32_t>       dcb   = range;
 	dcb.insert(dcb.end(), after.begin(), after.end());
@@ -6033,6 +6039,215 @@ void TestCondExecTitleForm() {
 			Check(rn.ok && cp.cx[0x10F] == 0xAu && cp.sh[0x00C] == (set != 0 ? 0xB0u : 0xA0u) && cp.uc[0x24A] == (set != 0 ? 0x7u : 0x3u),
 			      "after the next preamble too");
 		}
+	}
+}
+
+// The same block split over two of the title's segments, one COND_EXEC each on the same flag (the refused buffer of the
+// second crash: EXEC_COUNT 0x27 on its flag over libSceAgc's push then clear, the clear's table, the EVENT_WRITE and the first
+// context table, the range ending where the segment does; then EXEC_COUNT 0x42 over the rest of the block, the pop and the
+// flag's clear). The first range leaves the push open, the second pops it: the CP runs both or skips both, as on the PS5.
+// Translated in one buffer, as two chunks with a preamble each (gamescope's job between them) or streamed, the CPU or the
+// GPU doing the push and pop, run with the flag set and clear: nothing refuses, each count reaches its translated range's
+// end, and the GPU ends with the PS5's registers. The pop in a range on another flag refuses; outside any range, and in
+// libSceAgc's queue reset (its COND_EXEC on the push flag kept), it runs.
+void TestCondExecSplitPush() {
+	constexpr uint64_t    kFlag = 0x101bdebf2cull;
+	static uint32_t       flag  = 0;
+	std::vector<uint32_t> block = CondTitleRange();
+	block[1]   = static_cast<uint32_t>(kFlag);
+	block[107] = static_cast<uint32_t>(kFlag); // its DMA_DATA's destination
+	auto cond_on = [](uint64_t f, uint32_t count) {
+		return std::vector<uint32_t> {0xc0032200u, static_cast<uint32_t>(f), static_cast<uint32_t>(f >> 32u), 0u, count};
+	};
+	std::vector<uint32_t> first = cond_on(kFlag, 0x27u);
+	first.insert(first.end(), block.begin() + 5, block.begin() + 44);
+	std::vector<uint32_t> second = cond_on(kFlag, 0x42u);
+	second.insert(second.end(), block.begin() + 44, block.end());
+	const std::vector<uint32_t> after = {Pkt3(IT_DRAW_INDEX_AUTO, 2, false), 3u, 2u};
+	second.insert(second.end(), after.begin(), after.end());
+	const std::vector<uint32_t> logged = {0xc0032200u, 0x1bdebf2cu, 0x00000010u, 0x00000000u, 0x00000027u};
+	Check(std::equal(logged.begin(), logged.end(), first.begin()) && first.size() == 5u + 0x27u && second.size() == 5u + 0x42u + after.size() &&
+	          first[30] == 0xc0001200u && first[31] == 1u && second[5 + 57] == 0xc0001200u && second[5 + 58] == 2u,
+	      "the first range as logged, with the push; the second with the pop");
+	auto make = [&](bool gpu_pushpop, TestOracle& o) {
+		auto t = std::make_unique<Pm4Translator>();
+		t->SetNativeLabels(&o, kTrackerVa);
+		t->SetFenceAddress(kFenceVa);
+		t->SetCpShadow(kTestShadowVa, CpShadowMode::Load);
+		t->SetCpShadowPushPop(gpu_pushpop);
+		t->SetCondExec(true);
+		t->SetAudit(true);
+		Start(*t, {{0x10Fu, 0xAu}}, {{0x00Cu, 0xA0u}}, {{0x24Au, 0x3u}});
+		return t;
+	};
+	auto refused = [](const Pm4TranslateResult& r) {
+		if (!r.ok) {
+			std::fprintf(stderr, "    refused at dw %u, detail:", r.unknown_dw);
+			for (uint32_t v: r.unknown_detail) {
+				std::fprintf(stderr, " 0x%08x", v);
+			}
+			std::fprintf(stderr, "\n");
+		}
+	};
+	// Each COND_EXEC on the flag in `ib`, with where its count ends.
+	auto ranges = [&](const std::vector<uint32_t>& ib) {
+		std::vector<std::pair<size_t, size_t>> out;
+		for (size_t i = 0; i + 5 <= ib.size(); i++) {
+			if (ib[i] == 0xc0032200u && ib[i + 1] == static_cast<uint32_t>(kFlag) && ib[i + 2] == 0x10u && ib[i + 3] == 0u) {
+				out.emplace_back(i, i + 5 + ib[i + 4]);
+			}
+		}
+		return out;
+	};
+	auto ends_before = [&](const std::vector<uint32_t>& ib, size_t end, const std::vector<uint32_t>& what) {
+		return end + what.size() <= ib.size() && std::equal(what.begin(), what.end(), ib.begin() + static_cast<std::ptrdiff_t>(end));
+	};
+	// `seeded`: a register no job of ours wrote holds what S was seeded with (a preamble after another process's job LOADs
+	// it from S), else the toy CP's clear state.
+	auto check_gpu = [&](ToyCp& cp, uint32_t set, const char* what, const std::array<uint32_t, 2>* seeded) {
+		Check(flag == 0u, "the flag is clear after them either way");
+		Check(cp.cx[0x10F] == 0xAu, "the context is the one before them either way");
+		Check(set != 0 || (cp.cx[0x110] == (seeded != nullptr ? (*seeded)[0] : ToyCp::Csb(0x110)) &&
+		                   cp.cx[0x191] == (seeded != nullptr ? (*seeded)[1] : ToyCp::Csb(0x191))),
+		      "skipped: no context write of them reaches the GPU");
+		Check(cp.sh[0x00C] == (set != 0 ? 0xB0u : 0xA0u) && cp.sh[0x08C] == (set != 0 ? 0xC0u : 0u) && cp.uc[0x24A] == (set != 0 ? 0x7u : 0x3u), what);
+	};
+	auto check_next = [&](Pm4Translator& t, ToyCp& cp, uint32_t set) {
+		std::vector<uint32_t> next;
+		Append(next, IT_DRAW_INDEX_AUTO, {3u, 2u}, false);
+		auto rn = t.Translate(next);
+		cp.Foreign();
+		cp.Job(AsJob(rn.ib));
+		Check(rn.ok && cp.cx[0x10F] == 0xAu && cp.sh[0x00C] == (set != 0 ? 0xB0u : 0xA0u) && cp.uc[0x24A] == (set != 0 ? 0x7u : 0x3u),
+		      "after the next preamble too");
+	};
+	std::vector<uint32_t> whole = first;
+	whole.insert(whole.end(), second.begin(), second.end());
+	for (const bool gpu_pushpop: {false, true}) {
+		for (const uint32_t set: {0u, 1u}) {
+			// One buffer.
+			{
+				TestOracle o;
+				auto       t = make(gpu_pushpop, o);
+				ToyCp      cp;
+				cp.Seed(*t);
+				cp.flag_va = kFlag;
+				cp.flag    = &flag;
+				flag       = set;
+				auto r     = t->Translate(whole);
+				refused(r);
+				Check(r.ok && r.stats.cond_execs == 2, "the two ranges translate in one buffer");
+				const auto rs = ranges(r.ib);
+				Check(rs.size() == 2 && rs[0].second <= rs[1].first && ends_before(r.ib, rs[1].second, after),
+				      "each count reaches its translated range's end, the second's the draw after it");
+				SetCpShadowValidation(kTestShadowVa);
+				Check(PassesBothChecks(r.ib, NativeIbKind::Gfx), "they pass both packet checks");
+				SetCpShadowValidation(0);
+				cp.Job(AsJob(r.ib));
+				check_gpu(cp, set, set != 0 ? "run: the draw's SH and UCONFIG registers" : "skipped: the old ones", nullptr);
+				check_next(*t, cp, set);
+			}
+			// Two chunks, each with its preamble, another process's job between them; then streamed, the second without one.
+			for (const bool stream: {false, true}) {
+				TestOracle o;
+				auto       t = make(gpu_pushpop, o);
+				ToyCp      cp;
+				cp.Seed(*t);
+				cp.flag_va = kFlag;
+				cp.flag    = &flag;
+				flag       = set;
+				const std::array<uint32_t, 2> seeded = {cp.s[kCpShadowContextDw + 0x110], cp.s[kCpShadowContextDw + 0x191]};
+				t->SetPreambleFromStart(true);
+				auto ra = t->Translate(first);
+				t->SetNoPreamble(stream);
+				auto rb = t->Translate(second);
+				t->SetNoPreamble(false);
+				t->SetPreambleFromStart(false);
+				refused(ra);
+				refused(rb);
+				Check(ra.ok && rb.ok && ra.stats.cond_execs == 1 && rb.stats.cond_execs == 1,
+				      "the chunk with the push left open and the one with its pop translate");
+				const auto rsa = ranges(ra.ib), rsb = ranges(rb.ib);
+				Check(rsa.size() == 1 && rsa[0].second <= ra.ib.size() && rsb.size() == 1 && ends_before(rb.ib, rsb[0].second, after),
+				      "each chunk's count reaches its translated range's end");
+				SetCpShadowValidation(kTestShadowVa);
+				Check(PassesBothChecks(ra.ib, NativeIbKind::Gfx) && PassesBothChecks(rb.ib, NativeIbKind::Gfx), "both pass both packet checks");
+				SetCpShadowValidation(0);
+				if (stream) {
+					std::vector<uint32_t> ib = ra.ib;
+					ib.insert(ib.end(), rb.ib.begin(), rb.ib.end());
+					cp.Job(AsJob(ib));
+				} else {
+					cp.Job(AsJob(ra.ib));
+					Check(cp.cx[0x10F] == (set != 0 ? 0xCu : 0xAu), "between them: the clear's context where the CP ran the push, the old one where not");
+					cp.Foreign();
+					cp.Job(AsJob(rb.ib));
+				}
+				check_gpu(cp, set, stream ? "streamed: the PS5's registers" : "chunked: the PS5's registers", stream ? nullptr : &seeded);
+				check_next(*t, cp, set);
+			}
+		}
+	}
+	// The pop in a range on another flag: which way that one went says nothing of the push.
+	{
+		TestOracle            o;
+		auto                  t     = make(true, o);
+		std::vector<uint32_t> other = cond_on(kFlag + 0x40u, 0x42u);
+		other.insert(other.end(), second.begin() + 5, second.end());
+		std::vector<uint32_t> d = first;
+		d.insert(d.end(), other.begin(), other.end());
+		auto r = t->Translate(d);
+		Check(!r.ok && RefusedFor(r, RefuseWhy::CondExecForm) && r.unknown_detail.size() == 9 && r.unknown_detail[5] == 10u &&
+		          r.unknown_detail[6] == 5u + 57u,
+		      "a pop in a range on another flag refuses (kCondPushOpen at the pop)");
+		auto t2 = make(true, o);
+		Check(t2->Translate(first).ok && !t2->Translate(other).ok, "in the next chunk too");
+	}
+	// The pop outside any range: the title pops where the CP pushed, so the push ran.
+	{
+		TestOracle o;
+		auto       t = make(true, o);
+		ToyCp      cp;
+		cp.Seed(*t);
+		cp.flag_va = kFlag;
+		cp.flag    = &flag;
+		flag       = 1;
+		std::vector<uint32_t> d = first;
+		d.insert(d.end(), second.begin() + 5, second.end());
+		auto r = t->Translate(d);
+		refused(r);
+		Check(r.ok && r.stats.cond_execs == 1, "a pop outside any range after it translates");
+		cp.Job(AsJob(r.ib));
+		Check(cp.cx[0x10F] == 0xAu && cp.sh[0x00C] == 0xB0u, "and pops the context the range pushed");
+		auto rp = t->Translate(first);
+		Check(rp.ok, "the next range with a push translates: none is open");
+	}
+	// libSceAgc's queue reset while it is open: its pop on libSceAgc's push flag, which the title's push set where the CP
+	// ran it. The COND_EXEC stays, over the pop.
+	{
+		TestOracle            o;
+		auto                  t     = make(true, o);
+		const uint64_t        af    = 0x20013e000ull; // libSceAgc's push and pop flags, as the range's check names them
+		std::vector<uint32_t> reset = cond_on(af, 11u);
+		reset.insert(reset.end(), {0xc0001200u, 2u, 0xc0071e00u, 0x40000267u, static_cast<uint32_t>(af), static_cast<uint32_t>(af >> 32u), 0u, 1u, 0u, 0u, 6u});
+		std::vector<uint32_t> d = first;
+		d.insert(d.end(), reset.begin(), reset.end());
+		d.insert(d.end(), after.begin(), after.end());
+		auto r = t->Translate(d);
+		refused(r);
+		size_t at = 0;
+		for (size_t i = 0; i + 5 <= r.ib.size(); i++) {
+			if (r.ib[i] == 0xc0032200u && r.ib[i + 1] == static_cast<uint32_t>(af) && r.ib[i + 2] == 2u) {
+				at = i;
+			}
+		}
+		const auto in   = at != 0 ? Decode(std::vector<uint32_t>(r.ib.begin() + static_cast<std::ptrdiff_t>(at + 5),
+		                                                         r.ib.begin() + static_cast<std::ptrdiff_t>(at + 5 + r.ib[at + 4])))
+		                          : std::vector<Packet> {};
+		Check(r.ok && r.stats.cond_execs == 2 && at != 0 && FindFirst(in, IT_LOAD_CX) != nullptr && ends_before(r.ib, at + 5 + r.ib[at + 4], after),
+		      "the queue reset's COND_EXEC stays over the GPU pop");
+		auto r2 = make(true, o)->Translate(reset);
+		Check(r2.ok && r2.stats.cond_execs == 0, "without an open push it is left out as before");
 	}
 }
 
@@ -7124,6 +7339,7 @@ int main() {
 	TestCondExecRecount();
 	TestCondExecRegisters();
 	TestCondExecTitleForm();
+	TestCondExecSplitPush();
 	TestCondExecMec();
 	TestFlattenCondExecCount();
 	TestCopyDataForms();

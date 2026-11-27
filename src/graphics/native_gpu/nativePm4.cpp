@@ -43,7 +43,7 @@ enum CondRefuse : uint32_t {
 	kCondEndsInPacket = 7, // the range ends inside a packet
 	kCondTooLong      = 8, // the translated range is longer than EXEC_COUNT can say
 	kCondRegister     = 9, // a register inside the range only the GPU knows afterwards, without CP shadowing in load mode
-	kCondPushOpen     = 10, // a context push left open past the range, or a push or pop inside it of one made before it
+	kCondPushOpen     = 10, // a push or pop inside it of a push made before it, or on another flag than the range that left one open
 };
 constexpr uint32_t IT_SET_BASE                 = 0x11;
 constexpr uint32_t IT_SET_PREDICATION          = 0x20;
@@ -1401,6 +1401,36 @@ static void CondLog(uint64_t addr, uint32_t count, bool compute, int settled, bo
 		             compute ? "ACB" : "DCB", static_cast<unsigned long long>(addr), count, static_cast<unsigned long long>(e.seen),
 		             static_cast<unsigned long long>(e.set), flag, static_cast<unsigned long long>(e.cleared),
 		             static_cast<unsigned long long>(e.settled), static_cast<unsigned long long>(e.refused));
+	}
+}
+// A range that leaves a context push open (pushed only where the CP ran it) or closes one a range on its flag left open
+// (the translator's push_cond). KYTY_NATIVE_GPU_COND_LOG=1 logs the first 32 and every 256th after; with
+// KYTY_NATIVE_GPU_COND_DUMP=N the first N buffers holding one go to KYTY_NATIVE_GPU_DUMP_DIR/condpush_<n>.bin as walked.
+static void CondPushNote(uint64_t addr, uint32_t count, bool opened, std::span<const uint32_t> dcb) {
+	static std::atomic<uint64_t> notes {0};
+	static std::atomic<uint32_t> dumped {0};
+	static const uint32_t        dump = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_COND_DUMP");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+	}();
+	const uint64_t n = notes.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (CondLogOn() && (n <= 32 || n % 256 == 0)) {
+		std::fprintf(stderr, "native cond: COND_EXEC flag 0x%llx count 0x%x %s (%llu so far)\n", static_cast<unsigned long long>(addr), count,
+		             opened ? "leaves its context push open: pushed where the CP ran it" : "closes the push a range on its flag left open",
+		             static_cast<unsigned long long>(n));
+	}
+	if (dump != 0 && dumped.load(std::memory_order_relaxed) < dump) {
+		const uint32_t    k    = dumped.fetch_add(1, std::memory_order_relaxed);
+		const char*       dir  = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+		const std::string path = std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") + "/condpush_" + std::to_string(k) + ".bin";
+		if (k < dump) {
+			if (std::FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+				std::fwrite(dcb.data(), 4, dcb.size(), f);
+				std::fclose(f);
+				std::fprintf(stderr, "native cond: buffer with flag 0x%llx written to %s (%zu dwords)\n", static_cast<unsigned long long>(addr),
+				             path.c_str(), dcb.size());
+			}
+		}
 	}
 }
 
@@ -3359,6 +3389,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	auto cx        = m_cx;
 	auto saved_cx  = m_saved_cx;
 	bool cx_pushed = m_cx_pushed;
+	// A push left open by a title's COND_EXEC range (cond_settle_regs): its flag, else 0. Where the CP ran that range
+	// the context is pushed (cx_pushed, saved_cx), where it skipped it it is not.
+	uint64_t push_cond = m_push_cond;
 	auto sh = m_sh;
 	auto uc = m_uc;
 	auto cp = m_cp;
@@ -4759,6 +4792,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		RegFile                             cx, sh, uc;
 		std::array<uint8_t, RegFile::kDense> wcx {}, wsh {}, wuc {};
 		bool                                pushed = false;
+		uint64_t                            push_cond = 0;     // push_cond when it began
+		bool                                lockstep  = false; // run exactly where the range that left that push open ran
+		int                                 note      = 0;     // CondPushNote at its end: 1 it leaves a push open, 2 it closes one
 		uint32_t                            why    = 0; // a CondRefuse cond_close gave
 		uint64_t                            addr   = 0; // its flag (KYTY_NATIVE_GPU_COND_LOG)
 		uint32_t                            count  = 0; // EXEC_COUNT as written
@@ -4811,11 +4847,35 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// the walk left. Where the two are the same (a push and its pop, a write of the value already there) the copy knows the
 	// GPU's value. Where they differ only the GPU knows it: with CP shadowing in load mode S keeps what the CP ran, the
 	// preambles LOAD from S, and such a register is the GPU's (RegWriter::Gpu, as a late table's), so no decision of the
-	// CPU takes the copy's value for the GPU's; without, the buffer is refused. A push left open past the range's end, or a
-	// push or pop inside one of a push made before it, is refused too (a pop the CP may skip would leave the copy's push
-	// state wrong).
+	// CPU takes the copy's value for the GPU's; without, the buffer is refused. A push or pop inside a range of a push made
+	// before it is refused too (where the CP skipped the pop the push would stay open with a state the copy no longer has).
+	// A push the range leaves open is pushed only where the CP ran the range. libSceAgc pairs every push with a pop on every
+	// path the CP takes (its check before each raises the kernel's interrupt on a second push or pop in a row), so the title
+	// pops it where it was pushed: in a later range on the same flag, which the CP runs exactly where it ran this one (the
+	// block of a draw with its own context split over two of the title's segments, one COND_EXEC each), or in libSceAgc's
+	// queue reset, on its own push flag. Until then push_cond holds the flag: inside such a range the push is the copy's
+	// (cx_pushed, saved_cx), where it is skipped there is none; the push and pop run on the GPU where the title has them, in
+	// those ranges, and the registers are settled at each range's end as any other. A push or pop inside a range on another
+	// flag while one is open refuses (push_op_ok), as one inside a range of a push made before it.
+	auto cond_push_state = [&]() {
+		if (cond.push_cond != 0 && !cond.lockstep) {
+			return true; // no push or pop inside (push_op_ok): the open push stays as it was on both ways
+		}
+		const bool skip_pushed = cond.push_cond == 0 && cond.pushed; // skipped: as before the range
+		if (cx_pushed == skip_pushed) {
+			cond.note = cond.push_cond != 0 ? 2 : 0;
+			push_cond = 0;
+			return true;
+		}
+		if (!cx_pushed) {
+			return false; // skipped it stays pushed: a pop of a push made before it (push_op_ok refuses it first)
+		}
+		cond.note = cond.push_cond == 0 ? 1 : 0;
+		push_cond = cond.push_cond != 0 ? cond.push_cond : cond.addr;
+		return true;
+	};
 	auto cond_settle_regs = [&]() {
-		if (cx_pushed != cond.pushed) {
+		if (!cond_push_state()) {
 			cond.why = kCondPushOpen;
 			return false;
 		}
@@ -4890,7 +4950,31 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (CondLogOn()) {
 			CondLog(cond.addr, cond.count, m_compute_ring, cond.settled, false);
 		}
+		if (cond.note != 0) {
+			CondPushNote(cond.addr, cond.count, cond.note == 1, dcb);
+		}
 		return true;
+	};
+	// A context push or pop (an Agc context-state op, 1-3) where the CP may skip it: false refuses the buffer (the detail
+	// set). Inside a range as cond_push_state says. Outside any range while a range's push is open the op shows which way
+	// that range went, as libSceAgc pairs them: a pop, that the CP ran it (the push is the copy's), a push, that it skipped it.
+	auto push_op_ok = [&](uint32_t operation, uint32_t at) {
+		if (operation < 1u || operation > 3u) {
+			return true;
+		}
+		if (!cond.active) {
+			if (push_cond != 0 && operation != 2u) {
+				saved_cx.clear();
+				cx_pushed = false;
+			}
+			push_cond = 0;
+			return true;
+		}
+		if (cond.push_cond != 0 ? cond.lockstep : !cond.pushed) {
+			return true;
+		}
+		cond_detail(kCondPushOpen, at);
+		return false;
 	};
 	// SetInjectWait (KYTY_NATIVE_GPU_INJECT_HANG): a wait nobody satisfies where the body starts, after the preamble, so
 	// in load mode shadowing is on there, as at a title's own wait. The guarded form is what a guest wait the GPU gets
@@ -5686,8 +5770,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					}
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
-					if (cond.active && cond.pushed && bptr[0] >= 1u && bptr[0] <= 3u) {
-						cond_detail(kCondPushOpen, dw);
+					if (!push_op_ok(bptr[0], dw)) {
 						return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
 					}
 					context_state_op(bptr[0]);
@@ -6959,9 +7042,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const uint32_t next = dw + size;
 				// AgcDcbResetQueue op 0x400: on the push flag, a pop (CLEAR_STATE 2) and the flag's swap back to {0, 1}. The
 				// shadow pops only while a push is outstanding, and without one the swap writes what the flag holds, so
-				// both go on as written and the COND_EXEC is left out.
-				if (!m_compute_ring && body_count >= 4 && (bptr[3] & 0x3fffu) == 11u && next + 11u <= dcb.size() &&
-				    dcb[next] == 0xc0001200u && dcb[next + 1] == 2u && dcb[next + 2] == 0xc0071e00u) {
+				// both go on as written and the COND_EXEC is left out. While a range's push is open (push_cond) the flag says
+				// whether the CP ran that push: the COND_EXEC stays, as any other below, and runs the pop exactly there.
+				const bool reset_queue = !m_compute_ring && body_count >= 4 && (bptr[3] & 0x3fffu) == 11u && next + 11u <= dcb.size() &&
+				                         dcb[next] == 0xc0001200u && dcb[next + 1] == 2u && dcb[next + 2] == 0xc0071e00u;
+				if (reset_queue && push_cond == 0) {
 					stats.context_checks++;
 					break;
 				}
@@ -7035,6 +7120,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					cond.wsh        = wsh;
 					cond.wuc        = wuc;
 					cond.pushed     = cx_pushed;
+					cond.push_cond  = push_cond;
+					cond.lockstep   = push_cond != 0 && (addr == push_cond || reset_queue);
+					cond.note       = 0;
 					cond.why        = 0;
 					cond.addr       = addr;
 					cond.count      = bptr[3];
@@ -7062,8 +7150,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// PS5's CP does with register shadowing the kernel sets up. The shadow does them here.
 				reg_write = true;
 				if (body_count >= 1 && (bptr[0] & 0xfu) != 0) {
-					if (cond.active && cond.pushed && (bptr[0] & 0xfu) >= 1u && (bptr[0] & 0xfu) <= 3u) {
-						cond_detail(kCondPushOpen, dw);
+					if (!push_op_ok(bptr[0] & 0xfu, dw)) {
 						return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
 					}
 					context_state_op(bptr[0] & 0xfu);
@@ -7228,6 +7315,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_cx        = std::move(cx);
 	m_saved_cx  = std::move(saved_cx);
 	m_cx_pushed = cx_pushed;
+	m_push_cond = push_cond;
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
 	m_writer_cx       = wcx;

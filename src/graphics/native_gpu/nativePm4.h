@@ -1404,6 +1404,9 @@ private:
 	RegFile                      m_cx_defaults; // what a context clear restores (the seeded defaults)
 	RegFile                      m_saved_cx;    // context pushed by an Agc context-state push
 	bool                         m_cx_pushed = false;
+	// A push a title's COND_EXEC range left open: pushed only where the CP ran that range, so where its flag was set
+	// (the translator's push_cond, 0 when the push state is the same either way).
+	uint64_t                     m_push_cond = 0;
 	RegFile                      m_sh; // SH registers (SET_SH_REG space)
 	RegFile                      m_uc; // whitelisted UCONFIG registers
 	Pm4CpDrawState               m_cp; // CP draw state where the next DCB starts
