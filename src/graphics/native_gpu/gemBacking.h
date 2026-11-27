@@ -40,6 +40,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <drm/amdgpu_drm.h>
@@ -438,6 +439,10 @@ public:
 	}
 
 	~GemBacking() {
+		if (m_va2) {
+			std::fprintf(stderr, "GemBacking: GEM_VA2: %llu ops in %llu ioctls\n", static_cast<unsigned long long>(m_va2_ops),
+			             static_cast<unsigned long long>(m_va2_calls));
+		}
 		if (PrtNetOnUnlocked()) {
 			std::fprintf(stderr, "GemBacking: PRT net: %llu pre-splits, %llu unmaps left PRT\n",
 			             static_cast<unsigned long long>(m_net_presplits.load(std::memory_order_relaxed)),
@@ -558,13 +563,16 @@ public:
 		m_mapping_index.Erase(GpuMappingIndex::Kind::Direct, vaddr, vaddr + size);
 		VaSync                      va_sync(*this, !InPrtApertureUnlocked(vaddr, size));
 		const bool                  over_prt = PreSplitNetUnlocked(vaddr, size);
-		const bool ok = ForEachBackingPiece(offset, size,
+		// The pre-split's PRT ops stay their own ioctls (see PreSplitNetUnlocked); the view's pieces go out together.
+		VaBatch    batch(*this);
+		bool       ok = ForEachBackingPiece(offset, size,
 		                                    [&](const Bo& bo, uint64_t, uint64_t inner, bool resident, bool carved, uint64_t done, uint64_t part) {
 			if (carved) {
 				return VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, vaddr + done, inner, part) == 0;
 			}
 			return VaReplace(resident ? bo.handle : m_dummy.handle, vaddr + done, inner, offset + done, part) == 0;
 		});
+		ok = batch.Flush() == 0 && ok;
 		if (over_prt) {
 			MarkVaStale(); // a KFD queue may hold the PRT translations (zeros) of the hole
 		}
@@ -1328,8 +1336,11 @@ public:
 		::munmap(job->bo_cpu, size);
 		// GPU mappings of every view of the range now map the carve. Plain page flags: the coherent MTYPE
 		// is for system memory the CPU shares, and the CPU does not share display buffers.
-		for (size_t i = 0; i < gpu_pieces.size(); i++) {
-			VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, gpu_pieces[i].first, gpu_pieces[i].second, gpu_lengths[i]);
+		{
+			VaBatch batch(*this);
+			for (size_t i = 0; i < gpu_pieces.size(); i++) {
+				VaOp(AMDGPU_VA_OP_REPLACE, bo.handle, gpu_pieces[i].first, gpu_pieces[i].second, gpu_lengths[i]);
+			}
 		}
 		MarkVaStale(); // KFD queues may hold translations to the block buffers: flushed before the next KFD submission
 		m_carves[b] = Carve {bo, size, true};
@@ -1538,7 +1549,39 @@ private:
 			Ioctl(DRM_IOCTL_SYNCOBJ_DESTROY, &d);
 			m_va_syncobj = 0;
 		}
+		InitVa2();
 		InitVaExplicit();
+	}
+
+	// GEM_VA2 (KYTY_NATIVE_GPU_VA2=0 turns it off) on a 7.3 kernel with amdgpu 3.66 or later, where Valve's SteamOS
+	// kernel has it at 0x1B: probed with a PRT REPLACE on InitVaTimeline's address, which GEM_VA then clears. Never
+	// probed on another kernel line, where 0x1B is another ioctl (AMDGPU_UALINK_HANDLE from 7.4 on). Same conditions as
+	// explicit sync, which GEM_VA2 always does.
+	void InitVa2() {
+		const char* off  = std::getenv("KYTY_NATIVE_GPU_VA2");
+		const char* expl = std::getenv("KYTY_NATIVE_GPU_VA_EXPLICIT");
+		if ((off != nullptr && off[0] == '0') || (expl != nullptr && expl[0] == '0') || !AlwaysValidWanted()) {
+			return;
+		}
+		struct utsname u {};
+		struct drm_version ver {};
+		if (::uname(&u) != 0 || std::strncmp(u.release, "7.3.", 4) != 0 || Ioctl(DRM_IOCTL_VERSION, &ver) != 0 ||
+		    ver.version_major != 3 || ver.version_minor < 66) {
+			return;
+		}
+		GemVaMapping m {0, AMDGPU_VA_OP_REPLACE, AMDGPU_VM_PAGE_PRT, 0, kVaProbeAddress, 0, 0x1000};
+		GemVa2       a;
+		std::memset(&a, 0, sizeof(a));
+		a.num_mappings = 1;
+		a.mappings     = reinterpret_cast<uintptr_t>(&m);
+		const int r    = Ioctl(kIoctlGemVa2, &a);
+		VaOp(AMDGPU_VA_OP_CLEAR, 0, kVaProbeAddress, 0, 0x1000);
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: amdgpu %d.%d on %s has no usable GEM_VA2 (%s); GEM_VA as before\n",
+			             ver.version_major, ver.version_minor, u.release, std::strerror(-r));
+			return;
+		}
+		m_va2 = true;
 	}
 
 	// Every GEM_VA carries AMDGPU_VM_EXPLICIT_SYNC (KYTY_NATIVE_GPU_VA_EXPLICIT=0: none), as the PS5 kernel writes page
@@ -1553,13 +1596,18 @@ private:
 		if ((v != nullptr && v[0] == '0') || !AlwaysValidWanted()) {
 			return;
 		}
-		m_va_explicit = true;
+		m_va_flag10 = true;
 		if (VaOp(AMDGPU_VA_OP_CLEAR, 0, kVaProbeAddress, 0, 0x1000) != 0) {
-			m_va_explicit = false;
+			m_va_flag10 = false;
+		}
+		m_va_explicit = m_va_flag10 || m_va2;
+		if (!m_va_explicit) {
 			std::fprintf(stderr, "GemBacking: this kernel takes no AMDGPU_VM_EXPLICIT_SYNC; page-table updates sync implicitly\n");
 			return;
 		}
-		std::fprintf(stderr, "GemBacking: page-table updates with explicit sync (KYTY_NATIVE_GPU_VA_EXPLICIT=0 turns it off); unmaps leave PRT\n");
+		std::fprintf(stderr, "GemBacking: page-table updates with explicit sync (%s; KYTY_NATIVE_GPU_VA_EXPLICIT=0 turns it off); unmaps leave PRT\n",
+		             m_va2 ? (m_va_flag10 ? "GEM_VA2 batches, GEM_VA flag for CLEAR" : "GEM_VA2 batches, CLEAR implicit")
+		                   : "GEM_VA flag");
 	}
 	// Waits for the page-table update of the last VaOp, up to `timeout_ms`. False on a timeout or an error.
 	bool WaitVaUpdates(int timeout_ms = 50) const {
@@ -1588,9 +1636,13 @@ private:
 					const auto& e = m_va_recent[k % m_va_recent.size()];
 					if (e.point == k) {
 						char one[64];
-						std::snprintf(one, sizeof(one), " %llu:%s%s/%lluK", static_cast<unsigned long long>(k),
+						char batch[16] = "";
+						if (e.count > 1) {
+							std::snprintf(batch, sizeof(batch), "x%u", e.count);
+						}
+						std::snprintf(one, sizeof(one), " %llu:%s%s%s/%lluK", static_cast<unsigned long long>(k),
 						              e.op == AMDGPU_VA_OP_REPLACE ? "R" : e.op == AMDGPU_VA_OP_CLEAR ? "C" : e.op == AMDGPU_VA_OP_MAP ? "M" : "U",
-						              e.target == 2 ? "dummy" : e.target == 1 ? "bo" : "", static_cast<unsigned long long>(e.size >> 10u));
+						              e.target == 2 ? "dummy" : e.target == 1 ? "bo" : "", batch, static_cast<unsigned long long>(e.size >> 10u));
 						ops += one;
 					}
 				}
@@ -1640,20 +1692,78 @@ private:
 	};
 	static_assert(sizeof(GemVaTimeline) == 64 && sizeof(drm_amdgpu_gem_va) <= sizeof(GemVaTimeline));
 
+	// Valve's AMDGPU_GEM_VA2 (SteamOS 7.3, amdgpu 3.66): an array of VA ops in one ioctl, whose page-table updates go
+	// to the SDMA as one submission with one fence, and unmaps of always-valid buffers and PRT synced explicitly, as
+	// AMDGPU_VM_EXPLICIT_SYNC asks of GEM_VA. Valve declares the ioctl with drm_amdgpu_gem_va's size (DRM matches the
+	// number only). 0x1B is AMDGPU_UALINK_HANDLE from Linux 7.4 on: InitVa2 only probes a 7.3 kernel.
+	struct GemVaMapping {
+		uint32_t handle;
+		uint32_t operation;
+		uint32_t flags;
+		uint32_t pad;
+		uint64_t va;
+		uint64_t offset_in_bo;
+		uint64_t map_size;
+	};
+	struct GemVa2 {
+		uint32_t num_mappings;
+		uint32_t pad;
+		uint64_t mappings;
+		uint32_t num_syncobjs_in;
+		uint32_t num_syncobjs_out;
+		uint64_t syncobjs_in;
+		uint64_t timeline_points_in;
+		uint64_t syncobjs_out;
+		uint64_t timeline_points_out;
+	};
+	static_assert(sizeof(GemVaMapping) == 40 && sizeof(GemVa2) == 56);
+	static constexpr unsigned long kIoctlGemVa2 = DRM_IOW(DRM_COMMAND_BASE + 0x1B, GemVaTimeline);
+
+	// In a mapping call: the REPLACE and MAP VaOps until it ends (or Flush) go out as one GEM_VA2. Without GEM_VA2 each
+	// VaOp goes out at once, as before. Declared after the call's VaSync, so it flushes before VaSync waits. Any other
+	// VaOp flushes what is queued first, so the kernel sees the ops in their order.
+	struct VaBatch {
+		const GemBacking& g;
+		bool              on = true;
+		explicit VaBatch(const GemBacking& b): g(b) { g.m_va_batch_depth++; }
+		~VaBatch() { Flush(); }
+		int Flush() {
+			if (!on) {
+				return 0;
+			}
+			on = false;
+			return --g.m_va_batch_depth == 0 ? g.FlushVaBatch() : 0;
+		}
+		VaBatch(const VaBatch&)            = delete;
+		VaBatch& operator=(const VaBatch&) = delete;
+	};
+
 	int VaOp(uint32_t op, uint32_t handle, uint64_t vaddr, uint64_t offset_in_bo, uint64_t size,
 	         uint32_t page_flags = kRwxPageFlags) const {
+		// GEM_VA2 for REPLACE and MAP only: Valve's 7.3.1 hands UNMAP its flags as the address, and its CLEAR has no
+		// bo_va for the sync after each op (a NULL dereference). CLEAR and UNMAP stay on GEM_VA.
+		if (m_va2 && (op == AMDGPU_VA_OP_REPLACE || op == AMDGPU_VA_OP_MAP)) {
+			if (m_va_trace != nullptr) {
+				m_va_trace->push_back({op, handle, vaddr, size, page_flags});
+			}
+			m_va_batch.push_back({handle, op, page_flags, 0, vaddr, offset_in_bo, size});
+			return m_va_batch_depth == 0 ? FlushVaBatch() : 0;
+		}
+		if (!m_va_batch.empty()) {
+			FlushVaBatch();
+		}
 		GemVaTimeline v;
 		std::memset(&v, 0, sizeof(v));
 		v.handle       = handle;
 		v.operation    = op;
-		v.flags        = page_flags | (m_va_explicit ? kVmExplicitSync : 0u);
+		v.flags        = page_flags | (m_va_flag10 ? kVmExplicitSync : 0u);
 		v.va_address   = vaddr;
 		v.offset_in_bo = offset_in_bo;
 		v.map_size     = size;
 		if (m_va_syncobj != 0) {
 			v.vm_timeline_syncobj_out = m_va_syncobj;
 			v.vm_timeline_point       = ++m_va_point;
-			m_va_recent[m_va_point % m_va_recent.size()] = {m_va_point, op, handle == m_dummy.handle ? 2u : handle != 0 ? 1u : 0u, size};
+			m_va_recent[m_va_point % m_va_recent.size()] = {m_va_point, op, handle == m_dummy.handle ? 2u : handle != 0 ? 1u : 0u, size, 1};
 		}
 		if (m_va_trace != nullptr) {
 			m_va_trace->push_back({op, handle, vaddr, size, page_flags});
@@ -1666,6 +1776,47 @@ private:
 			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
 			             std::strerror(-r));
 		}
+		return r;
+	}
+
+	// The queued REPLACE and MAP ops as one GEM_VA2, its page-table update fence on the timeline (one point for all).
+	int FlushVaBatch() const {
+		if (m_va_batch.empty()) {
+			return 0;
+		}
+		GemVa2 a;
+		std::memset(&a, 0, sizeof(a));
+		a.num_mappings    = static_cast<uint32_t>(m_va_batch.size());
+		a.mappings        = reinterpret_cast<uintptr_t>(m_va_batch.data());
+		uint32_t handle   = m_va_syncobj;
+		uint64_t point    = 0;
+		if (m_va_syncobj != 0) {
+			point                 = ++m_va_point;
+			a.num_syncobjs_out    = 1;
+			a.syncobjs_out        = reinterpret_cast<uintptr_t>(&handle);
+			a.timeline_points_out = reinterpret_cast<uintptr_t>(&point);
+			uint64_t total        = 0;
+			for (const auto& m: m_va_batch) {
+				total += m.map_size;
+			}
+			const auto& last = m_va_batch.back();
+			m_va_recent[point % m_va_recent.size()] = {point, last.operation,
+			                                           last.handle == m_dummy.handle ? 2u : last.handle != 0 ? 1u : 0u, total,
+			                                           static_cast<uint32_t>(m_va_batch.size())};
+		}
+		m_va2_ops += m_va_batch.size();
+		m_va2_calls++;
+		const int r = Ioctl(kIoctlGemVa2, &a);
+		if ((m_va2_calls & 0xffffu) == 0) {
+			std::fprintf(stderr, "GemBacking: GEM_VA2: %llu ops in %llu ioctls so far\n",
+			             static_cast<unsigned long long>(m_va2_ops), static_cast<unsigned long long>(m_va2_calls));
+		}
+		if (r != 0) {
+			std::fprintf(stderr, "GemBacking: GEM_VA2 of %zu ops from 0x%llx (+0x%llx) failed: %s\n", m_va_batch.size(),
+			             static_cast<unsigned long long>(m_va_batch.front().va),
+			             static_cast<unsigned long long>(m_va_batch.front().map_size), std::strerror(-r));
+		}
+		m_va_batch.clear();
 		return r;
 	}
 
@@ -2902,14 +3053,21 @@ private:
 	mutable uint32_t              m_va_slow    = 0;       // slow or failed ones logged
 	struct VaRecent {
 		uint64_t point;
-		uint32_t op;
+		uint32_t op;     // the last op at this point
 		uint32_t target; // 2 the dummy, 1 a buffer, 0 none
-		uint64_t size;
+		uint64_t size;   // all ops at this point
+		uint32_t count;  // ops at this point: more than 1 for a GEM_VA2 batch
 	};
 	mutable std::array<VaRecent, 64> m_va_recent {}; // the last VaOps, for the slow-wait log
 	static constexpr uint64_t     kVaProbeAddress = 0x6f0000000000ull; // InitVaTimeline's CLEAR, nothing maps it
 	static constexpr uint32_t     kVmExplicitSync = 1u << 10u;         // AMDGPU_VM_EXPLICIT_SYNC (Linux 6.11)
-	bool                          m_va_explicit   = false;             // InitVaExplicit
+	bool                          m_va_explicit   = false;             // InitVaExplicit: unmaps sync explicitly (GEM_VA flag or GEM_VA2)
+	bool                          m_va_flag10     = false;             // InitVaExplicit: GEM_VA takes AMDGPU_VM_EXPLICIT_SYNC
+	bool                          m_va2           = false;             // InitVa2: REPLACE and MAP go out as GEM_VA2
+	mutable std::vector<GemVaMapping> m_va_batch;                       // VaBatch's queued ops
+	mutable int                   m_va_batch_depth = 0;                 // open VaBatch scopes
+	mutable uint64_t              m_va2_ops   = 0;                      // ops and ioctls sent as GEM_VA2
+	mutable uint64_t              m_va2_calls = 0;
 	int                           m_mem_fd = -1;
 	int                           m_kfd_fd  = -1; // KYTY_NATIVE_GPU_KFD_MEMORY: see InitKfd
 	uint32_t                      m_kfd_gpu = 0;
