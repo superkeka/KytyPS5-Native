@@ -1,7 +1,8 @@
-import { ButtonItem, ConfirmModal, Field, PanelSection, PanelSectionRow, showModal, staticClasses } from "@decky/ui";
+import { ButtonItem, ConfirmModal, DropdownItem, Field, PanelSection, PanelSectionRow, showModal, staticClasses } from "@decky/ui";
 import { definePlugin, routerHook } from "@decky/api";
 import { FaPlaystation } from "react-icons/fa";
 import {
+  Channel,
   KernelItem,
   autoSync,
   installKyty,
@@ -9,7 +10,10 @@ import {
   kernelRevert,
   latestRelease,
   reboot,
+  rollbackKyty,
+  setChannel,
   short,
+  tagChannel,
   toast,
   updatePlugin,
   usePlugin,
@@ -31,6 +35,29 @@ function Content() {
 
   const kytyUpdate = !!release?.kyty_url && release.tag !== state.kyty_version;
   const pluginUpdate = !!release?.plugin_url && !!state.plugin_release && release.tag !== state.plugin_release;
+  // Switching the channel reads its release: any tag other than the installed one is offered, an older one too.
+  const channelRow = (
+    <PanelSectionRow>
+      <DropdownItem
+        label="Channel"
+        description={
+          state.kyty_installed
+            ? `Installed: ${short(state.kyty_version) || "unknown"}${tagChannel(state.kyty_version) ? ` (${tagChannel(state.kyty_version)})` : ""}`
+            : "Stable: tested releases. Nightly: the newest builds"
+        }
+        disabled={!!busy}
+        rgOptions={(["stable", "nightly"] as Channel[]).map((c) => ({ data: c, label: c }))}
+        selectedOption={release?.channel ?? state.channel}
+        onChange={(option) =>
+          run("Channel", async () => {
+            const r = await setChannel(option.data);
+            setRelease(r);
+            if (r.error) toast(`No ${option.data} release: ${r.error}`);
+          })
+        }
+      />
+    </PanelSectionRow>
+  );
   const kernelText = (it: KernelItem) =>
     it.reverting ? "on until reboot" : it.ok ? "on" : it.pending ? "after reboot" : it.configured ? `set to ${it.configured}` : "off";
 
@@ -47,11 +74,12 @@ function Content() {
             {state.kyty_installed ? short(state.kyty_version) || "installed" : "not installed"}
           </Field>
         </PanelSectionRow>
+        {!state.kyty_installed && channelRow}
         {!state.kyty_installed && (
           <PanelSectionRow>
             <ButtonItem
               layout="below"
-              disabled={!!busy || state.game_running}
+              disabled={!!busy || state.game_running || !release?.kyty_url}
               onClick={() =>
                 run("Installing KytyPS5-Native", async () => {
                   const r = await installKyty(release!.kyty_url!, release!.tag);
@@ -126,6 +154,7 @@ function Content() {
             )}
           </PanelSectionRow>
         )}
+        {state.kyty_installed && channelRow}
         {state.kyty_installed && (
           <PanelSectionRow>
             <ButtonItem
@@ -159,6 +188,30 @@ function Content() {
               }
             >
               {busy === "Update" ? "Updating..." : busy === "Check" ? "Checking..." : "Updates"}
+            </ButtonItem>
+          </PanelSectionRow>
+        )}
+        {state.kyty_installed && (
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              description={state.kyty_previous ? `Back to ${short(state.kyty_previous)}` : "No previous version kept yet"}
+              disabled={!!busy || !state.kyty_previous || state.game_running}
+              onClick={() =>
+                confirm(
+                  "Previous version",
+                  `Go back to KytyPS5-Native ${short(state.kyty_previous)}? The one installed now (${short(state.kyty_version)}) is kept as the previous.`,
+                  "Go back",
+                  () =>
+                    run("Rollback", async () => {
+                      const r = await rollbackKyty();
+                      toast(r.ok ? `KytyPS5-Native ${short(r.tag || state.kyty_previous)} restored` : r.log || "failed");
+                      setRelease(await latestRelease());
+                    }),
+                )
+              }
+            >
+              {busy === "Rollback" ? "Restoring..." : "Previous version"}
             </ButtonItem>
           </PanelSectionRow>
         )}
