@@ -12,6 +12,7 @@ import {
   reboot,
   rollbackKyty,
   setChannel,
+  pretty,
   short,
   tagChannel,
   toast,
@@ -40,11 +41,6 @@ function Content() {
     <PanelSectionRow>
       <DropdownItem
         label="Channel"
-        description={
-          state.kyty_installed
-            ? `Installed: ${short(state.kyty_version) || "unknown"}${tagChannel(state.kyty_version) ? ` (${tagChannel(state.kyty_version)})` : ""}`
-            : "Stable: tested releases. Nightly: the newest builds"
-        }
         disabled={!!busy}
         rgOptions={(["stable", "nightly"] as Channel[]).map((c) => ({ data: c, label: c }))}
         selectedOption={release?.channel ?? state.channel}
@@ -67,11 +63,14 @@ function Content() {
         <PanelSectionRow>
           <Field
             label="Version"
-            description={
-              !state.ps5_apu ? "Vulkan path (native mode needs the PS5's APU)" : state.helper ? "Native mode, root helper running" : "Root helper not running"
-            }
+            description={[
+              state.kyty_installed && tagChannel(state.kyty_version),
+              !state.ps5_apu ? "Vulkan path (native mode needs the PS5's APU)" : state.helper ? "Native mode, root helper running" : "Root helper not running",
+            ]
+              .filter(Boolean)
+              .join(" · ")}
           >
-            {state.kyty_installed ? short(state.kyty_version) || "installed" : "not installed"}
+            <span style={{ whiteSpace: "nowrap" }}>{state.kyty_installed ? pretty(state.kyty_version) || "installed" : "not installed"}</span>
           </Field>
         </PanelSectionRow>
         {!state.kyty_installed && channelRow}
@@ -161,8 +160,10 @@ function Content() {
               layout="below"
               description={
                 kytyUpdate || pluginUpdate
-                  ? `${short(release!.tag)} is out: press to update`
-                  : `Plugin ${short(state.plugin_release) || state.plugin_version}: press to check`
+                  ? `${pretty(release!.tag, true)} is out: press to update`
+                  : release && !release.error
+                    ? "Up to date"
+                    : "Press to check"
               }
               disabled={!!busy || ((kytyUpdate || pluginUpdate) && state.game_running)}
               onClick={() =>
@@ -174,7 +175,7 @@ function Content() {
                           toast(r.log || "failed");
                           return;
                         }
-                        toast(`KytyPS5-Native ${short(release!.tag)} installed`);
+                        toast(`${pretty(release!.tag, true)} installed`);
                       }
                       if (pluginUpdate) await updatePlugin(release!);
                     })
@@ -183,7 +184,7 @@ function Content() {
                       setRelease(r);
                       const kyty = !!r.kyty_url && r.tag !== state.kyty_version;
                       const plugin = !!r.plugin_url && !!state.plugin_release && r.tag !== state.plugin_release;
-                      toast(r.error ? `No connection to GitHub: ${r.error}` : kyty || plugin ? `${short(r.tag)} is out` : "Up to date");
+                      toast(r.error ? `No connection to GitHub: ${r.error}` : kyty || plugin ? `${pretty(r.tag, true)} is out` : "Up to date");
                     })
               }
             >
@@ -195,17 +196,17 @@ function Content() {
           <PanelSectionRow>
             <ButtonItem
               layout="below"
-              description={state.kyty_previous ? `Back to ${short(state.kyty_previous)}` : "No previous version kept yet"}
+              description={state.kyty_previous ? `Back to ${pretty(state.kyty_previous, true)}` : "No previous version kept yet"}
               disabled={!!busy || !state.kyty_previous || state.game_running}
               onClick={() =>
                 confirm(
                   "Previous version",
-                  `Go back to KytyPS5-Native ${short(state.kyty_previous)}? The one installed now (${short(state.kyty_version)}) is kept as the previous.`,
+                  `Go back to ${pretty(state.kyty_previous, true)}? The one installed now (${pretty(state.kyty_version, true)}) is kept as the previous.`,
                   "Go back",
                   () =>
                     run("Rollback", async () => {
                       const r = await rollbackKyty();
-                      toast(r.ok ? `KytyPS5-Native ${short(r.tag || state.kyty_previous)} restored` : r.log || "failed");
+                      toast(r.ok ? `${pretty(r.tag || state.kyty_previous, true)} restored` : r.log || "failed");
                       setRelease(await latestRelease());
                     }),
                 )

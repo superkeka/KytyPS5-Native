@@ -133,6 +133,13 @@ export const toast = (body: string, title = "KytyPS5-Native") => toaster.toast({
 // Release tags without the project name: 2026-10-29-6957c86 (nightly-2026-10-29-6957c86 stays as is).
 export const short = (tag: string) => tag.replace(/^KytyPS5-Native-/, "");
 export const tagChannel = (tag: string): Channel | "" => (!tag ? "" : tag.startsWith("nightly-") ? "nightly" : "stable");
+// A release tag the way the panel shows it, on one line: "27.11 · e8a5324" (withChannel: "nightly 27.11 · e8a5324").
+export const pretty = (tag: string, withChannel = false) => {
+  const m = /^(?:KytyPS5-Native-|nightly-)?\d{4}-(\d{2})-(\d{2})-([0-9a-f]+)$/.exec(tag || "");
+  if (!m) return short(tag);
+  const text = `${m[2]}.${m[1]} · ${m[3]}`;
+  return withChannel ? `${tagChannel(tag)} ${text}` : text;
+};
 export const gigabytes = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB`;
 
 // Decky's own installer (as its store): asks, swaps the files and reloads this plugin alone. Without
