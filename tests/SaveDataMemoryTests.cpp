@@ -751,6 +751,142 @@ void TestSearchSortKeys() {
 	CHECK(search(SaveDataSortKey::Blocks, SaveDataSortOrder::Ascent) == "alpha bravo charlie");
 }
 
+int MountTxn(const char* text, uint32_t mode, int32_t resource, SaveDataMountResult* result) {
+	const auto            name = DirName(text);
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &name;
+	mount.mount_mode = mode;
+	mount.blocks     = 0x30;
+	mount.resource   = resource;
+	*result          = {};
+	return SaveDataMount3(&mount, result);
+}
+
+void WriteMounted(const SaveDataMountResult& result, const char* file, const std::string& text) {
+	std::ofstream(g_test_mounts.at(result.mount_point.data) / file) << text;
+}
+
+std::string ReadMounted(const SaveDataMountResult& result, const char* file) {
+	std::ifstream in(g_test_mounts.at(result.mount_point.data) / file);
+	std::string   text;
+	in >> text;
+	return text;
+}
+
+void TestTransactionDiscardedWithoutCommit() {
+	Reset("TXNDROP");
+	const auto save = fs::path("_SaveData/TXNDROP/SAVEDATA00");
+	SaveDataMountResult result {};
+	CHECK(MountTxn("SAVEDATA00", 4, 0, &result) == OK);
+	WriteMounted(result, "old", "old");
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+
+	const int32_t resource = SaveDataCreateTransactionResource(0x10000);
+	CHECK(resource > 0);
+	const auto            name = DirName("SAVEDATA00");
+	struct SaveDataDelete del {};
+	del.user_id  = 1;
+	del.dir_name = &name;
+	CHECK(SaveDataDelete(&del) == OK);
+	CHECK(!fs::exists(save));
+
+	CHECK(MountTxn("SAVEDATA00", 0x20, resource, &result) == OK && result.mount_status == 1);
+	// The directory created inside the transaction is not visible yet.
+	CHECK(!fs::exists(save));
+	CHECK(Search(1).empty());
+	SaveDataPrepareParam prepare {};
+	prepare.resource = resource;
+	CHECK(SaveDataPrepare(&result.mount_point, &prepare) == OK);
+	WriteMounted(result, "SPACECHECK00.dat", std::string(64, 'x'));
+	const auto busy = DirName("SAVEDATA00");
+	del.dir_name    = &busy;
+	CHECK(SaveDataDelete(&del) == SAVE_DATA_ERROR_BUSY);
+	SaveDataMountResult other {};
+	CHECK(MountTxn("SAVEDATA00", 2, 0, &other) == SAVE_DATA_ERROR_BUSY);
+	CHECK(SaveDataUmount2(2, &result.mount_point) == OK);
+
+	CHECK(!fs::exists(save));
+	CHECK(!fs::exists("_SaveData/TXNDROP/.txn"));
+	CHECK(MountTxn("SAVEDATA00", 1, 0, &result) == SAVE_DATA_ERROR_NOT_FOUND);
+	CHECK(MountTxn("SAVEDATA00", 1, resource, &result) == SAVE_DATA_ERROR_NOT_FOUND);
+	CHECK(SaveDataDeleteTransactionResource(resource) == OK);
+	CHECK(SaveDataDeleteTransactionResource(resource) == SAVE_DATA_ERROR_PARAMETER);
+}
+
+void TestTransactionCommit() {
+	Reset("TXNCOMMIT");
+	const auto    save     = fs::path("_SaveData/TXNCOMMIT/SAVEDATA00");
+	const int32_t resource = SaveDataCreateTransactionResource(0x10000);
+	SaveDataMountResult result {};
+	CHECK(MountTxn("SAVEDATA00", 0x20, resource, &result) == OK);
+	SaveDataPrepareParam prepare {};
+	prepare.resource = resource + 1;
+	CHECK(SaveDataPrepare(&result.mount_point, &prepare) == SAVE_DATA_ERROR_PARAMETER);
+	prepare.resource = resource;
+	CHECK(SaveDataPrepare(&result.mount_point, &prepare) == OK);
+	WriteMounted(result, "SPACECHECK00.dat", "first");
+	SaveDataCommitParam commit {};
+	commit.resource = resource + 1;
+	CHECK(SaveDataCommit(&commit) == SAVE_DATA_ERROR_PARAMETER);
+	commit.resource = resource;
+	CHECK(SaveDataCommit(&commit) == OK);
+	CHECK(fs::exists(save / "SPACECHECK00.dat") && fs::exists(save / "sce_sys/param.bin"));
+	CHECK(Search(1) == std::vector<std::string> {"SAVEDATA00"});
+	// Writes after the commit stay private until the next one.
+	WriteMounted(result, "late", "late");
+	CHECK(SaveDataUmount2(2, &result.mount_point) == OK);
+	CHECK(!fs::exists(save / "late"));
+	CHECK(MountTxn("SAVEDATA00", 1, 0, &result) == OK && result.mount_status == 0);
+	CHECK(ReadMounted(result, "SPACECHECK00.dat") == "first");
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+
+	// An existing save keeps its old contents until a commit replaces them.
+	CHECK(MountTxn("SAVEDATA00", 2, resource, &result) == OK && result.mount_status == 0);
+	CHECK(ReadMounted(result, "SPACECHECK00.dat") == "first");
+	CHECK(SaveDataPrepare(&result.mount_point, &prepare) == OK);
+	WriteMounted(result, "SPACECHECK00.dat", "second");
+	WriteMounted(result, "extra", "extra");
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	CHECK(MountTxn("SAVEDATA00", 1, 0, &result) == OK);
+	CHECK(ReadMounted(result, "SPACECHECK00.dat") == "first");
+	CHECK(!fs::exists(save / "extra"));
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+
+	CHECK(MountTxn("SAVEDATA00", 2, resource, &result) == OK);
+	CHECK(SaveDataPrepare(&result.mount_point, &prepare) == OK);
+	WriteMounted(result, "SPACECHECK00.dat", "second");
+	CHECK(SaveDataCommit(&commit) == OK);
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	CHECK(MountTxn("SAVEDATA00", 1, 0, &result) == OK);
+	CHECK(ReadMounted(result, "SPACECHECK00.dat") == "second");
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	CHECK(!fs::exists("_SaveData/TXNCOMMIT/.txn"));
+
+	// A deleted resource cannot commit, and its mount is discarded on unmount.
+	CHECK(MountTxn("SAVEDATA00", 2, resource, &result) == OK);
+	CHECK(SaveDataPrepare(&result.mount_point, &prepare) == OK);
+	WriteMounted(result, "SPACECHECK00.dat", "third");
+	CHECK(SaveDataDeleteTransactionResource(resource) == OK);
+	CHECK(SaveDataCommit(&commit) == SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	CHECK(MountTxn("SAVEDATA00", 1, 0, &result) == OK);
+	CHECK(ReadMounted(result, "SPACECHECK00.dat") == "second");
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+
+	// Mounts without a live resource write straight into the save.
+	CHECK(MountTxn("SAVEDATA00", 2, resource, &result) == OK);
+	CHECK(g_mounted_directory == save);
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+
+	// A commit interrupted after moving the old save aside is undone on the next mount.
+	fs::create_directories("_SaveData/TXNCOMMIT/.txn");
+	fs::rename(save, "_SaveData/TXNCOMMIT/.txn/SAVEDATA00.old");
+	CHECK(MountTxn("SAVEDATA00", 1, 0, &result) == OK);
+	CHECK(ReadMounted(result, "SPACECHECK00.dat") == "second");
+	CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+}
+
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
 	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
@@ -799,6 +935,8 @@ int main(int argc, char** argv) {
 	TestSaveAllocations();
 	TestClassicSaveParams();
 	TestSearchSortKeys();
+	TestTransactionDiscardedWithoutCommit();
+	TestTransactionCommit();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);
