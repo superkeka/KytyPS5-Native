@@ -1139,11 +1139,22 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
-	info->type             = 0;
-	info->available_bits   = 0x03;
-	info->flags            = 0;
-	info->speaker_angle[0] = {-30, 0};
-	info->speaker_angle[1] = {30, 0};
+	info->type  = 0;
+	info->flags = 0;
+
+	// Speakers in the order FL FR C LFE BL BR SL SR; the ports still take 8 channels, 5.1 is sent in them.
+	const int host     = DetectedOutputChannels();
+	const int speakers = host >= 8 ? 8 : (host >= 6 ? 6 : 2);
+	if (speakers > 2) {
+		info->available_bits = (1u << speakers) - 1;
+		static constexpr AudioOut2SpeakerAngle ANGLES[8] = {{-30, 0}, {30, 0},   {0, 0},    {0, 0},
+		                                                    {-135, 0}, {135, 0}, {-90, 0}, {90, 0}};
+		std::copy(ANGLES, ANGLES + speakers, info->speaker_angle);
+	} else {
+		info->available_bits   = 0x03;
+		info->speaker_angle[0] = {-30, 0};
+		info->speaker_angle[1] = {30, 0};
+	}
 
 	return OK;
 }

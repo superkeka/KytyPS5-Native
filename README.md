@@ -39,7 +39,9 @@ Each game has a page in the plugin, also opened from the game's menu in the libr
 (KytyPS5-Native...): its patches (cheats from the
 [HEN Cheats Collection](https://github.com/TeeKay87/HEN-Cheats-Collection) made for the game's exact
 version) and its add-ons, each with a switch, and the game's own settings: its present mode
-(Mailbox by default; FIFO suits a game that runs faster than the display).
+(Mailbox by default; FIFO suits a game that runs faster than the display) and its audio output
+channels (stereo, 5.1 or 7.1; by default the output device's, so SteamOS's setting, which can also
+be set for every game in the plugin's Audio tab).
 
 ### Other systems
 

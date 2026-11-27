@@ -14,6 +14,14 @@ struct Lifecycle {
 	static constexpr auto        shutdown   = Libs::Audio::Shutdown;
 };
 
+// Channels of the host's default playback device (2, 6, 8...), 0 when it can't be read. Cached;
+// `refresh` asks the device again (only while no stream is open).
+int DetectedOutputChannels(bool refresh = false);
+
+// What the guest is told its speakers can take: 8 (7.1 PCM) for a 5.1 or larger device, which SDL
+// folds down to the device's layout; 1 or 2 otherwise. 2 when the device can't be read.
+int ReportedOutputChannels();
+
 namespace AudioOut {
 
 struct AudioOutOutputParam;

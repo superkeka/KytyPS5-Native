@@ -15,6 +15,9 @@
 # --addcont-dir, the way the launcher's add-ons folder setting does.
 # ~/.config/KytyPS5-Native/present-mode/<title id> holds the game's present mode while it is not Kyty's
 # default (Mailbox): the word Fifo or Immediate on its first line. The plugin's game page writes it.
+# ~/.config/KytyPS5-Native/audio/<title id> and ~/.config/KytyPS5-Native/audio-default hold the audio
+# output's channels (KYTY_AUDIO_CHANNELS): 2, 6 or 8, or auto for what the device reports. The game's
+# file wins over the global one. The plugin writes them.
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -69,6 +72,20 @@ if [ -f "$PRESENT" ]; then
 	Fifo | Mailbox | Immediate) PRESENT_ARGS=(--present-mode "$present_mode") ;;
 	esac
 fi
+# The audio output's channels (KYTY_AUDIO_CHANNELS: 2, 6 or 8) from the plugin's audio settings: the
+# game's own file, else the global one; "auto" or no file leaves what the output device reports.
+AUDIO_FILE=
+audio_channels=
+for f in "$CONFIG/audio/$TITLE" "$CONFIG/audio-default"; do
+	if [ -f "$f" ]; then
+		AUDIO_FILE=$f
+		audio_channels=$(head -1 "$f" | tr -d '[:space:]')
+		break
+	fi
+done
+case $audio_channels in
+2 | 6 | 8) export KYTY_AUDIO_CHANNELS=$audio_channels ;;
+esac
 # Games run on the gamescope Xwayland Steam gives them, the base layer is set on the root one (:0).
 export DISPLAY=${DISPLAY:-:1}
 ROOT_DISPLAY=${KYTYPS5_ROOT_DISPLAY:-:0}
@@ -202,6 +219,11 @@ front "$GAME_APPID"
 		echo "patches from $PATCH"
 	elif [ -f "$PATCH" ]; then
 		echo "patches in $PATCH are for version '$patch_version', the game is '$game_version': left out"
+	fi
+	if [ -n "${KYTY_AUDIO_CHANNELS:-}" ]; then
+		echo "audio channels from $AUDIO_FILE: $KYTY_AUDIO_CHANNELS"
+	elif [ -n "$AUDIO_FILE" ] && [ "$audio_channels" != auto ]; then
+		echo "audio channels in $AUDIO_FILE are '$audio_channels', not 2, 6, 8 or auto: left out"
 	fi
 	if [ ${#PRESENT_ARGS[@]} -gt 0 ]; then
 		echo "present mode from $PRESENT: $present_mode"

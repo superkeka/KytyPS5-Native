@@ -16,7 +16,7 @@ import {
   useParams,
 } from "@decky/ui";
 import { Dispatch, SetStateAction, useEffect, useRef, useState } from "react";
-import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setPatch, setPresentMode, toast } from "./api";
+import { GameInfo, Patches, findAddons, getGame, getPatches, gigabytes, setAddon, setAudio, setPatch, setPresentMode, toast } from "./api";
 
 // Sizes and colours are those of Steam's page of a game, so the two read as one.
 const CSS = `
@@ -44,6 +44,15 @@ const TABS: TabId[] = ["patches", "addons", "settings", "about"];
 const PRESENT_MODES: [string, string][] = [
   ["Mailbox", "Mailbox (default)"],
   ["Fifo", "FIFO"],
+];
+
+// The audio output's channels offered for a game: [what the plugin's backend takes, its name here].
+const AUDIO_MODES: [string, string][] = [
+  ["global", "Global setting"],
+  ["auto", "Auto (the output device)"],
+  ["2", "Stereo"],
+  ["6", "5.1"],
+  ["8", "7.1"],
 ];
 
 const steamStore = () => (window as any).appStore;
@@ -377,8 +386,27 @@ function SettingsTab(props: { game: GameInfo; setGame: Dispatch<SetStateAction<G
       setGame(await getGame(game.title_id));
     }
   };
+  const changeAudio = async (mode: string) => {
+    setGame((g) => g && { ...g, audio: mode });
+    const r = await setAudio(game.title_id, mode);
+    if (!r.ok) {
+      toast(r.log || "failed", game.name);
+      setGame(await getGame(game.title_id));
+    }
+  };
   return (
     <DialogControlsSection>
+      <DropdownItem
+        label="Audio output channels"
+        description={
+          "How many speakers this game is told the output has. Stereo can lighten a game that mixes more " +
+          "channels than it needs; 7.1 on a 5.1 output is mixed down by the system. " +
+          "Applies from the game's next start"
+        }
+        rgOptions={AUDIO_MODES.map(([data, label]) => ({ data, label }))}
+        selectedOption={game.audio}
+        onChange={(option) => changeAudio(option.data)}
+      />
       <DropdownItem
         label="Present mode"
         description={

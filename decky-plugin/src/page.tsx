@@ -5,6 +5,7 @@ import {
   DialogButton,
   DialogControlsSection,
   DialogControlsSectionHeader,
+  DropdownItem,
   Field,
   Tabs,
   ToggleField,
@@ -17,6 +18,7 @@ import {
   PluginView,
   State,
   gigabytes,
+  setAudioDefault,
   setGamesDir,
   setHdr,
   setVideo,
@@ -118,6 +120,14 @@ function GamesTab({ view, state }: { view: PluginView; state: State }) {
   );
 }
 
+// The audio output's channels offered for every game: [what the wrapper takes, its name here].
+const AUDIO_MODES: [string, string][] = [
+  ["auto", "Auto (the output device)"],
+  ["2", "Stereo"],
+  ["6", "5.1"],
+  ["8", "7.1"],
+];
+
 function DisplayTab({ view, state }: { view: PluginView; state: State }) {
   const { busy, run } = view;
   return (
@@ -159,6 +169,33 @@ function DisplayTab({ view, state }: { view: PluginView; state: State }) {
   );
 }
 
+function AudioTab({ view, state }: { view: PluginView; state: State }) {
+  const { busy, run } = view;
+  return (
+    <Scroll>
+      <DialogControlsSection>
+        <DialogControlsSectionHeader>Audio</DialogControlsSectionHeader>
+        <DropdownItem
+          label="Output channels"
+          description={
+            "How many speakers games are told the output has, for every game (a game's page can set its own). " +
+            "Auto follows the output device, so Steam's 5.1 or 7.1 setting. Applies from the next game start"
+          }
+          rgOptions={AUDIO_MODES.map(([data, label]) => ({ data, label }))}
+          selectedOption={state.audio}
+          disabled={!!busy}
+          onChange={(option) =>
+            run("Audio", async () => {
+              const r = await setAudioDefault(option.data);
+              if (!r.ok) toast(r.log || "failed");
+            })
+          }
+        />
+      </DialogControlsSection>
+    </Scroll>
+  );
+}
+
 export function Page() {
   const view = usePlugin();
   const asked = useParams<{ tab?: string }>().tab;
@@ -180,6 +217,7 @@ export function Page() {
         tabs={[
           { id: "games", title: "Games", content: <GamesTab view={view} state={state} /> },
           { id: "display", title: "Display", content: <DisplayTab view={view} state={state} /> },
+          { id: "audio", title: "Audio", content: <AudioTab view={view} state={state} /> },
         ]}
       />
     </Screen>

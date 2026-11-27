@@ -970,6 +970,14 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 
 } // namespace Libs::Audio::AudioInternal
 
+namespace Libs::Audio {
+
+int DetectedOutputChannels(bool) {
+	return 2;
+}
+
+} // namespace Libs::Audio
+
 namespace Libs::LibKernel {
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
