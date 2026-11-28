@@ -15,6 +15,8 @@
 # --addcont-dir, the way the launcher's add-ons folder setting does.
 # ~/.config/KytyPS5-Native/present-mode/<title id> holds the game's present mode while it is not Kyty's
 # default (Mailbox): the word Fifo or Immediate on its first line. The plugin's game page writes it.
+# ~/.config/KytyPS5-Native/display-copy/<title id> holds 0 or 1 (KYTY_NATIVE_GPU_DISPLAY_COPY) while the game
+# does not use Kyty's default copy mode (2). The plugin's game page writes it.
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -67,6 +69,15 @@ if [ -f "$PRESENT" ]; then
 	present_mode=$(head -1 "$PRESENT" | tr -d '[:space:]')
 	case $present_mode in
 	Fifo | Mailbox | Immediate) PRESENT_ARGS=(--present-mode "$present_mode") ;;
+	esac
+fi
+# The game's video-out buffer copy mode: 0 no copies, 1 every buffer; Kyty's default (2) otherwise.
+DISPLAY_COPY=$CONFIG/display-copy/$TITLE
+display_copy=
+if [ -f "$DISPLAY_COPY" ]; then
+	display_copy=$(head -1 "$DISPLAY_COPY" | tr -d '[:space:]')
+	case $display_copy in
+	0 | 1) export KYTY_NATIVE_GPU_DISPLAY_COPY=$display_copy ;;
 	esac
 fi
 # Games run on the gamescope Xwayland Steam gives them, the base layer is set on the root one (:0).
@@ -202,6 +213,11 @@ front "$GAME_APPID"
 		echo "patches from $PATCH"
 	elif [ -f "$PATCH" ]; then
 		echo "patches in $PATCH are for version '$patch_version', the game is '$game_version': left out"
+	fi
+	if [ -n "${KYTY_NATIVE_GPU_DISPLAY_COPY:-}" ]; then
+		echo "display copy mode from $DISPLAY_COPY: $KYTY_NATIVE_GPU_DISPLAY_COPY"
+	elif [ -f "$DISPLAY_COPY" ]; then
+		echo "display copy mode in $DISPLAY_COPY is '$display_copy', not 0 or 1: left out"
 	fi
 	if [ ${#PRESENT_ARGS[@]} -gt 0 ]; then
 		echo "present mode from $PRESENT: $present_mode"

@@ -62,6 +62,9 @@ PATCHES_DIR = os.path.join(CONFIG_DIR, "patches")
 # the wrapper also takes Immediate, written by hand.
 PRESENT_DIR = os.path.join(CONFIG_DIR, "present-mode")
 PRESENT_MODES = ("Mailbox", "Fifo")
+# A game's display buffer copy mode (KYTY_NATIVE_GPU_DISPLAY_COPY): a file per title id, there only for 0 or 1.
+DISPLAY_COPY_DIR = os.path.join(CONFIG_DIR, "display-copy")
+DISPLAY_COPY_MODES = ("2", "0", "1")
 PATCH_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "patches")
 PATCH_SOURCE = "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
@@ -668,6 +671,32 @@ def _present_mode(tid):
     except OSError:
         return PRESENT_MODES[0]
     return word if word in PRESENT_MODES + ("Immediate",) else PRESENT_MODES[0]
+
+
+def _display_copy(tid):
+    try:
+        with open(os.path.join(DISPLAY_COPY_DIR, tid)) as f:
+            word = "".join(f.readline().split())
+    except OSError:
+        return DISPLAY_COPY_MODES[0]
+    return word if word in DISPLAY_COPY_MODES else DISPLAY_COPY_MODES[0]
+
+
+def _display_copy_write(tid, mode):
+    path = os.path.join(DISPLAY_COPY_DIR, tid)
+    if mode == DISPLAY_COPY_MODES[0]:
+        if os.path.lexists(path):
+            os.remove(path)
+        return
+    _mkdir_user(DISPLAY_COPY_DIR)
+    tmp = path + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    # Root writes in the user's folder: never through a link put there.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w") as f:
+        f.write(mode + "\n")
+    os.replace(tmp, path)
+    os.lchown(path, *_ids())
 
 
 def _present_mode_write(tid, mode):
@@ -1351,6 +1380,7 @@ class Plugin:
             # False while the game's executable is still being read for the first time.
             "addons_known": bool(entry) and entry.get("key") == _addon_key(g["path"]),
             "present_mode": _present_mode(title_id),
+            "display_copy": _display_copy(title_id),
             "game_running": _game_running(),
         }
 
@@ -1376,6 +1406,16 @@ class Plugin:
             await asyncio.to_thread(_present_mode_write, title_id, mode)
         except OSError as e:
             decky.logger.exception("present mode file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def set_display_copy(self, title_id, mode):
+        if mode not in DISPLAY_COPY_MODES or not title_id or os.path.basename(title_id) != title_id or title_id in (".", ".."):
+            return {"ok": False, "log": "not a copy mode of a game"}
+        try:
+            await asyncio.to_thread(_display_copy_write, title_id, mode)
+        except OSError as e:
+            decky.logger.exception("display copy file")
             return {"ok": False, "log": str(e)}
         return {"ok": True}
 
