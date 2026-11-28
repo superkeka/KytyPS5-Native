@@ -202,6 +202,17 @@ bool TakeLodStatsBanks(uint64_t addr, std::bitset<256>& banks);
 // its PC and single-steps it before closing the pages again.
 void LodStatsTrapArm(uint64_t addr, uint64_t size);
 bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context);
+// KYTY_CMD_TRAP=1 with the control socket's "wtrap N" (diagnostics): CPU writes to guest command memory traced for N
+// flips (see CmdTrapOnFlip); =hle traces libSceAgc's SH register setters instead. KYTY_CMD_PROBE adds hardware
+// breakpoints on program code, or write watches on data, for the same window. CmdTrapNote: a range FlattenIndirectBuffers read as commands; CmdTrapSetCode: the program's code.
+bool CmdTrapOn();
+void CmdTrapDemand(uint32_t flips);
+void CmdTrapNote(uint64_t va, uint64_t bytes);
+void CmdTrapSetCode(uint64_t lo, uint64_t hi);
+bool CmdTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context);
+// KYTY_CMD_TRAP=hle: libSceAgc's register setters report a pixel shader they set (0: none found; `first`: the first pairs).
+bool CmdTrapHleArmed();
+void CmdTrapHleRecord(uint32_t ps, uint32_t kind, uint64_t table, const uint32_t* first, uint32_t first_n);
 
 // Called at every video-out flip with the guest surface about to be presented. For the flips
 // listed in KYTY_NATIVE_GPU_DUMP_FLIPS ("300,600" or a range "300-2000/10"), writes to
@@ -209,14 +220,16 @@ bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_con
 //   flip_<n>.native.raw  the guest bytes as the native path rendered them,
 //   flip_<n>.vulkan.raw  the same surface after `download_region` wrote Kyty's Vulkan copy back
 //                        (shadow mode only; skipped in primary mode, where Kyty draws nothing),
-//   flip_<n>.txt         the layout,
+//   flip_<n>.txt         the layout, the flip's interrupt context and the frame it shows (flips reserved before it),
+//   flip_<n>.draws.txt   the draws and dispatches of that frame (KYTY_NATIVE_GPU_CTL), whenever it is shown,
 //   flip_<n>.rts.txt     every color target bound since the previous flip, native vs Vulkan
 //                        (differing bytes), with flip_<n>.rt_<addr>.{native,vulkan}.raw for those
 //                        that differ (shadow mode only).
 // tools/bc250-frame-diff compares the pairs. `download_region(addr, size)` writes Kyty's Vulkan copy
 // of guest range [addr, addr + size) back into guest memory and returns how many images it wrote.
+// `flip_ctx`: the interrupt context a command buffer raises the flip with (its draws are that frame's).
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
-                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
+                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode, uint32_t flip_ctx,
                   const std::function<uint32_t(uint64_t, uint64_t)>& download_region);
 
 } // namespace Libs::Graphics::NativeGpu

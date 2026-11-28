@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/archive.h"
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -16,10 +17,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,6 +34,13 @@
 #include <iterator>
 #include <variant>
 #include <vector>
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <cerrno>
+#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
+#endif
 
 namespace Libs {
 
@@ -550,6 +562,10 @@ constexpr uint64_t APR_MAP_END_RECORD_SIZE       = 0x04;
 constexpr uint64_t AMM_MAP_RECORD_SIZE           = 0x20;
 constexpr uint64_t AMM_MAP_DIRECT_RECORD_SIZE    = 0x30;
 constexpr uint64_t AMM_UNMAP_RECORD_SIZE         = 0x20;
+constexpr uint64_t AMM_MAP_PRT_RECORD_SIZE       = 0x0c;
+constexpr uint64_t AMM_ALLOCATE_PRT_RECORD_SIZE  = 0x10;
+constexpr uint64_t AMM_UNMAP_TO_PRT_RECORD_SIZE  = 0x0c;
+constexpr int      AMM_PRT_PROT_MASK             = 0x3f3;
 constexpr uint64_t AMM_PAGE_SIZE                 = 0x4000;
 constexpr int      AMM_MAP_FIXED                 = 0x10;
 constexpr int      AMM_USAGE_DIRECT              = 0;
@@ -574,6 +590,9 @@ enum class AmmCommandKind : uint32_t {
 	MapAuto,
 	MapDirect,
 	Unmap,
+	MapPrt,      // addresses without pages
+	AllocatePrt, // pages for a PRT range
+	UnmapToPrt,  // pages released, the addresses stay PRT
 };
 
 struct CommandBufferState {
@@ -816,6 +835,16 @@ static uint64_t AprReadFileRecordSize(uint64_t file_offset) {
 
 static uint64_t WriteAddressRecordSize(uint64_t value) {
 	return value <= 3 ? 8 : value < (uint64_t {1} << 34) ? 12 : 16;
+}
+
+// A counter write on completion: one dword, the value's low 12 bits in it; a second dword for the rest.
+static uint64_t WriteCounterOnCompletionRecordSize(uint32_t value) {
+	return value < 0x1000u ? 4 : 8;
+}
+
+// Application counters are the first 128.
+static bool IsApplicationCounter(uint8_t index) {
+	return index < 0x80u;
 }
 
 static uint64_t AprReadGatherRecordSize(uint64_t file_offset) {
@@ -1082,9 +1111,18 @@ static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	if (command.kind == AmmCommandKind::MapAuto) {
-		return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
-		                                             NormalizeAmmProtection(command.prot));
+	switch (command.kind) {
+		case AmmCommandKind::MapAuto:
+			return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
+			                                             NormalizeAmmProtection(command.prot));
+		case AmmCommandKind::Unmap: return LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
+		case AmmCommandKind::MapPrt:
+		case AmmCommandKind::UnmapToPrt:
+			return LibKernel::Memory::ReserveAmmMemory(command.va, command.size);
+		case AmmCommandKind::AllocatePrt:
+			return LibKernel::Memory::CommitAmmMemory(command.va, command.size, command.type,
+			                                          NormalizeAmmProtection(command.prot));
+		case AmmCommandKind::MapDirect: break;
 	}
 
 	void* addr = reinterpret_cast<void*>(command.va);
@@ -1112,34 +1150,12 @@ static bool AppendCommandRecord(uint64_t command_buffer, CommandBufferState::Com
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
-static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
+static int ReadHostFileToGuest(uint32_t file_id, const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
 static int ExecuteCommand(const CommandBufferState::Command& entry) {
-	if (const auto* payload = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
-		const auto& command = *payload;
-		std::filesystem::path host_path;
-		if (!AprShared::TryGetHostPath(command.file_id, &host_path)) {
-			LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n", command.file_id);
-			return LibKernel::KERNEL_ERROR_ENOENT;
-		}
-
-		uint64_t bytes_read = 0;
-		auto     result = ReadHostFileToGuest(host_path, command.file_offset, command.destination,
-		                                      command.size, &bytes_read);
-		static std::atomic<uint32_t> s_logged_dlc_reads {0};
-		if (host_path.filename() == "re_dlc_000.pak" && s_logged_dlc_reads.fetch_add(1) < 32) {
-			LOGF("\tAPR read dlc: id=0x%08" PRIx32 ", offset=0x%016" PRIx64 ", size=0x%016" PRIx64
-			     ", read=0x%016" PRIx64 ", result=0x%08" PRIx32 "\n",
-			     command.file_id, command.file_offset, command.size, bytes_read,
-			     static_cast<uint32_t>(result));
-		}
-		if (result != OK) {
-			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n",
-			     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
-			return result;
-		}
-	} else if (const auto* payload =
+	// Reads: CommandEngine issues them in pieces.
+	if (const auto* payload =
 	               std::get_if<CommandBufferState::KernelEventCommand>(&entry.data)) {
 		const auto& command = *payload;
 		const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
@@ -1162,12 +1178,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		g_counters[command->index].store(command->value, std::memory_order_release);
 	} else if (const auto* payload = std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
 		const auto& command = *payload;
-		int         result  = OK;
-		if (command.kind == AmmCommandKind::Unmap) {
-			result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
-		} else {
-			result = ExecuteAmmMapCommand(command);
-		}
+		const int   result  = ExecuteAmmMapCommand(command);
 
 		if (result != OK) {
 			LOGF("\tAMM submit command failed: kind=%u va=0x%016" PRIx64 " dmem=0x%016" PRIx64
@@ -1183,104 +1194,535 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 
 struct Submission {
 	std::vector<CommandBufferState::Command> commands;
-	size_t                                   cursor = 0;
-	void*                                    result = nullptr;
-	uint32_t                                 id     = 0;
+	size_t                                   cursor    = 0; // the next command not yet issued (a read) or run
+	void*                                    result    = nullptr;
+	uint32_t                                 id        = 0;
+	double                                   submitted = 0;
+	uint32_t                                 priority  = 0;
+
+	// Reads issued ahead of the cursor's position and not yet done, by command index.
+	struct ReadState {
+		std::filesystem::path path;
+		uint32_t              pieces_left = 0;
+		int                   result      = OK;
+		uint64_t              bytes_read  = 0;
+	};
+	std::vector<ReadState> reads;         // sized to commands on the first read
+	std::vector<size_t>    in_flight;     // indices of the reads not done
+	uint64_t               pending_bytes = 0;
+	size_t                 error_index   = std::numeric_limits<size_t>::max(); // the first command that failed
+	int                    error         = 0;
+	bool                   busy          = false; // a worker runs the command at the cursor
+	uint64_t               seq           = 0;     // the submit order across the AMM and APR queues
+	double                 held          = 0;     // when the order between the queues first held the command at the cursor
+	bool                   warned        = false;
 };
+
+// The AMM and APR queues as one consumer in submit order: a submit takes a number from one sequence for both.
+// - A read of an APR stream is not issued while a mapper submit numbered below the stream still has a record to run
+//   that changes the mapping or protection of the read's destination: the read lands where the map submitted first put
+//   it.
+// - A mapper record that changes a range does not run while an APR stream numbered below the mapper submit has a read
+//   into an overlapping range not done (pending from its submit): a later map never pulls the memory from under an
+//   earlier read.
+// Only overlapping ranges wait. KYTY_AMM_APR_ORDER=0 turns both off.
+static bool QueueOrderOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_AMM_APR_ORDER");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
+class QueueOrder {
+public:
+	// Takes the submit's number and publishes its ranges: the map records of a mapper submit, the reads of a stream.
+	uint64_t Register(bool mapper, const std::vector<CommandBufferState::Command>& commands) {
+		Entry e;
+		if (QueueOrderOn()) {
+			for (size_t i = 0; i < commands.size(); i++) {
+				uint64_t start = 0;
+				uint64_t size  = 0;
+				if (const auto* m = std::get_if<CommandBufferState::AmmMapCommand>(&commands[i].data); mapper && m != nullptr) {
+					start = m->va;
+					size  = m->size;
+				} else if (const auto* r = std::get_if<CommandBufferState::ReadFileCommand>(&commands[i].data); !mapper && r != nullptr) {
+					start = r->destination;
+					size  = r->size;
+				}
+				if (size == 0) {
+					continue;
+				}
+				const uint64_t end = start + size < start ? UINT64_MAX : start + size;
+				e.ranges.push_back({i, start, end, false});
+				e.lo = std::min(e.lo, start);
+				e.hi = std::max(e.hi, end);
+			}
+		}
+		std::scoped_lock lock(m_mutex);
+		const uint64_t   seq = ++m_seq;
+		if (!e.ranges.empty()) {
+			(mapper ? m_mappers : m_streams).emplace(seq, std::move(e));
+		}
+		return seq;
+	}
+
+	// The mapper submit `seq` has run its commands before `cursor`.
+	void MapperRan(uint64_t seq, size_t cursor) {
+		std::scoped_lock lock(m_mutex);
+		if (auto it = m_mappers.find(seq); it != m_mappers.end()) {
+			auto& e = it->second;
+			while (e.next < e.ranges.size() && e.ranges[e.next].index < cursor) {
+				e.next++;
+			}
+			if (e.next == e.ranges.size()) {
+				m_mappers.erase(it);
+			}
+		}
+	}
+
+	// The read at command `index` of the stream `seq` is done.
+	void ReadDone(uint64_t seq, size_t index) {
+		std::scoped_lock lock(m_mutex);
+		if (auto it = m_streams.find(seq); it != m_streams.end()) {
+			auto& e = it->second;
+			for (auto& r: e.ranges) {
+				if (r.index == index && !r.done) {
+					r.done = true;
+					e.next++; // here: the count of reads done
+					break;
+				}
+			}
+			if (e.next == e.ranges.size()) {
+				m_streams.erase(it);
+			}
+		}
+	}
+
+	// A submit that ended, also by a failed command, holds nothing.
+	void Done(bool mapper, uint64_t seq) {
+		std::scoped_lock lock(m_mutex);
+		(mapper ? m_mappers : m_streams).erase(seq);
+	}
+
+	// The mapper submit numbered below `before` with a record left to run that changes [start, end), 0 for none.
+	uint64_t MapperHolds(uint64_t before, uint64_t start, uint64_t end) {
+		std::scoped_lock lock(m_mutex);
+		for (auto it = m_mappers.begin(); it != m_mappers.end() && it->first < before; ++it) {
+			const auto& e = it->second;
+			if (e.hi <= start || e.lo >= end) {
+				continue;
+			}
+			for (size_t i = e.next; i < e.ranges.size(); i++) {
+				if (e.ranges[i].start < end && start < e.ranges[i].end) {
+					return it->first;
+				}
+			}
+		}
+		return 0;
+	}
+
+	// The APR stream numbered below `before` with a read into [start, end) not done, 0 for none.
+	uint64_t ReadHolds(uint64_t before, uint64_t start, uint64_t end) {
+		std::scoped_lock lock(m_mutex);
+		for (auto it = m_streams.begin(); it != m_streams.end() && it->first < before; ++it) {
+			const auto& e = it->second;
+			if (e.hi <= start || e.lo >= end) {
+				continue;
+			}
+			for (const auto& r: e.ranges) {
+				if (!r.done && r.start < end && start < r.end) {
+					return it->first;
+				}
+			}
+		}
+		return 0;
+	}
+
+private:
+	struct Range {
+		size_t   index;
+		uint64_t start;
+		uint64_t end;
+		bool     done;
+	};
+	struct Entry {
+		std::vector<Range> ranges;
+		size_t             next = 0; // a mapper: the first record not run; a stream: the count of reads done
+		uint64_t           lo   = UINT64_MAX;
+		uint64_t           hi   = 0;
+	};
+	std::mutex                m_mutex;
+	uint64_t                  m_seq = 0;
+	std::map<uint64_t, Entry> m_mappers;
+	std::map<uint64_t, Entry> m_streams;
+};
+
+static QueueOrder g_queue_order;
+
+// KYTY_LOG_AMM=1: every command as the engine runs it, with the CLOCK_MONOTONIC time.
+static bool LogAmm() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_LOG_AMM");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+
+static double NowSeconds() {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 static bool IsWaitSatisfied(const CommandBufferState::WaitCommand& wait) {
 	const uint64_t value = wait.is_counter
 	                           ? g_counters[wait.source].load(std::memory_order_acquire)
 	                           : std::atomic_ref(*reinterpret_cast<uint64_t*>(wait.source))
 	                                 .load(std::memory_order_acquire);
-	const uint64_t sign = uint64_t {1} << (wait.is_counter ? 31 : 63);
+	// The compare modes of WaitOnCounter and WaitOnAddress, on 64-bit values (a counter reads as its 32 bits).
 	switch (wait.compare) {
 		case 0: return value == wait.value;
 		case 1: return value > wait.value;
 		case 2: return value < wait.value;
 		case 3: return value != wait.value;
-		case 4: return ((value - wait.value) & sign) == 0;
-		case 5: return (value ^ sign) > (wait.value ^ sign);
-		default: return (value ^ sign) < (wait.value ^ sign);
+		case 4: return ((value - wait.value) >> 63u) == 0;
+		case 5: return static_cast<int64_t>(value) > static_cast<int64_t>(wait.value);
+		case 6: return static_cast<int64_t>(value) < static_cast<int64_t>(wait.value);
+		default: return false;
 	}
 }
 
+// The engine of a queue kind (APR, AMM): a ring of submissions per priority, each with its own cursor, so a wait or a
+// barrier in one priority holds up no other. Submissions of one priority run in order: the next starts once the one
+// before has completed.
+//
+// Within a submission the cursor issues file reads without waiting for them, up to kMaxPendingReads reads or
+// kMaxPendingBytes bytes not done, as the I/O hardware keeps many in flight. A read whose destination overlaps a read
+// of the submission not yet done waits for it, so the later bytes land last. A command that is not a read, and the end
+// of the submission, wait for every read before them. The first command that fails ends the submission with its offset
+// (reads already issued finish first).
+//
+// Reads go to the workers in pieces of up to kPiece bytes cut at kPiece boundaries of the file. A free worker takes a
+// command that is not a read when one is ready, otherwise the next piece of the most urgent priority with pieces
+// queued (the lower number), in order within a priority: an urgent read waits for one piece, not for the gigabytes of
+// a less urgent stream.
 class CommandEngine {
 public:
-	explicit CommandEngine(size_t priorities)
-	    : m_queues(priorities), m_worker([this](std::stop_token stop) { Run(stop); }) {}
+	static constexpr uint64_t kPiece           = 256 * 1024;
+	static constexpr size_t   kMaxPendingReads = 64;
+	static constexpr uint64_t kMaxPendingBytes = 64ull * 1024 * 1024;
+
+	CommandEngine(size_t priorities, uint32_t workers, const char* name, bool mapper)
+	    : m_mapper(mapper), m_queues(priorities), m_pieces(priorities) {
+		for (uint32_t i = 0; i < workers; i++) {
+			m_workers.emplace_back([this, name](std::stop_token stop) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+				pthread_setname_np(pthread_self(), name);
+#else
+				(void)name;
+#endif
+				Run(stop);
+			});
+		}
+	}
 
 	~CommandEngine() {
-		std::scoped_lock lock(m_mutex);
-		m_worker.request_stop();
+		{
+			std::scoped_lock lock(m_mutex);
+			for (auto& w: m_workers) {
+				w.request_stop();
+			}
+		}
 		m_cv.notify_all();
 	}
 
 	void Submit(uint32_t priority, Submission submission) {
 		std::scoped_lock lock(m_mutex);
+		submission.priority = priority;
 		m_queues[priority].push_back(std::move(submission));
-		m_cv.notify_one();
+		m_cv.notify_all();
 	}
 
 private:
-	void Run(std::stop_token stop) {
+	static constexpr size_t kNone = std::numeric_limits<size_t>::max();
+
+	struct Piece {
+		Submission* s;
+		size_t      read; // command index
+		uint64_t    offset;
+		uint64_t    size;
+	};
+
+	static bool IsRead(const Submission& s, size_t index) {
+		return std::holds_alternative<CommandBufferState::ReadFileCommand>(s.commands[index].data);
+	}
+	static const CommandBufferState::ReadFileCommand& Read(const Submission& s, size_t index) {
+		return std::get<CommandBufferState::ReadFileCommand>(s.commands[index].data);
+	}
+
+	void Complete(const Submission& submission, int result, uint32_t error_offset) {
+		g_queue_order.Done(m_mapper, submission.seq);
+		AprShared::WriteResult(submission.result, result, error_offset);
+		AprShared::SetSubmissionComplete(submission.id);
+		if (LogAmm()) {
+			const double t = NowSeconds();
+			std::fprintf(stderr, "amm %.6f %llu ms %p done %zu commands prio %u %.3f ms after submit\n", t,
+			             static_cast<unsigned long long>(Loader::Timer::GetTimeMs()), static_cast<const void*>(this),
+			             submission.commands.size(), submission.priority, (t - submission.submitted) * 1000.0);
+		}
+	}
+
+	static void Fail(Submission& s, size_t index, int result) {
+		if (index < s.error_index) {
+			s.error_index = index;
+			s.error       = result;
+		}
+	}
+
+	// Under m_mutex: issues the reads at the cursor that may go, as pieces. False when the read at the cursor waits
+	// (the pending limits, an overlap) or failed.
+	bool IssueReads(Submission& s, std::deque<Piece>& pieces, bool* waiting) {
+		while (s.cursor < s.commands.size() && IsRead(s, s.cursor)) {
+			const auto& r = Read(s, s.cursor);
+			if (s.in_flight.size() >= kMaxPendingReads || (s.pending_bytes != 0 && s.pending_bytes + r.size > kMaxPendingBytes)) {
+				return false;
+			}
+			if (r.size != 0 && QueueOrderOn() &&
+			    Held(s, g_queue_order.MapperHolds(s.seq, r.destination, r.destination + r.size), r.destination, r.size)) {
+				*waiting = true;
+				return false;
+			}
+			for (size_t k: s.in_flight) {
+				const auto& o = Read(s, k);
+				if (r.size != 0 && o.size != 0 && r.destination < o.destination + o.size && o.destination < r.destination + r.size) {
+					return false;
+				}
+			}
+			if (s.reads.empty()) {
+				s.reads.resize(s.commands.size());
+			}
+			auto& state = s.reads[s.cursor];
+			int   bad   = OK;
+			if (!AprShared::TryGetHostPath(r.file_id, &state.path)) {
+				LOGF("\tAPR submit failed for unknown file id: 0x%08" PRIx32 "\n", r.file_id);
+				bad = LibKernel::KERNEL_ERROR_ENOENT;
+			} else if (r.size != 0 && !AprShared::IsValidGuestRange(r.destination, r.size, true)) {
+				bad = LibKernel::KERNEL_ERROR_EFAULT;
+			}
+			if (bad != OK) {
+				LogCommand(s.commands[s.cursor], bad, s.priority);
+				Fail(s, s.cursor, bad);
+				return false;
+			}
+			if (r.size == 0) {
+				LogCommand(s.commands[s.cursor], OK, s.priority);
+				s.cursor++;
+				continue;
+			}
+			for (uint64_t at = 0; at < r.size;) {
+				const uint64_t next = std::min(r.size, (r.file_offset + at) / kPiece * kPiece + kPiece - r.file_offset);
+				pieces.push_back({&s, s.cursor, at, next - at});
+				state.pieces_left++;
+				at = next;
+			}
+			s.in_flight.push_back(s.cursor);
+			s.pending_bytes += r.size;
+			s.cursor++;
+		}
+		return true;
+	}
+
+	// Under m_mutex: moves the priority's submissions on as far as they go without a worker; returns the submission
+	// whose command at the cursor (not a read) is ready to run, or nullptr. Sets `waiting` when one waits on a value
+	// (CPU and GPU fence writes do not notify the engine).
+	Submission* Advance(std::deque<Submission>& q, std::deque<Piece>& pieces, bool* waiting) {
+		while (!q.empty()) {
+			Submission& s = q.front();
+			if (s.busy) {
+				return nullptr;
+			}
+			if (s.error_index == kNone) {
+				IssueReads(s, pieces, waiting);
+			}
+			if (!s.in_flight.empty()) {
+				return nullptr; // a barrier, the end or a failure waits for the reads before it
+			}
+			if (s.error_index != kNone) {
+				Complete(s, s.error, static_cast<uint32_t>(s.commands[s.error_index].record_offset));
+				q.pop_front();
+				continue;
+			}
+			if (s.cursor == s.commands.size()) {
+				Complete(s, OK, 0);
+				q.pop_front();
+				continue;
+			}
+			if (IsRead(s, s.cursor)) {
+				return nullptr;
+			}
+			if (const auto* wait = std::get_if<CommandBufferState::WaitCommand>(&s.commands[s.cursor].data);
+			    wait != nullptr && !IsWaitSatisfied(*wait)) {
+				*waiting = true;
+				return nullptr;
+			}
+			if (const auto* m = std::get_if<CommandBufferState::AmmMapCommand>(&s.commands[s.cursor].data);
+			    m_mapper && m != nullptr && m->size != 0 && QueueOrderOn() &&
+			    Held(s, g_queue_order.ReadHolds(s.seq, m->va, m->va + m->size), m->va, m->size)) {
+				*waiting = true;
+				return nullptr;
+			}
+			s.busy = true;
+			return &s;
+		}
+		return nullptr;
+	}
+
+	// Under m_mutex: a piece is done.
+	void PieceDone(const Piece& piece, int result, uint64_t bytes_read) {
+		Submission& s     = *piece.s;
+		auto&       state = s.reads[piece.read];
+		if (result != OK && state.result == OK) {
+			state.result = result;
+		}
+		state.bytes_read += bytes_read;
+		if (--state.pieces_left != 0) {
+			return;
+		}
+		const auto& r = Read(s, piece.read);
+		std::erase(s.in_flight, piece.read);
+		g_queue_order.ReadDone(s.seq, piece.read);
+		s.pending_bytes -= r.size;
+		LogCommand(s.commands[piece.read], state.result, s.priority);
+		static std::atomic<uint32_t> s_logged_dlc_reads {0};
+		if (state.path.filename() == "re_dlc_000.pak" && s_logged_dlc_reads.fetch_add(1) < 32) {
+			LOGF("\tAPR read dlc: id=0x%08" PRIx32 ", offset=0x%016" PRIx64 ", size=0x%016" PRIx64 ", read=0x%016" PRIx64
+			     ", result=0x%08" PRIx32 "\n",
+			     r.file_id, r.file_offset, r.size, state.bytes_read, static_cast<uint32_t>(state.result));
+		}
+		if (state.result != OK) {
+			LOGF("\tAPR submit read failed: id=0x%08" PRIx32 ", result=0x%08" PRIx32 ", path=%s\n", r.file_id,
+			     static_cast<uint32_t>(state.result), Common::PathToString(state.path).c_str());
+			Fail(s, piece.read, state.result);
+		}
+		state.path.clear();
+	}
+
+	void Run(const std::stop_token& stop) {
 		std::unique_lock lock(m_mutex);
 		while (!stop.stop_requested()) {
-			std::deque<Submission>* ready   = nullptr;
-			bool                    pending = false;
-			for (auto& queue: m_queues) {
-				if (queue.empty()) {
-					continue;
-				}
-				pending          = true;
-				auto& submission = queue.front();
-				if (submission.cursor < submission.commands.size()) {
-					const auto* wait = std::get_if<CommandBufferState::WaitCommand>(
-					    &submission.commands[submission.cursor].data);
-					if (wait != nullptr && !IsWaitSatisfied(*wait)) {
-						continue;
-					}
-				}
-				ready = &queue;
-				break;
+			bool        waiting = false;
+			Submission* barrier = nullptr;
+			for (size_t p = 0; p < m_queues.size() && barrier == nullptr; p++) {
+				barrier = Advance(m_queues[p], m_pieces[p], &waiting);
 			}
-			if (ready == nullptr) {
-				if (pending) {
-					// CPU and GPU fence writes do not notify the submission queue.
+			if (barrier != nullptr) {
+				const auto& command = barrier->commands[barrier->cursor];
+				lock.unlock();
+				const int result = ExecuteCommand(command);
+				LogCommand(command, result, barrier->priority);
+				lock.lock();
+				barrier->busy = false;
+				if (result != OK) {
+					Fail(*barrier, barrier->cursor, result);
+				}
+				barrier->cursor++;
+				if (m_mapper) {
+					g_queue_order.MapperRan(barrier->seq, barrier->cursor);
+				}
+				m_cv.notify_all();
+				continue;
+			}
+			auto queue = std::find_if(m_pieces.begin(), m_pieces.end(), [](const auto& pieces) { return !pieces.empty(); });
+			if (queue == m_pieces.end()) {
+				if (waiting) {
 					m_cv.wait_for(lock, std::chrono::microseconds(100));
 				} else {
 					m_cv.wait(lock);
 				}
 				continue;
 			}
-
-			auto& submission = ready->front();
+			const Piece piece = queue->front();
+			queue->pop_front();
+			const auto& r = Read(*piece.s, piece.read);
+			const auto  path = piece.s->reads[piece.read].path;
 			lock.unlock();
-			int      result       = OK;
-			uint32_t error_offset = 0;
-			if (submission.cursor < submission.commands.size()) {
-				const auto& command = submission.commands[submission.cursor++];
-				result              = ExecuteCommand(command);
-				if (result != OK) {
-					error_offset = static_cast<uint32_t>(command.record_offset);
-				}
-			}
-			const bool complete = result != OK || submission.cursor == submission.commands.size();
-			if (complete) {
-				AprShared::WriteResult(submission.result, result, error_offset);
-				AprShared::SetSubmissionComplete(submission.id);
-			}
+			uint64_t  bytes_read = 0;
+			const int result     = ReadHostFileToGuest(r.file_id, path, r.file_offset + piece.offset, r.destination + piece.offset,
+			                                           piece.size, &bytes_read);
 			lock.lock();
-			if (complete) {
-				ready->pop_front();
-			}
+			PieceDone(piece, result, bytes_read);
+			m_cv.notify_all();
 		}
 	}
 
+	// Under m_mutex: whether the command at the cursor of `s` (on [va, va + size)) waits for the submit `holder` of the
+	// other queue (0: none). Logs the hold and its end with KYTY_LOG_AMM=1, and always a hold over 1 s.
+	bool Held(Submission& s, uint64_t holder, uint64_t va, uint64_t size) const {
+		if (holder == 0 && s.held == 0) {
+			return false;
+		}
+		const double now = NowSeconds();
+		if (holder == 0) {
+			if (LogAmm()) {
+				std::fprintf(stderr, "amq %.6f %s seq %llu va 0x%llx released after %.3f ms\n", now, m_mapper ? "map" : "read",
+				             static_cast<unsigned long long>(s.seq), static_cast<unsigned long long>(va), (now - s.held) * 1000.0);
+			}
+			s.held   = 0;
+			s.warned = false;
+			return false;
+		}
+		if (s.held == 0) {
+			s.held = now;
+			if (LogAmm()) {
+				std::fprintf(stderr, "amq %.6f %s seq %llu va 0x%llx size 0x%llx held by %s seq %llu\n", now, m_mapper ? "map" : "read",
+				             static_cast<unsigned long long>(s.seq), static_cast<unsigned long long>(va),
+				             static_cast<unsigned long long>(size), m_mapper ? "read" : "map", static_cast<unsigned long long>(holder));
+			}
+		} else if (!s.warned && now - s.held > 1.0) {
+			s.warned = true;
+			std::fprintf(stderr, "amm: %s of submit %llu at 0x%llx (+0x%llx) held over 1 s by %s submit %llu\n",
+			             m_mapper ? "mapper record" : "APR read", static_cast<unsigned long long>(s.seq),
+			             static_cast<unsigned long long>(va), static_cast<unsigned long long>(size), m_mapper ? "APR" : "mapper",
+			             static_cast<unsigned long long>(holder));
+		}
+		return true;
+	}
+
+	void LogCommand(const CommandBufferState::Command& entry, int result, uint32_t priority) const {
+		if (!LogAmm()) {
+			return;
+		}
+		const double t = NowSeconds();
+		if (const auto* m = std::get_if<CommandBufferState::AmmMapCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p map kind %u va 0x%llx size 0x%llx dmem 0x%llx type %d prot 0x%x -> 0x%x\n", t,
+			             static_cast<const void*>(this), static_cast<unsigned>(m->kind), static_cast<unsigned long long>(m->va),
+			             static_cast<unsigned long long>(m->size), static_cast<unsigned long long>(m->dmem_offset), m->type,
+			             static_cast<unsigned>(m->prot), static_cast<unsigned>(result));
+		} else if (const auto* w = std::get_if<CommandBufferState::WaitCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p wait %s 0x%llx cmp %u value 0x%llx\n", t, static_cast<const void*>(this),
+			             w->is_counter ? "counter" : "address", static_cast<unsigned long long>(w->source), static_cast<unsigned>(w->compare),
+			             static_cast<unsigned long long>(w->value));
+		} else if (const auto* a = std::get_if<CommandBufferState::WriteAddressCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p write 0x%llx = 0x%llx\n", t, static_cast<const void*>(this),
+			             static_cast<unsigned long long>(a->address), static_cast<unsigned long long>(a->value));
+		} else if (const auto* c = std::get_if<CommandBufferState::WriteCounterCommand>(&entry.data)) {
+			std::fprintf(stderr, "amm %.6f %p counter %u = 0x%x\n", t, static_cast<const void*>(this), static_cast<unsigned>(c->index),
+			             c->value);
+		} else if (const auto* r = std::get_if<CommandBufferState::ReadFileCommand>(&entry.data)) {
+			std::filesystem::path host_path;
+			AprShared::TryGetHostPath(r->file_id, &host_path);
+			std::fprintf(stderr, "amm %.6f %llu ms %p read file 0x%x dst 0x%llx size 0x%llx -> 0x%x off 0x%llx prio %u %s\n", t,
+			             static_cast<unsigned long long>(Loader::Timer::GetTimeMs()), static_cast<const void*>(this), r->file_id, static_cast<unsigned long long>(r->destination),
+			             static_cast<unsigned long long>(r->size), static_cast<unsigned>(result),
+			             static_cast<unsigned long long>(r->file_offset), priority, host_path.filename().string().c_str());
+		}
+	}
+
+	const bool                          m_mapper;
 	std::mutex                          m_mutex;
 	std::condition_variable             m_cv;
 	std::vector<std::deque<Submission>> m_queues;
-	std::jthread                        m_worker;
+	std::vector<std::deque<Piece>>      m_pieces; // the pieces of each priority's reads, in order
+	std::vector<std::jthread>           m_workers;
 };
 
 static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t bytes,
@@ -1314,10 +1756,19 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	if (out_submission_id != nullptr) {
 		AprShared::WriteGuest(reinterpret_cast<uint64_t>(out_submission_id), id);
 	}
-	static CommandEngine apr_engine(7);
-	static CommandEngine amm_engine(3);
-	(amm ? amm_engine : apr_engine)
-	    .Submit(priority, {std::move(state.commands), 0, result, id});
+	static CommandEngine apr_engine(7, 8, "kyty-apr", false);
+	static CommandEngine amm_engine(3, 1, "kyty-amm", true);
+	Submission submission;
+	submission.seq = g_queue_order.Register(amm, state.commands);
+	if (LogAmm()) {
+		std::fprintf(stderr, "amq %.6f %s seq %llu prio %u %zu commands\n", NowSeconds(), amm ? "submit-amm" : "submit-apr",
+		             static_cast<unsigned long long>(submission.seq), priority, state.commands.size());
+	}
+	submission.commands  = std::move(state.commands);
+	submission.result    = result;
+	submission.id        = id;
+	submission.submitted = LogAmm() ? NowSeconds() : 0.0;
+	(amm ? amm_engine : apr_engine).Submit(priority, std::move(submission));
 	return OK;
 }
 
@@ -1338,7 +1789,58 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 	return CommitCommandBufferRecord(command_buffer, &state, record_size);
 }
 
-static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t file_offset,
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// The host files of APR reads, opened at their first read and kept open: a title's reads come by the thousand a second
+// from a few hundred files, and pread serves them from any thread. -1: an archive member or a file that did not open
+// (read the old way, which reports it).
+static int AprHostFd(uint32_t file_id, const std::filesystem::path& host_path) {
+	static std::mutex                        mutex;
+	static std::unordered_map<uint32_t, int> fds;
+	std::scoped_lock                         lock(mutex);
+	if (auto it = fds.find(file_id); it != fds.end()) {
+		return it->second;
+	}
+	if (fds.size() >= 1024 || Common::IsArchivePath(host_path)) {
+		return -1;
+	}
+	const int fd = ::open(host_path.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		fds.emplace(file_id, fd);
+	}
+	return fd;
+}
+
+// Reads straight into guest memory; a destination the kernel cannot write (EFAULT: a page Kyty keeps protected) goes
+// through a buffer, so the copy takes the fault the way a CPU store does.
+static void PreadToGuest(int fd, uint64_t file_offset, uint64_t destination, uint64_t size, uint64_t* bytes_read) {
+	static thread_local std::vector<uint8_t> buffer;
+	while (*bytes_read < size) {
+		const uint64_t left = size - *bytes_read;
+		const auto     at   = static_cast<off_t>(file_offset + *bytes_read);
+		ssize_t        n    = ::pread(fd, reinterpret_cast<void*>(destination + *bytes_read),
+		                              static_cast<size_t>(std::min<uint64_t>(left, 1ull << 30u)), at);
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		if (n < 0 && errno == EFAULT) {
+			const auto request = static_cast<size_t>(std::min<uint64_t>(left, APR_HOST_READ_CHUNK_SIZE));
+			if (buffer.size() < request) {
+				buffer.resize(request);
+			}
+			n = ::pread(fd, buffer.data(), request, at);
+			if (n > 0) {
+				std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), buffer.data(), static_cast<size_t>(n));
+			}
+		}
+		if (n <= 0) {
+			return;
+		}
+		*bytes_read += static_cast<uint64_t>(n);
+	}
+}
+#endif
+
+static int ReadHostFileToGuest(uint32_t file_id, const std::filesystem::path& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read) {
 	if (bytes_read == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -1351,6 +1853,14 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	if (!AprShared::IsValidGuestRange(destination, size, true)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	if (const int fd = AprHostFd(file_id, host_path); fd >= 0) {
+		PreadToGuest(fd, file_offset, destination, size, bytes_read);
+		return OK;
+	}
+#else
+	(void)file_id;
+#endif
 
 	Common::File file;
 	if (!file.Open(host_path, Common::File::Mode::Read)) {
@@ -1601,11 +2111,13 @@ MeasureCommandSizeWriteAddressFromCounterPairOnCompletion(volatile uint64_t*, ui
 	return 0x20;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t, uint8_t, uint64_t,
-                                                                         uint8_t) {
+static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t index, uint32_t value) {
 	PRINT_NAME();
 
-	return 0x20;
+	if (!IsApplicationCounter(index)) {
+		return static_cast<uint32_t>(LibKernel::KERNEL_ERROR_EINVAL);
+	}
+	return WriteCounterOnCompletionRecordSize(value);
 }
 
 static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMap(uint64_t, uint64_t, int32_t, int32_t) {
@@ -1951,11 +2463,28 @@ static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
-                                                               uint8_t, uint64_t, uint8_t) {
+// Writes `value` to counter `index` once the commands before it are done (the engine runs them in order); a stream of
+// the other engine can wait for it (CommandBufferWaitOnCounter).
+static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t index, uint32_t value) {
 	PRINT_NAME();
 
-	return AppendNoOpCommand(command_buffer, 0x20);
+	if (command_buffer == nullptr) {
+		return LibKernel::KERNEL_ERROR_EPERM;
+	}
+	if (!IsApplicationCounter(index)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	uint32_t type = 0;
+	if (!AprShared::ReadGuest(reinterpret_cast<uint64_t>(command_buffer) + COMMAND_BUFFER_TYPE_OFFSET, &type)) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if ((type & APR_TYPE_MAP_ACTIVE) != 0) {
+		return LibKernel::KERNEL_ERROR_EPERM;
+	}
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), CommandBufferState::WriteCounterCommand {index, value},
+	                           WriteCounterOnCompletionRecordSize(value))
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
 static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
@@ -2279,6 +2808,52 @@ static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
+static int AppendAmmPrtCommand(void* command_buffer, AmmCommandKind kind, uint64_t va,
+                               uint64_t size, int32_t type, int32_t prot, uint64_t record_size) {
+	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size)) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = kind;
+	command.va   = va;
+	command.size = size;
+	command.type = type;
+	command.prot = prot;
+
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command, record_size)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferMapAsPrt(void* command_buffer, uint64_t va,
+                                                  uint64_t size) {
+	PRINT_NAME();
+
+	return AppendAmmPrtCommand(command_buffer, AmmCommandKind::MapPrt, va, size, 0, 0,
+	                           AMM_MAP_PRT_RECORD_SIZE);
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferAllocatePaForPrt(void* command_buffer, uint64_t va,
+                                                          uint64_t size, int32_t type,
+                                                          int32_t prot) {
+	PRINT_NAME();
+
+	if ((prot & ~AMM_PRT_PROT_MASK) != 0) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	return AppendAmmPrtCommand(command_buffer, AmmCommandKind::AllocatePrt, va, size, type, prot,
+	                           AMM_ALLOCATE_PRT_RECORD_SIZE);
+}
+
+static int KYTY_SYSV_ABI AmmCommandBufferUnmapToPrt(void* command_buffer, uint64_t va,
+                                                    uint64_t size) {
+	PRINT_NAME();
+
+	return AppendAmmPrtCommand(command_buffer, AmmCommandKind::UnmapToPrt, va, size, 0, 0,
+	                           AMM_UNMAP_TO_PRT_RECORD_SIZE);
+}
+
 static int KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t search_end,
                                              uint64_t size, uint64_t align, int32_t usage,
                                              int64_t* dmem_offset) {
@@ -2462,6 +3037,9 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("8TBE+9XCZbI", Ampr::AmmCommandBufferMapDirect);
 	LIB_FUNC("kOfZlhbVAkc", Ampr::AmmCommandBufferMapDirectWithGpuMaskId);
 	LIB_FUNC("M-VFI2DJWQA", Ampr::AmmCommandBufferUnmap);
+	LIB_FUNC("ZJCgt+aPHAU", Ampr::AmmCommandBufferMapAsPrt);
+	LIB_FUNC("d3lKWPM6odc", Ampr::AmmCommandBufferAllocatePaForPrt);
+	LIB_FUNC("3A2X6OCHtnA", Ampr::AmmCommandBufferUnmapToPrt);
 	LIB_FUNC("lwS-7y3jcBI", Ampr::AmmSubmitCommandBuffer);
 	LIB_FUNC("NnKhlMJtIsI", Ampr::AmmSubmitCommandBufferAndGetId);
 	LIB_FUNC("OJf3vCckPAM", Ampr::AmmSubmitCommandBufferAndGetResult);

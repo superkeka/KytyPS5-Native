@@ -54,9 +54,13 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <dirent.h>
+#include <linux/hw_breakpoint.h>
+#include <linux/perf_event.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -102,6 +106,121 @@ bool EnvOn(const char* name) {
 	const char* v = std::getenv(name);
 	return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
+
+// Diagnostic. KYTY_NATIVE_GPU_SUBMIT_TRACE=path: one line per guest submission (E: time, id, queue, buffers of each
+// kind still unfinished), per translated buffer (X: id, kind, draws, draws whose pixel shader or compute shader is in
+// KYTY_NATIVE_GPU_TRACE_PS=0xADDR,..., the first draw's shader) and per finished buffer (D: time, id).
+// KYTY_NATIVE_GPU_SUBMIT_SYNC=1: a graphics buffer's submission returns once it and every buffer submitted before it
+// are finished (at most KYTY_NATIVE_GPU_SUBMIT_SYNC_MS later, 50 by default: a buffer may wait for something the
+// title does later), so the title never sees work it submitted earlier still running.
+class SubmitTrace {
+public:
+	static SubmitTrace& Instance() {
+		static SubmitTrace t;
+		return t;
+	}
+	bool On() const { return m_file != nullptr || m_sync; }
+	bool Logging() const { return m_file != nullptr; }
+
+	uint64_t Enqueued(uint32_t queue, bool acb, uint32_t size_dw) {
+		if (!On()) {
+			return 0;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		const uint64_t id = ++m_next;
+		m_pending.emplace(id, acb);
+		(acb ? m_open_acb : m_open_dcb)++;
+		if (m_file != nullptr) {
+			std::fprintf(m_file, "E %.6f %llu %x %u %u %u\n", NowSecShadow(), static_cast<unsigned long long>(id), queue, size_dw,
+			             m_open_dcb, m_open_acb);
+		}
+		return id;
+	}
+	void Translated(uint64_t id, bool acb, const std::vector<DrawRecord>& draws) {
+		if (m_file == nullptr || id == 0) {
+			return;
+		}
+		uint32_t marked = 0;
+		for (const auto& d: draws) {
+			marked += m_marks.count(d.ps) != 0 ? 1u : 0u;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::fprintf(m_file, "X %.6f %llu %c %zu %u 0x%llx\n", NowSecShadow(), static_cast<unsigned long long>(id), acb ? 'a' : 'd',
+		             draws.size(), marked, draws.empty() ? 0ull : static_cast<unsigned long long>(draws.front().ps));
+	}
+	void Done(uint64_t id) {
+		if (id == 0) {
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			auto it = m_pending.find(id);
+			if (it == m_pending.end()) {
+				return;
+			}
+			(it->second ? m_open_acb : m_open_dcb)--;
+			m_pending.erase(it);
+			if (m_file != nullptr) {
+				std::fprintf(m_file, "D %.6f %llu\n", NowSecShadow(), static_cast<unsigned long long>(id));
+			}
+		}
+		m_cv.notify_all();
+	}
+	void Flip() {
+		if (m_file == nullptr) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::fprintf(m_file, "F %.6f\n", NowSecShadow());
+		std::fflush(m_file);
+	}
+	// KYTY_NATIVE_GPU_SUBMIT_SYNC: blocks until every buffer up to `id` is finished or the timeout passes.
+	void Wait(uint64_t id, bool acb) {
+		if (!m_sync || id == 0 || acb) {
+			return;
+		}
+		std::unique_lock<std::mutex> lock(m_mutex);
+		const bool done = m_cv.wait_for(lock, std::chrono::milliseconds(m_sync_ms),
+		                                [&] { return m_pending.empty() || m_pending.begin()->first > id; });
+		m_waits++;
+		m_timeouts += done ? 0u : 1u;
+		if ((m_waits & (m_waits - 1)) == 0) {
+			std::fprintf(stderr, "native shadow: submit sync: %llu waits, %llu timed out\n", static_cast<unsigned long long>(m_waits),
+			             static_cast<unsigned long long>(m_timeouts));
+		}
+	}
+
+private:
+	SubmitTrace() {
+		if (const char* path = std::getenv("KYTY_NATIVE_GPU_SUBMIT_TRACE"); path != nullptr && path[0] != '\0') {
+			m_file = std::fopen(path, "w");
+		}
+		m_sync = EnvOn("KYTY_NATIVE_GPU_SUBMIT_SYNC");
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_SUBMIT_SYNC_MS"); v != nullptr) {
+			m_sync_ms = std::strtoul(v, nullptr, 0);
+		}
+		if (const char* v = std::getenv("KYTY_NATIVE_GPU_TRACE_PS"); v != nullptr) {
+			for (const char* p = v; *p != '\0';) {
+				char* end = nullptr;
+				m_marks.insert(std::strtoull(p, &end, 0));
+				if (end == p) {
+					break;
+				}
+				p = *end == ',' ? end + 1 : end;
+			}
+		}
+	}
+	std::FILE*                         m_file = nullptr;
+	bool                               m_sync = false;
+	uint32_t                           m_sync_ms = 50;
+	std::set<uint64_t>                 m_marks;
+	std::mutex                         m_mutex;
+	std::condition_variable            m_cv;
+	std::map<uint64_t, bool>           m_pending; // id -> ACB
+	uint64_t                           m_next = 0, m_waits = 0, m_timeouts = 0;
+	uint32_t                           m_open_dcb = 0, m_open_acb = 0;
+};
+thread_local uint64_t t_trace_job = 0; // the submission the worker is translating
 
 // KYTY_NATIVE_GPU_AUDIT=1: log-only measurements, summed over the whole run. CPU clocks (CLOCK_MONOTONIC) and counters
 // only: nothing the GPU runs changes (no packet is added, removed or altered, no segment or point moves, no buffer is
@@ -951,6 +1070,9 @@ void StartControlSocket() {
 					count = count != 0 ? count : 8u;
 					DemandedDumps().store(count);
 					std::snprintf(reply, sizeof(reply), "ok dumping the next %u flips\n", count);
+				} else if (std::sscanf(line.c_str(), "wtrap %u", &count) == 1) {
+					CmdTrapDemand(count);
+					std::snprintf(reply, sizeof(reply), "ok trapping command writes for %u flips (KYTY_CMD_TRAP=1)\n", count);
 				} else if (line == "cpshadow") {
 					DemandedCpShadowCheck().store(true);
 					std::snprintf(reply, sizeof(reply), "ok comparing the CP shadow with the CPU copy when the gfx ring is next idle (cpshadow_N.txt)\n");
@@ -1345,6 +1467,21 @@ public:
 		m_frame_buffers = 0;
 		return out;
 	}
+	// The draws translated before the release that raises flip `ctx` and after the previous flip's: that flip's
+	// frame, however far submission runs ahead of the display. Without such a release (a CPU flip), those since the last.
+	std::vector<FrameDraw> TakeFlipDraws(uint32_t ctx) {
+		std::lock_guard<std::mutex> lock(m_mutex);
+		std::vector<FrameDraw>      out;
+		auto&                       slot = m_flip_draws[ctx & 0xffu];
+		if (slot.ctx == ctx) {
+			out.swap(slot.draws);
+			slot.ctx = 0;
+		} else {
+			out.swap(m_frame_draws); // a flip from the CPU: the draws since the last
+			m_frame_buffers = 0;
+		}
+		return out;
+	}
 
 	// The color targets the DCBs bound since the last call, for the flip dump.
 	std::vector<RenderTargetInfo> TakeFrameTargets() {
@@ -1360,7 +1497,16 @@ public:
 	// Reads guest memory through the backing (clipped to the view holding `addr`); 0 when unavailable.
 	uint64_t ReadGuest(uint64_t addr, void* dst, uint64_t size) {
 #if KYTY_GEM_BACKING_SUPPORTED
-		return m_gem != nullptr ? m_gem->ReadGuest(addr, dst, size) : 0;
+		// Across views: a surface the title mapped page by page (AMM) is a view per page.
+		uint64_t done = 0;
+		while (m_gem != nullptr && done < size) {
+			const uint64_t n = m_gem->ReadGuest(addr + done, static_cast<uint8_t*>(dst) + done, size - done);
+			if (n == 0) {
+				break;
+			}
+			done += n;
+		}
+		return done;
 #else
 		(void)addr;
 		(void)dst;
@@ -1735,10 +1881,23 @@ public:
 				}
 			}
 		}
-		if (!result.draw_log.empty()) {
+		SubmitTrace::Instance().Translated(t_trace_job, acb, result.draw_log);
+		if ((!result.draw_log.empty() || !result.flip_marks.empty()) && m_draw_log_frames) {
 			const uint32_t buffer = m_frame_buffers++;
-			for (const auto& d: result.draw_log) {
-				m_frame_draws.push_back(FrameDraw {acb, buffer, d});
+			size_t         i      = 0;
+			// The draws up to a flip's release in this buffer are that flip's frame (TakeFlipDraws), whenever the flip
+			// is shown.
+			for (const auto& [ctx, upto]: result.flip_marks) {
+				for (; i < upto && i < result.draw_log.size(); i++) {
+					m_frame_draws.push_back(FrameDraw {acb, buffer, result.draw_log[i]});
+				}
+				auto& slot = m_flip_draws[ctx & 0xffu];
+				slot.ctx   = ctx;
+				slot.draws.swap(m_frame_draws);
+				m_frame_draws.clear();
+			}
+			for (; i < result.draw_log.size(); i++) {
+				m_frame_draws.push_back(FrameDraw {acb, buffer, result.draw_log[i]});
 			}
 		}
 		if (m_collect_targets) {
@@ -1774,6 +1933,24 @@ public:
 				}
 				if (!result.unknown_detail.empty()) {
 					std::fprintf(stderr, "\n");
+				}
+			}
+			// KYTY_NATIVE_GPU_DUMP_REFUSED=N (diagnostics): the first N refused buffers as translated, to
+			// refused_<kind>_<frame>.bin in KYTY_NATIVE_GPU_DUMP_DIR.
+			static const uint32_t dump_refused = [] {
+				const char* v = std::getenv("KYTY_NATIVE_GPU_DUMP_REFUSED");
+				return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+			}();
+			if (m_refused_dumped < dump_refused) {
+				m_refused_dumped++;
+				const char*       dir  = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+				const std::string path = std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") + "/refused_" + kind + "_" +
+				                         std::to_string(frame) + ".bin";
+				if (std::FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+					std::fwrite(dcb.data(), 4, dcb.size(), f);
+					std::fclose(f);
+					std::fprintf(stderr, "native shadow: refused %s %llu written to %s (%zu dwords)\n", kind,
+					             static_cast<unsigned long long>(frame), path.c_str(), dcb.size());
 				}
 			}
 			m_refused++;
@@ -6024,6 +6201,11 @@ private:
 			StartControlSocket();
 			m_translator.SetDrawLog(true);
 			m_acb_translator.SetDrawLog(true);
+			m_draw_log_frames = true;
+		}
+		if (SubmitTrace::Instance().Logging()) {
+			m_translator.SetDrawLog(true);
+			m_acb_translator.SetDrawLog(true);
 		}
 		if (EnvOn("KYTY_NATIVE_GPU_WATCHDOG")) {
 			StartWatchdog();
@@ -6200,6 +6382,9 @@ private:
 		}
 		// Video-out buffers presented from plain copies (ShadowAddDisplayCopy).
 		StartDisplayCopiesLocked();
+		if (StaleCheckOn()) {
+			SetStaleCheckReader([](uint64_t va, void* dst, uint64_t bytes) { return Shadow::Instance().ReadGuest(va, dst, bytes); });
+		}
 		// KYTY_NATIVE_GPU_FIND=0xADDR:0xSIZE: log the draws/dispatches whose resources reach that range.
 		if (const char* find = std::getenv("KYTY_NATIVE_GPU_FIND"); find != nullptr) {
 			char*          end  = nullptr;
@@ -6977,11 +7162,18 @@ private:
 	bool          m_collect_targets = false;           // flip dumps compare render targets too
 	bool          m_collect_refs    = true;            // the translators collect per-draw references (SyncCollectRefs)
 	std::map<uint64_t, RenderTargetInfo> m_frame_targets; // color targets bound since the last flip dump
+	bool                                 m_draw_log_frames = false; // KYTY_NATIVE_GPU_CTL keeps them for the flip dump
 	std::vector<FrameDraw>               m_frame_draws;   // KYTY_NATIVE_GPU_CTL: draws since the last flip
+	struct FlipDraws {
+		uint32_t               ctx = 0;
+		std::vector<FrameDraw> draws;
+	};
+	std::array<FlipDraws, 256> m_flip_draws; // KYTY_NATIVE_GPU_CTL: the draws of each pending flip (TakeFlipDraws)
 	uint32_t                             m_frame_buffers = 0;
 	std::atomic<uint64_t> m_frames {0}; // the ACB thread reads it for the hang tests
 	uint64_t      m_completed      = 0;
 	uint32_t      m_refused        = 0;
+	uint32_t      m_refused_dumped = 0;
 	uint64_t      m_flattened      = 0; // buffers FlattenIndirectBuffers inlined
 	uint64_t                m_verbatim_dw   = 0; // Pm4TranslateStats::verbatim_dw over the flips being summed
 	uint64_t                m_total_dw      = 0;
@@ -7297,8 +7489,15 @@ public:
 	}
 
 	void Enqueue(const uint32_t* buffer, uint32_t size_dw, uint32_t queue, Then then) {
+		const uint64_t trace = buffer != nullptr ? SubmitTrace::Instance().Enqueued(queue, IsGuestComputeQueue(queue), size_dw) : 0;
+		EnqueueJob(buffer, size_dw, queue, std::move(then), trace);
+		SubmitTrace::Instance().Wait(trace, IsGuestComputeQueue(queue));
+	}
+
+	void EnqueueJob(const uint32_t* buffer, uint32_t size_dw, uint32_t queue, Then then, uint64_t trace) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		Job job {buffer, size_dw, queue, std::move(then), NowSecShadow()};
+		job.trace = trace;
 		if (m_acb_thread && buffer != nullptr && IsGuestComputeQueue(queue)) {
 			job.gate = m_acb_gate.EnqueueCompute();
 			m_acb_jobs.push_back(std::move(job));
@@ -7386,7 +7585,8 @@ private:
 		uint32_t        queue;
 		Then            then;
 		double          enqueued;
-		uint64_t        gate = 0; // m_acb_gate's stamp, with the ACB thread: compute buffers and Kyty's own submissions
+		uint64_t        gate  = 0; // m_acb_gate's stamp, with the ACB thread: compute buffers and Kyty's own submissions
+		uint64_t        trace = 0; // SubmitTrace's id
 	};
 	// What runs once a buffer is done.
 	struct Done {
@@ -7400,6 +7600,7 @@ private:
 		bool                  gfx      = false; // a guest DCB (FlipTrace times it)
 		bool                  acb      = false; // a guest ACB
 		int                   joins    = 1;     // the queues it is in: Finish runs it once the last one reaches it
+		uint64_t              trace    = 0;     // SubmitTrace's id
 	};
 	// KYTY_NATIVE_GPU_CHUNK_DW=N: graphics buffers longer than N dwords go to the GPU in chunks of about N
 	// (TranslateChunks) instead of at the title's segments.
@@ -7587,9 +7788,10 @@ private:
 		for (;;) {
 			{
 				std::unique_lock<std::mutex> lock(m_mutex);
-				if (m_held > 0) {
+				if (m_held > 0 || m_rewind_rest) {
 					// A label with no GPU writer shows up in memory when the tracker writes it, or when
-					// the GPU does and the fence (or this timeout) says so. Not a 50 us poll.
+					// the GPU does and the fence (or this timeout) says so. Not a 50 us poll. A REWIND's valid
+					// bit only shows up in memory.
 					m_cv.wait_for(lock, std::chrono::milliseconds(2), [this] { return !m_jobs.empty() || m_wake || !m_acb_done.empty(); });
 					m_wake = false;
 				} else {
@@ -7598,10 +7800,59 @@ private:
 				m_round.swap(m_jobs);
 			}
 			const double picked = NowSecShadow();
+			if (m_rewind_rest && (__atomic_load_n(&m_rewind_rest->buffer[1], __ATOMIC_ACQUIRE) & 0x80000000u) != 0) {
+				// The title set the REWIND valid: the rest of its buffer, then what waited behind it, then the new jobs.
+				std::deque<Job> round;
+				round.push_back(std::move(*m_rewind_rest));
+				m_rewind_rest.reset();
+				for (auto& behind: m_rewind_behind) {
+					round.push_back(std::move(behind));
+				}
+				m_rewind_behind.clear();
+				for (auto& next: m_round) {
+					round.push_back(std::move(next));
+				}
+				m_round.swap(round);
+			}
 			while (!m_round.empty()) {
 				// Out of the deque first: TranslateComputeAhead takes jobs from the middle of it.
 				Job job = std::move(m_round.front());
 				m_round.pop_front();
+				if (m_rewind_rest && !IsGuestComputeQueue(job.queue)) {
+					m_rewind_behind.push_back(std::move(job));
+					continue;
+				}
+				if (job.buffer != nullptr && job.queue == 0) {
+					RewindStop stop;
+					if (FindRewindStop(std::span<const uint32_t>(job.buffer, job.size_dw), &stop)) {
+						Job rest = job;
+						if (stop.next != nullptr) {
+							if (stop.call && stop.at + 4u < job.size_dw) {
+								Job back = job; // the caller's dwords after the call, once the target is done
+								back.buffer  = job.buffer + stop.at + 4u;
+								back.size_dw = job.size_dw - stop.at - 4u;
+								m_round.push_front(std::move(back));
+							}
+							rest.buffer  = stop.next;
+							rest.size_dw = stop.next_size;
+							m_round.push_front(std::move(rest));
+						} else {
+							rest.buffer  = job.buffer + stop.at;
+							rest.size_dw = job.size_dw - stop.at;
+							if (m_rewind_stops++ < 4) {
+								std::fprintf(stderr,
+								             "native shadow: graphics buffer %p stops at a REWIND the title has not set valid (dw %u of %u): "
+								             "what comes before it runs, the rest and the graphics jobs after it wait for the REWIND\n",
+								             static_cast<const void*>(job.buffer), stop.at, job.size_dw);
+							}
+							m_rewind_rest = std::move(rest);
+						}
+						job.size_dw = stop.at;
+						if (job.size_dw == 0) {
+							continue;
+						}
+					}
+				}
 				const bool own_submission = m_acb_thread && job.buffer == nullptr;
 				if (own_submission) {
 					WaitForAcbsBefore(job);
@@ -7651,7 +7902,12 @@ private:
 	}
 
 	void Translate(Job& job, double picked) {
+		struct TraceScope {
+			uint64_t outer;
+			~TraceScope() { t_trace_job = outer; }
+		} trace_scope {std::exchange(t_trace_job, job.trace)};
 		auto done      = std::make_shared<Done>();
+		done->trace    = job.trace;
 		done->then     = std::move(job.then);
 		done->buffer   = job.buffer;
 		done->size_dw  = job.size_dw;
@@ -7815,6 +8071,8 @@ private:
 	AcbReady TranslateAcbJob(Job& job) {
 		const double now = NowSecShadow();
 		auto         done = std::make_shared<Done>();
+		done->trace       = job.trace;
+		t_trace_job       = job.trace;
 		done->then        = std::move(job.then);
 		done->buffer      = job.buffer;
 		done->size_dw     = job.size_dw;
@@ -8811,6 +9069,7 @@ private:
 		if (--done.joins > 0) {
 			return;
 		}
+		SubmitTrace::Instance().Done(done.trace);
 		const double start = NowSecShadow();
 		if (done.whole) {
 			// A buffer Kyty's command processor runs whole: its WaitUntilSafeForRendering paddings take the EOP flips
@@ -8878,6 +9137,11 @@ private:
 	bool                                    m_acb_busy = false; // it holds a job
 	AcbNullGate                             m_acb_gate;
 	std::deque<Job>                         m_round; // what the worker took from m_jobs and has not translated yet (its thread only)
+	// The rest of a graphics buffer from a REWIND the title has not set valid yet (FindRewindStop), and the graphics
+	// jobs submitted after it: they wait for the REWIND as the CP would, compute queues go on (worker thread only).
+	std::optional<Job>                      m_rewind_rest;
+	std::deque<Job>                         m_rewind_behind;
+	uint32_t                                m_rewind_stops = 0;
 	bool                                    m_native  = false;
 	bool                                    m_acb_rings = false;
 	uint32_t                                m_compute_mask = 0;
@@ -9023,7 +9287,16 @@ void ShadowRemoveDisplayCopy(uint64_t label) {
 	}
 }
 
+namespace {
+// Diagnostics (flip dumps, KYTY_CMD_TRAP/PROBE records): the frame a title is building is the number of flips it has
+// reserved so far (sceVideoOutSubmitEopFlip, when it writes the frame's last command buffer); a flip shows the frame
+// its reservation closed.
+std::atomic<uint64_t>                       g_frames_reserved {0};
+std::array<std::atomic<uint64_t>, 256>      g_frame_of_ctx {};
+} // namespace
+
 void ShadowNoteFlipContext(uint32_t ctx, uint64_t label) {
+	g_frame_of_ctx[ctx & 0xffu].store(g_frames_reserved.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
 	if (DisplayCopyMode() != 0) {
 		Shadow::Instance().NoteFlipContext(ctx, label);
 	}
@@ -9308,6 +9581,660 @@ bool LodStatsTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_con
 	return false;
 }
 
+namespace {
+
+// Control socket "wtrap N" (KYTY_NATIVE_GPU_CTL, diagnostics): for N flips from the next one, the pages of guest command
+// memory (what FlattenIndirectBuffers read in the last 240 flips) are read-only. Each CPU write there is single-stepped
+// (EFLAGS.TF) with its page open. A write that completes a SET_SH_REG_INDIRECT whose table sets SPI_SHADER_PGM_LO_PS
+// (or, with KYTY_CMD_TRAP_RANGE=lo:hi, leaves a dword in [lo, hi)) is recorded with the writer's pc, the pixel shader,
+// the table and the return addresses on its stack into the program (the loader sets its range, CmdTrapSetCode).
+// Needs KYTY_CMD_TRAP=1, which notes the command pages. cmdtrap_<first flip>.txt in KYTY_NATIVE_GPU_DUMP_DIR when the window closes.
+struct CmdTrapRecord {
+	uint64_t flip;
+	uint64_t frame; // g_frames_reserved
+	uint64_t pc;
+	uint64_t vaddr;
+	uint32_t value[8];
+	uint32_t nret;
+	uint32_t tid;
+	uint64_t pkt;   // the SET_SH_REG_INDIRECT's address
+	uint64_t table; // its table
+	uint32_t ps;    // the PGM_LO_PS the table sets
+	uint64_t ret[32];
+};
+constexpr uint32_t        kCmdTrapRecords = 1u << 17;
+CmdTrapRecord*            g_ct_records    = nullptr;
+std::atomic<uint32_t>     g_ct_next {0};
+std::atomic<bool>         g_ct_armed {false};
+const uint64_t*           g_ct_pages   = nullptr; // sorted host pages, fixed once published
+std::atomic<uint32_t>     g_ct_pages_n {0};
+std::atomic<uint64_t>     g_ct_flip {0};
+std::atomic<uint64_t>     g_ct_faults {0};
+std::atomic<uint32_t>     g_ct_demand {0};
+uint32_t                  g_ct_flips_left = 0; // flip thread only
+uint64_t                  g_ct_arm_flip   = 0;
+uint32_t                  g_ct_lo = 0, g_ct_hi = 0; // KYTY_CMD_TRAP_RANGE
+std::atomic<uint64_t>     g_ct_code_lo {0}, g_ct_code_hi {0};
+std::mutex                g_ct_seen_mutex;
+std::unordered_map<uint64_t, uint64_t> g_ct_seen; // page -> last flip it was read as commands
+const bool                g_ct_on = EnvOn("KYTY_CMD_TRAP");
+// KYTY_CMD_TRAP=hle: no pages are trapped; libSceAgc's register setters report the pixel shaders they set
+// (CmdTrapHleRecord) with their callers.
+const bool                g_ct_hle = [] {
+	const char* v = std::getenv("KYTY_CMD_TRAP");
+	return v != nullptr && std::strcmp(v, "hle") == 0;
+}();
+struct sigaction          g_ct_prev_trap {};
+thread_local uint64_t     t_ct_page[4] = {};
+thread_local uint32_t     t_ct_npages  = 0;
+thread_local uint64_t     t_ct_vaddr = 0, t_ct_pc = 0, t_ct_rsp = 0;
+
+bool CmdTrapPage(uint64_t page) {
+	const uint32_t n = g_ct_pages_n.load(std::memory_order_acquire);
+	const uint64_t* p = g_ct_pages;
+	if (n == 0 || p == nullptr) {
+		return false;
+	}
+	uint32_t lo = 0, hi = n;
+	while (lo < hi) {
+		const uint32_t mid = (lo + hi) / 2;
+		if (p[mid] < page) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return lo < n && p[lo] == page;
+}
+
+// KYTY_CMD_PROBE="ADDR[:REG+OFF,...]/..." (program offsets in hex, diagnostics): while a "wtrap" window is open, a breakpoint at
+// each ADDR (a hardware breakpoint, up to 4) records the flip, the thread, rdi rsi rdx rcx r8, 8 bytes at each REG[+REG2]+OFF and
+// the frame-pointer chain. "wADDR" (an absolute address) watches the 8 bytes there for writes instead: the record has the
+// writing instruction's successor (pc) and the value written. "ADDR:...@REG+OFF" also watches REG+OFF for writes from the
+// next flip on, as of the first hit where the 8 bytes there are not 0 (one such watch per window, in the slot after the last).
+struct CmdProbe {
+	uint64_t addr  = 0;
+	bool     write = false;
+	int      arm_reg = -1;
+	int64_t  arm_off = 0;
+	uint32_t nmem = 0;
+	int      reg[8] {};
+	int      reg2[8] {-1, -1, -1, -1, -1, -1, -1, -1};
+	int64_t  off[8] {};
+};
+struct CmdProbeRecord {
+	uint64_t flip;
+	uint64_t frame; // g_frames_reserved
+	uint32_t tid;
+	uint32_t probe;
+	uint64_t regs[10]; // rdi rsi rdx rcx r8 rax r12 r13 r14 r15
+	uint64_t mem[8];
+	uint64_t ret[6];
+	uint64_t pc;
+	uint64_t value; // a write watch: the watched 8 bytes after the write
+};
+constexpr uint32_t    kCmdProbeRecords = 1u << 18;
+CmdProbe              g_cp[16];
+uint32_t              g_cp_n       = 0;
+std::atomic<bool>     g_cp_on {false};
+CmdProbeRecord*       g_cp_records = nullptr;
+std::atomic<uint32_t> g_cp_next {0};
+
+int CmdProbeReg(const char* name) {
+	static const char* const names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r12", "r13", "r14", "r15"};
+	static const int         regs[]  = {REG_RAX, REG_RBX, REG_RCX, REG_RDX, REG_RSI, REG_RDI, REG_RBP, REG_RSP, REG_R8, REG_R9, REG_R12, REG_R13, REG_R14, REG_R15};
+	for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
+		if (std::strncmp(name, names[i], std::strlen(names[i])) == 0) {
+			return regs[i];
+		}
+	}
+	return -1;
+}
+
+uint64_t CmdProbeRead(uint64_t a) {
+	uint64_t v = 0;
+	iovec    local {&v, 8};
+	iovec    remote {reinterpret_cast<void*>(a), 8};
+	return ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == 8 ? v : 0xdeaddeaddeaddeadull;
+}
+
+std::vector<int>      g_cp_fds;
+std::atomic<uint64_t> g_cp_arm_addr {0}; // "@REG+OFF": the address to watch, 1 once armed
+uint32_t              g_cp_armed_slots = 0; // flip thread: the slots it added
+
+// Hardware execution breakpoints (perf, sigtrap) on every thread there is now: the program's code stays as it is. `only`:
+// just that slot.
+void CmdProbeSet(bool on, int only = -1) {
+	if (!on) {
+		for (const int fd: g_cp_fds) {
+			::close(fd);
+		}
+		g_cp_fds.clear();
+		g_cp_arm_addr.store(0);
+		return;
+	}
+	std::vector<int> tids;
+	if (DIR* d = ::opendir("/proc/self/task"); d != nullptr) {
+		while (const dirent* e = ::readdir(d)) {
+			if (e->d_name[0] != '.') {
+				tids.push_back(std::atoi(e->d_name));
+			}
+		}
+		::closedir(d);
+	}
+	uint32_t failed = 0;
+	for (uint32_t i = 0; i < g_cp_n && i < 4; i++) {
+		if (only >= 0 && i != static_cast<uint32_t>(only)) {
+			continue;
+		}
+		for (const int tid: tids) {
+			perf_event_attr a {};
+			a.type           = PERF_TYPE_BREAKPOINT;
+			a.size           = sizeof(a);
+			a.bp_type        = g_cp[i].write ? HW_BREAKPOINT_W : HW_BREAKPOINT_X;
+			a.bp_addr        = g_cp[i].addr;
+			a.bp_len         = g_cp[i].write ? HW_BREAKPOINT_LEN_8 : sizeof(long);
+			a.sample_period  = 1;
+			a.exclude_kernel = 1;
+			a.exclude_hv     = 1;
+			a.sigtrap        = 1;
+			a.remove_on_exec = 1;
+			a.sig_data       = i;
+			const int fd = static_cast<int>(::syscall(SYS_perf_event_open, &a, tid, -1, -1, PERF_FLAG_FD_CLOEXEC));
+			if (fd >= 0) {
+				g_cp_fds.push_back(fd);
+			} else {
+				failed++;
+			}
+		}
+	}
+	std::fprintf(stderr, "native shadow: code probes: %zu breakpoints on %zu threads, %u failed (%s)\n", g_cp_fds.size(), tids.size(),
+	             failed, failed != 0 ? std::strerror(errno) : "-");
+}
+
+// From CmdTrapStep: a breakpoint of ours. True when handled.
+bool CmdProbeTrap(siginfo_t* info, ucontext_t* uc) {
+	// TRAP_PERF (6) with the event's sig_data in si_perf_data, the word after si_addr (older glibc names neither).
+	if (info == nullptr || info->si_code != 6) {
+		return false;
+	}
+	uint64_t perf_data = 0;
+	std::memcpy(&perf_data, reinterpret_cast<const uint8_t*>(info) + 24, 8);
+	auto&          g = uc->uc_mcontext.gregs;
+	const uint32_t i = static_cast<uint32_t>(perf_data);
+	if (i >= g_cp_n || g_cp_records == nullptr || !g_cp_on.load(std::memory_order_acquire)) {
+		return true;
+	}
+	const uint32_t idx = g_cp_next.fetch_add(1, std::memory_order_relaxed);
+	if (idx >= kCmdProbeRecords) {
+		return true;
+	}
+	CmdProbeRecord& r = g_cp_records[idx];
+	r.flip            = g_ct_flip.load(std::memory_order_relaxed);
+	r.frame           = g_frames_reserved.load(std::memory_order_relaxed);
+	r.tid             = static_cast<uint32_t>(::syscall(SYS_gettid));
+	r.probe           = i;
+	r.regs[0]         = g[REG_RDI];
+	r.regs[1]         = g[REG_RSI];
+	r.regs[2]         = g[REG_RDX];
+	r.regs[3]         = g[REG_RCX];
+	r.regs[4]         = g[REG_R8];
+	r.regs[5]         = g[REG_RAX];
+	r.regs[6]         = g[REG_R12];
+	r.regs[7]         = g[REG_R13];
+	r.regs[8]         = g[REG_R14];
+	r.regs[9]         = g[REG_R15];
+	r.pc              = static_cast<uint64_t>(g[REG_RIP]);
+	r.value           = g_cp[i].write ? *reinterpret_cast<const volatile uint64_t*>(g_cp[i].addr) : 0;
+	if (g_cp[i].arm_reg >= 0 && g_cp_arm_addr.load(std::memory_order_relaxed) == 0) {
+		const uint64_t a = static_cast<uint64_t>(g[g_cp[i].arm_reg]) + g_cp[i].arm_off;
+		if (*reinterpret_cast<const volatile uint64_t*>(a) != 0) {
+			uint64_t none = 0;
+			g_cp_arm_addr.compare_exchange_strong(none, a);
+		}
+	}
+	for (uint32_t k = 0; k < 8; k++) {
+		// Read in place: guest memory backed by GPU buffers is not readable with process_vm_readv. The probe names
+		// fields of objects the probed code itself uses.
+		const uint64_t base2 = k < g_cp[i].nmem && g_cp[i].reg2[k] >= 0 ? static_cast<uint64_t>(g[g_cp[i].reg2[k]]) : 0;
+		r.mem[k] = k < g_cp[i].nmem ? *reinterpret_cast<const volatile uint64_t*>(static_cast<uint64_t>(g[g_cp[i].reg[k]]) + base2 + g_cp[i].off[k]) : 0;
+	}
+	uint64_t fp = static_cast<uint64_t>(g[REG_RBP]);
+	for (uint32_t k = 0; k < 6; k++) {
+		r.ret[k]          = fp != 0 ? CmdProbeRead(fp + 8) : 0;
+		const uint64_t up = fp != 0 ? CmdProbeRead(fp) : 0;
+		fp                = up > fp ? up : 0;
+	}
+	return true;
+}
+
+void CmdProbeParse(uint64_t base) {
+	const char* v = std::getenv("KYTY_CMD_PROBE");
+	for (const char* p = v; p != nullptr && *p != '\0' && g_cp_n < 16;) {
+		char*     end = nullptr;
+		CmdProbe& c   = g_cp[g_cp_n];
+		c.write       = *p == 'w';
+		if (c.write) {
+			p++;
+		}
+		c.addr = (c.write ? 0 : base) + std::strtoull(p, &end, 16);
+		if (end == p) {
+			break;
+		}
+		p = end;
+		if (*p == ':') {
+			p++;
+			while (*p != '\0' && *p != '/' && *p != '@' && c.nmem < 8) {
+				const int r = CmdProbeReg(p);
+				while (*p != '\0' && *p != '+' && *p != '-' && *p != ',' && *p != '/' && *p != '@') {
+					p++;
+				}
+				int r2 = -1; // "REG+REG2+OFF"
+				if (*p == '+' && p[1] == 'r') {
+					p++;
+					r2 = CmdProbeReg(p);
+					while (*p != '\0' && *p != '+' && *p != '-' && *p != ',' && *p != '/' && *p != '@') {
+						p++;
+					}
+				}
+				const int64_t o = (*p == '+' || *p == '-') ? std::strtoll(p, &end, 16) : 0;
+				if (*p == '+' || *p == '-') {
+					p = end;
+				}
+				if (r >= 0) {
+					c.reg[c.nmem]   = r;
+					c.reg2[c.nmem]  = r2;
+					c.off[c.nmem++] = o;
+				}
+				if (*p == ',') {
+					p++;
+				}
+			}
+		}
+		if (*p == '@') {
+			p++;
+			c.arm_reg = CmdProbeReg(p);
+			while (*p != '\0' && *p != '+' && *p != '-' && *p != '/') {
+				p++;
+			}
+			if (*p == '+' || *p == '-') {
+				c.arm_off = std::strtoll(p, &end, 16);
+				p         = end;
+			}
+		}
+		g_cp_n++;
+		if (*p == '/') {
+			p++;
+		}
+	}
+}
+
+void CmdTrapStep(int sig, siginfo_t* info, void* native_context) {
+	auto* uc = static_cast<ucontext_t*>(native_context);
+	if (t_ct_npages == 0 && CmdProbeTrap(info, uc)) {
+		return;
+	}
+	if (t_ct_npages == 0) {
+		if ((g_ct_prev_trap.sa_flags & SA_SIGINFO) != 0 && g_ct_prev_trap.sa_sigaction != nullptr) {
+			g_ct_prev_trap.sa_sigaction(sig, info, native_context);
+		} else if (g_ct_prev_trap.sa_handler != SIG_DFL && g_ct_prev_trap.sa_handler != SIG_IGN && g_ct_prev_trap.sa_handler != nullptr) {
+			g_ct_prev_trap.sa_handler(sig);
+		}
+		return;
+	}
+	uc->uc_mcontext.gregs[REG_EFL] &= ~0x100ll;
+	// What the write left: up to 8 dwords from its address, within its page.
+	const uint64_t a    = t_ct_vaddr & ~3ull;
+	const uint64_t end  = (a & ~0xfffull) + 0x1000;
+	uint32_t       v[8] = {};
+	const uint32_t nv   = static_cast<uint32_t>(std::min<uint64_t>(8, (end - a) / 4));
+	std::memcpy(v, reinterpret_cast<const void*>(a), nv * 4);
+	bool match = false;
+	for (uint32_t i = 0; i < nv; i++) {
+		match = match || (v[i] >= g_ct_lo && v[i] < g_ct_hi);
+	}
+	// A SET_SH_REG_INDIRECT around the write (6 dwords before it to 10 after) whose table sets PGM_LO_PS (SH 0x08).
+	uint64_t pkt = 0, table = 0;
+	uint32_t ps  = 0;
+	{
+		uint32_t       win[16] = {};
+		const uint64_t from    = a - 24;
+		iovec          local {win, sizeof(win)};
+		iovec          remote {reinterpret_cast<void*>(from), sizeof(win)};
+		if (::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(sizeof(win))) {
+			for (uint32_t i = 0; i + 4 < 16 && ps == 0; i++) {
+				if ((win[i] & 0xffffff00u) != 0xC0036300u || win[i + 2] > 0xffffu) {
+					continue;
+				}
+				const uint64_t t   = (win[i + 1] & ~3ull) | (static_cast<uint64_t>(win[i + 2]) << 32u);
+				const uint32_t num = std::min<uint32_t>(win[i + 4] & 0x3fffu, 64u);
+				uint32_t       pairs[128];
+				iovec          l2 {pairs, num * 8ull};
+				iovec          r2 {reinterpret_cast<void*>(t), num * 8ull};
+				if (num == 0 || ::process_vm_readv(::getpid(), &l2, 1, &r2, 1, 0) != static_cast<ssize_t>(num * 8ull)) {
+					continue;
+				}
+				for (uint32_t k = 0; k < num; k++) {
+					if (pairs[2 * k] == 0x08u) {
+						ps    = pairs[2 * k + 1];
+						table = t;
+						pkt   = from + i * 4ull;
+						break;
+					}
+				}
+			}
+		}
+	}
+	match = match || ps != 0;
+	if (match && g_ct_records != nullptr) {
+		const uint32_t idx = g_ct_next.fetch_add(1, std::memory_order_relaxed);
+		if (idx < kCmdTrapRecords) {
+			CmdTrapRecord& r = g_ct_records[idx];
+			r.flip           = g_ct_flip.load(std::memory_order_relaxed);
+			r.frame          = g_frames_reserved.load(std::memory_order_relaxed);
+			r.pc             = t_ct_pc;
+			r.vaddr          = t_ct_vaddr;
+			std::memcpy(r.value, v, sizeof(v));
+			r.pkt   = pkt;
+			r.table = table;
+			r.ps    = ps;
+			r.tid  = static_cast<uint32_t>(::syscall(SYS_gettid));
+			r.nret = 0;
+			const uint64_t clo = g_ct_code_lo.load(std::memory_order_relaxed);
+			const uint64_t chi = g_ct_code_hi.load(std::memory_order_relaxed);
+			uint64_t       buf[64];
+			for (uint64_t off = 0; off < 32768 && r.nret < 32; off += sizeof(buf)) {
+				iovec local {buf, sizeof(buf)};
+				iovec remote {reinterpret_cast<void*>(t_ct_rsp + off), sizeof(buf)};
+				const ssize_t got = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+				if (got <= 0) {
+					break;
+				}
+				for (size_t i = 0; i < static_cast<size_t>(got) / 8 && r.nret < 32; i++) {
+					if (buf[i] >= clo && buf[i] < chi) {
+						r.ret[r.nret++] = buf[i];
+					}
+				}
+				if (got != static_cast<ssize_t>(sizeof(buf))) {
+					break;
+				}
+			}
+		}
+	}
+	if (g_ct_armed.load(std::memory_order_acquire)) {
+		for (uint32_t i = 0; i < t_ct_npages; i++) {
+			::mprotect(reinterpret_cast<void*>(t_ct_page[i]), 0x1000, PROT_READ);
+		}
+	}
+	t_ct_npages = 0;
+}
+
+void CmdTrapProtect(int prot) {
+	const uint32_t n = g_ct_pages_n.load();
+	for (uint32_t i = 0; i < n;) {
+		uint32_t j = i + 1;
+		while (j < n && g_ct_pages[j] == g_ct_pages[j - 1] + 0x1000) {
+			j++;
+		}
+		::mprotect(reinterpret_cast<void*>(g_ct_pages[i]), (j - i) * 0x1000ull, prot);
+		i = j;
+	}
+}
+
+// At every flip (the flip thread): arms a demanded window, closes one that has run its flips.
+void CmdTrapOnFlip(uint64_t n) {
+	g_ct_flip.store(n, std::memory_order_relaxed);
+	if (!g_ct_on) {
+		return;
+	}
+	// A probe's "@REG+OFF" found its address: a write watch on it in the next slot, from now to the window's end.
+	if (const uint64_t a = g_cp_arm_addr.load(); a > 1 && g_cp_on.load() && g_cp_n < 4) {
+		g_cp[g_cp_n] = CmdProbe {a, true};
+		g_cp_n++;
+		g_cp_armed_slots++;
+		CmdProbeSet(true, static_cast<int>(g_cp_n - 1));
+		g_cp_arm_addr.store(1);
+		std::fprintf(stderr, "native shadow: write watch on 0x%llx from flip %llu\n", static_cast<unsigned long long>(a),
+		             static_cast<unsigned long long>(n));
+	}
+	if (g_ct_flips_left > 0) {
+		if (--g_ct_flips_left > 0) {
+			return;
+		}
+		g_ct_armed.store(false, std::memory_order_release);
+		CmdTrapProtect(PROT_READ | PROT_WRITE);
+		if (g_cp_on.exchange(false)) {
+			CmdProbeSet(false);
+		}
+		while (g_cp_n > 0 && g_cp[g_cp_n - 1].write && g_cp[g_cp_n - 1].arm_reg < 0 && g_cp_armed_slots > 0) {
+			g_cp_n--;
+			g_cp_armed_slots--;
+		}
+		const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+		char        path[512];
+		std::snprintf(path, sizeof(path), "%s/cmdtrap_%llu.txt", dir != nullptr && dir[0] != '\0' ? dir : ".",
+		              static_cast<unsigned long long>(g_ct_arm_flip));
+		const uint32_t count = std::min(g_ct_next.load(), kCmdTrapRecords);
+		if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+			std::fprintf(f, "# armed at flip %llu, closed at %llu, %u pages, %llu write faults, %u records; code 0x%llx-0x%llx\n",
+			             static_cast<unsigned long long>(g_ct_arm_flip), static_cast<unsigned long long>(n), g_ct_pages_n.load(),
+			             static_cast<unsigned long long>(g_ct_faults.load()), count,
+			             static_cast<unsigned long long>(g_ct_code_lo.load()), static_cast<unsigned long long>(g_ct_code_hi.load()));
+			std::fprintf(f, "# flip/frame tid pc vaddr v0..v7 ps pkt table | returns (frame: flips reserved before, flip_N.txt)\n");
+			for (uint32_t i = 0; i < count; i++) {
+				const CmdTrapRecord& r = g_ct_records[i];
+				std::fprintf(f, "%llu/%llu %u %llx %llx", static_cast<unsigned long long>(r.flip), static_cast<unsigned long long>(r.frame), r.tid,
+				             static_cast<unsigned long long>(r.pc),
+				             static_cast<unsigned long long>(r.vaddr));
+				for (uint32_t k = 0; k < 8; k++) {
+					std::fprintf(f, " %08x", r.value[k]);
+				}
+				std::fprintf(f, " %08x %llx %llx |", r.ps, static_cast<unsigned long long>(r.pkt), static_cast<unsigned long long>(r.table));
+				for (uint32_t k = 0; k < r.nret && k < 32; k++) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(r.ret[k]));
+				}
+				std::fprintf(f, "\n");
+			}
+			const uint32_t pn = std::min(g_cp_next.load(), kCmdProbeRecords);
+			std::fprintf(f, "# probes: P flip/frame tid probe rdi rsi rdx rcx r8 rax r12 r13 r14 r15 | mem0..7 | rbp chain returns | pc value (%u records)\n", pn);
+			for (uint32_t i = 0; i < pn; i++) {
+				const CmdProbeRecord& r = g_cp_records[i];
+				std::fprintf(f, "P %llu/%llu %u %u", static_cast<unsigned long long>(r.flip), static_cast<unsigned long long>(r.frame), r.tid, r.probe);
+				for (uint64_t x: r.regs) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(x));
+				}
+				std::fprintf(f, " |");
+				for (uint32_t k = 0; k < g_cp[r.probe].nmem; k++) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(r.mem[k]));
+				}
+				std::fprintf(f, " |");
+				for (uint64_t x: r.ret) {
+					std::fprintf(f, " %llx", static_cast<unsigned long long>(x));
+				}
+				std::fprintf(f, " | %llx %llx\n", static_cast<unsigned long long>(r.pc), static_cast<unsigned long long>(r.value));
+			}
+			std::fclose(f);
+		}
+		std::fprintf(stderr, "native shadow: write trap closed at flip %llu: %llu write faults, %u records -> %s\n",
+		             static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_ct_faults.load()), count, path);
+		return;
+	}
+	const uint32_t want = g_ct_demand.exchange(0);
+	if (want == 0 || g_ct_pages_n.load() != 0) {
+		return;
+	}
+	if (const char* r = std::getenv("KYTY_CMD_TRAP_RANGE"); r != nullptr) {
+		char* end = nullptr;
+		g_ct_lo   = static_cast<uint32_t>(std::strtoul(r, &end, 0));
+		g_ct_hi   = *end == ':' ? static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0)) : g_ct_lo + 1;
+	}
+	std::vector<uint64_t> pages;
+	if (!g_ct_hle) {
+		std::lock_guard<std::mutex> lock(g_ct_seen_mutex);
+		for (const auto& [page, last]: g_ct_seen) {
+			if (last + 240 >= n) {
+				pages.push_back(page);
+			}
+		}
+	}
+	std::sort(pages.begin(), pages.end());
+	auto* arr = new uint64_t[pages.size() + 1];
+	std::copy(pages.begin(), pages.end(), arr);
+	if (g_ct_records == nullptr) {
+		g_ct_records = new CmdTrapRecord[kCmdTrapRecords];
+	}
+	g_ct_next.store(0);
+	g_cp_next.store(0);
+	g_ct_pages   = arr;
+	g_ct_pages_n.store(static_cast<uint32_t>(pages.size()), std::memory_order_release);
+	static const bool installed = [] {
+		struct sigaction sa {};
+		sa.sa_sigaction = CmdTrapStep;
+		sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+		sigemptyset(&sa.sa_mask);
+		return ::sigaction(SIGTRAP, &sa, &g_ct_prev_trap) == 0;
+	}();
+	if (!installed) {
+		return;
+	}
+	g_ct_arm_flip   = n;
+	g_ct_flips_left = want;
+	g_ct_armed.store(true, std::memory_order_release);
+	CmdTrapProtect(PROT_READ);
+	if (static bool parsed = false; !parsed) {
+		parsed = true;
+		CmdProbeParse(g_ct_code_lo.load());
+		g_cp_records = new CmdProbeRecord[kCmdProbeRecords];
+	}
+	if (g_cp_n > 0) {
+		CmdProbeSet(true);
+		g_cp_on.store(true, std::memory_order_release);
+		std::fprintf(stderr, "native shadow: %u code probes set\n", g_cp_n);
+	}
+	std::fprintf(stderr, "native shadow: write trap (%s) armed at flip %llu for %u flips over %zu pages of command memory\n",
+	             g_ct_hle ? "libSceAgc setters" : "pages", static_cast<unsigned long long>(n), want, pages.size());
+}
+
+} // namespace
+
+bool CmdTrapOn() {
+	return g_ct_on && !g_ct_hle;
+}
+
+void CmdTrapDemand(uint32_t flips) {
+	g_ct_demand.store(flips);
+}
+
+void CmdTrapSetCode(uint64_t lo, uint64_t hi) {
+	g_ct_code_lo.store(lo);
+	g_ct_code_hi.store(hi);
+}
+
+void CmdTrapNote(uint64_t va, uint64_t bytes) {
+	if (!CmdTrapOn() || bytes == 0) {
+		return;
+	}
+	const uint64_t flip = g_ct_flip.load(std::memory_order_relaxed);
+	std::lock_guard<std::mutex> lock(g_ct_seen_mutex);
+	for (uint64_t p = va & ~0xfffull; p < va + bytes; p += 0x1000) {
+		g_ct_seen[p] = flip;
+	}
+}
+
+bool CmdTrapHleArmed() {
+	return g_ct_hle && g_ct_armed.load(std::memory_order_relaxed);
+}
+
+void CmdTrapHleRecord(uint32_t ps, uint32_t kind, uint64_t table, const uint32_t* first, uint32_t first_n) {
+	static std::atomic<uint32_t> misses {0};
+	if (!CmdTrapHleArmed() || g_ct_records == nullptr || (ps == 0 && misses.fetch_add(1) >= 4000)) {
+		return;
+	}
+	const uint32_t idx = g_ct_next.fetch_add(1, std::memory_order_relaxed);
+	if (idx >= kCmdTrapRecords) {
+		return;
+	}
+	CmdTrapRecord& r = g_ct_records[idx];
+	r.flip           = g_ct_flip.load(std::memory_order_relaxed);
+	r.frame          = g_frames_reserved.load(std::memory_order_relaxed);
+	r.pc             = kind;
+	r.vaddr          = table;
+	std::memset(r.value, 0, sizeof(r.value));
+	std::memcpy(r.value, first, std::min<uint32_t>(first_n, 8) * 4);
+	r.tid   = static_cast<uint32_t>(::syscall(SYS_gettid));
+	r.pkt   = 0;
+	r.table = table;
+	r.ps    = ps;
+	r.nret  = 0;
+	const uint64_t clo = g_ct_code_lo.load(std::memory_order_relaxed);
+	const uint64_t chi = g_ct_code_hi.load(std::memory_order_relaxed);
+	// The program's frames by their frame pointers: the first return into the program on the stack is the setter's
+	// caller; the guest frame pointer a host frame saved below it starts a chain of (saved rbp, return) pairs.
+	const auto            sp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+	std::vector<uint64_t> buf(16384);
+	iovec                 local {buf.data(), buf.size() * 8};
+	iovec                 remote {reinterpret_cast<void*>(sp), buf.size() * 8};
+	const ssize_t         got = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+	const size_t          n   = got > 0 ? static_cast<size_t>(got) / 8 : 0;
+	size_t                top = n;
+	for (size_t i = 0; i < n; i++) {
+		if (buf[i] >= clo && buf[i] < chi) {
+			top = i;
+			break;
+		}
+	}
+	if (top == n) {
+		return;
+	}
+	r.ret[r.nret++] = buf[top];
+	const uint64_t s  = sp + top * 8;
+	const uint64_t hi = sp + n * 8;
+	auto at           = [&](uint64_t a) -> uint64_t { return a >= sp && a + 8 <= hi ? buf[(a - sp) / 8] : 0; };
+	auto in_code      = [&](uint64_t v) { return v >= clo && v < chi; };
+	uint64_t best     = 0;
+	for (size_t i = 0; i < top; i++) {
+		const uint64_t v = buf[i];
+		if (v > s && v < hi && (v & 7) == 0 && in_code(at(v + 8)) && (best == 0 || v < best)) {
+			best = v;
+		}
+	}
+	for (uint64_t fp = best; fp != 0 && r.nret < 32;) {
+		const uint64_t ret = at(fp + 8);
+		if (!in_code(ret)) {
+			break;
+		}
+		r.ret[r.nret++]   = ret;
+		const uint64_t up = at(fp);
+		if (up <= fp) {
+			break;
+		}
+		fp = up;
+	}
+}
+
+bool CmdTrapFault(uint64_t vaddr, uint64_t pc, bool write, void* native_context) {
+	const uint64_t page = vaddr & ~0xfffull;
+	if (!CmdTrapPage(page)) {
+		return false;
+	}
+	::mprotect(reinterpret_cast<void*>(page), 0x1000, PROT_READ | PROT_WRITE);
+	if (!write || native_context == nullptr || !g_ct_armed.load(std::memory_order_acquire)) {
+		return true;
+	}
+	g_ct_faults.fetch_add(1, std::memory_order_relaxed);
+	auto* uc = static_cast<ucontext_t*>(native_context);
+	if (t_ct_npages == 0) {
+		t_ct_vaddr = vaddr;
+		t_ct_pc    = pc;
+		t_ct_rsp   = static_cast<uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
+	}
+	if (t_ct_npages < 4) {
+		t_ct_page[t_ct_npages++] = page;
+	}
+	uc->uc_mcontext.gregs[REG_EFL] |= 0x100ll;
+	return true;
+}
+
 bool PrimaryRendering() {
 	static const bool primary = EnvOn("KYTY_NATIVE_GPU_PRIMARY");
 	// KYTY_NATIVE_GPU_NULL=1: nothing renders at all, natively or through Vulkan, while the game and
@@ -9436,10 +10363,22 @@ void DumpRenderTargets(const char* dir, unsigned long long flip,
 } // namespace
 
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
-                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
+                  uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode, uint32_t flip_ctx,
                   const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
+	SubmitTrace::Instance().Flip();
+	// KYTY_COUNT_HLE with KYTY_COUNT_HLE_EVERY=N (diagnostics): the counted HLE calls of every N flips.
+	if (static const uint64_t every = [] {
+		    const char* v = std::getenv("KYTY_COUNT_HLE_EVERY");
+		    return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+	    }();
+	    every != 0 && Libs::CountHleList() != nullptr && n % every == 0) {
+		std::fprintf(stderr, "flip %llu %llu ms: ", static_cast<unsigned long long>(n),
+		             static_cast<unsigned long long>(Loader::Timer::GetTimeMs()));
+		Libs::DumpHleCounts(stderr, 1.0, 400);
+	}
+	CmdTrapOnFlip(n);
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
 		Shadow::Instance().KeepResident(address, size);
 	}
@@ -9462,9 +10401,10 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 	if ((list == nullptr && !on_demand) || address == 0 || size == 0 || !Shadow::Instance().Active()) {
 		return;
 	}
+	auto take_draws = [flip_ctx]() { return Shadow::Instance().TakeFlipDraws(flip_ctx); };
 	if (!wanted) {
 		(void)Shadow::Instance().TakeFrameTargets(); // keep only the dumped frame's targets
-		(void)Shadow::Instance().TakeFrameDraws();
+		(void)take_draws();
 		return;
 	}
 	if (demand_left > 0) {
@@ -9488,7 +10428,8 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			WriteFile(path, reinterpret_cast<const void*>(address), size);
 		}
 		DumpRenderTargets(dir, flip, download_region);
-	} else if (PrimaryRendering() && (EnvOn("KYTY_NATIVE_GPU_DUMP_RTS") || on_demand)) {
+	} else if (const char* rts = std::getenv("KYTY_NATIVE_GPU_DUMP_RTS");
+	           PrimaryRendering() && (rts != nullptr ? rts[0] != '0' : on_demand)) { // =0: the presented surface alone
 		DumpRenderTargets(dir, flip, nullptr);
 	}
 	// KYTY_NATIVE_GPU_DUMP_RANGES=0xADDR:0xSIZE[,...]: guest ranges saved next to the flip, e.g. a
@@ -9509,7 +10450,7 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 		}
 	}
 	// Every draw and dispatch of the frame, with the arguments of indirect ones as the GPU left them.
-	if (const auto draws = Shadow::Instance().TakeFrameDraws(); !draws.empty()) {
+	if (const auto draws = take_draws(); !draws.empty()) {
 		std::snprintf(path, sizeof(path), "%s/flip_%llu.draws.txt", dir, flip);
 		if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
 			std::fprintf(f, "# q buf idx op count inst ps gs cb0 zbase ud_hash gs_hash indirect args\n");
@@ -9544,14 +10485,84 @@ void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t heig
 			}
 			std::fclose(f);
 		}
+		// KYTY_NATIVE_GPU_DUMP_UD=1 (diagnostics): each draw's and dispatch's first 16 user-data registers, the code of
+		// each shader, and 64 bytes at each user-data pair that looks like a GPU address, once per shader and user data.
+		if (const char* ud = std::getenv("KYTY_NATIVE_GPU_DUMP_UD"); ud != nullptr && ud[0] == '1') {
+			std::snprintf(path, sizeof(path), "%s/flip_%llu.ud.txt", dir, flip);
+			if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
+				auto hex = [&](uint64_t addr, uint64_t bytes) {
+					std::vector<uint32_t> v(bytes / 4);
+					const uint64_t        got = Shadow::Instance().ReadGuest(addr, v.data(), bytes);
+					std::fprintf(f, "  mem 0x%llx %llu:", static_cast<unsigned long long>(addr),
+					             static_cast<unsigned long long>(got));
+					for (uint64_t i = 0; i < got / 4; i++) {
+						std::fprintf(f, " %08x", v[i]);
+					}
+					std::fprintf(f, "\n");
+				};
+				std::vector<uint64_t> shaders;
+				std::vector<std::pair<uint64_t, uint32_t>> seen;
+				for (const auto& fd: draws) {
+					const auto& d = fd.draw;
+					std::fprintf(f, "%s %u %u 0x%02x ps 0x%llx ud", fd.acb ? "acb" : "dcb", fd.buffer, d.index, d.op,
+					             static_cast<unsigned long long>(d.ps));
+					for (uint32_t i = 0; i < 16; i++) {
+						std::fprintf(f, " %08x", d.ud[i]);
+					}
+					std::fprintf(f, "\n");
+					if (std::find(shaders.begin(), shaders.end(), d.ps) == shaders.end() && d.ps != 0) {
+						shaders.push_back(d.ps);
+						hex(d.ps, 2048);
+					}
+					// KYTY_NATIVE_GPU_DUMP_UD_PS=ADDR: for that shader, 0x600 bytes at each user-data address and at each
+					// address found in them (two levels).
+					static const uint64_t deep_ps = [] {
+						const char* v = std::getenv("KYTY_NATIVE_GPU_DUMP_UD_PS");
+						return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+					}();
+					if (deep_ps != 0 && d.ps == deep_ps) {
+						for (uint32_t i = 0; i + 1 < 16; i += 2) {
+							const uint64_t a = (static_cast<uint64_t>(d.ud[i + 1]) << 32u) | d.ud[i];
+							if (a < 0x1000000000ull || a >= 0x11000000000ull || (a & 3u) != 0) {
+								continue;
+							}
+							std::vector<uint64_t> t(0x600 / 8);
+							const uint64_t        got = Shadow::Instance().ReadGuest(a, t.data(), 0x600);
+							hex(a, 0x600);
+							for (uint64_t k = 0; k < got / 8; k++) {
+								const uint64_t b = t[k] & 0xffffffffffffull;
+								if (b >= 0x1000000000ull && b < 0x11000000000ull && (b & 3u) == 0 && (t[k] >> 48u) == 0) {
+									std::fprintf(f, "  at 0x%llx+0x%llx\n", static_cast<unsigned long long>(a),
+									             static_cast<unsigned long long>(k * 8));
+									hex(b, 0x600);
+								}
+							}
+						}
+					}
+					const std::pair<uint64_t, uint32_t> key {d.ps, d.ud_hash};
+					if (std::find(seen.begin(), seen.end(), key) != seen.end()) {
+						continue;
+					}
+					seen.push_back(key);
+					for (uint32_t i = 0; i + 1 < 16; i++) {
+						const uint32_t hi = d.ud[i + 1] & 0xffffu;
+						if (hi != 0 && hi < 0x100u && (d.ud[i + 1] >> 16u) == 0 && (d.ud[i] & 3u) == 0) {
+							hex((static_cast<uint64_t>(hi) << 32u) | d.ud[i], 64);
+						}
+					}
+				}
+				std::fclose(f);
+			}
+		}
 	}
 	std::snprintf(path, sizeof(path), "%s/flip_%llu.txt", dir, flip);
 	if (std::FILE* f = std::fopen(path, "w"); f != nullptr) {
 		std::fprintf(f,
 		             "address 0x%llx\nsize %llu\nwidth %u\nheight %u\nbytes_per_pixel %u\n"
-		             "pixel_format %u\ntile_mode 0x%x\nvulkan_images %u\n",
+		             "pixel_format %u\ntile_mode 0x%x\nvulkan_images %u\nctx 0x%x\nframe %llu\n",
 		             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-		             width, height, bytes_per_pixel, pixel_format, tile_mode, vulkan_images);
+		             width, height, bytes_per_pixel, pixel_format, tile_mode, vulkan_images, flip_ctx,
+		             static_cast<unsigned long long>(g_frame_of_ctx[flip_ctx & 0xffu].load(std::memory_order_relaxed)));
 		std::fclose(f);
 	}
 	std::fprintf(stderr, "native shadow: dumped flip %llu (%ux%u) native%s to %s\n", flip, width,

@@ -462,6 +462,16 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	auto flags_u = static_cast<uint32_t>(flags);
 
+	// KYTY_LOG_OPEN=1 (diagnostics): every file the title opens, with the time.
+	if (static const bool log_open = [] {
+		    const char* v = std::getenv("KYTY_LOG_OPEN");
+		    return v != nullptr && v[0] == '1';
+	    }();
+	    log_open) {
+		std::fprintf(stderr, "open %llu ms: %s flags 0x%x\n", static_cast<unsigned long long>(Loader::Timer::GetTimeMs()),
+		             path, flags_u);
+	}
+
 	LOGF("\t path = %s\n"
 	     "\t flags = %08" PRIx32 "\n"
 	     "\t mode = %04" PRIx16 "\n",

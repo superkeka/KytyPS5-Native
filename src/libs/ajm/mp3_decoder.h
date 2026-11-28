@@ -134,7 +134,11 @@ public:
 		}
 	}
 
-	~AjmMp3Decoder() override { Release(); }
+	~AjmMp3Decoder() override {
+		Release();
+		av_packet_free(&m_packet);
+		av_frame_free(&m_frame);
+	}
 
 	void Reset() override {
 		if (m_codec_context != nullptr) {
@@ -335,48 +339,47 @@ private:
 			return true;
 		}
 
-		AVPacket* packet = av_packet_alloc();
-		if (packet == nullptr || av_new_packet(packet, packet_size) < 0) {
-			av_packet_free(&packet);
+		if (m_packet == nullptr) {
+			m_packet = av_packet_alloc();
+		}
+		if (m_frame == nullptr) {
+			m_frame = av_frame_alloc();
+		}
+		AVPacket* packet = m_packet;
+		if (packet == nullptr || m_frame == nullptr || av_new_packet(packet, packet_size) < 0) {
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 			return false;
 		}
 		std::memcpy(packet->data, packet_data, static_cast<size_t>(packet_size));
 
 		int rc = avcodec_send_packet(m_codec_context, packet);
-		av_packet_free(&packet);
+		av_packet_unref(packet);
 		if (rc < 0) {
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 			return false;
 		}
 
 		for (;;) {
-			AVFrame* frame = av_frame_alloc();
-			if (frame == nullptr) {
-				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
-				return false;
-			}
-
-			rc = avcodec_receive_frame(m_codec_context, frame);
+			AVFrame* frame = m_frame;
+			rc             = avcodec_receive_frame(m_codec_context, frame);
 			if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
-				av_frame_free(&frame);
+				av_frame_unref(frame);
 				return true;
 			}
 			if (rc < 0) {
-				av_frame_free(&frame);
+				av_frame_unref(frame);
 				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
 				return false;
 			}
 
-			AVFrame* converted = AjmConvertFfmpegFrame(frame, m_sample_encoding, result);
-			av_frame_free(&frame);
+			const AVFrame* converted = m_converter.Convert(frame, m_sample_encoding, result);
+			av_frame_unref(frame);
 			if (converted == nullptr) {
 				return false;
 			}
 
 			const bool ok =
 			    WriteFrame(converted, output, output_size, output_offset, gapless, result);
-			av_frame_free(&converted);
 			if (!ok) {
 				return false;
 			}
@@ -385,6 +388,9 @@ private:
 
 	const AVCodec*        m_codec         = nullptr;
 	AVCodecContext*       m_codec_context = nullptr;
+	AVPacket*             m_packet        = nullptr;
+	AVFrame*              m_frame         = nullptr;
+	AjmFfmpegConverter    m_converter;
 	AVCodecParserContext* m_parser        = nullptr;
 	bool                  m_have_header   = false;
 	uint32_t              m_bitrate       = 0;

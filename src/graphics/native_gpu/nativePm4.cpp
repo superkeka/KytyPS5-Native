@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #if defined(__linux__)
@@ -28,6 +32,19 @@ constexpr uint32_t IT_COPY_DATA                = 0x40;
 constexpr uint32_t IT_CLEAR_STATE              = 0x12;
 constexpr uint32_t IT_ATOMIC_MEM               = 0x1E;
 constexpr uint32_t IT_COND_EXEC                = 0x22;
+// Why a title's COND_EXEC was refused (Pm4TranslateResult::unknown_detail, the dword after the packet).
+enum CondRefuse : uint32_t {
+	kCondOff          = 1, // KYTY_NATIVE_GPU_COND_EXEC=0, or on MEC KYTY_NATIVE_GPU_ACB_COND_EXEC=0
+	kCondNested       = 2, // inside another one's range
+	kCondPacket       = 3, // not the five-dword form, address 0 or EXEC_COUNT above 14 bits
+	kCondPastBuffer   = 4, // the range runs past the buffer
+	kCondCpuFlag      = 5, // its flag is a store the tracker does on the CPU
+	kCondLeftStream   = 6, // something inside the range left the GPU's stream
+	kCondEndsInPacket = 7, // the range ends inside a packet
+	kCondTooLong      = 8, // the translated range is longer than EXEC_COUNT can say
+	kCondRegister     = 9, // a register inside the range only the GPU knows afterwards, without CP shadowing in load mode
+	kCondPushOpen     = 10, // a push or pop inside it of a push made before it, or on another flag than the range that left one open
+};
 constexpr uint32_t IT_SET_BASE                 = 0x11;
 constexpr uint32_t IT_SET_PREDICATION          = 0x20;
 constexpr uint32_t IT_INDEX_BUFFER_SIZE        = 0x13;
@@ -1309,6 +1326,114 @@ static bool AcbCondExec() {
 	return on;
 }
 
+// Registers written inside a title's COND_EXEC range are settled when it ends (the translator's cond_settle_regs).
+// KYTY_NATIVE_GPU_COND_EXEC_REGS=0 refuses any register write inside one, as before.
+static bool CondExecRegs() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_COND_EXEC_REGS");
+		return v == nullptr || v[0] != '0';
+	}();
+	return on;
+}
+
+// KYTY_NATIVE_GPU_COND_LOG=1 (diagnostics): each title COND_EXEC translated, by its flag's address and EXEC_COUNT as
+// written: how often, with its flag set when translated (the CPU's view of the dword the CP reads), and how often a flag
+// seen set earlier was found clear again (a range that clears its own flag ran on the GPU), the registers settled when
+// its range ended, and the refusals. The first four of each and every 256th after are logged.
+struct CondLogEntry {
+	uint64_t seen = 0, set = 0, cleared = 0, settled = 0, refused = 0;
+	uint32_t last = 0;
+	bool     armed = false; // seen set and not yet seen clear again
+};
+static bool CondLogOn() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_COND_LOG");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+// The flags of the COND_EXECs logged, sampled at every translation from then on: a flag the CPU or the GPU sets and the
+// range's own write clears (as the title's draw with its own context does) goes 0 -> 1 -> 0 once per run of its range.
+struct CondFlagSample {
+	uint32_t last = 0;
+	uint64_t sets = 0, clears = 0;
+};
+static std::mutex                                                 g_cond_log_mutex;
+static std::map<uint64_t, CondFlagSample>                         g_cond_flags;
+static void CondLogSample() {
+	std::lock_guard<std::mutex> lock(g_cond_log_mutex);
+	for (auto& [addr, f]: g_cond_flags) {
+		const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(addr);
+		if ((v != 0) == (f.last != 0)) {
+			continue;
+		}
+		(v != 0 ? f.sets : f.clears)++;
+		f.last = v;
+		if (f.sets + f.clears <= 32 || (f.sets + f.clears) % 256 == 0) {
+			std::fprintf(stderr, "native cond: flag 0x%llx went %s (set %llu times, cleared %llu times)\n", static_cast<unsigned long long>(addr),
+			             v != 0 ? "set" : "clear", static_cast<unsigned long long>(f.sets), static_cast<unsigned long long>(f.clears));
+		}
+	}
+}
+static void CondLog(uint64_t addr, uint32_t count, bool compute, int settled, bool refused) {
+	static std::map<std::tuple<uint64_t, uint32_t, bool>, CondLogEntry> entries;
+	std::lock_guard<std::mutex>                                       lock(g_cond_log_mutex);
+	if (g_cond_flags.count(addr) == 0) {
+		g_cond_flags[addr].last = *reinterpret_cast<const volatile uint32_t*>(addr);
+	}
+	CondLogEntry&  e    = entries[{addr, count, compute}];
+	const uint32_t flag = *reinterpret_cast<const volatile uint32_t*>(addr);
+	e.seen++;
+	e.last = flag;
+	if (flag != 0) {
+		e.set++;
+		e.armed = true;
+	} else if (e.armed) {
+		e.cleared++;
+		e.armed = false;
+	}
+	e.settled += settled > 0 ? static_cast<uint64_t>(settled) : 0u;
+	e.refused += refused ? 1u : 0u;
+	if (e.seen <= 4 || e.seen % 256 == 0 || refused) {
+		std::fprintf(stderr,
+		             "native cond: %s COND_EXEC flag 0x%llx count 0x%x: seen %llu, flag set %llu (now 0x%x), cleared after a set %llu, "
+		             "registers settled %llu, refused %llu\n",
+		             compute ? "ACB" : "DCB", static_cast<unsigned long long>(addr), count, static_cast<unsigned long long>(e.seen),
+		             static_cast<unsigned long long>(e.set), flag, static_cast<unsigned long long>(e.cleared),
+		             static_cast<unsigned long long>(e.settled), static_cast<unsigned long long>(e.refused));
+	}
+}
+// A range that leaves a context push open (pushed only where the CP ran it) or closes one a range on its flag left open
+// (the translator's push_cond). KYTY_NATIVE_GPU_COND_LOG=1 logs the first 32 and every 256th after; with
+// KYTY_NATIVE_GPU_COND_DUMP=N the first N buffers holding one go to KYTY_NATIVE_GPU_DUMP_DIR/condpush_<n>.bin as walked.
+static void CondPushNote(uint64_t addr, uint32_t count, bool opened, std::span<const uint32_t> dcb) {
+	static std::atomic<uint64_t> notes {0};
+	static std::atomic<uint32_t> dumped {0};
+	static const uint32_t        dump = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_COND_DUMP");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+	}();
+	const uint64_t n = notes.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (CondLogOn() && (n <= 32 || n % 256 == 0)) {
+		std::fprintf(stderr, "native cond: COND_EXEC flag 0x%llx count 0x%x %s (%llu so far)\n", static_cast<unsigned long long>(addr), count,
+		             opened ? "leaves its context push open: pushed where the CP ran it" : "closes the push a range on its flag left open",
+		             static_cast<unsigned long long>(n));
+	}
+	if (dump != 0 && dumped.load(std::memory_order_relaxed) < dump) {
+		const uint32_t    k    = dumped.fetch_add(1, std::memory_order_relaxed);
+		const char*       dir  = std::getenv("KYTY_NATIVE_GPU_DUMP_DIR");
+		const std::string path = std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") + "/condpush_" + std::to_string(k) + ".bin";
+		if (k < dump) {
+			if (std::FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+				std::fwrite(dcb.data(), 4, dcb.size(), f);
+				std::fclose(f);
+				std::fprintf(stderr, "native cond: buffer with flag 0x%llx written to %s (%zu dwords)\n", static_cast<unsigned long long>(addr),
+				             path.c_str(), dcb.size());
+			}
+		}
+	}
+}
+
 // An ACB's ATOMIC_MEM on memory the GPU may write goes to MEC as written (probe atomicops and mecplain, 2.11; see the
 // translator's atomic_mem). KYTY_NATIVE_GPU_ACB_ATOMICS=0 has the tracker perform it on the CPU, as before.
 static bool AcbAtomicsOnGpu() {
@@ -1948,6 +2073,44 @@ void LogBranch(std::FILE* f, std::span<const uint32_t> in, size_t dw, uint32_t l
 	std::fflush(f);
 }
 
+// A REWIND holds the CP until the title sets its valid bit, which it does once it has written what comes after
+// (the next chunk and the chain to it): the inlining waits the same way, up to KYTY_NATIVE_GPU_REWIND_WAIT_MS
+// (10000 by default).
+static bool WaitRewindValid(const uint32_t* control) {
+	auto valid = [control] { return (__atomic_load_n(control, __ATOMIC_ACQUIRE) & 0x80000000u) != 0; };
+	if (valid()) {
+		return true;
+	}
+	static const int64_t limit_us = [] {
+		const char* v = std::getenv("KYTY_NATIVE_GPU_REWIND_WAIT_MS");
+		return (v != nullptr && v[0] != '\0' ? std::strtoll(v, nullptr, 10) : 10000) * 1000;
+	}();
+	static std::atomic<uint32_t> logged {0};
+	const auto                   start = std::chrono::steady_clock::now();
+	int64_t                      waited_us = 0;
+	while (!valid()) {
+		waited_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+		if (waited_us >= limit_us) {
+			std::fprintf(stderr, "native flatten: REWIND at %p still not valid after %lld ms; the 16 dwords before it:",
+			             static_cast<const void*>(control - 1), static_cast<long long>(waited_us / 1000));
+			const auto page = reinterpret_cast<uint64_t>(control - 1) & ~uint64_t {0xfff};
+			for (int i = -17; i < -1; i++) {
+				if (reinterpret_cast<uint64_t>(control + i) >= page) {
+					std::fprintf(stderr, " 0x%08x", control[i]);
+				}
+			}
+			std::fprintf(stderr, "\n");
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::microseconds(50));
+	}
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+		std::fprintf(stderr, "native flatten: REWIND at %p became valid after %.3f ms\n", static_cast<const void*>(control - 1),
+		             static_cast<double>(waited_us) / 1000.0);
+	}
+	return true;
+}
+
 // 1: inlined something, 0: nothing to inline, -1: cannot.
 int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int depth, std::string* why,
                 std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
@@ -2026,7 +2189,7 @@ int FlattenInto(std::span<const uint32_t> in, std::vector<uint32_t>* out, int de
 			conds.push_back({out->size() + (dw - run) + 4u, dw + len + (in[dw + 4] & 0x3fffu)});
 		}
 		if ((header >> 30u) == 3u && op == kRewind && len == 2) {
-			if ((in[dw + 1] & 0x80000000u) == 0) {
+			if (!WaitRewindValid(&in[dw + 1])) {
 				return stop("REWIND not valid yet", dw);
 			}
 			if (!flush(dw)) {
@@ -2134,6 +2297,220 @@ void SetFlattenBranchLog(std::FILE* f) {
 	g_branch_log.store(f, std::memory_order_relaxed);
 }
 
+// The top level of `in` and of the buffers it chains to, `hops` deep at most.
+static bool StopsAtRewind(std::span<const uint32_t> in, RewindStop* out, int hops) {
+	constexpr uint32_t kRewind = 0x59, kIndirect = 0x3f;
+	size_t             cond_end = 0; // the end of the last COND_EXEC's range
+	for (size_t dw = 0; dw < in.size();) {
+		const uint32_t header = in[dw];
+		const uint32_t len    = (header >> 30u) == 3u ? PacketSizeDw(header) : 1u;
+		if (dw + len > in.size()) {
+			return false;
+		}
+		const uint32_t op = (header >> 8u) & 0xffu;
+		if ((header >> 30u) == 3u && op == IT_COND_EXEC && len == 5) {
+			cond_end = std::max(cond_end, dw + len + (in[dw + 4] & 0x3fffu));
+		}
+		if ((header >> 30u) == 3u && op == kRewind && len == 2 &&
+		    (__atomic_load_n(&in[dw + 1], __ATOMIC_ACQUIRE) & 0x80000000u) == 0) {
+			if (dw < cond_end) {
+				return false;
+			}
+			*out = {static_cast<uint32_t>(dw), nullptr, 0};
+			return true;
+		}
+		if ((header >> 30u) == 3u && op == kIndirect && len == 4) {
+			// A chain: the CP goes on in its target and never comes back. A call: it comes back after the target.
+			const bool     chain  = (in[dw + 3] & (1u << 20u)) != 0;
+			const auto*    target = reinterpret_cast<const uint32_t*>((static_cast<uint64_t>(in[dw + 2]) << 32u) | (in[dw + 1] & ~3u));
+			const uint32_t size   = in[dw + 3] & 0xfffffu;
+			RewindStop     inner;
+			const bool     stops  = target != nullptr && size != 0 && hops != 0 && StopsAtRewind({target, size}, &inner, hops - 1);
+			if (stops) {
+				if (dw < cond_end) {
+					return false;
+				}
+				*out = {static_cast<uint32_t>(dw), target, size, !chain};
+				return true;
+			}
+			if (chain) {
+				return false;
+			}
+		}
+		dw += len;
+	}
+	return false;
+}
+
+bool FindRewindStop(std::span<const uint32_t> in, RewindStop* out) {
+	return StopsAtRewind(in, out, 64);
+}
+
+namespace {
+
+std::atomic<StaleCheckReader> g_stale_reader {nullptr};
+
+// KYTY_NATIVE_GPU_STALE_CHECK=MS (diagnostics): the command dwords the translator took from guest memory (a buffer and
+// everything its chains and calls reach) are read again MS ms later. A dword that changed in between was still being
+// written by the title when it was translated: the CP, which reads a buffer as it runs it, would have run the new one.
+// Changes are logged with the packet they fall in; a summary line every 2 s.
+class StaleCheck {
+public:
+	static StaleCheck* Get() {
+		static StaleCheck* check = []() -> StaleCheck* {
+			const char* v = std::getenv("KYTY_NATIVE_GPU_STALE_CHECK");
+			if (v == nullptr || v[0] == '\0' || v[0] == '0') {
+				return nullptr;
+			}
+			return new StaleCheck(std::strtod(v, nullptr));
+		}();
+		return check;
+	}
+
+	void Record(std::span<const uint32_t> content, std::span<const SourcePiece> pieces) {
+		const double due = Now() + m_delay_ms / 1000.0;
+		std::lock_guard<std::mutex> lock(m_mutex);
+		const uint64_t              buffer = m_buffers++;
+		for (const auto& p: pieces) {
+			if (p.len == 0 || p.dw + static_cast<uint64_t>(p.len) > content.size()) {
+				continue;
+			}
+			if (m_queue.size() >= 65536) {
+				m_dropped++;
+				continue;
+			}
+			m_queue.push_back({due, p.va, buffer, std::vector<uint32_t>(content.begin() + p.dw, content.begin() + p.dw + p.len)});
+		}
+	}
+
+private:
+	struct Snapshot {
+		double                due;
+		uint64_t              va;
+		uint64_t              buffer;
+		std::vector<uint32_t> dw;
+	};
+
+	explicit StaleCheck(double delay_ms): m_delay_ms(delay_ms) {
+		std::fprintf(stderr, "native stale check: translated command dwords read again %.1f ms later\n", delay_ms);
+		std::thread([this] { Run(); }).detach();
+	}
+
+	static double Now() {
+		return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	}
+
+	void Run() {
+		double next_summary = Now() + 2.0;
+		for (;;) {
+			Snapshot s;
+			bool     have = false;
+			{
+				std::lock_guard<std::mutex> lock(m_mutex);
+				if (!m_queue.empty()) {
+					s = std::move(m_queue.front());
+					m_queue.pop_front();
+					have = true;
+				}
+			}
+			if (!have) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			} else {
+				if (const double wait = s.due - Now(); wait > 0) {
+					std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+				}
+				Compare(s);
+			}
+			if (Now() >= next_summary) {
+				next_summary = Now() + 2.0;
+				std::lock_guard<std::mutex> lock(m_mutex);
+				std::string ops;
+				for (const auto& [op, n]: m_ops) {
+					char one[32];
+					std::snprintf(one, sizeof(one), " 0x%02x:%llu", op, static_cast<unsigned long long>(n));
+					ops += one;
+				}
+				std::fprintf(stderr,
+				             "native stale check: %llu buffers, %llu pieces checked, %llu changed (%llu dwords), %llu unreadable, %llu "
+				             "dropped; changed dwords by packet:%s\n",
+				             static_cast<unsigned long long>(m_buffers), static_cast<unsigned long long>(m_checked),
+				             static_cast<unsigned long long>(m_changed), static_cast<unsigned long long>(m_changed_dw),
+				             static_cast<unsigned long long>(m_unreadable), static_cast<unsigned long long>(m_dropped), ops.c_str());
+			}
+		}
+	}
+
+	void Compare(const Snapshot& s) {
+		std::vector<uint32_t> now(s.dw.size());
+		const auto            reader = g_stale_reader.load(std::memory_order_acquire);
+		const bool            read   = reader != nullptr && reader(s.va, now.data(), now.size() * 4) == now.size() * 4;
+		std::lock_guard<std::mutex> lock(m_mutex);
+		m_checked++;
+		if (!read) {
+			m_unreadable++;
+			return;
+		}
+		uint32_t first = UINT32_MAX, n = 0;
+		for (uint32_t i = 0; i < now.size(); i++) {
+			if (now[i] != s.dw[i]) {
+				first = std::min(first, i);
+				n++;
+			}
+		}
+		if (n == 0) {
+			return;
+		}
+		m_changed++;
+		m_changed_dw += n;
+		// The packets the changed dwords fall in (the piece starts at a packet).
+		uint32_t first_op = 0, first_at = 0;
+		for (uint32_t j = 0, i = 0; j < s.dw.size();) {
+			const uint32_t h    = s.dw[j];
+			const uint32_t size = (h >> 30u) == 3u ? PacketSizeDw(h) : 1u;
+			const uint32_t op   = (h >> 30u) == 3u ? (h >> 8u) & 0xffu : 0x100u;
+			for (; i < now.size() && i < j + size; i++) {
+				if (now[i] != s.dw[i]) {
+					m_ops[op]++;
+					if (i == first) {
+						first_op = op;
+						first_at = i - j;
+					}
+				}
+			}
+			j += size;
+		}
+		if (m_logged++ < 200) {
+			std::fprintf(stderr,
+			             "native stale check: buffer %llu piece 0x%llx (%zu dw): %u dwords changed, first at dw %u (0x%08x -> 0x%08x), "
+			             "dw %u of a packet 0x%02x\n",
+			             static_cast<unsigned long long>(s.buffer), static_cast<unsigned long long>(s.va), s.dw.size(), n, first, s.dw[first],
+			             now[first], first_at, first_op);
+		}
+	}
+
+	double                       m_delay_ms;
+	std::mutex                   m_mutex;
+	std::deque<Snapshot>         m_queue;
+	std::map<uint32_t, uint64_t> m_ops;
+	uint64_t                     m_buffers    = 0;
+	uint64_t                     m_checked    = 0;
+	uint64_t                     m_changed    = 0;
+	uint64_t                     m_changed_dw = 0;
+	uint64_t                     m_unreadable = 0;
+	uint64_t                     m_dropped    = 0;
+	uint32_t                     m_logged     = 0;
+};
+
+} // namespace
+
+void SetStaleCheckReader(StaleCheckReader reader) {
+	g_stale_reader.store(reader, std::memory_order_release);
+}
+
+bool StaleCheckOn() {
+	return StaleCheck::Get() != nullptr;
+}
+
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why,
                             std::vector<SourcePiece>* pieces, std::vector<uint32_t>* marks) {
 	out->clear();
@@ -2143,12 +2520,34 @@ bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>*
 	if (marks != nullptr) {
 		marks->clear();
 	}
+	StaleCheck*              stale = StaleCheck::Get();
+	std::vector<SourcePiece> own_pieces;
+	const bool               trap = CmdTrapOn();
+	if ((stale != nullptr || trap) && pieces == nullptr) {
+		pieces = &own_pieces;
+	}
 	if (FlattenInto(in, out, 0, why, pieces, marks) <= 0) {
 		out->clear();
 		if (pieces != nullptr) {
 			pieces->clear();
 		}
+		if (trap) {
+			CmdTrapNote(reinterpret_cast<uint64_t>(in.data()), in.size() * 4ull);
+		}
+		if (stale != nullptr && (why == nullptr || why->empty())) {
+			// Nothing to inline: the buffer is translated as it sits in guest memory.
+			const SourcePiece whole {0, static_cast<uint32_t>(in.size()), reinterpret_cast<uint64_t>(in.data())};
+			stale->Record(in, std::span<const SourcePiece>(&whole, 1));
+		}
 		return false;
+	}
+	if (trap) {
+		for (const auto& p: *pieces) {
+			CmdTrapNote(p.va, p.len * 4ull);
+		}
+	}
+	if (stale != nullptr) {
+		stale->Record(*out, *pieces);
 	}
 	return true;
 }
@@ -2936,6 +3335,9 @@ LodStatsHandoff& LodStatsReports() {
 }
 
 Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
+	if (CondLogOn()) {
+		CondLogSample();
+	}
 	Pm4TranslateResult             r;
 	const std::vector<SourcePiece> source = std::move(m_source); // SetSource is for this buffer only
 	m_source.clear();
@@ -2987,6 +3389,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	auto cx        = m_cx;
 	auto saved_cx  = m_saved_cx;
 	bool cx_pushed = m_cx_pushed;
+	// A push left open by a title's COND_EXEC range (cond_settle_regs): its flag, else 0. Where the CP ran that range
+	// the context is pushed (cx_pushed, saved_cx), where it skipped it it is not.
+	uint64_t push_cond = m_push_cond;
 	auto sh = m_sh;
 	auto uc = m_uc;
 	auto cp = m_cp;
@@ -3741,6 +4146,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (dispatch) {
 			d.ps      = (static_cast<uint64_t>(reg(sh, 0x20C)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20D)) << 40u);
 			d.ud_hash = fnv(0x240);
+			for (uint32_t i = 0; i < 16; i++) {
+				d.ud[i] = reg(sh, 0x240 + i);
+			}
 		} else {
 			d.instances = log_instances;
 			d.ps        = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009)) << 40u);
@@ -3749,6 +4157,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 			d.zbase     = (static_cast<uint64_t>(reg(cx, kDbZReadBase)) << 8u) | (static_cast<uint64_t>(reg(cx, kDbZReadBaseHi) & 0xffu) << 40u);
 			d.ud_hash   = fnv(0x00C);
 			d.gs_hash   = fnv(0x08C);
+			for (uint32_t i = 0; i < 16; i++) {
+				d.ud[i] = reg(sh, 0x00C + i);
+			}
 		}
 		r.draw_log.push_back(d);
 	};
@@ -4362,9 +4773,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	// dwords, which on the PS5 are the title's own. The translated range differs in length (patched packets, inserted
 	// waits and stores), so the COND_EXEC goes as written with its count set to the translated range once the walk
 	// reaches the range's end. Inside the range nothing may happen outside the GPU's stream: no direct runs (the IB2s
-	// change the length again), no segment cut, no tracker store but a wake, no CPU-tail packet, no barrier on our fence, and no
-	// register write (the shadow copy would take it as done when the CP may skip it). Label writes in it are recorded as
-	// unknown once the range ends: the CP may have skipped them.
+	// change the length again), no segment cut, no tracker store but a wake, no CPU-tail packet, and no barrier on our fence.
+	// Label writes in it are recorded as unknown once the range ends: the CP may have skipped them; registers written in it
+	// are settled then (cond_settle_regs).
 	struct CondExecRange {
 		bool     active        = false;
 		uint32_t dw            = 0; // the COND_EXEC in the buffer
@@ -4377,6 +4788,17 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		size_t   seg_writes    = 0; // segs.back().writes when it began
 		uint32_t fence_seq     = 0;
 		size_t   guards        = 0; // body_guards when it began (a compute ring's exit guards), the one before it included
+		// The registers when it began (register writes inside the range), with their writers and the push state.
+		RegFile                             cx, sh, uc;
+		std::array<uint8_t, RegFile::kDense> wcx {}, wsh {}, wuc {};
+		bool                                pushed = false;
+		uint64_t                            push_cond = 0;     // push_cond when it began
+		bool                                lockstep  = false; // run exactly where the range that left that push open ran
+		int                                 note      = 0;     // CondPushNote at its end: 1 it leaves a push open, 2 it closes one
+		uint32_t                            why    = 0; // a CondRefuse cond_close gave
+		uint64_t                            addr   = 0; // its flag (KYTY_NATIVE_GPU_COND_LOG)
+		uint32_t                            count  = 0; // EXEC_COUNT as written
+		int                                 settled = 0; // registers only the GPU knows after it
 	} cond;
 	// False when something left the GPU's stream inside the range (see above). A wake that comes anyway is harmless, also
 	// as a tracker store inside the range (the points a GPU wait there flushes first): the tracker passes a point once
@@ -4391,9 +4813,118 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		return std::all_of(segs.back().points.begin() + static_cast<std::ptrdiff_t>(cond.seg_points), segs.back().points.end(), wake) &&
 		       std::all_of(queued_points.begin(), queued_points.end(), wake);
 	};
+	// Why a range was refused, for the log (Pm4TranslateResult::unknown_detail): the COND_EXEC as written, the reason
+	// (CondRefuse), where in the range, that packet's header, and what left the GPU's stream (bits, as cond_clean checks).
+	auto cond_detail = [&](uint32_t why, uint32_t at) {
+		uint32_t left = 0;
+		if (cond.active) {
+			left |= segs.size() != cond.segs ? 1u : 0u;
+			left |= segs.size() == cond.segs && segs.back().points.size() < cond.seg_points ? 2u : 0u;
+			left |= r.cpu_tail.size() != cond.tail ? 4u : 0u;
+			left |= m_fence_seq != cond.fence_seq ? 8u : 0u;
+			const auto wake = [](const TrackerPoint& p) { return p.kind == TrackerPoint::Kind::Wake; };
+			if (segs.size() == cond.segs && segs.back().points.size() >= cond.seg_points &&
+			    (!std::all_of(segs.back().points.begin() + static_cast<std::ptrdiff_t>(cond.seg_points), segs.back().points.end(), wake) ||
+			     !std::all_of(queued_points.begin(), queued_points.end(), wake))) {
+				left |= 16u;
+			}
+		}
+		if (cond.active && CondLogOn()) {
+			CondLog(cond.addr, cond.count, m_compute_ring, 0, true);
+		}
+		const uint32_t c = cond.active ? cond.dw : at;
+		r.unknown_detail.clear();
+		for (uint32_t i = 0; i < 5u && c + i < dcb.size(); i++) {
+			r.unknown_detail.push_back(dcb[c + i]);
+		}
+		r.unknown_detail.push_back(why);
+		r.unknown_detail.push_back(at - c);
+		r.unknown_detail.push_back(at < dcb.size() ? dcb[at] : 0u);
+		r.unknown_detail.push_back(left);
+	};
+	// Registers written inside the range (title SETs, its indirect loads, a context push or pop): the CP runs them or skips them
+	// with the range, as on the PS5, so afterwards the GPU holds either the values they had when the range began or the ones
+	// the walk left. Where the two are the same (a push and its pop, a write of the value already there) the copy knows the
+	// GPU's value. Where they differ only the GPU knows it: with CP shadowing in load mode S keeps what the CP ran, the
+	// preambles LOAD from S, and such a register is the GPU's (RegWriter::Gpu, as a late table's), so no decision of the
+	// CPU takes the copy's value for the GPU's; without, the buffer is refused. A push or pop inside a range of a push made
+	// before it is refused too (where the CP skipped the pop the push would stay open with a state the copy no longer has).
+	// A push the range leaves open is pushed only where the CP ran the range. libSceAgc pairs every push with a pop on every
+	// path the CP takes (its check before each raises the kernel's interrupt on a second push or pop in a row), so the title
+	// pops it where it was pushed: in a later range on the same flag, which the CP runs exactly where it ran this one (the
+	// block of a draw with its own context split over two of the title's segments, one COND_EXEC each), or in libSceAgc's
+	// queue reset, on its own push flag. Until then push_cond holds the flag: inside such a range the push is the copy's
+	// (cx_pushed, saved_cx), where it is skipped there is none; the push and pop run on the GPU where the title has them, in
+	// those ranges, and the registers are settled at each range's end as any other. A push or pop inside a range on another
+	// flag while one is open refuses (push_op_ok), as one inside a range of a push made before it.
+	auto cond_push_state = [&]() {
+		if (cond.push_cond != 0 && !cond.lockstep) {
+			return true; // no push or pop inside (push_op_ok): the open push stays as it was on both ways
+		}
+		const bool skip_pushed = cond.push_cond == 0 && cond.pushed; // skipped: as before the range
+		if (cx_pushed == skip_pushed) {
+			cond.note = cond.push_cond != 0 ? 2 : 0;
+			push_cond = 0;
+			return true;
+		}
+		if (!cx_pushed) {
+			return false; // skipped it stays pushed: a pop of a push made before it (push_op_ok refuses it first)
+		}
+		cond.note = cond.push_cond == 0 ? 1 : 0;
+		push_cond = cond.push_cond != 0 ? cond.push_cond : cond.addr;
+		return true;
+	};
+	auto cond_settle_regs = [&]() {
+		if (!cond_push_state()) {
+			cond.why = kCondPushOpen;
+			return false;
+		}
+		const auto gpu_kind = [](uint8_t k) {
+			return k == static_cast<uint8_t>(RegWriter::Table) || k == static_cast<uint8_t>(RegWriter::Gpu);
+		};
+		bool       ok       = true;
+		const auto settle   = [&](const RegFile& now, const RegFile& then, std::array<uint8_t, RegFile::kDense>& w,
+                                const std::array<uint8_t, RegFile::kDense>& w0) {
+            const auto differs = [&](uint32_t off, uint32_t value, const RegFile& other) {
+                const uint32_t* o = other.Find(off);
+                return o == nullptr || *o != value;
+            };
+            auto mark = [&](uint32_t off) {
+                if (!shadow_load) {
+                    ok = false;
+                    return;
+                }
+                writer(w, off, RegWriter::Gpu);
+                cond.settled++;
+            };
+            for (const auto& [off, value]: now) {
+                if (differs(off, value, then)) {
+                    mark(off);
+                } else if (off < RegFile::kDense && gpu_kind(w0[off]) && !gpu_kind(w[off])) {
+                    w[off] = w0[off]; // a value only the GPU knew before the range stays the GPU's
+                }
+            }
+            for (const auto& entry: then) {
+                if (now.count(entry.first) == 0) {
+                    mark(entry.first);
+                }
+            }
+		};
+		settle(cx, cond.cx, wcx, cond.wcx);
+		settle(sh, cond.sh, wsh, cond.wsh);
+		settle(uc, cond.uc, wuc, cond.wuc);
+		if (!ok) {
+			cond.why = kCondRegister;
+		}
+		return ok;
+	};
 	auto cond_close = [&]() {
 		const size_t count = body.size() - (cond.count_at + 1u);
 		if (count > 0x3fffu) {
+			cond.why = kCondTooLong;
+			return false;
+		}
+		if (!cond_settle_regs()) {
 			return false;
 		}
 		body[cond.count_at] = (body[cond.count_at] & ~0x3fffu) | static_cast<uint32_t>(count);
@@ -4416,7 +4947,34 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		cond.active = false;
 		direct      = direct_base;
+		if (CondLogOn()) {
+			CondLog(cond.addr, cond.count, m_compute_ring, cond.settled, false);
+		}
+		if (cond.note != 0) {
+			CondPushNote(cond.addr, cond.count, cond.note == 1, dcb);
+		}
 		return true;
+	};
+	// A context push or pop (an Agc context-state op, 1-3) where the CP may skip it: false refuses the buffer (the detail
+	// set). Inside a range as cond_push_state says. Outside any range while a range's push is open the op shows which way
+	// that range went, as libSceAgc pairs them: a pop, that the CP ran it (the push is the copy's), a push, that it skipped it.
+	auto push_op_ok = [&](uint32_t operation, uint32_t at) {
+		if (operation < 1u || operation > 3u) {
+			return true;
+		}
+		if (!cond.active) {
+			if (push_cond != 0 && operation != 2u) {
+				saved_cx.clear();
+				cx_pushed = false;
+			}
+			push_cond = 0;
+			return true;
+		}
+		if (cond.push_cond != 0 ? cond.lockstep : !cond.pushed) {
+			return true;
+		}
+		cond_detail(kCondPushOpen, at);
+		return false;
 	};
 	// SetInjectWait (KYTY_NATIVE_GPU_INJECT_HANG): a wait nobody satisfies where the body starts, after the preamble, so
 	// in load mode shadowing is on there, as at a title's own wait. The guarded form is what a guest wait the GPU gets
@@ -4768,6 +5326,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	};
 	while (dw < dcb.size()) {
 		if (cond.active && (!cond_clean() || (dw >= cond.end && (dw != cond.end || !cond_close())))) {
+			cond_detail(!cond_clean() ? kCondLeftStream : dw != cond.end ? kCondEndsInPacket : cond.why, dw);
 			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
 		}
 		// A compute ring's guards skip a few thousand dwords at most: one more before the next packet.
@@ -4777,9 +5336,14 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		}
 		// SetDisplayCopies: a flip of a registered video-out buffer comes next (libSceAgc's RELEASE_MEM into the buffer's
 		// label with a kernel interrupt context, bit 27). Its plain copy is filled first, in packets of their own.
-		if (!display_copies.empty() && (dcb[dw] >> 30u) == 3u && ((dcb[dw] >> 8u) & 0xffu) == IT_RELEASE_MEM && ((dcb[dw] >> 16u) & 0x3fffu) >= 6u && dw + 8u <= dcb.size() &&
+		if ((dcb[dw] >> 30u) == 3u && ((dcb[dw] >> 8u) & 0xffu) == IT_RELEASE_MEM && ((dcb[dw] >> 16u) & 0x3fffu) >= 6u && dw + 8u <= dcb.size() &&
 		    (dcb[dw + 7u] & (1u << 27u)) != 0) {
-			emit_display_copy(static_cast<uint64_t>(dcb[dw + 3u]) | (static_cast<uint64_t>(dcb[dw + 4u]) << 32u), dcb[dw + 7u] & 0x0fffffffu);
+			if (!display_copies.empty()) {
+				emit_display_copy(static_cast<uint64_t>(dcb[dw + 3u]) | (static_cast<uint64_t>(dcb[dw + 4u]) << 32u), dcb[dw + 7u] & 0x0fffffffu);
+			}
+			if (m_draw_log) {
+				r.flip_marks.emplace_back(dcb[dw + 7u] & 0x0fffffffu, static_cast<uint32_t>(r.draw_log.size()));
+			}
 		}
 		const size_t   body_before = body.size();
 		const size_t   segs_before = segs.size();
@@ -5206,6 +5770,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						r.cpu_tail.insert(r.cpu_tail.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					}
 				} else if (marker == R_CONTEXT_STATE && body_count >= 1) {
+					if (!push_op_ok(bptr[0], dw)) {
+						return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
+					}
 					context_state_op(bptr[0]);
 					reg_write = true;
 				}
@@ -6475,9 +7042,11 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				const uint32_t next = dw + size;
 				// AgcDcbResetQueue op 0x400: on the push flag, a pop (CLEAR_STATE 2) and the flag's swap back to {0, 1}. The
 				// shadow pops only while a push is outstanding, and without one the swap writes what the flag holds, so
-				// both go on as written and the COND_EXEC is left out.
-				if (!m_compute_ring && body_count >= 4 && (bptr[3] & 0x3fffu) == 11u && next + 11u <= dcb.size() &&
-				    dcb[next] == 0xc0001200u && dcb[next + 1] == 2u && dcb[next + 2] == 0xc0071e00u) {
+				// both go on as written and the COND_EXEC is left out. While a range's push is open (push_cond) the flag says
+				// whether the CP ran that push: the COND_EXEC stays, as any other below, and runs the pop exactly there.
+				const bool reset_queue = !m_compute_ring && body_count >= 4 && (bptr[3] & 0x3fffu) == 11u && next + 11u <= dcb.size() &&
+				                         dcb[next] == 0xc0001200u && dcb[next + 1] == 2u && dcb[next + 2] == 0xc0071e00u;
+				if (reset_queue && push_cond == 0) {
 					stats.context_checks++;
 					break;
 				}
@@ -6505,6 +7074,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					});
 					if (!m_cond_exec || (m_compute_ring && !AcbCondExec()) || cond.active || body_count != 4 || addr == 0 ||
 					    (bptr[3] & ~0x3fffu) != 0 || next + bptr[3] > dcb.size() || cpu_flag) {
+						cond_detail(!m_cond_exec || (m_compute_ring && !AcbCondExec()) ? kCondOff
+						            : cond.active                                      ? kCondNested
+						            : body_count != 4 || addr == 0 || (bptr[3] & ~0x3fffu) != 0 ? kCondPacket
+						            : next + bptr[3] > dcb.size()                      ? kCondPastBuffer
+						                                                               : kCondCpuFlag,
+						            dw);
 						return fail(op, dw, RefuseWhy::CondExecForm);
 					}
 					// The points queued before the range (an interrupt, a store the GPU cannot do) go before it, not inside
@@ -6538,6 +7113,20 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					cond.writes     = local_writes.size();
 					cond.seg_writes = segs.back().writes.size();
 					cond.fence_seq  = m_fence_seq;
+					cond.cx         = cx;
+					cond.sh         = sh;
+					cond.uc         = uc;
+					cond.wcx        = wcx;
+					cond.wsh        = wsh;
+					cond.wuc        = wuc;
+					cond.pushed     = cx_pushed;
+					cond.push_cond  = push_cond;
+					cond.lockstep   = push_cond != 0 && (addr == push_cond || reset_queue);
+					cond.note       = 0;
+					cond.why        = 0;
+					cond.addr       = addr;
+					cond.count      = bptr[3];
+					cond.settled    = 0;
 					direct          = false;
 					stats.cond_execs++;
 					break;
@@ -6561,6 +7150,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				// PS5's CP does with register shadowing the kernel sets up. The shadow does them here.
 				reg_write = true;
 				if (body_count >= 1 && (bptr[0] & 0xfu) != 0) {
+					if (!push_op_ok(bptr[0] & 0xfu, dw)) {
+						return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm);
+					}
 					context_state_op(bptr[0] & 0xfu);
 					break;
 				}
@@ -6621,8 +7213,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		if (cp_shadow && reg_write) {
 			seg_effects = true;
 		}
-		if (cond.active && dw != cond.dw && reg_write) {
-			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // a register write the CP may skip
+		if (cond.active && dw != cond.dw && reg_write && !CondExecRegs()) {
+			cond_detail(kCondRegister, dw);
+			return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // KYTY_NATIVE_GPU_COND_EXEC_REGS=0
 		}
 		const bool same_seg = segs.size() == segs_before;
 		if (!same_seg && segs.back().held) {
@@ -6674,6 +7267,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		dw += size;
 	}
 	if (cond.active && (!cond_clean() || dw != cond.end || !cond_close())) {
+		cond_detail(!cond_clean() ? kCondLeftStream : dw != cond.end ? kCondPastBuffer : cond.why, dw);
 		return fail(IT_COND_EXEC, cond.dw, RefuseWhy::CondExecForm); // the range runs past the buffer
 	}
 	end_run();
@@ -6721,6 +7315,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	m_cx        = std::move(cx);
 	m_saved_cx  = std::move(saved_cx);
 	m_cx_pushed = cx_pushed;
+	m_push_cond = push_cond;
 	m_sh = std::move(sh);
 	m_uc = std::move(uc);
 	m_writer_cx       = wcx;

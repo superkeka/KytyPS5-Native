@@ -1,28 +1,40 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/threads.h"
 #include "libs/ajm/aac_decoder.h"
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/ajm/decoder.h"
 #include "libs/ajm/mp3_decoder.h"
 #include "libs/ajm/opus_decoder.h"
 #include "libs/ajm/resampler.h"
+#include "kernel/longWait.h"
 #include "libs/audio.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 namespace Libs::Audio::Ajm {
 
@@ -81,6 +93,7 @@ enum class AjmCodec : uint32_t {
 
 constexpr int32_t AJM_ERROR_INVALID_CONTEXT     = static_cast<int32_t>(0x80930002u);
 constexpr int32_t AJM_ERROR_INVALID_PARAMETER   = static_cast<int32_t>(0x80930005u);
+constexpr int32_t AJM_ERROR_OUT_OF_RESOURCES    = static_cast<int32_t>(0x80930007u);
 constexpr int32_t AJM_ERROR_CODEC_NOT_SUPPORTED = static_cast<int32_t>(0x80930008u);
 constexpr int32_t AJM_ERROR_JOB_CREATION        = static_cast<int32_t>(0x80930012u);
 constexpr size_t  AJM_JOB_CONTROL_SIZE          = 48;
@@ -109,7 +122,12 @@ constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_OFFSET    = 7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_MASK      = 0x7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_MAX_CHANNEL_MASK = 0x7fu;
 
-static std::atomic_uint32_t g_ajm_next_instance {1};
+// An instance id is the codec above a 14-bit index; the index is unique among live instances.
+constexpr uint32_t AJM_INSTANCE_INDEX_BITS = 14u;
+constexpr uint32_t AJM_INSTANCE_INDEX_MASK = (1u << AJM_INSTANCE_INDEX_BITS) - 1u;
+// Sideband inputs are copied when a job is built; codec parameters are a few words.
+constexpr size_t AJM_MAX_SIDEBAND_INPUT_SIZE = 256;
+
 static std::atomic_uint32_t g_ajm_next_batch {1};
 
 static uint32_t AjmGetFlagChannelCount(uint64_t flags) {
@@ -195,10 +213,20 @@ struct AjmInstanceState {
 	AjmGaplessState             gapless;
 	std::unique_ptr<AjmDecoder> decoder;
 	AjmResampler                resampler;
+
+	// The instance's jobs run in the order their batches were started: a started batch takes a
+	// ticket (under the job queue lock) and runs when the earlier tickets have been served.
+	uint64_t                next_ticket = 0;
+	std::mutex              order_mutex;
+	std::condition_variable order_cv;
+	uint64_t                serving = 0;
 };
 
-static std::mutex                                     g_ajm_instances_mutex;
-static std::unordered_map<uint32_t, AjmInstanceState> g_ajm_instances;
+using AjmInstancePtr = std::shared_ptr<AjmInstanceState>;
+
+static std::mutex                                   g_ajm_instances_mutex;
+static std::unordered_map<uint32_t, AjmInstancePtr> g_ajm_instances;
+static std::bitset<AJM_INSTANCE_INDEX_MASK + 1>     g_ajm_used_indices;
 
 static bool AjmCodecIsSupported(uint32_t codec) {
 	return codec == static_cast<uint32_t>(AjmCodec::DecMp3) ||
@@ -246,14 +274,6 @@ static std::unique_ptr<AjmDecoder> AjmCreateDecoder(uint32_t codec, uint64_t fla
 	}
 
 	return {};
-}
-
-static AjmInstanceState* AjmFindInstanceLocked(uint32_t instance) {
-	const auto it = g_ajm_instances.find(instance);
-	if (it == g_ajm_instances.end()) {
-		return nullptr;
-	}
-	return &it->second;
 }
 
 static uint8_t* AjmReserveJob(AjmBatchInfo* info, size_t job_size) {
@@ -455,14 +475,21 @@ static void AjmLogDecodeFailure(uint32_t instance, const AjmDecodeResult& result
 	    static_cast<size_t>(result.input_consumed), output_size, static_cast<size_t>(result.output_written), head));
 }
 
-static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
-                                         void* output, size_t output_size, bool multiple_frames) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr) {
-		AjmDecodeResult result {};
-		result.result = AJM_RESULT_INVALID_PARAMETER;
-		return result;
+static AjmDecodeResult AjmInvalidInstanceResult() {
+	AjmDecodeResult result {};
+	result.result = AJM_RESULT_INVALID_PARAMETER;
+	return result;
+}
+
+static bool AjmIsValid(const AjmInstanceState* state) {
+	return state != nullptr && state->decoder != nullptr;
+}
+
+static AjmDecodeResult AjmDecodeInstance(uint32_t instance, AjmInstanceState* state, const void* input,
+                                         size_t input_size, void* output, size_t output_size,
+                                         bool multiple_frames) {
+	if (!AjmIsValid(state)) {
+		return AjmInvalidInstanceResult();
 	}
 
 	// The resampler requires one complete decoded packet per decoder call.
@@ -479,79 +506,74 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 	return decode_result;
 }
 
-static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,
-                                              size_t           input_buffers_num,
-                                              const AjmBuffer* output_buffers,
-                                              size_t output_buffers_num, bool multiple_frames) {
+static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, AjmInstanceState* state,
+                                              const std::vector<AjmBuffer>& input_buffers,
+                                              const std::vector<AjmBuffer>& output_buffers,
+                                              bool                          multiple_frames) {
+	// One buffer each way needs no gathering: decoders write only the bytes they report.
+	if (input_buffers.size() == 1 && output_buffers.size() == 1 && input_buffers[0].address != nullptr &&
+	    output_buffers[0].address != nullptr) {
+		return AjmDecodeInstance(instance, state, input_buffers[0].address, input_buffers[0].size,
+		                         output_buffers[0].address, output_buffers[0].size, multiple_frames);
+	}
+
 	size_t input_size  = 0;
 	size_t output_size = 0;
-	for (size_t i = 0; i < input_buffers_num && input_buffers != nullptr; i++) {
-		input_size += input_buffers[i].size;
+	for (const auto& buffer: input_buffers) {
+		input_size += buffer.size;
 	}
-	for (size_t i = 0; i < output_buffers_num && output_buffers != nullptr; i++) {
-		output_size += output_buffers[i].size;
+	for (const auto& buffer: output_buffers) {
+		output_size += buffer.size;
 	}
 
-	std::vector<uint8_t> input(input_size);
-	size_t               input_offset = 0;
-	for (size_t i = 0; i < input_buffers_num && input_buffers != nullptr; i++) {
-		if (input_buffers[i].address != nullptr && input_buffers[i].size != 0) {
-			std::memcpy(input.data() + input_offset, input_buffers[i].address,
-			            input_buffers[i].size);
+	thread_local std::vector<uint8_t> input;
+	thread_local std::vector<uint8_t> output;
+	input.resize(input_size);
+	output.resize(output_size);
+	size_t input_offset = 0;
+	for (const auto& buffer: input_buffers) {
+		if (buffer.address != nullptr && buffer.size != 0) {
+			std::memcpy(input.data() + input_offset, buffer.address, buffer.size);
+		} else if (buffer.size != 0) {
+			std::memset(input.data() + input_offset, 0, buffer.size);
 		}
-		input_offset += input_buffers[i].size;
+		input_offset += buffer.size;
 	}
 
-	std::vector<uint8_t> output(output_size);
-	auto result = AjmDecodeInstance(instance, input.data(), input.size(), output.data(),
+	auto result = AjmDecodeInstance(instance, state, input.data(), input.size(), output.data(),
 	                                output.size(), multiple_frames);
 
 	size_t output_offset = 0;
-	for (size_t i = 0; i < output_buffers_num && output_buffers != nullptr; i++) {
+	for (const auto& buffer: output_buffers) {
 		const auto bytes = std::min(
-		    output_buffers[i].size,
+		    buffer.size,
 		    (result.output_written > output_offset ? result.output_written - output_offset : 0));
-		if (output_buffers[i].address != nullptr && bytes != 0) {
-			std::memcpy(output_buffers[i].address, output.data() + output_offset, bytes);
+		if (buffer.address != nullptr && bytes != 0) {
+			std::memcpy(buffer.address, output.data() + output_offset, bytes);
 		}
-		output_offset += output_buffers[i].size;
+		output_offset += buffer.size;
 	}
 
 	return result;
 }
 
-static AjmDecodeResult AjmInitializeInstance(uint32_t instance, const void* codec_parameters,
+static AjmDecodeResult AjmInitializeInstance(AjmInstanceState* state, const void* codec_parameters,
                                              size_t codec_parameters_size) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr) {
-		AjmDecodeResult result {};
-		result.result = AJM_RESULT_INVALID_PARAMETER;
-		return result;
+	if (!AjmIsValid(state)) {
+		return AjmInvalidInstanceResult();
 	}
 
 	state->gapless.Reset();
 	return state->decoder->Initialize(codec_parameters, codec_parameters_size);
 }
 
-static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
-                                          const void* sideband_input, size_t sideband_input_size,
-                                          AjmDecoder** out_decoder, AjmGaplessState** out_gapless) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr) {
-		AjmDecodeResult result {};
-		result.result = AJM_RESULT_INVALID_PARAMETER;
-		return result;
+static AjmDecodeResult AjmControlInstance(AjmInstanceState* state, uint64_t flags,
+                                          const void* sideband_input, size_t sideband_input_size) {
+	if (!AjmIsValid(state)) {
+		return AjmInvalidInstanceResult();
 	}
 
 	auto* decoder = state->decoder.get();
-	if (out_decoder != nullptr) {
-		*out_decoder = decoder;
-	}
-	if (out_gapless != nullptr) {
-		*out_gapless = &state->gapless;
-	}
 
 	AjmDecodeResult result = decoder->MakeResult();
 	if ((flags & AJM_FLAG_SIDEBAND_GAPLESS) != 0) {
@@ -604,21 +626,10 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 	return result;
 }
 
-static AjmDecodeResult AjmSetGaplessDecode(uint32_t instance, const void* gapless_decode,
-                                           int reset) {
-	const auto flags = AJM_FLAG_SIDEBAND_GAPLESS | (reset != 0 ? AJM_FLAG_CONTROL_RESET : 0);
-	return AjmControlInstance(instance, flags, gapless_decode, sizeof(AjmSidebandGaplessDecode),
-	                          nullptr, nullptr);
-}
-
-static AjmDecodeResult AjmGetGaplessDecode(uint32_t                  instance,
+static AjmDecodeResult AjmGetGaplessDecode(AjmInstanceState*         state,
                                            AjmSidebandGaplessDecode* gapless_decode) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr) {
-		AjmDecodeResult result {};
-		result.result = AJM_RESULT_INVALID_PARAMETER;
-		return result;
+	if (!AjmIsValid(state)) {
+		return AjmInvalidInstanceResult();
 	}
 
 	if (gapless_decode != nullptr) {
@@ -627,31 +638,198 @@ static AjmDecodeResult AjmGetGaplessDecode(uint32_t                  instance,
 	return state->decoder->MakeResult();
 }
 
-static AjmSidebandFormat AjmGetInstanceFormat(uint32_t          instance,
-                                              AjmDecodeResult*  out_result  = nullptr,
-                                              AjmDecoder**      out_decoder = nullptr,
-                                              AjmGaplessState** out_gapless = nullptr) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr) {
+static AjmSidebandFormat AjmGetInstanceFormat(AjmInstanceState* state, AjmDecodeResult* out_result) {
+	if (!AjmIsValid(state)) {
 		if (out_result != nullptr) {
 			out_result->result = AJM_RESULT_INVALID_PARAMETER;
 		}
 		return AjmMakeFormat(2, 48000, AjmSampleEncoding::S16);
 	}
 
-	if (out_decoder != nullptr) {
-		*out_decoder = state->decoder.get();
-	}
-	if (out_gapless != nullptr) {
-		*out_gapless = &state->gapless;
-	}
 	if (out_result != nullptr) {
-		*out_result        = state->decoder->MakeResult();
-		out_result->format = state->decoder->GetFormat();
+		*out_result               = state->decoder->MakeResult();
+		out_result->format        = state->decoder->GetFormat();
 		out_result->resample_info = state->resampler.GetInfo();
 	}
 	return state->decoder->GetFormat();
+}
+
+static AjmDecoder* AjmGetDecoder(AjmInstanceState* state) {
+	return state != nullptr ? state->decoder.get() : nullptr;
+}
+
+static AjmGaplessState* AjmGetGapless(AjmInstanceState* state) {
+	return AjmIsValid(state) ? &state->gapless : nullptr;
+}
+
+static std::vector<uint8_t> AjmCopySidebandInput(const void* input, size_t size) {
+	if (input == nullptr) {
+		return {};
+	}
+	const auto* bytes = static_cast<const uint8_t*>(input);
+	return {bytes, bytes + std::min(size, AJM_MAX_SIDEBAND_INPUT_SIZE)};
+}
+
+static std::vector<AjmBuffer> AjmCopyBuffers(const AjmBuffer* buffers, size_t count) {
+	if (buffers == nullptr) {
+		return {};
+	}
+	return {buffers, buffers + count};
+}
+
+// Batches. A job is recorded when it is built and runs once its batch is started, as the
+// hardware runs it: on the instance's state, or on nullptr for an instance that does not exist.
+// Instances are independent, so a batch runs as one chain of jobs per instance; the chains of a
+// batch run in parallel on the AJM workers, each instance's chains in start order, and
+// sceAjmBatchWait returns once all chains of the batch are done.
+// KYTY_AJM_WORKERS=<n> sets the number of workers (default 4); 0 runs batches when they start,
+// on the starting thread.
+struct AjmJob {
+	uint32_t                               instance = 0;
+	size_t                                 end      = 0;
+	std::function<void(AjmInstanceState*)> run;
+};
+
+struct AjmBatchState {
+	std::atomic_uint32_t    pending {0};
+	std::mutex              mutex;
+	std::condition_variable done_cv;
+
+	void Finish() {
+		if (pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+			std::scoped_lock lock(mutex);
+			done_cv.notify_all();
+		}
+	}
+
+	void Wait() {
+		std::unique_lock lock(mutex);
+		done_cv.wait(lock, [this] { return pending.load(std::memory_order_acquire) == 0; });
+	}
+};
+
+struct AjmChain {
+	uint32_t                       instance = 0;
+	AjmInstancePtr                 state;
+	uint64_t                       ticket = 0;
+	std::vector<AjmJob>            jobs;
+	std::shared_ptr<AjmBatchState> batch;
+};
+
+static std::mutex                                                g_ajm_pending_mutex;
+static std::unordered_map<const void*, std::vector<AjmJob>>      g_ajm_pending;
+static std::mutex                                                g_ajm_batches_mutex;
+static std::unordered_map<uint32_t, std::shared_ptr<AjmBatchState>> g_ajm_batches;
+
+// The workers never exit, so their queue is never destroyed.
+struct AjmQueue {
+	std::mutex              mutex;
+	std::condition_variable cv;
+	std::deque<AjmChain>    chains;
+	int                     worker_count    = -1;
+	int                     workers_started = 0;
+};
+
+static AjmQueue& AjmGetQueue() {
+	static auto* queue = new AjmQueue;
+	return *queue;
+}
+
+static void AjmRunChain(AjmChain& chain) {
+	auto& state = *chain.state;
+	{
+		std::unique_lock lock(state.order_mutex);
+		state.order_cv.wait(lock, [&] { return state.serving == chain.ticket; });
+	}
+	for (auto& job: chain.jobs) {
+		job.run(&state);
+	}
+	{
+		std::scoped_lock lock(state.order_mutex);
+		state.serving++;
+	}
+	state.order_cv.notify_all();
+	chain.batch->Finish();
+}
+
+static void AjmWorkerMain() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	pthread_setname_np(pthread_self(), "AjmWorker");
+#endif
+	// Chains come in bursts; at a low P-state a worker would decode up to twice as slowly.
+	Common::Thread::RunAtTopClock("KYTY_UCLAMP");
+	auto& queue = AjmGetQueue();
+	for (;;) {
+		AjmChain chain;
+		{
+			std::unique_lock lock(queue.mutex);
+			queue.cv.wait(lock, [&] { return !queue.chains.empty(); });
+			chain = std::move(queue.chains.front());
+			queue.chains.pop_front();
+		}
+		AjmRunChain(chain);
+	}
+}
+
+static int AjmWorkerCountLocked(AjmQueue& queue) {
+	if (queue.worker_count < 0) {
+		const char* value  = std::getenv("KYTY_AJM_WORKERS");
+		queue.worker_count = value != nullptr ? std::clamp(std::atoi(value), 0, 16) : 4;
+	}
+	return queue.worker_count;
+}
+
+[[maybe_unused]] static void AjmSetWorkerCount(int count) {
+	auto&            queue = AjmGetQueue();
+	std::scoped_lock lock(queue.mutex);
+	queue.worker_count = std::clamp(count, 0, 16);
+}
+
+// Tickets are taken and chains queued under one lock, so the queue never holds a chain ahead of an
+// earlier chain of the same instance and a worker never waits on a chain queued behind it.
+static void AjmSubmit(std::vector<AjmChain>& chains) {
+	auto& queue    = AjmGetQueue();
+	bool  run_here = false;
+	{
+		std::scoped_lock lock(queue.mutex);
+		for (auto& chain: chains) {
+			chain.ticket = chain.state->next_ticket++;
+		}
+		const int workers = AjmWorkerCountLocked(queue);
+		run_here          = workers == 0;
+		if (!run_here) {
+			for (; queue.workers_started < workers; queue.workers_started++) {
+				std::thread(AjmWorkerMain).detach();
+			}
+			for (auto& chain: chains) {
+				queue.chains.push_back(std::move(chain));
+			}
+		}
+	}
+	if (run_here) {
+		for (auto& chain: chains) {
+			AjmRunChain(chain);
+		}
+	} else {
+		queue.cv.notify_all();
+	}
+}
+
+static int AjmAddJob(AjmBatchInfo* info, size_t job_size, const char* name, uint32_t instance,
+                     std::function<void(AjmInstanceState*)> run) {
+	const auto start  = info->offset;
+	const int  result = AjmAppendJob(info, job_size, name);
+	if (result != OK) {
+		return result;
+	}
+	std::scoped_lock lock(g_ajm_pending_mutex);
+	auto&            jobs = g_ajm_pending[info->buffer];
+	// A job built over earlier ones means the batch was rebuilt without being started.
+	if (!jobs.empty() && start < jobs.back().end) {
+		jobs.clear();
+	}
+	jobs.push_back({instance, info->offset, std::move(run)});
+	return OK;
 }
 
 int KYTY_SYSV_ABI AjmInitialize(int64_t reserved, uint32_t* context) {
@@ -714,17 +892,25 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 	EXIT_NOT_IMPLEMENTED(instance == nullptr);
 	const auto supported = AjmLogCodecSupport(codec);
 
-	const auto slot = (g_ajm_next_instance.fetch_add(1, std::memory_order_relaxed) & 0x3fffu);
-	*instance       = (codec << 14u) | slot;
-
-	auto state    = AjmInstanceState {};
-	state.context = context;
-	state.codec   = codec;
-	state.flags   = flags;
-	state.decoder = AjmCreateDecoder(codec, flags);
+	auto state     = std::make_shared<AjmInstanceState>();
+	state->context = context;
+	state->codec   = codec;
+	state->flags   = flags;
+	state->decoder = AjmCreateDecoder(codec, flags);
 
 	{
+		// The lowest free index: a live instance's id is never handed out again.
 		std::scoped_lock lock(g_ajm_instances_mutex);
+		uint32_t         index = 1;
+		while (index <= AJM_INSTANCE_INDEX_MASK && g_ajm_used_indices.test(index)) {
+			index++;
+		}
+		if (index > AJM_INSTANCE_INDEX_MASK) {
+			LOGF("\t no free instance\n");
+			return AJM_ERROR_OUT_OF_RESOURCES;
+		}
+		g_ajm_used_indices.set(index);
+		*instance                  = (codec << AJM_INSTANCE_INDEX_BITS) | index;
 		g_ajm_instances[*instance] = std::move(state);
 	}
 
@@ -744,8 +930,16 @@ int KYTY_SYSV_ABI AjmInstanceDestroy(uint32_t context, uint32_t instance) {
 	PRINT_NAME();
 	LOGF("\t context = %" PRIu32 ", instance = 0x%08" PRIx32 "\n", context, instance);
 
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	g_ajm_instances.erase(instance);
+	// Batches already started keep the state until their jobs have run.
+	AjmInstancePtr state;
+	{
+		std::scoped_lock lock(g_ajm_instances_mutex);
+		if (const auto it = g_ajm_instances.find(instance); it != g_ajm_instances.end()) {
+			state = std::move(it->second);
+			g_ajm_instances.erase(it);
+			g_ajm_used_indices.reset(instance & AJM_INSTANCE_INDEX_MASK);
+		}
+	}
 
 	return OK;
 }
@@ -777,6 +971,9 @@ int KYTY_SYSV_ABI AjmBatchInitialize(void* buffer, size_t size, AjmBatchInfo* in
 	info->last_good_job    = nullptr;
 	info->last_good_job_ra = nullptr;
 
+	std::scoped_lock lock(g_ajm_pending_mutex);
+	g_ajm_pending.erase(buffer);
+
 	return OK;
 }
 
@@ -796,14 +993,77 @@ int KYTY_SYSV_ABI AjmBatchStart(uint32_t context, const AjmBatchInfo* info, int 
 
 	*batch = g_ajm_next_batch.fetch_add(1, std::memory_order_relaxed);
 
+	std::vector<AjmJob> jobs;
+	{
+		std::scoped_lock lock(g_ajm_pending_mutex);
+		if (const auto it = g_ajm_pending.find(info->buffer); it != g_ajm_pending.end()) {
+			jobs = std::move(it->second);
+			g_ajm_pending.erase(it);
+		}
+	}
+
+	auto                  batch_state = std::make_shared<AjmBatchState>();
+	std::vector<AjmChain> chains;
+	std::vector<AjmJob>   unbound;
+	{
+		std::scoped_lock lock(g_ajm_instances_mutex);
+		for (auto& job: jobs) {
+			auto chain = std::find_if(chains.begin(), chains.end(),
+			                          [&](const AjmChain& c) { return c.instance == job.instance; });
+			if (chain == chains.end()) {
+				const auto it = g_ajm_instances.find(job.instance);
+				if (it == g_ajm_instances.end()) {
+					unbound.push_back(std::move(job));
+					continue;
+				}
+				chain = chains.insert(chains.end(), AjmChain {job.instance, it->second, 0, {}, batch_state});
+			}
+			chain->jobs.push_back(std::move(job));
+		}
+	}
+
+	// Jobs without an instance read no instance state.
+	for (auto& job: unbound) {
+		job.run(nullptr);
+	}
+	if (chains.empty()) {
+		return OK;
+	}
+
+	batch_state->pending.store(static_cast<uint32_t>(chains.size()), std::memory_order_relaxed);
+	{
+		std::scoped_lock lock(g_ajm_batches_mutex);
+		// Batches nobody waits for are dropped once done.
+		if (g_ajm_batches.size() >= 1024) {
+			std::erase_if(g_ajm_batches, [](const auto& entry) {
+				return entry.second->pending.load(std::memory_order_acquire) == 0;
+			});
+		}
+		g_ajm_batches[*batch] = batch_state;
+	}
+	AjmSubmit(chains);
+
 	return OK;
 }
 
+// Returns once the batch's jobs have run and their results are written.
 int KYTY_SYSV_ABI AjmBatchWait(uint32_t context, uint32_t batch, uint32_t timeout,
                                AjmBatchError* error) {
 	(void)context;
-	(void)batch;
 	(void)timeout;
+
+	std::shared_ptr<AjmBatchState> state;
+	{
+		std::scoped_lock lock(g_ajm_batches_mutex);
+		if (const auto it = g_ajm_batches.find(batch); it != g_ajm_batches.end()) {
+			state = std::move(it->second);
+			g_ajm_batches.erase(it);
+		}
+	}
+	if (state != nullptr && state->pending.load(std::memory_order_acquire) != 0) {
+		LibKernel::LongWait long_wait("ajm_batch_wait", state.get(), __builtin_return_address(0), batch);
+		state->Wait();
+	}
 
 	if (error != nullptr) {
 		std::memset(error, 0, sizeof(AjmBatchError));
@@ -833,27 +1093,30 @@ int KYTY_SYSV_ABI AjmBatchJobInitialize(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	const auto decode_result =
-	    AjmInitializeInstance(instance, codec_parameters, codec_parameters_size);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
-
 	LOGF("\t instance = 0x%08" PRIx32 ", codec_parameters = 0x%016" PRIx64 ", size = 0x%016" PRIx64
 	     "\n",
 	     instance, reinterpret_cast<uint64_t>(codec_parameters),
 	     static_cast<uint64_t>(codec_parameters_size));
-	return AjmAppendJob(info, AJM_JOB_CONTROL_SIZE, "initialize");
+	return AjmAddJob(info, AJM_JOB_CONTROL_SIZE, "initialize", instance,
+	                 [parameters = AjmCopySidebandInput(codec_parameters, codec_parameters_size),
+	                  present = codec_parameters != nullptr, result](AjmInstanceState* state) {
+		                 const auto decode_result = AjmInitializeInstance(
+		                     state, present ? parameters.data() : nullptr, parameters.size());
+		                 AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobClearContext(AjmBatchInfo* info, uint32_t instance, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	const auto decode_result =
-	    AjmControlInstance(instance, AJM_FLAG_CONTROL_RESET, nullptr, 0, nullptr, nullptr);
-
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
-	return AjmAppendJob(info, AJM_JOB_CONTROL_SIZE, "clear-context");
+	return AjmAddJob(info, AJM_JOB_CONTROL_SIZE, "clear-context", instance,
+	                 [result](AjmInstanceState* state) {
+		                 const auto decode_result =
+		                     AjmControlInstance(state, AJM_FLAG_CONTROL_RESET, nullptr, 0);
+		                 AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobDecode(AjmBatchInfo* info, uint32_t instance,
@@ -862,18 +1125,18 @@ int KYTY_SYSV_ABI AjmBatchJobDecode(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	const auto decode_result = AjmDecodeInstance(instance, bitstream_input, bitstream_input_size,
-	                                             pcm_output, pcm_output_size, true);
-	AjmWriteStreamResult(
-	    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
-	    decode_result, true);
-
 	LOGF("\t instance = 0x%08" PRIx32 ", input = 0x%016" PRIx64 ", input_size = 0x%016" PRIx64
 	     ", output = 0x%016" PRIx64 ", output_size = 0x%016" PRIx64 "\n",
 	     instance, reinterpret_cast<uint64_t>(bitstream_input),
 	     static_cast<uint64_t>(bitstream_input_size), reinterpret_cast<uint64_t>(pcm_output),
 	     static_cast<uint64_t>(pcm_output_size));
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "decode");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "decode", instance, [=](AjmInstanceState* state) {
+		const auto decode_result = AjmDecodeInstance(instance, state, bitstream_input,
+		                                             bitstream_input_size, pcm_output, pcm_output_size, true);
+		AjmWriteStreamResult(
+		    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
+		    decode_result, true);
+	});
 }
 
 int KYTY_SYSV_ABI AjmBatchJobDecodeSingle(AjmBatchInfo* info, uint32_t instance,
@@ -882,13 +1145,13 @@ int KYTY_SYSV_ABI AjmBatchJobDecodeSingle(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	const auto decode_result = AjmDecodeInstance(instance, bitstream_input, bitstream_input_size,
-	                                             pcm_output, pcm_output_size, false);
-	AjmWriteStreamResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE, decode_result,
-	                     false);
-
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "decode-single");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "decode-single", instance, [=](AjmInstanceState* state) {
+		const auto decode_result = AjmDecodeInstance(instance, state, bitstream_input,
+		                                             bitstream_input_size, pcm_output, pcm_output_size, false);
+		AjmWriteStreamResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE, decode_result,
+		                     false);
+	});
 }
 
 int KYTY_SYSV_ABI AjmBatchJobDecodeSplit(AjmBatchInfo* info, uint32_t instance,
@@ -898,19 +1161,23 @@ int KYTY_SYSV_ABI AjmBatchJobDecodeSplit(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	const auto decode_result = AjmDecodeSplitInstance(instance, input_buffers, input_buffers_num,
-	                                                  output_buffers, output_buffers_num, true);
-	AjmWriteStreamResult(
-	    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
-	    decode_result, true);
-
 	LOGF("\t instance = 0x%08" PRIx32 ", input_buffers = 0x%016" PRIx64
 	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
 	     ", output_num = 0x%016" PRIx64 "\n",
 	     instance, reinterpret_cast<uint64_t>(input_buffers),
 	     static_cast<uint64_t>(input_buffers_num), reinterpret_cast<uint64_t>(output_buffers),
 	     static_cast<uint64_t>(output_buffers_num));
-	return AjmAppendJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "decode-split");
+	return AjmAddJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "decode-split", instance,
+	                 [instance, inputs = AjmCopyBuffers(input_buffers, input_buffers_num),
+	                  outputs = AjmCopyBuffers(output_buffers, output_buffers_num),
+	                  result](AjmInstanceState* state) {
+		                 const auto decode_result =
+		                     AjmDecodeSplitInstance(instance, state, inputs, outputs, true);
+		                 AjmWriteStreamResult(result,
+		                                      AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE +
+		                                          AJM_SIDEBAND_MFRAME_SIZE,
+		                                      decode_result, true);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobEncode(AjmBatchInfo* info, uint32_t instance, const void* pcm_input,
@@ -919,35 +1186,35 @@ int KYTY_SYSV_ABI AjmBatchJobEncode(AjmBatchInfo* info, uint32_t instance, const
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult encode_result {};
-	encode_result.input_consumed = pcm_input_size;
-	encode_result.output_written = bitstream_output_size;
-	encode_result.frames         = (pcm_input_size != 0 || bitstream_output_size != 0 ? 1u : 0u);
-	encode_result.total_decoded_samples = bitstream_output_size;
-	if (bitstream_output != nullptr && bitstream_output_size != 0) {
-		std::memset(bitstream_output, 0, bitstream_output_size);
-	}
-
-	AjmWriteStreamResult(
-	    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
-	    encode_result, true);
 	LOGF("\t instance = 0x%08" PRIx32 ", input = 0x%016" PRIx64 ", output = 0x%016" PRIx64 "\n",
 	     instance, reinterpret_cast<uint64_t>(pcm_input),
 	     reinterpret_cast<uint64_t>(bitstream_output));
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "encode");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "encode", instance, [=](AjmInstanceState*) {
+		AjmDecodeResult encode_result {};
+		encode_result.input_consumed = pcm_input_size;
+		encode_result.output_written = bitstream_output_size;
+		encode_result.frames = (pcm_input_size != 0 || bitstream_output_size != 0 ? 1u : 0u);
+		encode_result.total_decoded_samples = bitstream_output_size;
+		if (bitstream_output != nullptr && bitstream_output_size != 0) {
+			std::memset(bitstream_output, 0, bitstream_output_size);
+		}
+		AjmWriteStreamResult(
+		    result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_STREAM_SIZE + AJM_SIDEBAND_MFRAME_SIZE,
+		    encode_result, true);
+	});
 }
 
 int KYTY_SYSV_ABI AjmBatchJobGetInfo(AjmBatchInfo* info, uint32_t instance, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult decode_result {};
-	const auto      format = AjmGetInstanceFormat(instance, &decode_result);
-	AjmWriteFormat(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_FORMAT_SIZE, format,
-	               decode_result);
-
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-info");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "get-info", instance, [result](AjmInstanceState* state) {
+		AjmDecodeResult decode_result {};
+		const auto      format = AjmGetInstanceFormat(state, &decode_result);
+		AjmWriteFormat(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_FORMAT_SIZE, format,
+		               decode_result);
+	});
 }
 
 int KYTY_SYSV_ABI AjmBatchJobGetCodecInfo(AjmBatchInfo* info, uint32_t instance, void* result,
@@ -955,60 +1222,68 @@ int KYTY_SYSV_ABI AjmBatchJobGetCodecInfo(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult decode_result {};
-	AjmDecoder*     decoder = nullptr;
-	(void)AjmGetInstanceFormat(instance, &decode_result, &decoder);
-	AjmWriteResult(result, result_size, decode_result);
-	AjmWriteCodecInfo(decoder, result, result_size, decode_result);
-
 	LOGF("\t instance = 0x%08" PRIx32 ", result_size = 0x%016" PRIx64 "\n", instance,
 	     static_cast<uint64_t>(result_size));
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-codec-info");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "get-codec-info", instance,
+	                 [result, result_size](AjmInstanceState* state) {
+		                 AjmDecodeResult decode_result {};
+		                 (void)AjmGetInstanceFormat(state, &decode_result);
+		                 AjmWriteResult(result, result_size, decode_result);
+		                 AjmWriteCodecInfo(AjmIsValid(state) ? state->decoder.get() : nullptr, result,
+		                                   result_size, decode_result);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobSetGaplessDecode(AjmBatchInfo* info, uint32_t instance,
                                               const void* gapless_decode, int reset, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	const auto decode_result = AjmSetGaplessDecode(instance, gapless_decode, reset);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
 	LOGF("\t instance = 0x%08" PRIx32 ", gapless_decode = 0x%016" PRIx64 ", reset = %d\n", instance,
 	     reinterpret_cast<uint64_t>(gapless_decode), reset);
-	return AjmAppendJob(info, AJM_JOB_CONTROL_SIZE, "set-gapless");
+	const auto flags = AJM_FLAG_SIDEBAND_GAPLESS | (reset != 0 ? AJM_FLAG_CONTROL_RESET : 0);
+	return AjmAddJob(info, AJM_JOB_CONTROL_SIZE, "set-gapless", instance,
+	                 [flags, result,
+	                  gapless = AjmCopySidebandInput(gapless_decode, sizeof(AjmSidebandGaplessDecode)),
+	                  present = gapless_decode != nullptr](AjmInstanceState* state) {
+		                 const auto decode_result = AjmControlInstance(
+		                     state, flags, present ? gapless.data() : nullptr, gapless.size());
+		                 AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobGetGaplessDecode(AjmBatchInfo* info, uint32_t instance, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult          decode_result {};
-	AjmSidebandGaplessDecode gapless_decode {};
-	decode_result = AjmGetGaplessDecode(instance, &gapless_decode);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_GAPLESS_SIZE, decode_result);
-	if (result != nullptr) {
-		auto* gapless = reinterpret_cast<AjmSidebandGaplessDecode*>(static_cast<uint8_t*>(result) +
-		                                                            AJM_SIDEBAND_RESULT_SIZE);
-		*gapless      = gapless_decode;
-	}
-
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-gapless");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "get-gapless", instance, [result](AjmInstanceState* state) {
+		AjmSidebandGaplessDecode gapless_decode {};
+		const auto               decode_result = AjmGetGaplessDecode(state, &gapless_decode);
+		AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_GAPLESS_SIZE, decode_result);
+		if (result != nullptr) {
+			auto* gapless = reinterpret_cast<AjmSidebandGaplessDecode*>(static_cast<uint8_t*>(result) +
+			                                                            AJM_SIDEBAND_RESULT_SIZE);
+			*gapless      = gapless_decode;
+		}
+	});
 }
 
 int KYTY_SYSV_ABI AjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t instance,
                                                    float ratio, uint32_t flags, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	const struct {
-		float    ratio;
-		uint32_t flags;
-	} params {ratio, flags};
-	const auto decoded = AjmControlInstance(instance, AJM_FLAG_CONTROL_RESAMPLE, &params,
-	                                        sizeof(params), nullptr, nullptr);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio = %f, flags = 0x%08" PRIx32 "\n", instance,
 	     static_cast<double>(ratio), flags);
-	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample");
+	return AjmAddJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample", instance,
+	                 [ratio, flags, result](AjmInstanceState* state) {
+		                 const struct {
+			                 float    ratio;
+			                 uint32_t flags;
+		                 } params {ratio, flags};
+		                 const auto decoded =
+		                     AjmControlInstance(state, AJM_FLAG_CONTROL_RESAMPLE, &params, sizeof(params));
+		                 AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_t instance,
@@ -1017,44 +1292,49 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_
                                                      void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	const struct {
-		float    ratio;
-		float    change;
-		uint32_t flags;
-	} params {ratio_start, ratio_change_per_sample, flags};
-	const auto decoded = AjmControlInstance(instance, AJM_FLAG_CONTROL_RESAMPLE_EX, &params,
-	                                        sizeof(params), nullptr, nullptr);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio_start = %f, ratio_change = %f, flags = 0x%08" PRIx32
 	     "\n",
 	     instance, static_cast<double>(ratio_start), static_cast<double>(ratio_change_per_sample),
 	     flags);
-	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample-ex");
+	return AjmAddJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample-ex", instance,
+	                 [ratio_start, ratio_change_per_sample, flags, result](AjmInstanceState* state) {
+		                 const struct {
+			                 float    ratio;
+			                 float    change;
+			                 uint32_t flags;
+		                 } params {ratio_start, ratio_change_per_sample, flags};
+		                 const auto decoded = AjmControlInstance(state, AJM_FLAG_CONTROL_RESAMPLE_EX,
+		                                                         &params, sizeof(params));
+		                 AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instance, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult decode_result {};
-	(void)AjmGetInstanceFormat(instance, &decode_result);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_RESAMPLE_INFO_SIZE,
-	               decode_result);
-	if (result != nullptr) {
-		auto* resample  = reinterpret_cast<AjmSidebandResampleInfo*>(static_cast<uint8_t*>(result) +
-		                                                             AJM_SIDEBAND_RESULT_SIZE);
-		*resample = decode_result.resample_info;
-	}
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-resample-info");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "get-resample-info", instance,
+	                 [result](AjmInstanceState* state) {
+		                 AjmDecodeResult decode_result {};
+		                 (void)AjmGetInstanceFormat(state, &decode_result);
+		                 AjmWriteResult(result,
+		                                AJM_SIDEBAND_RESULT_SIZE + AJM_SIDEBAND_RESAMPLE_INFO_SIZE,
+		                                decode_result);
+		                 if (result != nullptr) {
+			                 auto* resample = reinterpret_cast<AjmSidebandResampleInfo*>(
+			                     static_cast<uint8_t*>(result) + AJM_SIDEBAND_RESULT_SIZE);
+			                 *resample = decode_result.resample_info;
+		                 }
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobGetStatistics(AjmBatchInfo* info, float interval, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	AjmWriteResult(result, sizeof(AjmGetStatisticsResult));
 	(void)interval;
-	return AjmAppendJob(info, AJM_JOB_GET_STATISTICS_SIZE, "get-statistics");
+	return AjmAddJob(info, AJM_JOB_GET_STATISTICS_SIZE, "get-statistics", 0,
+	                 [result](AjmInstanceState*) { AjmWriteResult(result, sizeof(AjmGetStatisticsResult)); });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobControl(AjmBatchInfo* info, uint32_t instance, uint64_t flags,
@@ -1063,19 +1343,21 @@ int KYTY_SYSV_ABI AjmBatchJobControl(AjmBatchInfo* info, uint32_t instance, uint
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecoder*      decoder       = nullptr;
-	AjmGaplessState* gapless       = nullptr;
-	const auto       decode_result = AjmControlInstance(instance, flags, sideband_input,
-	                                                    sideband_input_size, &decoder, &gapless);
-	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
-
 	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input = 0x%016" PRIx64
 	     ", input_size = 0x%016" PRIx64 ", output = 0x%016" PRIx64 ", output_size = 0x%016" PRIx64
 	     "\n",
 	     instance, flags, reinterpret_cast<uint64_t>(sideband_input),
 	     static_cast<uint64_t>(sideband_input_size), reinterpret_cast<uint64_t>(sideband_output),
 	     static_cast<uint64_t>(sideband_output_size));
-	return AjmAppendJob(info, AJM_JOB_CONTROL_SIZE, "control");
+	return AjmAddJob(info, AJM_JOB_CONTROL_SIZE, "control", instance,
+	                 [flags, input = AjmCopySidebandInput(sideband_input, sideband_input_size),
+	                  present = sideband_input != nullptr, sideband_output,
+	                  sideband_output_size](AjmInstanceState* state) {
+		                 const auto decode_result = AjmControlInstance(
+		                     state, flags, present ? input.data() : nullptr, input.size());
+		                 AjmWriteSideband(flags, sideband_output, sideband_output_size,
+		                                  AjmGetDecoder(state), AjmGetGapless(state), decode_result);
+	                 });
 }
 
 int KYTY_SYSV_ABI AjmBatchJobRun(AjmBatchInfo* info, uint32_t instance, uint64_t flags,
@@ -1085,21 +1367,19 @@ int KYTY_SYSV_ABI AjmBatchJobRun(AjmBatchInfo* info, uint32_t instance, uint64_t
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	auto decode_result =
-	    AjmDecodeInstance(instance, data_input, data_input_size, data_output, data_output_size,
-	                      (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
-	AjmDecoder*      decoder = nullptr;
-	AjmGaplessState* gapless = nullptr;
-	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
-	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
-
 	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input = 0x%016" PRIx64
 	     ", input_size = 0x%016" PRIx64 ", output = 0x%016" PRIx64 ", output_size = 0x%016" PRIx64
 	     "\n",
 	     instance, flags, reinterpret_cast<uint64_t>(data_input),
 	     static_cast<uint64_t>(data_input_size), reinterpret_cast<uint64_t>(data_output),
 	     static_cast<uint64_t>(data_output_size));
-	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "run");
+	return AjmAddJob(info, AJM_JOB_RUN_SIZE, "run", instance, [=](AjmInstanceState* state) {
+		const auto decode_result =
+		    AjmDecodeInstance(instance, state, data_input, data_input_size, data_output,
+		                      data_output_size, (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
+		AjmWriteSideband(flags, sideband_output, sideband_output_size, AjmGetDecoder(state),
+		                 AjmGetGapless(state), decode_result);
+	});
 }
 
 int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uint64_t flags,
@@ -1109,15 +1389,15 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	auto decode_result =
-	    AjmDecodeSplitInstance(instance, input_buffers, input_buffers_num, output_buffers,
-	                           output_buffers_num, (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
-	AjmDecoder*      decoder = nullptr;
-	AjmGaplessState* gapless = nullptr;
-	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
-	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
-
-	return AjmAppendJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "run-split");
+	return AjmAddJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "run-split", instance,
+	                 [instance, flags, inputs = AjmCopyBuffers(input_buffers, input_buffers_num),
+	                  outputs = AjmCopyBuffers(output_buffers, output_buffers_num), sideband_output,
+	                  sideband_output_size](AjmInstanceState* state) {
+		                 const auto decode_result = AjmDecodeSplitInstance(
+		                     instance, state, inputs, outputs, (flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0);
+		                 AjmWriteSideband(flags, sideband_output, sideband_output_size,
+		                                  AjmGetDecoder(state), AjmGetGapless(state), decode_result);
+	                 });
 }
 
 const char* KYTY_SYSV_ABI AjmStrError(int error) {

@@ -912,6 +912,26 @@ static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
 	return (type == RegIndirectPacket::Uc && is_trinity_mode() ? 1u : 0u);
 }
 
+// KYTY_CMD_TRAP=hle (diagnostics): a pixel shader an SH register setter sets, with its caller (NativeGpu::CmdTrapHleRecord).
+static void TrapShPairs(const volatile ShaderRegister* regs, uint32_t num_regs, uint32_t kind) {
+	if (!NativeGpu::CmdTrapHleArmed() || regs == nullptr) {
+		return;
+	}
+	uint32_t first[8] = {};
+	for (uint32_t i = 0; i < num_regs && i < 4; i++) {
+		first[2 * i]     = regs[i].offset;
+		first[2 * i + 1] = regs[i].value;
+	}
+	for (uint32_t i = 0; i < num_regs && i < 256; i++) {
+		const uint32_t off = regs[i].offset & 0xffffu;
+		if (off == 0x08u || off == 0x2c08u || off == 0x20cu) { // PGM_LO_PS; COMPUTE_PGM_LO (kind + 16)
+			NativeGpu::CmdTrapHleRecord(regs[i].value, kind + (off == 0x20cu ? 16u : 0u), reinterpret_cast<uint64_t>(regs), first, 8);
+			return;
+		}
+	}
+	NativeGpu::CmdTrapHleRecord(0, kind, reinterpret_cast<uint64_t>(regs), first, 8);
+}
+
 static void reg_indirect_write_packet(uint32_t* cmd, uint64_t vaddr, uint32_t num_regs,
                                       RegIndirectPacket type) {
 	cmd[0] = KYTY_PM4(RegIndirectPacketSizeDw, reg_indirect_native_op(type), reg_indirect_pm4_r(type));
@@ -987,6 +1007,7 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*                  
 
 	auto vaddr = reinterpret_cast<uint64_t>(regs);
 
+	TrapShPairs(regs, cmd[4] & 0x3fffu, 1);
 	return reg_indirect_patch_set_address(cmd, vaddr, RegIndirectPacket::Sh);
 }
 
@@ -2108,6 +2129,10 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 
 	cmd[0] = KYTY_PM4(num_values + 2, Pm4::IT_SET_SH_REG, 0u);
 	cmd[1] = offset & 0xffffu;
+	if (NativeGpu::CmdTrapHleArmed() && values != nullptr && (offset & 0xffffu) <= 0x08u && (offset & 0xffffu) + num_values > 0x08u) {
+		const uint32_t first[2] = {offset, num_values};
+		NativeGpu::CmdTrapHleRecord(values[0x08u - (offset & 0xffffu)], 5, 0, first, 2);
+	}
 
 	if (values != nullptr) {
 		memcpy(cmd + 2, values, static_cast<size_t>(num_values) * 4);
@@ -2184,6 +2209,7 @@ static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderR
 uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
                                                   const volatile ShaderRegister* regs,
                                                   uint32_t                       num_regs) {
+	TrapShPairs(regs, num_regs, 3);
 	return set_registers_direct(buf, regs, num_regs, Pm4::IT_SET_SH_REG);
 }
 
@@ -2496,6 +2522,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegi
 	cmd[0] = KYTY_PM4(3, Pm4::IT_SET_SH_REG, 0u);
 	cmd[1] = reg.offset & 0xffffu;
 	cmd[2] = reg.value;
+	TrapShPairs(&reg, 1, 4);
 
 	return cmd;
 }
@@ -2588,6 +2615,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 
 	auto vaddr = reinterpret_cast<uint64_t>(regs);
 
+	TrapShPairs(regs, num_regs, 2);
 	reg_indirect_write_packet(cmd, vaddr, num_regs, RegIndirectPacket::Sh);
 
 	return cmd;

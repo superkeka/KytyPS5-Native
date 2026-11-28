@@ -1200,6 +1200,11 @@ int KYTY_SYSV_ABI FontOpenFontInstance(FontHandle font_handle, void* setup_font,
 int KYTY_SYSV_ABI FontCloseFont(FontHandle font_handle) {
 	PRINT_NAME();
 
+	// No handle, no font: the console answers SCE_FONT_ERROR_INVALID_FONT_HANDLE.
+	if (font_handle == nullptr) {
+		return FONT_ERROR_INVALID_FONT_HANDLE;
+	}
+
 	auto* font = static_cast<FontState*>(font_handle);
 	delete font;
 
@@ -1703,8 +1708,13 @@ FontTextCodes* KYTY_SYSV_ABI FontTextCodesStepBack(FontTextCodes* text_codes_ste
 int KYTY_SYSV_ABI FontCharacterGetBidiLevel(FontTextCharacter text_character, int* bidi_level) {
 	PRINT_NAME();
 
+	// A missing argument is SCE_FONT_ERROR_INVALID_PARAMETER; the level still reads 0 when it can
+	// be written.
 	if (text_character == nullptr || bidi_level == nullptr) {
-		return -1;
+		if (bidi_level != nullptr) {
+			*bidi_level = 0;
+		}
+		return FONT_ERROR_INVALID_PARAMETER;
 	}
 
 	*bidi_level = 0;

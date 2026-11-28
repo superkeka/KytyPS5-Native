@@ -315,15 +315,25 @@ struct VoicePort {
 	float    volume     = 1.0f;
 };
 
-static std::array<VoicePort, 256> g_voice_ports;
-static uint32_t                   g_next_voice_port_id = 1;
-static bool                       g_voice_started      = false;
+constexpr int VOICE_ERROR_NOT_INIT         = static_cast<int>(0x804e0801u);
+constexpr int VOICE_ERROR_ALREADY_INIT     = static_cast<int>(0x804e0802u);
+constexpr int VOICE_ERROR_PORT_INVALID     = static_cast<int>(0x804e0804u);
+constexpr int VOICE_ERROR_ARGUMENT_INVALID = static_cast<int>(0x804e0805u);
+constexpr int VOICE_ERROR_NO_FREE_PORT     = static_cast<int>(0x804e0808u);
+
+// Port ids run from 0 to 127; anything above is refused before the port is even looked up.
+constexpr uint32_t VOICE_PORT_ID_MAX = 127;
+
+static std::array<VoicePort, VOICE_PORT_ID_MAX + 1> g_voice_ports;
+static uint32_t                                     g_next_voice_port_id = 1;
+static bool                                         g_voice_initialized  = false;
+static bool                                         g_voice_started      = false;
 
 static uint32_t alloc_voice_port(const VoicePortParam* param) {
-	for (uint32_t i = 0; i < static_cast<uint32_t>(g_voice_ports.size()) - 1; i++) {
+	for (uint32_t i = 0; i < VOICE_PORT_ID_MAX; i++) {
 		const auto id = g_next_voice_port_id;
 		g_next_voice_port_id++;
-		if (g_next_voice_port_id == 0xff) {
+		if (g_next_voice_port_id > VOICE_PORT_ID_MAX) {
 			g_next_voice_port_id = 1;
 		}
 
@@ -350,38 +360,63 @@ static uint32_t alloc_voice_port(const VoicePortParam* param) {
 }
 
 static VoicePort* get_voice_port(uint32_t port_id) {
-	if (port_id >= g_voice_ports.size() || port_id == 0xff || !g_voice_ports[port_id].used) {
+	if (port_id > VOICE_PORT_ID_MAX || !g_voice_ports[port_id].used) {
 		return nullptr;
 	}
 
 	return &g_voice_ports[port_id];
 }
 
-int KYTY_SYSV_ABI VoiceInit(VoiceInitParam* /*param*/, int32_t /*version*/) {
-	PRINT_NAME();
+static void reset_voice() {
 	g_voice_started = false;
 	for (auto& port: g_voice_ports) {
 		port = {};
 	}
 	g_next_voice_port_id = 1;
+}
+
+// Every call but sceVoiceInit answers SCE_VOICE_ERROR_NOT_INIT until the library is initialized,
+// whatever its arguments.
+int KYTY_SYSV_ABI VoiceInit(VoiceInitParam* param, int32_t /*version*/) {
+	PRINT_NAME();
+
+	if (g_voice_initialized) {
+		return VOICE_ERROR_ALREADY_INIT;
+	}
+	if (param == nullptr) {
+		return VOICE_ERROR_ARGUMENT_INVALID;
+	}
+
+	reset_voice();
+	g_voice_initialized = true;
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceSetThreadsParams(void* /*params*/) {
+int KYTY_SYSV_ABI VoiceSetThreadsParams(void* params) {
 	PRINT_NAME();
+
+	if (params == nullptr) {
+		return VOICE_ERROR_ARGUMENT_INVALID;
+	}
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
 	return 0;
 }
 
 int KYTY_SYSV_ABI VoiceCreatePort(uint32_t* port_id, const VoicePortParam* param) {
 	PRINT_NAME();
 
-	if (port_id == nullptr) {
-		return -2142369787;
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (port_id == nullptr || param == nullptr) {
+		return VOICE_ERROR_ARGUMENT_INVALID;
 	}
 
 	const auto id = alloc_voice_port(param);
 	if (id == 0xff) {
-		return -2142369784;
+		return VOICE_ERROR_NO_FREE_PORT;
 	}
 
 	*port_id = id;
@@ -390,6 +425,13 @@ int KYTY_SYSV_ABI VoiceCreatePort(uint32_t* port_id, const VoicePortParam* param
 
 int KYTY_SYSV_ABI VoiceConnectIPortToOPort(uint32_t input_port_id, uint32_t output_port_id) {
 	PRINT_NAME();
+
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (input_port_id > VOICE_PORT_ID_MAX || output_port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
 
 	auto* input_port  = get_voice_port(input_port_id);
 	auto* output_port = get_voice_port(output_port_id);
@@ -407,6 +449,13 @@ int KYTY_SYSV_ABI VoiceConnectIPortToOPort(uint32_t input_port_id, uint32_t outp
 int KYTY_SYSV_ABI VoiceDisconnectIPortFromOPort(uint32_t input_port_id, uint32_t output_port_id) {
 	PRINT_NAME();
 
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (input_port_id > VOICE_PORT_ID_MAX || output_port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
+
 	auto* input_port  = get_voice_port(input_port_id);
 	auto* output_port = get_voice_port(output_port_id);
 
@@ -423,9 +472,16 @@ int KYTY_SYSV_ABI VoiceDisconnectIPortFromOPort(uint32_t input_port_id, uint32_t
 int KYTY_SYSV_ABI VoiceDeletePort(uint32_t port_id) {
 	PRINT_NAME();
 
-	if (auto* port = get_voice_port(port_id); port != nullptr) {
-		*port = {};
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
 	}
+
+	// A port that was never created (or is already deleted) is refused, SCE_VOICE_ERROR_PORT_INVALID.
+	auto* port = get_voice_port(port_id);
+	if (port == nullptr) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
+	*port = {};
 
 	return 0;
 }
@@ -433,35 +489,55 @@ int KYTY_SYSV_ABI VoiceDeletePort(uint32_t port_id) {
 int KYTY_SYSV_ABI VoiceEnd() {
 	PRINT_NAME();
 
-	g_voice_started = false;
-	for (auto& port: g_voice_ports) {
-		port = {};
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
 	}
-	g_next_voice_port_id = 1;
+
+	reset_voice();
+	g_voice_initialized = false;
 
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceStart(const VoiceStartParam* /*param*/) {
+int KYTY_SYSV_ABI VoiceStart(const VoiceStartParam* param) {
 	PRINT_NAME();
+
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (param == nullptr || param->container == nullptr) {
+		return VOICE_ERROR_ARGUMENT_INVALID;
+	}
+
 	g_voice_started = true;
 	return 0;
 }
 
 int KYTY_SYSV_ABI VoiceStop() {
 	PRINT_NAME();
+
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+
 	g_voice_started = false;
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceReadFromOPort(uint32_t /*output_port_id*/, void* data, uint32_t* size) {
+int KYTY_SYSV_ABI VoiceReadFromOPort(uint32_t output_port_id, void* data, uint32_t* size) {
 	PRINT_NAME();
 
-	if (size == nullptr) {
-		return -2142369787;
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (output_port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
+	if (data == nullptr || size == nullptr) {
+		return VOICE_ERROR_ARGUMENT_INVALID;
 	}
 
-	if (data != nullptr && *size != 0) {
+	if (*size != 0) {
 		std::memset(data, 0, *size);
 	}
 
@@ -469,12 +545,18 @@ int KYTY_SYSV_ABI VoiceReadFromOPort(uint32_t /*output_port_id*/, void* data, ui
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceWriteToIPort(uint32_t /*input_port_id*/, const void* /*data*/,
-                                    uint32_t* size, int16_t /*frame_gaps*/) {
+int KYTY_SYSV_ABI VoiceWriteToIPort(uint32_t input_port_id, const void* data, uint32_t* size,
+                                    int16_t /*frame_gaps*/) {
 	PRINT_NAME();
 
-	if (size == nullptr) {
-		return -2142369787;
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (input_port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
+	if (data == nullptr || size == nullptr) {
+		return VOICE_ERROR_ARGUMENT_INVALID;
 	}
 
 	return 0;
@@ -483,8 +565,14 @@ int KYTY_SYSV_ABI VoiceWriteToIPort(uint32_t /*input_port_id*/, const void* /*da
 int KYTY_SYSV_ABI VoiceGetPortInfo(uint32_t port_id, VoicePortInfo* info) {
 	PRINT_NAME();
 
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
 	if (info == nullptr) {
-		return -2142369787;
+		return VOICE_ERROR_ARGUMENT_INVALID;
 	}
 
 	const auto* port = get_voice_port(port_id);
@@ -501,11 +589,17 @@ int KYTY_SYSV_ABI VoiceGetPortInfo(uint32_t port_id, VoicePortInfo* info) {
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceGetPortAttr(uint32_t /*port_id*/, int32_t attr, void* value, int32_t size) {
+int KYTY_SYSV_ABI VoiceGetPortAttr(uint32_t port_id, int32_t attr, void* value, int32_t size) {
 	PRINT_NAME();
 
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
 	if (value == nullptr || size <= 0) {
-		return -2142369787;
+		return VOICE_ERROR_ARGUMENT_INVALID;
 	}
 
 	std::memset(value, 0, static_cast<size_t>(size));
@@ -521,18 +615,34 @@ int KYTY_SYSV_ABI VoiceGetPortAttr(uint32_t /*port_id*/, int32_t attr, void* val
 int KYTY_SYSV_ABI VoiceGetBitRate(uint32_t port_id, uint32_t* bitrate) {
 	PRINT_NAME();
 
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
 	if (bitrate == nullptr) {
-		return -2142369787;
+		return VOICE_ERROR_ARGUMENT_INVALID;
 	}
 
 	const auto* port = get_voice_port(port_id);
-	*bitrate         = (port != nullptr && port->bitrate != 0 ? port->bitrate : 48000);
+	if (port == nullptr) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
+	*bitrate = (port->bitrate != 0 ? port->bitrate : 48000);
 
 	return 0;
 }
 
 int KYTY_SYSV_ABI VoiceSetVolume(uint32_t port_id, float volume) {
 	PRINT_NAME();
+
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
 
 	if (auto* port = get_voice_port(port_id); port != nullptr) {
 		port->volume = volume;
@@ -544,8 +654,14 @@ int KYTY_SYSV_ABI VoiceSetVolume(uint32_t port_id, float volume) {
 int KYTY_SYSV_ABI VoiceGetVolume(uint32_t port_id, float* volume) {
 	PRINT_NAME();
 
+	if (!g_voice_initialized) {
+		return VOICE_ERROR_NOT_INIT;
+	}
+	if (port_id > VOICE_PORT_ID_MAX) {
+		return VOICE_ERROR_PORT_INVALID;
+	}
 	if (volume == nullptr) {
-		return -2142369787;
+		return VOICE_ERROR_ARGUMENT_INVALID;
 	}
 
 	const auto* port = get_voice_port(port_id);
@@ -607,7 +723,7 @@ LIB_DEFINE(InitAudio_1_Ajm) {
 	LIB_FUNC("bkRHEYG6lEM", Ajm::AjmMemoryRegister);
 	LIB_FUNC("pIpGiaYkHkM", Ajm::AjmMemoryUnregister);
 	LIB_FUNC("MmpF1XsQiHw", Ajm::AjmBatchInitialize);
-	LIB_FUNC("5tOfnaClcqM", Ajm::AjmBatchStart);
+	LIB_FUNC("5tOfnaClcqM", ::Libs::LibKernel::OnHostStack<&Ajm::AjmBatchStart>::Call);
 	LIB_FUNC("-qLsfDAywIY", Ajm::AjmBatchWait);
 	LIB_FUNC("NVDXiUesSbA", Ajm::AjmBatchCancel);
 	LIB_FUNC("WfAiBW8Wcek", Ajm::AjmBatchErrorDump);

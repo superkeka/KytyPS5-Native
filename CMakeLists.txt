@@ -537,6 +537,13 @@ add_executable(ajm_resample_tests EXCLUDE_FROM_ALL
 target_link_libraries(ajm_resample_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)
 target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
 
+add_executable(ajm_decode_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmDecodeTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ajm_decode_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)
+target_include_directories(ajm_decode_tests PRIVATE ${inc_headers})
+
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
@@ -739,6 +746,7 @@ if(BUILD_TESTING)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
+	add_test(NAME ajm_decode COMMAND $<TARGET_FILE:ajm_decode_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
@@ -863,6 +871,7 @@ if(BUILD_TESTING)
 		audio_out_timing_tests
 		ngs2_sampler_tests
 		ajm_resample_tests
+		ajm_decode_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests

@@ -55,6 +55,9 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if !defined(__APPLE__)
+#include <asm/prctl.h>
+#endif
 #endif
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -3516,6 +3519,10 @@ static void* RunThread(void* arg) {
 	if (!Common::HostException::InitializeThreadSignalStack()) {
 		EXIT("Failed to initialize the thread signal stack\n");
 	}
+#if !defined(__APPLE__)
+	// A new thread inherits its creator's gs base, the creator's TCB: the thread's own is set at its first read.
+	syscall(SYS_arch_prctl, ARCH_SET_GS, 0ull);
+#endif
 #endif
 
 	auto* thread = static_cast<Pthread>(arg);

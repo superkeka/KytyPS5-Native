@@ -1390,6 +1390,12 @@ static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 	return Loader::SystemContentIsTrinityMode() ? 1 : 0;
 }
 
+// Whether the console hardware is a Pro, in either operation mode. The emulated console is a Pro
+// only when the game runs in Pro mode.
+static bool KYTY_SYSV_ABI KernelIsTrinitySoc() {
+	return Loader::SystemContentIsTrinityMode();
+}
+
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	*mode    = Loader::SystemContentIsTrinityMode() ? 3 : 2;
 	*submode = 0; // None
@@ -3595,6 +3601,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
+	LIB_FUNC("yu17wG8L5FI", LibKernel::KernelIsTrinitySoc);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
 	LIB_FUNC("fTx66l5iWIA", FileSystem::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);

@@ -527,6 +527,7 @@ struct DrawRecord {
 	uint64_t indirect  = 0;
 	uint32_t ud_hash   = 0; // FNV of the PS (or compute) user data
 	uint32_t gs_hash   = 0; // FNV of the GS user data
+	uint32_t ud[16] {};     // the first PS (or compute) user-data registers
 };
 
 // A draw or dispatch whose resources point into the range given to SetFindRange: directly from a
@@ -768,8 +769,28 @@ struct SourcePiece {
 };
 // `pieces`, when given, gets where each stretch of `out` came from; `marks`, where in `out` each buffer the
 // top level calls or chains to begins and ends (the title's own segments of the command buffer).
+// KYTY_CMD_TRAP (nativeShadow.cpp, diagnostics): the command memory FlattenIndirectBuffers reads.
+bool CmdTrapOn();
+void CmdTrapNote(uint64_t va, uint64_t bytes);
 bool FlattenIndirectBuffers(std::span<const uint32_t> in, std::vector<uint32_t>* out, std::string* why = nullptr,
                             std::vector<SourcePiece>* pieces = nullptr, std::vector<uint32_t>* marks = nullptr);
+// KYTY_NATIVE_GPU_STALE_CHECK=MS (diagnostics): FlattenIndirectBuffers keeps what it took from guest memory and reads it
+// again MS ms later through `reader` (bytes copied), logging what the title changed in between.
+using StaleCheckReader = uint64_t (*)(uint64_t va, void* dst, uint64_t bytes);
+void SetStaleCheckReader(StaleCheckReader reader);
+bool StaleCheckOn();
+// Where the CP would stop in a graphics buffer: at a REWIND of its top level the title has not set valid yet
+// (`next` == nullptr: the buffer runs up to `at`, the rest from `at` on once the REWIND is valid), or at an
+// INDIRECT_BUFFER of its top level to a buffer that stops so (`next`, `next_size`: its target, which runs after
+// `at`; `call`: the CP comes back after it to the dwords behind the packet, else it was a chain and does not).
+// False when it runs through, or when the stop is inside a COND_EXEC's range (inlining then waits for it).
+struct RewindStop {
+	uint32_t        at        = 0;
+	const uint32_t* next      = nullptr;
+	uint32_t        next_size = 0;
+	bool            call      = false;
+};
+bool FindRewindStop(std::span<const uint32_t> in, RewindStop* out);
 // A line in `f` for each always-taken AgcCbBranch (COND_INDIRECT_BUFFER) FlattenIndirectBuffers inlines as a call, once
 // per branch, target and tail: where the target ends (a chain back to the parent's tail, elsewhere, none) and what the
 // parent runs after it. nullptr: KYTY_NATIVE_GPU_LOG_BRANCHES=1 decides (to stderr; off by default). Logging only.
@@ -879,6 +900,8 @@ struct Pm4TranslateResult {
 	std::vector<FindHit>          find_hits;      // references into the SetFindRange range
 	std::vector<LodBankScan>      lod_scans;      // SetLodBankScan: one per GET_LOD_STATS packet
 	std::vector<uint32_t>         display_copies; // SetDisplayCopies: the flips (their interrupt contexts) with a copy pass
+	// SetDrawLog: the flips this buffer raises (kernel interrupt contexts, bit 27) and draw_log's size at each.
+	std::vector<std::pair<uint32_t, uint32_t>> flip_marks;
 	struct UnmetWait {
 		uint64_t addr;
 		uint64_t ref;
@@ -1381,6 +1404,9 @@ private:
 	RegFile                      m_cx_defaults; // what a context clear restores (the seeded defaults)
 	RegFile                      m_saved_cx;    // context pushed by an Agc context-state push
 	bool                         m_cx_pushed = false;
+	// A push a title's COND_EXEC range left open: pushed only where the CP ran that range, so where its flag was set
+	// (the translator's push_cond, 0 when the push state is the same either way).
+	uint64_t                     m_push_cond = 0;
 	RegFile                      m_sh; // SH registers (SET_SH_REG space)
 	RegFile                      m_uc; // whitelisted UCONFIG registers
 	Pm4CpDrawState               m_cp; // CP draw state where the next DCB starts

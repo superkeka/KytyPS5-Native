@@ -45,6 +45,8 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <asm/prctl.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -668,8 +670,45 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+static KYTY_MS_ABI uint8_t* TlsMainGetAddr();
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+// `mov <reg>, gs:[0]` (PatchProgram's form of the guest's fs:[0] read) on a thread whose gs base is not
+// set yet: the base becomes the thread's TCB, whose first qword points to itself, and the read runs again.
+static bool SetGuestThreadPointer(const Common::HostException::ExceptionInfo& info) {
+	if (info.type != Common::HostException::ExceptionType::AccessViolation || g_tls_main_program == nullptr) {
+		return false;
+	}
+	const auto* code = reinterpret_cast<const uint8_t*>(info.exception_address);
+	if (!g_tls_main_program->elf || info.exception_address < g_tls_main_program->base_vaddr ||
+	    info.exception_address >= g_tls_main_program->base_vaddr + g_tls_main_program->base_size_aligned) {
+		return false;
+	}
+	// The fault address is the instruction's first byte: operand-size prefixes a compiler pads the read with
+	// (66 66 66 64 48 8b 04 25 ...) come before the segment prefix.
+	for (int i = 0; i < 4 && code[0] == 0x66; i++) {
+		code++;
+	}
+	if (code[0] != 0x65 || (code[1] != 0x48 && code[1] != 0x4C) || code[2] != 0x8B || (code[3] & 0xc7u) != 0x04u ||
+	    code[4] != 0x25 || (code[5] | code[6] | code[7] | code[8]) != 0) {
+		return false;
+	}
+	uint64_t base = 0;
+	if (syscall(SYS_arch_prctl, ARCH_GET_GS, &base) != 0 || base != 0) {
+		return false;
+	}
+	return syscall(SYS_arch_prctl, ARCH_SET_GS, reinterpret_cast<uint64_t>(TlsMainGetAddr())) == 0;
+}
+#endif
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (SetGuestThreadPointer(*info)) {
+		return true;
+	}
+#endif
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
@@ -692,6 +731,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		                                                 access == GpuAccess::Write, info->native_context)) {
 			return true;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		// KYTY_CMD_TRAP: CPU writes to guest command memory, traced (diagnostics).
+		if (Libs::Graphics::NativeGpu::CmdTrapFault(info->access_violation_vaddr, info->exception_address,
+		                                            access == GpuAccess::Write, info->native_context)) {
+			return true;
+		}
+#endif
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
@@ -1083,6 +1129,23 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		}
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// mov <reg>, qword ptr fs:[0] -> mov <reg>, qword ptr gs:[0]: the gs base is the guest thread's TCB
+	// (SetGuestThreadPointer). The instruction stays what it was: a call in its place would push its return
+	// address into the red zone a leaf function keeps its locals in.
+	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 && size >= 9) {
+		auto* start_ptr = reinterpret_cast<uint8_t*>(address);
+		auto* end_ptr   = start_ptr + size - 9;
+		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
+			if (ptr[0] == 0x64 && (ptr[1] == 0x48 || ptr[1] == 0x4C) && ptr[2] == 0x8B && (ptr[3] & 0xc7u) == 0x04u &&
+			    ptr[4] == 0x25 && (ptr[5] | ptr[6] | ptr[7] | ptr[8]) == 0) {
+				EXIT_NOT_IMPLEMENTED(((ptr[3] >> 3u) & 7u) == 4u && ptr[1] == 0x48); // rsp
+				ptr[0] = 0x65;
+				ptr += 8;
+			}
+		}
+	}
+#else
 	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
 	    size >= Jit::Call9::GetSize()) {
 		// Replace:
@@ -1092,7 +1155,7 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		//   call <handler>
 		//   mov <reg>,rax
 		//   nop ...
-		const uint8_t tls_pattern[5]       = {0x64, 0x48, 0x8B, 0x00, 0x25};
+		// <reg> is any of rax..rdi (REX.W) or r8..r15 (REX.WR); rsp never holds the thread pointer.
 		const uint8_t zero_displacement[4] = {};
 
 		EXIT_IF(Jit::Call9::GetSize() != 9);
@@ -1112,13 +1175,14 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				break;
 			}
 
+			const uint8_t rex   = inst_ptr[1];
 			const uint8_t modrm = inst_ptr[3];
-			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
-			    inst_ptr[4] == tls_pattern[4] &&
+			if (inst_ptr[0] == 0x64 && (rex == 0x48 || rex == 0x4C) && inst_ptr[2] == 0x8B &&
+			    (modrm & 0xc7u) == 0x04u && inst_ptr[4] == 0x25 &&
 			    memcmp(inst_ptr + 5, zero_displacement, sizeof(zero_displacement)) == 0) {
 				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
 
-				const auto reg = (modrm >> 3u) & 7u;
+				const auto reg = ((modrm >> 3u) & 7u) | ((rex & 0x04u) << 1u);
 				EXIT_NOT_IMPLEMENTED(reg == 4u);
 
 				// A raw scan can encounter a 0x66 in the preceding instruction, so do not
@@ -1132,6 +1196,7 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 			}
 		}
 	}
+#endif
 }
 
 uint64_t RuntimeLinker::GetEntry() {
@@ -1834,6 +1899,11 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (thread_id == Common::Thread::GetThreadIdUnique() && program == g_tls_main_program) {
+		syscall(SYS_arch_prctl, ARCH_SET_GS, 0ull);
+	}
+#endif
 
 	Common::LockGuard lock(program->tls.mutex);
 
@@ -2365,12 +2435,15 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 	EXIT_IF(program->tls.handler_vaddr == 0);
 
 	g_tls_main_program = program;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	Libs::Graphics::NativeGpu::CmdTrapSetCode(program->base_vaddr, program->base_vaddr + program->base_size_aligned);
+#endif
 
 	auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
 
 	code->SetFunc(TlsMainGetAddr);
 
-	for (uint8_t reg = 1; reg < 8; reg++) {
+	for (uint8_t reg = 1; reg < 16; reg++) {
 		if (reg == 4) {
 			continue;
 		}

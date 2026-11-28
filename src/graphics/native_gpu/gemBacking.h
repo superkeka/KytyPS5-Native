@@ -595,15 +595,25 @@ public:
 	// amdgpu would map it CC, which cost GT7 its GPU time (median 15.2 ms instead of 13.3, 90th
 	// percentile 25 ms, 50 fps): there it stays NC with the invalidates unless asked for.
 	// KYTY_NATIVE_GPU_COHERENT_TYPES: comma-separated types (12 as the PS5); "none" maps everything NC.
-	void SetMemoryType(uint64_t offset, uint64_t size, int type) {
+	// A map with a type and mtypeprotect re-type the bytes they cover (the PS5 keeps the type with the direct memory
+	// area, not with the allocation). True when that changes how they map (coherent or not).
+	bool SetMemoryType(uint64_t offset, uint64_t size, int type) {
 		if (size == 0) {
-			return;
+			return false;
 		}
 		std::lock_guard<std::mutex> lock(m_lock);
-		const uint64_t end = offset + size;
-		auto           it  = m_coherent.lower_bound(offset);
+		const uint64_t end      = offset + size;
+		const bool     coherent = CoherentType(type);
+		auto           it       = m_coherent.lower_bound(offset);
 		if (it != m_coherent.begin() && std::prev(it)->second > offset) {
 			it = std::prev(it);
+		}
+		uint64_t covered = 0;
+		for (auto c = it; c != m_coherent.end() && c->first < end; ++c) {
+			covered += std::min(end, c->second) - std::max(offset, c->first);
+		}
+		if (covered == (coherent ? size : 0)) {
+			return false;
 		}
 		while (it != m_coherent.end() && it->first < end) {
 			const auto [s, e] = *it;
@@ -615,11 +625,35 @@ public:
 				m_coherent.emplace(end, e);
 			}
 		}
-		if (CoherentType(type)) {
+		if (coherent) {
 			m_coherent.emplace(offset, end);
 			std::fprintf(stderr, "GemBacking: direct memory 0x%llx +0x%llx (type %d) maps coherent (MTYPE %s)\n",
 			             static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size), type,
 			             CoherentMtype() == AMDGPU_VM_MTYPE_RW ? "C_RW_S" : "CC");
+		}
+		return true;
+	}
+
+	// mtypeprotect of a mapped view: backing bytes [offset, offset + size) at `vaddr` take `type`, and the view's GPU
+	// mapping is made again with that type's MTYPE when it is mapped for the GPU and the MTYPE changes.
+	void RetypeView(uint64_t vaddr, uint64_t size, uint64_t offset, int type) {
+		if (!SetMemoryType(offset, size, type)) {
+			return;
+		}
+		bool gpu = false;
+		{
+			std::lock_guard<std::mutex> lock(m_lock);
+			auto                        it = m_views.upper_bound(vaddr);
+			if (it != m_views.begin()) {
+				--it;
+			}
+			for (; it != m_views.end() && it->first < vaddr + size; ++it) {
+				gpu = gpu || (it->second.gpu && it->first + it->second.size > vaddr);
+			}
+		}
+		if (gpu) {
+			BindView(vaddr, size, offset);
+			MarkVaStale(); // KFD queues may hold the old translations
 		}
 	}
 

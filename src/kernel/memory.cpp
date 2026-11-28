@@ -349,6 +349,10 @@ public:
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
+	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
+		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
+	}
+
 	bool Query(uint64_t addr, int flags, Range* out) {
 		EXIT_IF(out == nullptr);
 
@@ -687,6 +691,7 @@ public:
 	PhysicalMemory() {
 		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 		m_free.emplace(0, Size());
+		m_mapped_refs.emplace(0, 0);
 	}
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
@@ -719,6 +724,8 @@ public:
 private:
 	void                                  ReclaimAutomatic(uint64_t start, uint64_t size);
 	std::map<uint64_t, Mapping>::iterator SplitMapping(uint64_t vaddr);
+	std::map<uint64_t, uint32_t>::iterator SplitMappedRefs(uint64_t phys_addr);
+	void                                  AddMappedRefs(uint64_t phys_addr, uint64_t size, int delta);
 
 	std::map<uint64_t, AllocatedBlock> m_physical;
 	std::map<uint64_t, uint64_t>       m_free;
@@ -726,6 +733,10 @@ private:
 	// Track backing ownership while a transaction changes views before publishing VirtualRanges.
 	// Names, protections and memory types live only in VirtualRanges. Physical offsets may alias.
 	std::map<uint64_t, Mapping> m_mappings;
+	// How many of m_mappings cover each physical byte: the count of [key, next key). An unmap gives the automatic
+	// pool back what no other mapping covers without walking every mapping (the title's mapper maps and unmaps
+	// hundreds of ranges a second among tens of thousands).
+	std::map<uint64_t, uint32_t> m_mapped_refs;
 };
 
 class FlexibleMemory {
@@ -1414,13 +1425,47 @@ void PhysicalMemory::ReclaimAutomatic(uint64_t start, uint64_t size) {
 		automatic = true;
 	}
 	if (automatic) {
-		for (const auto& [vaddr, mapping]: m_mappings) {
-			const auto first = std::max(start, mapping.start_addr);
-			const auto last  = std::min(end, mapping.start_addr + mapping.size);
-			if (first < last) {
+		// What a mapping still covers stays out of the pool.
+		auto segment = m_mapped_refs.upper_bound(start);
+		--segment; // the first key is 0
+		for (; segment != m_mapped_refs.end() && segment->first < end; ++segment) {
+			const auto next  = std::next(segment);
+			const auto first = std::max(start, segment->first);
+			const auto last  = std::min(end, next != m_mapped_refs.end() ? next->first : end);
+			if (segment->second != 0 && first < last) {
 				RemoveFreeRange(m_automatic_free, first, last - first);
 			}
 		}
+	}
+}
+
+// The segment of m_mapped_refs that begins at `phys_addr`, splitting the one containing it.
+std::map<uint64_t, uint32_t>::iterator PhysicalMemory::SplitMappedRefs(uint64_t phys_addr) {
+	auto next = m_mapped_refs.upper_bound(phys_addr);
+	auto prev = std::prev(next); // the first key is 0
+	if (prev->first == phys_addr) {
+		return prev;
+	}
+	return m_mapped_refs.emplace_hint(next, phys_addr, prev->second);
+}
+
+void PhysicalMemory::AddMappedRefs(uint64_t phys_addr, uint64_t size, int delta) {
+	if (size == 0) {
+		return;
+	}
+	const auto end   = phys_addr + size;
+	auto       first = SplitMappedRefs(phys_addr);
+	const auto last  = SplitMappedRefs(end);
+	for (auto it = first; it != last; ++it) {
+		EXIT_IF(delta < 0 && it->second < static_cast<uint32_t>(-delta));
+		it->second = static_cast<uint32_t>(static_cast<int64_t>(it->second) + delta);
+	}
+	// Neighbours with the same count merge, so the map stays as small as the distinct coverage.
+	if (last != m_mapped_refs.end() && std::prev(last)->second == last->second) {
+		m_mapped_refs.erase(last);
+	}
+	if (first != m_mapped_refs.begin() && std::prev(first)->second == first->second) {
+		m_mapped_refs.erase(first);
 	}
 }
 
@@ -1466,6 +1511,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
 	}
 
 	m_mappings.emplace_hint(next, vaddr, Mapping {phys_addr, len});
+	AddMappedRefs(phys_addr, len, 1);
 	RemoveFreeRange(m_automatic_free, phys_addr, len);
 	return true;
 }
@@ -1562,6 +1608,7 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	while (first != last) {
 		const auto removed = first->second;
 		first              = m_mappings.erase(first);
+		AddMappedRefs(removed.start_addr, removed.size, -1);
 		ReclaimAutomatic(removed.start_addr, removed.size);
 	}
 	return true;
@@ -2340,6 +2387,32 @@ static void LogDirectMemory(const char* what, uint64_t addr, uint64_t len, int m
 	}
 }
 
+#if KYTY_GEM_BACKING_SUPPORTED
+// Allocation-time residency (GemBacking::ResidencyAtAlloc) for direct memory [addr, addr + len).
+static void PromoteDirectMemory(Libs::Graphics::NativeGpu::GemBacking* gem, uint64_t addr, uint64_t len) {
+	if (!gem->PromoteBackingAtAlloc(addr, len) && gem->AllocFailed()) {
+		static std::atomic<bool> told {false};
+		if (!told.exchange(true)) {
+			Libs::Dialog::SystemDialog::HostNotice(
+			    "Not enough memory",
+			    "The game's memory could not be reserved: expect stutter and lower performance.\n"
+			    "Close other apps and launch the game without --keep-steam.");
+		}
+	}
+}
+
+// The memory of the automatic pool (AMM) gets its pages when AMM maps them (MapAutomaticMemory), not when the pool is
+// given: the pool is a budget the title hands to AMM, much of it never mapped, and which pages back it is not
+// observable. KYTY_AMM_POOL_EAGER=1 makes the whole pool resident at once, as other direct memory.
+static bool AutomaticPoolEager() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_AMM_POOL_EAGER");
+		return v != nullptr && v[0] == '1';
+	}();
+	return on;
+}
+#endif
+
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic) {
 
@@ -2377,15 +2450,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 	if (auto* gem = GetGemBacking(); gem != nullptr) {
 		gem->SetMemoryType(addr, len, memory_type);
 		// PS5 residency: direct memory is the GPU's from its allocation (KYTY_NATIVE_GPU_RESIDENCY=alloc).
-		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc() && !gem->PromoteBackingAtAlloc(addr, len) &&
-		    gem->AllocFailed()) {
-			static std::atomic<bool> told {false};
-			if (!told.exchange(true)) {
-				Libs::Dialog::SystemDialog::HostNotice(
-				    "Not enough memory",
-				    "The game's memory could not be reserved: expect stutter and lower performance.\n"
-				    "Close other apps and launch the game without --keep-steam.");
-			}
+		if (Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc() && (!automatic || AutomaticPoolEager())) {
+			PromoteDirectMemory(gem, addr, len);
 		}
 	}
 #endif
@@ -2580,6 +2646,22 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	PhysicalMemory::AllocatedBlock mapped_block {};
 	g_physical_memory->Find(direct_memory_start, &mapped_block);
 	const int memory_type = type == -1 ? mapped_block.memory_type : type;
+#if KYTY_GEM_BACKING_SUPPORTED
+	// A map with a type re-types the direct memory it maps, as the PS5 keeps the type with the memory: its GPU
+	// mapping takes that type's MTYPE (one without a type keeps what the memory has).
+	if (type != -1) {
+		if (auto* gem = GetGemBacking(); gem != nullptr) {
+			gem->SetMemoryType(static_cast<uint64_t>(direct_memory_start), len, memory_type);
+		}
+	}
+#endif
+	if (memory_type != mapped_block.memory_type) {
+		if (const char* v = std::getenv("KYTY_LOG_DIRECT_MEMORY"); v != nullptr && v[0] == '1') {
+			std::fprintf(stderr, "direct memory: map 0x%llx +0x%llx dmem 0x%llx as type %d, allocated as %d\n",
+			             static_cast<unsigned long long>(reinterpret_cast<uint64_t>(*addr)), static_cast<unsigned long long>(len),
+			             static_cast<unsigned long long>(direct_memory_start), memory_type, mapped_block.memory_type);
+		}
+	}
 	char      range_name[KERNEL_MAXIMUM_NAME_LENGTH];
 	CopyVirtualRangeName(range_name, name);
 	uint64_t out_addr = 0;
@@ -2690,6 +2772,13 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot) {
 	uint64_t mapped = 0;
 	for (const auto& [offset, length]: ranges) {
 		void* address = reinterpret_cast<void*>(vaddr + mapped);
+#if KYTY_GEM_BACKING_SUPPORTED
+		// The pool's pages become resident as AMM first maps them, with the allocation's residency (no map budget).
+		if (auto* gem = GetGemBacking(); gem != nullptr && Libs::Graphics::NativeGpu::GemBacking::ResidencyAtAlloc() &&
+		                                 !AutomaticPoolEager()) {
+			PromoteDirectMemory(gem, offset, length);
+		}
+#endif
 		EXIT_IF(MapDirectMemory(&address, length, prot, 0x10, static_cast<int64_t>(offset),
 		                        page_size, "", type) != OK);
 		mapped += length;
@@ -3334,11 +3423,112 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	return ProtectMemory(addr, len, prot);
 }
 
+// The direct memory of [vaddr, vaddr + size) takes `type`: its records and, for the GPU, its bytes (the MTYPE of its
+// GPU mapping follows the type). Other committed memory keeps its type.
+static void RetypeMemory(uint64_t vaddr, uint64_t size, int type) {
+	std::vector<VirtualRanges::Range> ranges;
+	{
+		std::lock_guard state(g_memory_state_mutex);
+		g_virtual_ranges->QueryFragments(vaddr, size, &ranges);
+		for (const auto& r: ranges) {
+			if (r.type == VirtualRangeType::Direct || r.type == VirtualRangeType::Pooled) {
+				g_virtual_ranges->SetMemoryType(r.start, r.size, type);
+			}
+		}
+	}
+#if KYTY_GEM_BACKING_SUPPORTED
+	if (auto* gem = GetGemBacking(); gem != nullptr) {
+		for (const auto& r: ranges) {
+			if (r.type == VirtualRangeType::Direct) {
+				gem->RetypeView(r.start, r.size, r.offset, type);
+			}
+		}
+	}
+#endif
+}
+
 int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int prot) {
 	PRINT_NAME();
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	LOGF("\t type = %d\n", type);
-	return ProtectMemory(addr, len, prot);
+	if (const char* v = std::getenv("KYTY_LOG_DIRECT_MEMORY"); v != nullptr && v[0] == '1') {
+		const auto                        vaddr = reinterpret_cast<uint64_t>(addr);
+		std::vector<VirtualRanges::Range> ranges;
+		g_virtual_ranges->QueryFragments(vaddr & ~uint64_t {0x3fff}, (len + (vaddr & 0x3fffu) + 0x3fffu) & ~size_t {0x3fff}, &ranges);
+		std::fprintf(stderr, "direct memory: mtypeprotect 0x%llx +0x%llx type %d prot 0x%x;", static_cast<unsigned long long>(vaddr),
+		             static_cast<unsigned long long>(len), type, static_cast<unsigned>(prot));
+		for (const auto& r: ranges) {
+			PhysicalMemory::AllocatedBlock block {};
+			const bool found = r.type == VirtualRangeType::Direct && g_physical_memory->Find(r.offset, &block);
+			std::fprintf(stderr, " [0x%llx +0x%llx kind %d dmem 0x%llx type %d alloc %d]", static_cast<unsigned long long>(r.start),
+			             static_cast<unsigned long long>(r.size), static_cast<int>(r.type), static_cast<unsigned long long>(r.offset),
+			             r.memory_type, found ? block.memory_type : -2);
+		}
+		std::fprintf(stderr, "\n");
+	}
+	// The type and protection of direct memory in one call: types 0 to 20, no execute bit, type 10 only readable.
+	const auto     vaddr = reinterpret_cast<uint64_t>(addr);
+	const uint64_t last  = vaddr + len;
+	if (last < vaddr || ((last + 0x3fffu) & ~uint64_t {0x3fff}) < last || static_cast<uint32_t>(type) >= 21u ||
+	    (prot & 0xfc08) != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (const uint32_t word = (static_cast<uint32_t>(prot) | ((static_cast<uint32_t>(prot) >> 1u) & 0x141u)) & 0xffffu;
+	    type == 10 && (word & 0xfeaeu) != 0) {
+		return KERNEL_ERROR_EACCES;
+	}
+	const uint64_t start = vaddr & ~uint64_t {0x3fff};
+	const uint64_t end   = (last + 0x3fffu) & ~uint64_t {0x3fff};
+	if (start == end) {
+		return OK;
+	}
+	{
+		std::vector<VirtualRanges::Range> ranges;
+		std::lock_guard                   state(g_memory_state_mutex);
+		g_virtual_ranges->QueryFragments(start, end - start, &ranges);
+		for (const auto& r: ranges) {
+			if (IsCommittedRangeType(r.type) && r.type != VirtualRangeType::Direct && r.type != VirtualRangeType::Pooled) {
+				return KERNEL_ERROR_EOPNOTSUPP;
+			}
+		}
+	}
+	if (const int result = ProtectMemory(addr, len, prot); result != OK) {
+		return result;
+	}
+	RetypeMemory(start, end - start, type);
+	return OK;
+}
+
+// A PRT range has addresses but no pages: the GPU reads it as zeros and drops writes to it.
+int ReserveAmmMemory(uint64_t vaddr, size_t size) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
+	return ReplaceFixedRangeWithReserved(vaddr, size);
+}
+
+// The parts of the range without pages get them; the parts with pages keep their contents and
+// take the new protection.
+int CommitAmmMemory(uint64_t vaddr, size_t size, int type, int prot) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	if (!IsAmmMemoryRange(vaddr, size)) return KERNEL_ERROR_EINVAL;
+
+	std::vector<VirtualRanges::Range> ranges;
+	g_virtual_ranges->QueryFragments(vaddr, size, &ranges);
+	auto commit = [&](uint64_t start, uint64_t length) {
+		return length == 0 ? OK : MapAutomaticMemory(start, length, type, prot);
+	};
+	uint64_t cursor = vaddr;
+	for (const auto& range: ranges) {
+		if (!IsCommittedRangeType(range.type)) continue;
+		if (int result = commit(cursor, range.start - cursor); result != OK) return result;
+		if (int result = ProtectMemory(reinterpret_cast<const void*>(range.start), range.size, prot);
+		    result != OK) {
+			return result;
+		}
+		RetypeMemory(range.start, range.size, type);
+		cursor = range.start + range.size;
+	}
+	return commit(cursor, vaddr + size - cursor);
 }
 
 int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
@@ -3565,6 +3755,12 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 		// Validation precedes the first backing map; failing after it is an emulator fault.
 		for (const auto& mapping: mappings) {
 			auto failure_reason = GuestBackingStore::FailureReason::None;
+#if KYTY_GEM_BACKING_SUPPORTED
+			// The committed pages take the commit's type, for the GPU too (MapDirectMemory).
+			if (auto* gem = GetGemBacking(); gem != nullptr) {
+				gem->SetMemoryType(mapping.phys_addr, mapping.size, type);
+			}
+#endif
 			if (!g_guest_address_space->MapBacking(mapping.vaddr, mapping.size, mapping.phys_addr,
 			                                       mode, &failure_reason)) {
 				EXIT("failed to map pooled memory: %s\n",

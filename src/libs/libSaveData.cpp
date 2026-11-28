@@ -15,10 +15,13 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <ctime>
 #include <deque>
 #include <map>
+#include <optional>
+#include <set>
 #include <vector>
 
 namespace Libs {
@@ -279,11 +282,23 @@ struct SaveDataMemory {
 	uint32_t             option = 0;
 };
 
+// A writable mount bound to a transaction resource works on a private copy of the save.
+// Commit publishes the copy of every prepared mount; unmounting discards whatever was not
+// committed, including a save directory that only the transaction created.
+struct SaveDataTransactionMount {
+	int32_t               resource = -1;
+	std::filesystem::path directory;
+	bool                  prepared = false;
+};
+
 static std::map<std::filesystem::path, SaveDataMemory> g_save_data_memory;
 static int32_t                   g_next_transaction_resource = 1;
+static std::set<int32_t>         g_transaction_resources;
 static std::deque<SaveDataEvent> g_save_data_events;
 static SaveDataMountSlots        g_mount_slots;
-static Common::Mutex             g_mount_mutex;
+static std::array<std::optional<SaveDataTransactionMount>, SaveDataMountSlots::COUNT>
+                     g_transaction_mounts;
+static Common::Mutex g_mount_mutex;
 
 static bool valid_path_component(std::string_view name) {
 	return !name.empty() && name != "." && name != ".." &&
@@ -542,6 +557,130 @@ static int mount_save_data(int slot, const std::filesystem::path& directory,
 	return OK;
 }
 
+static bool same_directory(const std::filesystem::path& a, const std::filesystem::path& b) {
+	std::error_code error;
+	return a == b || std::filesystem::equivalent(a, b, error);
+}
+
+// Transactional mounts occupy their slot with the private copy, so the save itself is
+// checked separately.
+static int find_available(const std::filesystem::path& directory) {
+	for (const auto& mount: g_transaction_mounts) {
+		if (mount.has_value() && same_directory(mount->directory, directory)) {
+			return SaveDataMountSlots::BUSY;
+		}
+	}
+	return g_mount_slots.FindAvailable(directory);
+}
+
+// Private copies and commit scratch live in a hidden directory next to the saves.
+static std::filesystem::path transaction_root(const std::filesystem::path& directory) {
+	return directory.parent_path() / ".txn";
+}
+
+static std::filesystem::path transaction_stage(const std::filesystem::path& directory,
+                                               int32_t                      resource) {
+	return transaction_root(directory) / std::to_string(resource) / directory.filename();
+}
+
+static std::filesystem::path transaction_scratch(const std::filesystem::path& directory,
+                                                 const char*                  suffix) {
+	return transaction_root(directory) / (directory.filename().string() + suffix);
+}
+
+static void remove_empty_directory(const std::filesystem::path& directory) {
+	std::error_code error;
+	if (std::filesystem::is_directory(directory, error) &&
+	    std::filesystem::is_empty(directory, error)) {
+		std::filesystem::remove(directory, error);
+	}
+}
+
+static void remove_transaction_stage(const std::filesystem::path& stage) {
+	std::error_code error;
+	std::filesystem::remove_all(stage, error);
+	remove_empty_directory(stage.parent_path());
+	remove_empty_directory(stage.parent_path().parent_path());
+}
+
+// A commit interrupted between moving the old save aside and publishing the new one leaves
+// only the old save; bring it back.
+static void restore_interrupted_commit(const std::filesystem::path& directory) {
+	std::error_code error;
+	const auto      old = transaction_scratch(directory, ".old");
+	if (!std::filesystem::exists(directory, error) && !error &&
+	    std::filesystem::is_directory(old, error)) {
+		std::filesystem::rename(old, directory, error);
+	}
+}
+
+static int copy_directory(const std::filesystem::path& from, const std::filesystem::path& to) {
+	std::error_code error;
+	std::filesystem::create_directories(to.parent_path(), error);
+	if (!error) {
+		std::filesystem::copy(from, to, std::filesystem::copy_options::recursive, error);
+	}
+	if (error) {
+		std::filesystem::remove_all(to, error);
+		return SAVE_DATA_ERROR_INTERNAL;
+	}
+	return OK;
+}
+
+static int commit_transaction(int32_t resource) {
+	std::vector<size_t> slots;
+	for (size_t slot = 0; slot < g_transaction_mounts.size(); slot++) {
+		const auto& mount = g_transaction_mounts[slot];
+		if (mount.has_value() && mount->resource == resource && mount->prepared) {
+			slots.push_back(slot);
+		}
+	}
+
+	// Copy every participant before touching any save so a failure leaves all of them as
+	// they were.
+	std::error_code error;
+	for (size_t i = 0; i < slots.size(); i++) {
+		const auto& directory = g_transaction_mounts[slots[i]]->directory;
+		const auto  incoming  = transaction_scratch(directory, ".new");
+		std::filesystem::remove_all(incoming, error);
+		if (copy_directory(g_mount_slots.Directory(slots[i]), incoming) != OK) {
+			for (size_t j = 0; j < i; j++) {
+				std::filesystem::remove_all(
+				    transaction_scratch(g_transaction_mounts[slots[j]]->directory, ".new"), error);
+			}
+			return SAVE_DATA_ERROR_INTERNAL;
+		}
+	}
+
+	int status = OK;
+	for (size_t slot: slots) {
+		const auto& directory = g_transaction_mounts[slot]->directory;
+		const auto  incoming  = transaction_scratch(directory, ".new");
+		const auto  old       = transaction_scratch(directory, ".old");
+		std::filesystem::remove_all(old, error);
+		error.clear();
+		const bool existed = std::filesystem::exists(directory, error);
+		if (existed) {
+			std::filesystem::rename(directory, old, error);
+		}
+		if (!error) {
+			std::filesystem::rename(incoming, directory, error);
+			if (error && existed) {
+				std::error_code restore;
+				std::filesystem::rename(old, directory, restore);
+			}
+		}
+		if (error) {
+			std::filesystem::remove_all(incoming, error);
+			status = SAVE_DATA_ERROR_INTERNAL;
+			continue;
+		}
+		std::filesystem::remove_all(old, error);
+		remove_empty_directory(transaction_root(directory));
+	}
+	return status;
+}
+
 int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
 	PRINT_NAME();
 
@@ -568,13 +707,28 @@ int KYTY_SYSV_ABI SaveDataCreateTransactionResource(uint32_t size) {
 
 	LOGF("\t size = %" PRIu32 "\n", size);
 
-	return g_next_transaction_resource++;
+	Common::LockGuard lock(g_mount_mutex);
+	const int32_t     resource = g_next_transaction_resource++;
+	g_transaction_resources.insert(resource);
+	return resource;
 }
 
 int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 	PRINT_NAME();
 
 	LOGF("\t resource = %" PRId32 "\n", resource);
+
+	Common::LockGuard lock(g_mount_mutex);
+	if (g_transaction_resources.erase(resource) == 0) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	// Mounts still bound to the resource can no longer commit; their changes are dropped
+	// when they are unmounted.
+	for (auto& mount: g_transaction_mounts) {
+		if (mount.has_value() && mount->resource == resource) {
+			mount->prepared = false;
+		}
+	}
 
 	return OK;
 }
@@ -718,7 +872,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	const bool create2 = ((mount->mount_mode & 32u) != 0);
 	const bool open    = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
 
-	const int slot = g_mount_slots.FindAvailable(mount_dir);
+	const int slot = find_available(mount_dir);
 	if (slot == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -730,6 +884,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT("unknown mount mode: %u", mount->mount_mode);
 	}
 
+	restore_interrupted_commit(mount_dir);
 	const bool exists = Common::File::IsDirectoryExisting(mount_dir);
 	if (open && !exists) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
@@ -739,35 +894,64 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 
-	bool created = false;
-	if ((create || create2) && !exists) {
-		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
-			return SAVE_DATA_ERROR_PARAMETER;
+	const bool creating = (create || create2) && !exists;
+	if (creating &&
+	    (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+
+	// Read-only mounts never write, so only writable ones need the private copy.
+	const bool writable    = create || create2 || (mount->mount_mode & 2u) != 0;
+	const bool transaction = writable && g_transaction_resources.contains(mount->resource) &&
+	                         !is_memory_dir_name(dir_name);
+	auto       target      = mount_dir;
+	if (transaction) {
+		target = transaction_stage(mount_dir, mount->resource);
+		std::error_code error;
+		std::filesystem::remove_all(target, error);
+		if (exists && copy_directory(mount_dir, target) != OK) {
+			remove_transaction_stage(target);
+			return SAVE_DATA_ERROR_INTERNAL;
 		}
-		const auto metadata = mount_dir / "sce_sys";
+	}
+	const auto discard = [&] {
+		std::error_code error;
+		if (transaction) {
+			remove_transaction_stage(target);
+		} else {
+			std::filesystem::remove_all(target, error);
+		}
+	};
+
+	if (creating) {
+		const auto metadata = target / "sce_sys";
 		std::error_code error;
 		std::filesystem::create_directories(metadata, error);
 		if (error) {
+			discard();
 			return SAVE_DATA_ERROR_INTERNAL;
 		}
 		const int status = write_save_file(metadata / "blocks.bin", &mount->blocks,
 		                                   sizeof(mount->blocks));
 		if (status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
+			discard();
 			return status;
 		}
 		const SaveDataParam initial {};
-		const int param_status = write_save_file(save_param_path(mount_dir), &initial,
+		const int param_status = write_save_file(save_param_path(target), &initial,
 		                                         sizeof(initial));
 		if (param_status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
+			discard();
 			return param_status;
 		}
-		created = true;
 	}
 
+	if (transaction) {
+		g_transaction_mounts[static_cast<size_t>(slot)] =
+		    SaveDataTransactionMount {.resource = mount->resource, .directory = mount_dir};
+	}
 	*mount_result = {};
-	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
+	return mount_save_data(slot, target, creating ? 1u : 0u, mount_result);
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
@@ -793,7 +977,7 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 	Common::LockGuard lock(g_mount_mutex);
 	const auto        directory = memory_directory(setup_param->user_id, setup_param->slot_id);
 	if (g_save_data_memory.contains(directory) ||
-	    g_mount_slots.FindAvailable(directory) ==
+	    find_available(directory) ==
 	        SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -956,7 +1140,7 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name = mount->dir_name->data;
 	const auto mount_dir = save_directory(mount->title_id->data, dir_name, mount->user_id);
-	const int slot = g_mount_slots.FindAvailable(mount_dir);
+	const int slot = find_available(mount_dir);
 	if (slot == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -992,8 +1176,14 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 	if ((mode & SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC) != 0) {
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END, 0, nullptr, nullptr);
 	}
+	const auto directory = g_mount_slots.Directory(static_cast<size_t>(slot));
 	LibKernel::FileSystem::Umount(point);
 	g_mount_slots.Release(static_cast<size_t>(slot));
+	auto& transaction = g_transaction_mounts[static_cast<size_t>(slot)];
+	if (transaction.has_value()) {
+		remove_transaction_stage(directory);
+		transaction.reset();
+	}
 
 	return OK;
 }
@@ -1011,6 +1201,22 @@ int KYTY_SYSV_ABI SaveDataPrepare(const SaveDataMountPoint*   mount_point,
 	     "\t prepare_mode = %" PRIu32 "\n",
 	     mount_point->data, param->resource, param->prepare_mode);
 
+	Common::LockGuard lock(g_mount_mutex);
+	const int         slot = g_mount_slots.Find(mount_point->data);
+	if (slot == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	auto& transaction = g_transaction_mounts[static_cast<size_t>(slot)];
+	if (!transaction.has_value()) {
+		// Without a transaction every write already lands in the save.
+		return OK;
+	}
+	if (transaction->resource != param->resource ||
+	    !g_transaction_resources.contains(param->resource)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	transaction->prepared = true;
+
 	return OK;
 }
 
@@ -1025,8 +1231,16 @@ int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	     "\t commit_mode = %" PRIu32 "\n",
 	     param->resource, param->commit_mode);
 
+	Common::LockGuard lock(g_mount_mutex);
+	if (!g_transaction_resources.contains(param->resource)) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	const int status = commit_transaction(param->resource);
+	if (status != OK) {
+		return status;
+	}
+
 	if ((param->commit_mode & SAVE_DATA_COMMIT_MODE_BACKUP_ASYNC) != 0) {
-		Common::LockGuard lock(g_mount_mutex);
 		queue_save_data_event(SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END, 0, nullptr, nullptr);
 	}
 
@@ -1053,7 +1267,7 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	Common::LockGuard lock(g_mount_mutex);
 	const auto dir = save_directory(del->title_id != nullptr ? del->title_id->data : get_title_id(),
 	                                del->dir_name->data, del->user_id);
-	if (g_mount_slots.FindAvailable(dir) == SaveDataMountSlots::BUSY ||
+	if (find_available(dir) == SaveDataMountSlots::BUSY ||
 	    g_save_data_memory.contains(dir)) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
@@ -1166,7 +1380,7 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 		return SAVE_DATA_ERROR_MEMORY_NOT_READY;
 	}
 	const auto dir_name = memory_dir_name(sync_param->slot_id);
-	if (g_mount_slots.FindAvailable(it->first) == SaveDataMountSlots::BUSY) {
+	if (find_available(it->first) == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
 	const int status = save_memory(it->first, it->second);
@@ -1239,7 +1453,7 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 	if (!Common::File::IsDirectoryExisting(source)) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
-	if (g_mount_slots.FindAvailable(source) == SaveDataMountSlots::BUSY) {
+	if (find_available(source) == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
 	if (convert->dst_dir_name != nullptr &&
