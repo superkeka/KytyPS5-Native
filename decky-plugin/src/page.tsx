@@ -19,6 +19,7 @@ import {
   gigabytes,
   setGamesDir,
   setHdr,
+  setPluginKeep,
   setVideo,
   toast,
   usePlugin,
@@ -159,6 +160,41 @@ function DisplayTab({ view, state }: { view: PluginView; state: State }) {
   );
 }
 
+function PluginsTab({ view, state }: { view: PluginView; state: State }) {
+  const { busy, run } = view;
+  return (
+    <Scroll>
+      <DialogControlsSection>
+        <DialogControlsSectionHeader>Decky plugins during a game</DialogControlsSectionHeader>
+        <Field
+          label="Turned off while a game runs"
+          description={
+            "Steam is unloaded while a game runs, but Decky plugins keep running and hold memory the game needs. " +
+            "They are turned off at the start (the way Decky's own menu does) and back on when you leave the game. " +
+            "Turn one on here to leave it running. This Decky plugin always stays on"
+          }
+        />
+        {state.plugins.length === 0 && <Field label="No other Decky plugin installed" />}
+        {state.plugins.map((p) => (
+          <ToggleField
+            key={p.name}
+            label={p.name}
+            description={p.keep ? "Stays on during a game" : "Turned off during a game"}
+            checked={p.keep}
+            disabled={!!busy}
+            onChange={(on) =>
+              run("Decky plugins", async () => {
+                const r = await setPluginKeep(p.name, on);
+                if (!r.ok) toast(r.log || "failed");
+              })
+            }
+          />
+        ))}
+      </DialogControlsSection>
+    </Scroll>
+  );
+}
+
 export function Page() {
   const view = usePlugin();
   const asked = useParams<{ tab?: string }>().tab;
@@ -180,6 +216,7 @@ export function Page() {
         tabs={[
           { id: "games", title: "Games", content: <GamesTab view={view} state={state} /> },
           { id: "display", title: "Display", content: <DisplayTab view={view} state={state} /> },
+          { id: "plugins", title: "Decky plugins", content: <PluginsTab view={view} state={state} /> },
         ]}
       />
     </Screen>

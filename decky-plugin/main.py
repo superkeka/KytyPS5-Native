@@ -62,6 +62,9 @@ PATCHES_DIR = os.path.join(CONFIG_DIR, "patches")
 # the wrapper also takes Immediate, written by hand.
 PRESENT_DIR = os.path.join(CONFIG_DIR, "present-mode")
 PRESENT_MODES = ("Mailbox", "Fifo")
+# While a game runs the wrapper turns Decky's plugins off (kytyps5-decky.py). The names of the ones to leave on, a
+# line each (a * line: all of them); this plugin is always left on.
+KEEP_PLUGINS = os.path.join(CONFIG_DIR, "keep-plugins")
 PATCH_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "patches")
 PATCH_SOURCE = "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
@@ -99,6 +102,57 @@ def _mkdir_user(path):
     while p.startswith(HOME + "/"):
         os.lchown(p, uid, gid)
         p = os.path.dirname(p)
+
+
+def _plugin_names():
+    """The names Decky knows the installed plugins by (their plugin.json), without this one."""
+    root = os.path.dirname(decky.DECKY_PLUGIN_DIR)
+    names = set()
+    try:
+        folders = os.listdir(root)
+    except OSError:
+        return []
+    for folder in folders:
+        try:
+            with open(os.path.join(root, folder, "plugin.json")) as f:
+                name = json.load(f).get("name")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(name, str) and name and name != "KytyPS5-Native":
+            names.add(name)
+    return sorted(names, key=str.lower)
+
+
+def _keep_read():
+    """The names in keep-plugins; "*" in it stands for all of them."""
+    try:
+        with open(KEEP_PLUGINS) as f:
+            lines = [line.strip() for line in f]
+    except OSError:
+        return set()
+    return {line for line in lines if line and not line.startswith("#")}
+
+
+def _keep_write(names):
+    """keep-plugins holds these names; no file at all when there is none."""
+    if not names:
+        if os.path.lexists(KEEP_PLUGINS):
+            os.remove(KEEP_PLUGINS)
+        return
+    _mkdir_user(CONFIG_DIR)
+    tmp = KEEP_PLUGINS + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    # Root writes in the user's folder: never through a link put there.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w") as f:
+        f.write("".join(name + "\n" for name in sorted(names, key=str.lower)))
+    os.replace(tmp, KEEP_PLUGINS)
+    os.lchown(KEEP_PLUGINS, *_ids())
+
+
+def _plugins_state():
+    keep = _keep_read()
+    return [{"name": n, "keep": "*" in keep or n in keep} for n in _plugin_names()]
 
 
 def _load():
@@ -1060,6 +1114,7 @@ class Plugin:
             "gone": {k: v for k, v in known.items() if k not in {g["title_id"] for g in games} and v.get("appid")},
             "videos": {k: os.path.exists(os.path.join(CONFIG_DIR, k + ".webm")) for k in VIDEOS},
             "hdr": not os.path.exists(SDR_FLAG),
+            "plugins": _plugins_state(),
             "ps5_apu": _ps5_apu(),
             "kernel": _kernel_status(),
             "game_running": _game_running(),
@@ -1478,6 +1533,23 @@ class Plugin:
             return {"ok": False, "log": str(e)}
 
     # --- videos -----------------------------------------------------------------------------------
+
+    async def set_plugin_keep(self, name, keep):
+        """Leave this plugin on while a game runs (keep), or turn it off with the others."""
+        installed = _plugin_names()
+        if name not in installed:
+            return {"ok": False, "log": "not an installed Decky plugin"}
+        try:
+            names = _keep_read()
+            if "*" in names:
+                # Everything was kept: the list now says which, by name.
+                names = (names - {"*"}) | set(installed)
+            names.add(name) if keep else names.discard(name)
+            await asyncio.to_thread(_keep_write, names)
+        except OSError as e:
+            decky.logger.exception("keep-plugins file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
 
     async def set_video(self, kind, on):
         path = os.path.join(CONFIG_DIR, kind + ".webm")
