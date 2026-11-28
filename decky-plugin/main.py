@@ -62,6 +62,11 @@ PATCHES_DIR = os.path.join(CONFIG_DIR, "patches")
 # the wrapper also takes Immediate, written by hand.
 PRESENT_DIR = os.path.join(CONFIG_DIR, "present-mode")
 PRESENT_MODES = ("Mailbox", "Fifo")
+# The refresh rate Kyty gives the games, in Hz (--vblank-frequency): vblank-default for every game and, for
+# a game, vblank/<title id>, which wins. 60 is Kyty's default.
+VBLANK_DEFAULT = os.path.join(CONFIG_DIR, "vblank-default")
+VBLANK_DIR = os.path.join(CONFIG_DIR, "vblank")
+VBLANK_RATES = ("60", "90", "120")
 PATCH_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "patches")
 PATCH_SOURCE = "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
@@ -670,6 +675,33 @@ def _present_mode(tid):
     return word if word in PRESENT_MODES + ("Immediate",) else PRESENT_MODES[0]
 
 
+def _vblank_read(path):
+    """The refresh rate in this file, or None when there is none (or it is not one of the rates)."""
+    try:
+        with open(path) as f:
+            word = "".join(f.readline().split())
+    except OSError:
+        return None
+    return word if word in VBLANK_RATES else None
+
+
+def _vblank_write(path, rate):
+    """The file the wrapper reads; none when rate is None."""
+    if rate is None:
+        if os.path.lexists(path):
+            os.remove(path)
+        return
+    _mkdir_user(os.path.dirname(path))
+    tmp = path + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    # Root writes in the user's folder: never through a link put there.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w") as f:
+        f.write(rate + "\n")
+    os.replace(tmp, path)
+    os.lchown(path, *_ids())
+
+
 def _present_mode_write(tid, mode):
     """The file the wrapper reads; none for the default."""
     path = os.path.join(PRESENT_DIR, tid)
@@ -1060,6 +1092,7 @@ class Plugin:
             "gone": {k: v for k, v in known.items() if k not in {g["title_id"] for g in games} and v.get("appid")},
             "videos": {k: os.path.exists(os.path.join(CONFIG_DIR, k + ".webm")) for k in VIDEOS},
             "hdr": not os.path.exists(SDR_FLAG),
+            "vblank": _vblank_read(VBLANK_DEFAULT) or "60",
             "ps5_apu": _ps5_apu(),
             "kernel": _kernel_status(),
             "game_running": _game_running(),
@@ -1351,6 +1384,7 @@ class Plugin:
             # False while the game's executable is still being read for the first time.
             "addons_known": bool(entry) and entry.get("key") == _addon_key(g["path"]),
             "present_mode": _present_mode(title_id),
+            "vblank": _vblank_read(os.path.join(VBLANK_DIR, title_id)) or "global",
             "game_running": _game_running(),
         }
 
@@ -1376,6 +1410,26 @@ class Plugin:
             await asyncio.to_thread(_present_mode_write, title_id, mode)
         except OSError as e:
             decky.logger.exception("present mode file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def set_vblank(self, title_id, rate):
+        if rate not in VBLANK_RATES + ("global",) or not title_id or os.path.basename(title_id) != title_id or title_id in (".", ".."):
+            return {"ok": False, "log": "not a refresh rate of a game"}
+        try:
+            await asyncio.to_thread(_vblank_write, os.path.join(VBLANK_DIR, title_id), None if rate == "global" else rate)
+        except OSError as e:
+            decky.logger.exception("refresh rate file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def set_vblank_default(self, rate):
+        if rate not in VBLANK_RATES:
+            return {"ok": False, "log": "not a refresh rate"}
+        try:
+            await asyncio.to_thread(_vblank_write, VBLANK_DEFAULT, None if rate == VBLANK_RATES[0] else rate)
+        except OSError as e:
+            decky.logger.exception("refresh rate default file")
             return {"ok": False, "log": str(e)}
         return {"ok": True}
 

@@ -15,6 +15,9 @@
 # --addcont-dir, the way the launcher's add-ons folder setting does.
 # ~/.config/KytyPS5-Native/present-mode/<title id> holds the game's present mode while it is not Kyty's
 # default (Mailbox): the word Fifo or Immediate on its first line. The plugin's game page writes it.
+# ~/.config/KytyPS5-Native/vblank/<title id> and ~/.config/KytyPS5-Native/vblank-default hold the refresh
+# rate Kyty gives the game, in Hz (--vblank-frequency, 30 to 360; Kyty's default is 60). The game's file wins
+# over the global one. The plugin writes them.
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -69,6 +72,20 @@ if [ -f "$PRESENT" ]; then
 	Fifo | Mailbox | Immediate) PRESENT_ARGS=(--present-mode "$present_mode") ;;
 	esac
 fi
+# The refresh rate (--vblank-frequency) from the plugin's settings: the game's own file, else the global one.
+VBLANK_ARGS=()
+VBLANK_FILE=
+vblank_hz=
+for f in "$CONFIG/vblank/$TITLE" "$CONFIG/vblank-default"; do
+	if [ -f "$f" ]; then
+		VBLANK_FILE=$f
+		vblank_hz=$(head -1 "$f" | tr -d '[:space:]')
+		break
+	fi
+done
+case $vblank_hz in
+[0-9] | [0-9][0-9] | [0-9][0-9][0-9]) [ "$vblank_hz" -ge 30 ] && [ "$vblank_hz" -le 360 ] && VBLANK_ARGS=(--vblank-frequency "$vblank_hz") ;;
+esac
 # Games run on the gamescope Xwayland Steam gives them, the base layer is set on the root one (:0).
 export DISPLAY=${DISPLAY:-:1}
 ROOT_DISPLAY=${KYTYPS5_ROOT_DISPLAY:-:0}
@@ -203,6 +220,11 @@ front "$GAME_APPID"
 	elif [ -f "$PATCH" ]; then
 		echo "patches in $PATCH are for version '$patch_version', the game is '$game_version': left out"
 	fi
+	if [ ${#VBLANK_ARGS[@]} -gt 0 ]; then
+		echo "refresh rate from $VBLANK_FILE: $vblank_hz Hz"
+	elif [ -n "$VBLANK_FILE" ]; then
+		echo "refresh rate in $VBLANK_FILE is '$vblank_hz', not 30 to 360: left out"
+	fi
 	if [ ${#PRESENT_ARGS[@]} -gt 0 ]; then
 		echo "present mode from $PRESENT: $present_mode"
 	elif [ -f "$PRESENT" ]; then
@@ -210,7 +232,7 @@ front "$GAME_APPID"
 	fi
 	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" KYTY_GAMESCOPE_APPID=$GAME_APPID "$EMU" --game "$GAME" \
 		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS $LANGUAGE_ARGS \
-		"${ADDCONT_ARGS[@]}" "${PATCH_ARGS[@]}" "${PRESENT_ARGS[@]}"
+		"${ADDCONT_ARGS[@]}" "${PATCH_ARGS[@]}" "${PRESENT_ARGS[@]}" "${VBLANK_ARGS[@]}"
 	echo "== exit=$?"
 } >> "$LOG" 2>&1 &
 EMUPID=$!
