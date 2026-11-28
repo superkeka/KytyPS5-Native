@@ -55,13 +55,15 @@ int ItemCount(Page page) {
 const char* MonitoringLabel(int mode) {
 	switch (mode) {
 		case 1: return "FPS";
-		case 2: return "Detailed";
+		case 2: return "Compact";
+		case 3: return "Detailed";
+		case 4: return "Machine";
 		default: return "Off";
 	}
 }
 
 void StepMonitoring(int step) {
-	SetPerformanceOverlayMode((PerformanceOverlayMode() + step + 3) % 3);
+	SetPerformanceOverlayMode((PerformanceOverlayMode() + step + 5) % 5);
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 

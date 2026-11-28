@@ -147,6 +147,8 @@ std::mutex            g_frame_mutex;
 FrameWindow           g_frames;
 std::atomic<uint64_t> g_generation {0};
 std::atomic<bool>     g_details {false};
+// What the panel shows: 0 FPS and graph only, 1 compact, 2 detailed, 3 the machine (cores, temperatures, GPU).
+std::atomic<int>      g_view {1};
 std::atomic<uint64_t> g_revision {0};
 
 std::mutex                  g_host_mutex;
@@ -154,6 +156,11 @@ Common::HostStats           g_host_stats;
 uint64_t                    g_host_generation = 0;
 std::condition_variable_any g_sampler_wait;
 std::jthread                g_sampler;
+
+void SetView(int view) {
+	g_view.store(view, std::memory_order_release);
+	g_details.store(view == 2, std::memory_order_release);
+}
 
 void SetOverlayEnabled(bool enabled) {
 	{
@@ -191,6 +198,7 @@ void SamplerThread(const std::stop_token& stop) {
 			sampler.emplace();
 			sampled_generation = generation;
 		}
+		sampler->SetGpuLoadWanted(g_view.load(std::memory_order_acquire) == 3);
 		auto stats = sampler->Sample();
 		lock.lock();
 		g_host_stats      = std::move(stats);
@@ -743,6 +751,45 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 	}
 }
 
+// Whether the machine itself is at its limit: every core, the temperatures, the GPU and the memory.
+void DrawSystem(const Snapshot& shown) {
+	const auto& host = shown.host;
+	if (BeginSection("CPU")) {
+		Row("Machine", Percent(host.system_cpu_percent),
+		    host.system_cpu_percent ? std::optional(LevelColor(*host.system_cpu_percent, 70, 90)) : std::nullopt);
+		for (size_t i = 0; i < host.core_percent.size(); i++) {
+			Row(Fmt("  core %zu", i).c_str(), Fmt("%.0f%%", host.core_percent[i]),
+			    LevelColor(host.core_percent[i], 70, 95));
+		}
+		if (host.core_percent.empty()) {
+			Row("Cores", "n/a");
+		}
+		Row("Temperature", host.cpu_temp_c ? Fmt("%.0f C", *host.cpu_temp_c) : std::string("n/a"),
+		    host.cpu_temp_c ? std::optional(LevelColor(*host.cpu_temp_c, 75, 90)) : std::nullopt);
+		ImGui::EndTable();
+	}
+	if (BeginSection("GPU")) {
+		Row("Load", Percent(host.gpu_percent),
+		    host.gpu_percent ? std::optional(LevelColor(*host.gpu_percent, 80, 95)) : std::nullopt);
+		Row("Clock", host.gpu_clock_mhz ? Fmt("%.0f MHz", *host.gpu_clock_mhz) : std::string("n/a"));
+		Row("Temperature", host.gpu_temp_c ? Fmt("%.0f C", *host.gpu_temp_c) : std::string("n/a"),
+		    host.gpu_temp_c ? std::optional(LevelColor(*host.gpu_temp_c, 80, 95)) : std::nullopt);
+		Row("Power", host.gpu_power_w ? Fmt("%.0f W", *host.gpu_power_w) : std::string("n/a"));
+		ImGui::EndTable();
+	}
+	if (BeginSection("Memory")) {
+		if (host.system_memory_used && host.system_memory_total) {
+			Row("RAM", Bytes(*host.system_memory_used) + " / " + Bytes(*host.system_memory_total));
+		}
+		if (host.swap_used && host.swap_total && *host.swap_total != 0) {
+			Row("Swap", Bytes(*host.swap_used) + " / " + Bytes(*host.swap_total));
+		}
+		Row("Waiting on memory", host.memory_stall_percent ? Fmt("%.1f%%", *host.memory_stall_percent) : std::string("n/a"),
+		    host.memory_stall_percent ? std::optional(LevelColor(*host.memory_stall_percent, 2, 10)) : std::nullopt);
+		ImGui::EndTable();
+	}
+}
+
 } // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
@@ -766,9 +813,9 @@ void TogglePerformanceOverlay() noexcept {
 
 void TogglePerformanceOverlayDetails() noexcept {
 	if (Common::DebugCounters::Enabled()) {
-		g_details.store(!g_details.load(std::memory_order_acquire), std::memory_order_release);
+		SetView(g_view.load(std::memory_order_acquire) == 2 ? 1 : 2);
 	} else {
-		g_details.store(true, std::memory_order_release);
+		SetView(2);
 		SetOverlayEnabled(true);
 	}
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
@@ -778,11 +825,13 @@ int PerformanceOverlayMode() noexcept {
 	if (!Common::DebugCounters::Enabled()) {
 		return 0;
 	}
-	return g_details.load(std::memory_order_acquire) ? 2 : 1;
+	return g_view.load(std::memory_order_acquire) + 1;
 }
 
 void SetPerformanceOverlayMode(int mode) noexcept {
-	g_details.store(mode == 2, std::memory_order_release);
+	if (mode > 0) {
+		SetView(std::clamp(mode - 1, 0, 3));
+	}
 	if ((mode != 0) != Common::DebugCounters::Enabled()) {
 		SetOverlayEnabled(mode != 0);
 	}
@@ -804,6 +853,7 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	static bool     shown_details    = false;
 	const auto      generation       = g_generation.load(std::memory_order_acquire);
 	const bool      details          = g_details.load(std::memory_order_acquire);
+	const int       view             = g_view.load(std::memory_order_acquire);
 	const auto      now              = Clock::now();
 	if (generation != shown_generation) {
 		shown            = {};
@@ -878,7 +928,9 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 		}
 		DrawFrameGraph(shown.history, shown.history_count, (details ? 330.0f : 260.0f) * scale,
 		               46.0f * scale);
-		if (details) {
+		if (view == 0) {
+			// FPS and the graph only.
+		} else if (details) {
 			// Three columns keep the detailed panel within a 720p window.
 			if (ImGui::BeginTable("##details", 3, TABLE_FLAGS)) {
 				ImGui::TableNextRow();
@@ -890,15 +942,19 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 				DrawMemoryAndIo(shown);
 				ImGui::EndTable();
 			}
+		} else if (view == 3) {
+			DrawSystem(shown);
 		} else {
 			DrawCompact(shown);
 		}
+		if (view != 0) {
 #if defined(__APPLE__)
-		ImGui::TextDisabled(details ? "Cmd+Shift+P compact   Cmd+P hide"
-		                            : "Cmd+Shift+P details   Cmd+P hide");
+			ImGui::TextDisabled(details ? "Cmd+Shift+P compact   Cmd+P hide"
+			                            : "Cmd+Shift+P details   Cmd+P hide");
 #else
-		ImGui::TextDisabled(details ? "Shift+F2 compact   F2 hide" : "Shift+F2 details   F2 hide");
+			ImGui::TextDisabled(details ? "Shift+F2 compact   F2 hide" : "Shift+F2 details   F2 hide");
 #endif
+		}
 	}
 	const float bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
 	ImGui::End();

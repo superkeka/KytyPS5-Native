@@ -17,7 +17,8 @@ void               TogglePerformanceOverlay() noexcept;
 // Switches between the compact and the detailed panel, showing the panel if it was hidden.
 void TogglePerformanceOverlayDetails() noexcept;
 
-// 0 hidden, 1 compact, 2 detailed (the game menu's monitoring switch).
+// 0 hidden, 1 FPS and the graph, 2 compact, 3 detailed, 4 the machine: cores, temperatures, GPU
+// (the game menu's monitoring switch).
 [[nodiscard]] int PerformanceOverlayMode() noexcept;
 void              SetPerformanceOverlayMode(int mode) noexcept;
 
